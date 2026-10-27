@@ -637,12 +637,6 @@ setInterval(() => {}, 1000);
         assert_eq!(stdout, "ready");
         assert!(stderr.contains("cancelled"));
         assert!(!truncated);
-        assert!(
-            TcpStream::connect(("127.0.0.1", fixture.port))
-                .await
-                .is_err(),
-            "The descendant must release its listening socket"
-        );
         assert_eq!(
             unsafe { libc::kill(fixture.pid, 0) },
             -1,
@@ -652,6 +646,18 @@ setInterval(() => {}, 1000);
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
+        // Reaping the direct child does not wait for its orphaned descendant.
+        // Group SIGKILL can still be completing socket teardown on another CPU.
+        timeout(Duration::from_secs(5), async {
+            while TcpStream::connect(("127.0.0.1", fixture.port))
+                .await
+                .is_ok()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("The cancelled descendant must release its listening socket");
     }
 
     #[tokio::test]
