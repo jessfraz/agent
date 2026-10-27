@@ -144,3 +144,10 @@ Include Rex, Switchboard and enabled provider CLIs in `extraPackages` as well.
 The worker's TOML must set `coordinator`; the coordinator's must omit it.
 Model settings, source configuration, credentials and context stay in private
 runtime files. Restart the service after changing its settings.
+
+For generated preferences, `agent config apply preferences.toml` updates only
+the supplied model, context repositories, sources or polling interval in the
+existing private configuration. Connection and trust settings remain local.
+Invalid preferences leave the file untouched; repeated applications are a
+no-op. This allows Nix to manage shared preferences without publishing machine
+connection details or credentials.

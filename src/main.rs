@@ -58,6 +58,11 @@ struct Arguments {
 enum Action {
     /// Create private TOML settings without overwriting an existing file.
     Init,
+    /// Apply declarative preferences while preserving private machine settings.
+    Config {
+        #[command(subcommand)]
+        command: ConfigAction,
+    },
     Login,
     Status,
     Logout,
@@ -184,6 +189,11 @@ enum TasksAction {
 }
 
 #[derive(Subcommand)]
+enum ConfigAction {
+    Apply { settings: PathBuf },
+}
+
+#[derive(Subcommand)]
 enum ResourcesAction {
     List,
     Collect,
@@ -235,6 +245,30 @@ async fn main() -> Result<()> {
         selection: ModelArgs::default(),
     });
     match action {
+        Action::Config {
+            command: ConfigAction::Apply { settings },
+        } => {
+            let path = arguments
+                .config
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(config::default_path)?;
+            let result = config::apply(&path, &settings)?;
+            if arguments.json {
+                println!("{}", serde_json::to_string(&result)?);
+            } else {
+                println!(
+                    "{} {}",
+                    if result.changed {
+                        "Updated"
+                    } else {
+                        "Unchanged"
+                    },
+                    result.path.display()
+                );
+            }
+            return Ok(());
+        }
         Action::Init => {
             let path = arguments
                 .config

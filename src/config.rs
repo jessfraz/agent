@@ -55,6 +55,94 @@ fn default_poll_interval() -> u64 {
     60
 }
 
+/// Declarative preferences cannot change a machine's connection or trust.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedSettings {
+    pub model: Option<ModelSelection>,
+    pub context_repositories: Option<Vec<PathBuf>>,
+    pub sources: Option<Vec<SourceConfig>>,
+    pub poll_interval_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ApplyResult {
+    pub changed: bool,
+    pub path: PathBuf,
+}
+
+pub fn apply(path: &Path, settings_path: &Path) -> Result<ApplyResult> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let managed: ManagedSettings = toml::from_str(
+        &fs::read_to_string(settings_path).context("Could not read managed agent settings")?,
+    )
+    .context("Invalid managed agent TOML")?;
+    let path = std::path::absolute(path)?;
+    let metadata = fs::symlink_metadata(&path)
+        .context("Private agent configuration must already exist; run agent init first")?;
+    ensure!(
+        metadata.is_file(),
+        "Private agent configuration must be a regular file, not a symlink"
+    );
+    let original =
+        fs::read_to_string(&path).context("Could not read private agent configuration")?;
+    let mut config: ClientConfig =
+        toml::from_str(&original).context("Invalid private agent TOML")?;
+    let previous = toml::to_string(&config)?;
+    if let Some(model) = managed.model {
+        config.model = model;
+    }
+    if let Some(repositories) = managed.context_repositories {
+        config.context_repositories = repositories;
+    }
+    if let Some(sources) = managed.sources {
+        config.sources = sources;
+    }
+    if let Some(interval) = managed.poll_interval_seconds {
+        config.poll_interval_seconds = interval;
+    }
+    // Path expansion is a runtime view; retain portable ~/ paths on disk.
+    validate(&mut config.clone())?;
+    let contents = toml::to_string_pretty(&config)?;
+    if toml::to_string(&config)? == previous {
+        return Ok(ApplyResult {
+            changed: false,
+            path,
+        });
+    }
+    let directory = path
+        .parent()
+        .context("Configuration has no parent directory")?;
+    let temporary = directory.join(format!(".agent-config-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)
+            .context("Could not prepare private agent configuration")?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        // Refuse to clobber an edit made while preparing the replacement.
+        ensure!(
+            fs::read_to_string(&path)? == original,
+            "Agent configuration changed while applying preferences; retry after reviewing it"
+        );
+        fs::rename(&temporary, &path).context("Could not replace private agent configuration")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    Ok(ApplyResult {
+        changed: true,
+        path,
+    })
+}
+
 pub fn default_path() -> Result<PathBuf> {
     Ok(env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -117,6 +205,11 @@ pub fn load(explicit: Option<&Path>) -> Result<ClientConfig> {
         config.path =
             Some(fs::canonicalize(&path).context("Could not resolve agent configuration")?);
     }
+    validate(&mut config)?;
+    Ok(config)
+}
+
+fn validate(config: &mut ClientConfig) -> Result<()> {
     config.model.validate()?;
     let home = dirs::home_dir();
     for repository in &mut config.context_repositories {
@@ -137,7 +230,16 @@ pub fn load(explicit: Option<&Path>) -> Result<ClientConfig> {
     if let Some(coordinator) = &config.coordinator {
         validate_coordinator(coordinator)?;
     }
-    Ok(config)
+    for source in &config.sources {
+        if source.enabled()
+            && let SourceConfig::Slack {
+                command, account, ..
+            } = source
+        {
+            crate::sources::slack::SlackSource::new(command.clone(), account.clone())?;
+        }
+    }
+    Ok(())
 }
 
 fn context_repository_path(path: &Path, home: Option<&Path>) -> Result<PathBuf> {
