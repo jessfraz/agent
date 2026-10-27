@@ -1,6 +1,9 @@
 //! Typed Rex CLI boundary. No routing policy and no automatic mutation retries.
 //! Native schemas are discovered per server with `rex api describe`.
 
+pub mod install;
+pub mod source;
+
 use std::fmt;
 use std::path::Path;
 use std::process::Stdio;

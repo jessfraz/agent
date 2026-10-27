@@ -145,6 +145,12 @@ coverage. Admit events durably before advancing a cursor. Partial reads never
 pretend to be complete, and repeated event versions do not create duplicate
 work. Exact triage input survives interrupted requests.
 
+Messages reads use Rex Server's existing macOS permission identity. A short
+action starts a headless Rust helper; subsequent calls collect bounded chunks.
+The helper owns the read deadline and process group cleanup. Rex retains one
+bounded job slot, without creating sessions or terminals. Agent upgrades pass
+the current helper path to the same actions and require no new disk-access grant.
+
 Email replies and due checks enter the same routing path. A tool must durably
 link each event to work or dismiss it with a reason; prose alone does not clear
 the inbox. A worker finishing does not resolve the user's outcome. Keep an
@@ -225,7 +231,3 @@ Rex server restart behavior needs investigation: what persists, how bindings
 become stale, and how to reattach without duplicate workers. Conversation
 recovery and terminal recovery are separate. Automatic restart recovery is not
 part of the MVP.
-
-macOS packaging also needs a stable executable identity for Full Disk Access
-across Nix upgrades. A launchd coordinator has its own permission context;
-Rex Server's grant covers its terminals, not the separate coordinator service.

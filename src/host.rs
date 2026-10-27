@@ -1,5 +1,5 @@
 //! Effects run on the attached CLI's machine, never an implicit fallback host.
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{future::Future, path::Path, process::Stdio, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use tokio::{
@@ -422,6 +422,27 @@ pub(crate) async fn run_process(
     deadline: Duration,
     output_limit: usize,
 ) -> Result<HostResult> {
+    run_process_until(
+        program,
+        args,
+        cwd,
+        deadline,
+        output_limit,
+        std::future::pending(),
+    )
+    .await
+}
+
+/// Cancellation retains the same group ownership, reaping and pipe draining as
+/// timeout. Dropping the future also kills the group through its owned guard.
+pub(crate) async fn run_process_until(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    deadline: Duration,
+    output_limit: usize,
+    cancelled: impl Future<Output = ()>,
+) -> Result<HostResult> {
     let mut child = Command::new(program)
         .args(args)
         .current_dir(cwd)
@@ -448,7 +469,10 @@ pub(crate) async fn run_process(
         .context("Command error pipe is unavailable")?;
     let mut output = tokio::spawn(captured(stdout, output_limit));
     let mut errors = tokio::spawn(captured(stderr, output_limit));
-    let finished = timeout(deadline, exited_unreaped(group.0)).await;
+    let finished = tokio::select! {
+        result = timeout(deadline, exited_unreaped(group.0)) => Some(result),
+        _ = cancelled => None,
+    };
     group.terminate();
     let status = timeout(Duration::from_secs(3), child.wait())
         .await
@@ -467,13 +491,17 @@ pub(crate) async fn run_process(
     };
     let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
     let exit_code = match finished {
-        Ok(result) => {
+        Some(Ok(result)) => {
             result?;
             status.code().unwrap_or(128)
         }
-        Err(_) => {
+        Some(Err(_)) => {
             stderr.push_str("\nCommand timed out and its process group was stopped.");
             124
+        }
+        None => {
+            stderr.push_str("\nCommand cancelled and its process group was stopped.");
+            143
         }
     };
     Ok(HostResult::Process {
@@ -486,10 +514,141 @@ pub(crate) async fn run_process(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use serde::Deserialize;
+    use tokio::{net::TcpStream, sync::oneshot, time::timeout};
+
     use crate::{
-        host::execute,
+        host::{execute, run_process, run_process_until},
         protocol::{HostCommand, HostResult},
     };
+
+    #[tokio::test]
+    async fn source_capture_preserves_literal_arguments_and_nonzero_status() {
+        let literal = "$(literal);*.chat";
+        let result = run_process(
+            "node",
+            &[
+                "--eval".into(),
+                "process.stdout.write(process.argv[1]); process.stderr.write('diagnostic'); process.exitCode=7".into(),
+                literal.into(),
+            ],
+            std::path::Path::new("/"),
+            Duration::from_secs(5),
+            1024,
+        )
+        .await
+        .unwrap();
+        let HostResult::Process {
+            exit_code,
+            stdout,
+            stderr,
+            truncated,
+        } = result
+        else {
+            panic!("Expected captured native process");
+        };
+        assert_eq!(exit_code, 7);
+        assert_eq!(stdout, literal);
+        assert_eq!(stderr, "diagnostic");
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn cancelled_source_capture_kills_descendants_reaps_the_child_and_drains_output() {
+        #[derive(Deserialize)]
+        struct Fixture {
+            pid: i32,
+            port: u16,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("child.json");
+        let script = r#"
+const {spawn} = require('node:child_process');
+const {writeFileSync} = require('node:fs');
+const descendant = spawn(process.execPath, ['--eval', `
+  const server = require('node:net').createServer();
+  server.listen(0, '127.0.0.1', () => process.stdout.write(String(server.address().port)));
+`], {stdio:['ignore','pipe','ignore']});
+descendant.stdout.once('data', (data) => {
+  writeFileSync(process.argv[1], JSON.stringify({pid:process.pid,port:Number(data.toString())}));
+  process.stdout.write('ready');
+});
+setInterval(() => {}, 1000);
+"#;
+        let (stop, cancelled) = oneshot::channel();
+        let cwd = directory.path().to_owned();
+        let args = vec![
+            "--eval".into(),
+            script.into(),
+            marker.to_string_lossy().into_owned(),
+        ];
+        let running = tokio::spawn(async move {
+            run_process_until(
+                "node",
+                &args,
+                &cwd,
+                Duration::from_secs(900),
+                2 * 1024 * 1024,
+                async move {
+                    let _ = cancelled.await;
+                },
+            )
+            .await
+        });
+        let fixture: Fixture = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(contents) = tokio::fs::read(&marker).await
+                    && let Ok(fixture) = serde_json::from_slice(&contents)
+                {
+                    break fixture;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Native descendant must be listening before cancellation");
+        assert!(
+            TcpStream::connect(("127.0.0.1", fixture.port))
+                .await
+                .is_ok()
+        );
+        stop.send(()).unwrap();
+        let result = timeout(Duration::from_secs(5), running)
+            .await
+            .expect("Cancellation must complete cleanup")
+            .unwrap()
+            .unwrap();
+        let HostResult::Process {
+            exit_code,
+            stdout,
+            stderr,
+            truncated,
+        } = result
+        else {
+            panic!("Expected cancelled native process");
+        };
+        assert_eq!(exit_code, 143);
+        assert_eq!(stdout, "ready");
+        assert!(stderr.contains("cancelled"));
+        assert!(!truncated);
+        assert!(
+            TcpStream::connect(("127.0.0.1", fixture.port))
+                .await
+                .is_err(),
+            "The descendant must release its listening socket"
+        );
+        assert_eq!(
+            unsafe { libc::kill(fixture.pid, 0) },
+            -1,
+            "The direct child must be reaped before the result is returned"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
 
     #[tokio::test]
     async fn runs_literal_arguments_and_retains_real_exit_status() {

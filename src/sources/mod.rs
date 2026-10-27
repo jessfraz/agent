@@ -5,6 +5,7 @@ pub mod calendar;
 pub mod github;
 pub mod google;
 pub mod messages;
+pub mod messages_read;
 pub mod slack;
 
 use std::{
@@ -254,10 +255,11 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
     SourceCatalog { sources, failures }
 }
 
-pub(crate) struct ReadOutput {
-    exit_code: i32,
-    stdout: String,
-    truncated: bool,
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ReadOutput {
+    pub(crate) exit_code: i32,
+    pub(crate) stdout: String,
+    pub(crate) truncated: bool,
 }
 
 pub(crate) async fn read_command(argv: &[String]) -> Result<ReadOutput> {

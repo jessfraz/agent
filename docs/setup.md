@@ -118,12 +118,22 @@ needs its account and command prefix. The source command must be available in
 the service's PATH. `agent sources` reports coverage and checkpoints; an access
 failure is not an empty inbox.
 
-Messages also uses macOS Full Disk Access permissions for the process running
-the CLI. `messages doctor` checks local database access and schema support.
-A standalone launchd coordinator runs outside Rex Server's permission context.
-A successful check in a Rex terminal does not prove that the service can read
-Messages. Authorize the service's process separately before enabling this source.
-Nix upgrades change executable paths, so access may need to be granted again.
+Messages reads run headlessly through the local Rex Server, using its macOS
+Full Disk Access grant. Enable access for Rex Server once in System Settings;
+agent binaries do not need their own grant. No sessions or terminals are created
+for polling. `messages doctor` checks database access and schema support.
+
+With Messages enabled, `agent serve` installs the small Rex action module once.
+Existing Rex configuration is preserved. An unchanged module causes no reload
+on agent upgrades. Setup can also be run explicitly:
+
+```sh
+agent rex install
+```
+
+If Rex configuration is managed elsewhere, include `require('agent_messages')`
+through that owner. The command reports any setup failure and preserves the
+existing configuration; other sources and chat can continue.
 
 `agent usage` reads quota from the installed, signed-in Codex app-server. Its
 reported account should match the intended plan. This integration does not

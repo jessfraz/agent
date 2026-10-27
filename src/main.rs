@@ -63,6 +63,11 @@ enum Action {
         #[command(subcommand)]
         command: ConfigAction,
     },
+    /// Install the headless Messages reader in the local Rex server.
+    Rex {
+        #[command(subcommand)]
+        command: RexAction,
+    },
     Login,
     Status,
     Logout,
@@ -119,6 +124,11 @@ enum Action {
     Mail {
         #[command(subcommand)]
         command: MailAction,
+    },
+    #[command(hide = true)]
+    MessagesRead {
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
     },
 }
 
@@ -194,6 +204,11 @@ enum ConfigAction {
 }
 
 #[derive(Subcommand)]
+enum RexAction {
+    Install,
+}
+
+#[derive(Subcommand)]
 enum ResourcesAction {
     List,
     Collect,
@@ -245,6 +260,23 @@ async fn main() -> Result<()> {
         selection: ModelArgs::default(),
     });
     match action {
+        Action::MessagesRead { argv } => {
+            let output = agent_cli::sources::messages_read::capture(&argv).await?;
+            println!("{}", serde_json::to_string(&output)?);
+            return Ok(());
+        }
+        Action::Rex {
+            command: RexAction::Install,
+        } => {
+            let installed =
+                agent_cli::rex::install::install(agent_cli::rex::source::MODULE).await?;
+            if arguments.json {
+                println!("{}", serde_json::to_string(&installed)?);
+            } else {
+                println!("Messages reads configured through Rex Server");
+            }
+            return Ok(());
+        }
         Action::Config {
             command: ConfigAction::Apply { settings },
         } => {
@@ -347,6 +379,18 @@ async fn main() -> Result<()> {
                 "A worker profile cannot start a second local coordinator"
             );
             return worker_service(&config, coordinator.as_deref(), &script, &directory, 300).await;
+        }
+        if !no_sources
+            && config.sources.iter().any(|source| {
+                matches!(
+                    source,
+                    agent_cli::sources::SourceConfig::Messages { enabled: true, .. }
+                )
+            })
+            && let Err(error) =
+                agent_cli::rex::install::install(agent_cli::rex::source::MODULE).await
+        {
+            eprintln!("Messages Rex setup is unavailable: {error}");
         }
         let policy = agent_cli::tailnet::PeerPolicy::new(&config.trusted_nodes)?;
         let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;

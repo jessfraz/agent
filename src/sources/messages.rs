@@ -530,22 +530,14 @@ impl Source for MessagesSource {
     async fn poll(&self, checkpoint: Option<&SourceCheckpoint>) -> Result<SourceBatch> {
         let result = async {
             let window = self.window(checkpoint, now_seconds()?)?;
-            let output = read_command(&self.argv(&window)?).await?;
+            let output = crate::rex::source::read_command(&self.argv(&window)?).await?;
             self.normalize(output, window)
         }
         .await;
-        Ok(result.unwrap_or_else(|_| {
-            let process = std::env::current_exe().map_or_else(
-                |_| "the process running agent".to_owned(),
-                |path| path.display().to_string(),
-            );
-            SourceBatch::unavailable(
-                self.key(),
-                format!(
-                    "Messages local history is unavailable; check CLI setup and macOS Full Disk Access for {process}"
-                ),
-            )
-        }))
+        Ok(result.unwrap_or_else(|_| SourceBatch::unavailable(
+            self.key(),
+            "Messages reads are unavailable; run agent rex install and check Rex Server's Full Disk Access",
+        )))
     }
 }
 
