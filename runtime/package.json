@@ -8,7 +8,7 @@
     "test": "node --test dist/test/*.test.js"
   },
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=26.12.1"
   },
   "dependencies": {
     "@earendil-works/chord": "1.4.0",

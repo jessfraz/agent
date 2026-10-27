@@ -20,7 +20,7 @@
             ./runtime/package-lock.json ./runtime/tsconfig.json
           ];
         };
-        nodejs = pkgs.nodejs_22;
+        nodejs = pkgs.nodejs_26;
         npmDeps = pkgs.importNpmLock {npmRoot = ./runtime;};
         npmConfigHook = pkgs.importNpmLock.npmConfigHook;
         npmFlags = ["--ignore-scripts"];
@@ -46,11 +46,11 @@
         cargoLock.lockFile = ./Cargo.lock;
         cargoBuildFlags = ["--bin" "agent"];
         nativeBuildInputs = [pkgs.makeWrapper];
-        nativeCheckInputs = [pkgs.nodejs_22 pkgs.git pkgs.lsof];
+        nativeCheckInputs = [pkgs.nodejs_26 pkgs.git pkgs.lsof];
         postInstall = ''
           wrapProgram "$out/bin/agent" \
             --set AGENT_RUNTIME_PATH "${runtime}/lib/agent-runtime/dist/src/bridge.js" \
-            --prefix PATH : "${pkgs.lib.makeBinPath [pkgs.nodejs_22 pkgs.git pkgs.lsof pkgs.openssh]}" \
+            --prefix PATH : "${pkgs.lib.makeBinPath [pkgs.nodejs_26 pkgs.git pkgs.lsof pkgs.openssh]}" \
             --suffix PATH : /run/current-system/sw/bin
         '';
       };
@@ -69,7 +69,7 @@
       pkgs = import nixpkgs {inherit system;};
     in {
       default = pkgs.mkShell {
-        packages = with pkgs; [cargo rustc rustfmt clippy nodejs_22 pkg-config git lsof actionlint];
+        packages = with pkgs; [cargo rustc rustfmt clippy nodejs_26 pkg-config git lsof actionlint];
       };
     });
   };
