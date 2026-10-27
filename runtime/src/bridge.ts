@@ -2,14 +2,13 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
-import { createModels } from "@earendil-works/pi-ai";
-import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { AssistantEntry, createRegistry, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ErrorCode } from "./generated/ErrorCode.js";
+import { ConversationModels, ModelError } from "./models.js";
 import { ChatGptAuth } from "./auth.js";
 import { validRequest, validEvent, errorEvent } from "./protocol.js";
 import { TaskError, TaskStore } from "./tasks.js";
@@ -33,12 +32,8 @@ function emit(id: number, event: RuntimeEventKind): void {
 }
 function failure(id: number, code: ErrorCode, message: string): void { emit(id, { type: "failure", code, message }); }
 const hostRequests = new HostRequests((id, call_id, command) => emit(id, { type: "host_call", call_id, command }));
-const models = createModels();
-const upstream = openaiProvider();
-models.setProvider({ ...upstream, auth: { apiKey: { name: "ChatGPT plan", async resolve() {
-  const credential = await auth.credential();
-  return { auth: { apiKey: credential.access }, source: "ChatGPT plan" };
-} } } });
+const inference = new ConversationModels(undefined, auth);
+const models = inference.models;
 
 async function openApplication() {
   const database = await openNodeSqliteDatabase(join(state, "session.sqlite"));
@@ -46,7 +41,7 @@ async function openApplication() {
   const storage = await SqliteStorage.open(database);
   const registry = createRegistry();
   const harness = await Harness.open(storage, { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
-  const tasks = new TaskStore(harness);
+  const tasks = new TaskStore(harness, inference);
   const executions = new Executions();
   const sources = new SourceJournal(harness, tasks);
   const tools = createAppTools(tasks, executions);
@@ -101,9 +96,8 @@ async function handle(request: RuntimeRequest): Promise<void> {
       case "triage_sources": {
         const { sources, executions, tools, sourceTools, resourceTools } = await app();
         if (await sources.hasWork()) {
-          await auth.credential();
-          await sources.triage(command, (conversation) => executions.bind(conversation.id.toString(), {
-            cwd: command.cwd, hosts: command.hosts, role: "triage", call: (operation) => hostRequests.call(id, operation),
+          await sources.triage(command, (conversation, model) => executions.bind(conversation.id.toString(), {
+            model, cwd: command.cwd, hosts: command.hosts, role: "triage", call: (operation) => hostRequests.call(id, operation),
             notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
           }), [tools.host, tools.main, sourceTools, resourceTools]);
         }
@@ -112,20 +106,21 @@ async function handle(request: RuntimeRequest): Promise<void> {
       }
       case "run_task": {
         const { tasks, executions, tools, sourceTools, resourceTools } = await app();
-        const answer = await tasks.run(command, (conversation, host) => executions.bind(conversation.id.toString(), {
-          cwd: command.cwd, hosts: [host], role: "worker", call: (operation) => hostRequests.call(id, operation),
+        const answer = await tasks.run(command, (conversation, host, model) => executions.bind(conversation.id.toString(), {
+          model, cwd: command.cwd, hosts: [host], role: "worker", call: (operation) => hostRequests.call(id, operation),
         }), (task, text) => emit(id, { type: "notice", task_id: task.id, text: `${task.title}: ${text}` }),
-        [tools.host, tools.worker, sourceTools, resourceTools], (operation) => hostRequests.call(id, operation), async () => { await auth.credential(); });
+        [tools.host, tools.worker, sourceTools, resourceTools], (operation) => hostRequests.call(id, operation), (selected) => inference.preflight(selected));
         emit(id, { type: "answer", ...answer });
         break;
       }
       case "chat": {
         const turn = mainQueue.then(async () => {
-          await auth.credential();
+          await inference.preflight(command.model);
           const { harness, tasks, executions, tools, sourceTools, resourceTools } = await app();
           const root = await harness.root(BACKGROUND_CONTEXT);
+          await root.waitForIdle(BACKGROUND_CONTEXT);
           const release = executions.bind(root.id.toString(), {
-            cwd: command.cwd, hosts: command.hosts, call: (operation) => hostRequests.call(id, operation),
+            model: command.model, cwd: command.cwd, hosts: command.hosts, call: (operation) => hostRequests.call(id, operation),
             notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
           });
           try {
@@ -134,8 +129,8 @@ async function handle(request: RuntimeRequest): Promise<void> {
               JSON.stringify(related.map((task) => ({ id: task.id, title: task.title, outcome: task.outcome, state: task.state, summary: task.summary })));
             const hostsContext = "\n\nConfigured worker hosts (first is default): " +
               JSON.stringify(command.hosts.map((host) => ({ name: host.name, cwd: host.cwd })));
-            await root.configure({ model: { provider: "openai", modelId: command.model },
-              instructions: command.instructions + relatedContext + hostsContext, cwd: command.cwd, extensions: [tools.host, tools.main, sourceTools, resourceTools] }, BACKGROUND_CONTEXT);
+            await inference.configure(root, command.model, {
+              instructions: command.instructions + relatedContext + hostsContext, cwd: command.cwd, extensions: [tools.host, tools.main, sourceTools, resourceTools] });
             const submission = await root.submit({ type: "input", content: command.input }, BACKGROUND_CONTEXT);
             const settled = await submission.wait(BACKGROUND_CONTEXT);
             if (settled.type !== "input" || settled.status !== "done") throw new TaskError("The model turn did not complete; its state is retained");
@@ -153,7 +148,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
       default: throw new TaskError("This request is handled by the coordinator");
     }
   } catch (error) {
-    if (error instanceof TaskError) failure(id, "invalid_request", error.message);
+    if (error instanceof TaskError || error instanceof ModelError) failure(id, "invalid_request", error.message);
     else emit(id, errorEvent(error));
   } finally {
     hostRequests.finish(id);

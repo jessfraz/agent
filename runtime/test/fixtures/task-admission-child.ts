@@ -1,3 +1,5 @@
+import { fixtureModel } from "../model.js";
+import { ConversationModels } from "../../src/models.js";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
@@ -14,7 +16,7 @@ const storage = await SqliteStorage.open(database);
 const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 });
 const models = createModels(); models.setProvider(faux.provider);
 const session = await Harness.open(storage, { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
-const tasks = new TaskStore(session);
+const tasks = new TaskStore(session, new ConversationModels(models));
 faux.setResponses([async () => {
   while ((await tasks.get(id)).pending.length > 0) await new Promise<void>((resolve) => setTimeout(resolve, 5));
   process.stdout.write("ADMITTED\n");
@@ -29,4 +31,4 @@ await tasks.dispatch(id, host, async () => ({ type: "spawned", binding }));
 const task = await tasks.get(id);
 if (task.worker.state !== "bound") throw new Error("Fixture binding missing");
 await tasks.run({ type: "run_task", task_id: id, allocation_id: task.worker.allocation_id,
-  binding, instructions: "Use the original request.", model: "fixture", cwd: host.cwd }, () => () => {}, () => {});
+  binding, instructions: "Use the original request.", model: fixtureModel, cwd: host.cwd }, () => () => {}, () => {});

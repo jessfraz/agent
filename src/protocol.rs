@@ -1,3 +1,4 @@
+use crate::models::ModelSelection;
 use crate::resources::{CleanupPlan, ResourceRecord, ResourceReport, WorktreeAllocation};
 use crate::sources::{SourceBatch, SourceCheckpoint, SourceCoverage, SourceKey};
 use schemars::JsonSchema;
@@ -107,7 +108,7 @@ pub enum RuntimeCommand {
     },
     TriageSources {
         instructions: String,
-        model: String,
+        model: ModelSelection,
         cwd: String,
         hosts: Vec<WorkerHost>,
     },
@@ -117,7 +118,7 @@ pub enum RuntimeCommand {
     Chat {
         input: String,
         instructions: String,
-        model: String,
+        model: ModelSelection,
         cwd: String,
         hosts: Vec<WorkerHost>,
     },
@@ -140,7 +141,7 @@ pub enum RuntimeCommand {
         allocation_id: String,
         binding: WorkerRef,
         instructions: String,
-        model: String,
+        model: ModelSelection,
         cwd: String,
     },
     HostReply {
@@ -167,7 +168,8 @@ pub struct WorkerLaunch {
     pub runtime: Option<String>,
     pub config: Option<String>,
     pub instructions: Option<String>,
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<ModelSelection>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -225,6 +227,8 @@ pub struct TaskRecord {
     pub title: String,
     pub outcome: String,
     pub summary: String,
+    #[serde(default)]
+    pub model: Option<ModelSelection>,
     pub state: TaskState,
     pub worker: WorkerState,
     pub sources: Vec<SourceRef>,
@@ -241,6 +245,8 @@ pub struct TaskAgentRecord {
     pub title: String,
     pub outcome: String,
     pub summary: String,
+    #[serde(default)]
+    pub model: Option<ModelSelection>,
     pub state: TaskAgentState,
     pub worker: WorkerState,
     pub pending: Vec<TaskInput>,

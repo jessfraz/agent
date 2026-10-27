@@ -41,7 +41,7 @@
         version = "0.1.0";
         src = pkgs.lib.fileset.toSource {
           root = ./.;
-          fileset = pkgs.lib.fileset.unions [./src ./tests ./Cargo.toml ./Cargo.lock];
+          fileset = pkgs.lib.fileset.unions [./src ./tests ./examples ./Cargo.toml ./Cargo.lock];
         };
         cargoLock.lockFile = ./Cargo.lock;
         cargoBuildFlags = ["--bin" "agent"];

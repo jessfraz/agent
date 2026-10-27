@@ -55,8 +55,9 @@ agent mail accounts
 ```
 
 Install the same package on both machines. Put private configuration in
-`~/.config/agent/config.json`, using [this example](examples/config.json) as a
-starting point. On the coordinator, run `agent serve --tailnet-port 43187`.
+`~/.config/agent/config.toml`, using the commented
+[coordinator](examples/coordinator.toml) or [client](examples/client.toml)
+example. On the coordinator, run `agent serve` (port 43187 by default).
 Other machines set `coordinator` to its `tailscale://IP:43187` address. Both
 ends require Tailscale; the listener binds only to its native Tailscale
 interface. By default, only authorized, untagged devices of the same user are
@@ -73,6 +74,12 @@ CLI command. Calendar and GitHub sources use the existing `gws` and `gh` CLIs
 through Switchboard. Remove an entry from `sources` to disable it; an empty list
 disables intake. Failed reads remain visible as coverage gaps. Only the selected
 coordinator polls sources and owns conversation state.
+
+The same TOML file sets a typed provider, model, optional reasoning level and
+fast mode. Pi supplies the provider catalog and inference. ChatGPT is the
+default; other providers use Pi's native environment or ambient credentials.
+Unsupported reasoning or fast-mode choices produce an error. New tasks inherit
+the current defaults; resumed tasks retain their saved selection.
 
 Add `{"provider":"messages","namespaces":null}` to `sources` to enable the
 read-only `messages` CLI on macOS.

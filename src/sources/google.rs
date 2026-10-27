@@ -59,17 +59,13 @@ struct Coverage {
 struct Message {
     #[serde(default)]
     gmail_message_id: String,
-    #[serde(default)]
-    gmail_thread_id: String,
-    #[serde(default)]
-    subject: String,
-    #[serde(default)]
-    body_text: String,
+    gmail_thread_id: Option<String>,
+    subject: Option<String>,
+    body_text: Option<String>,
     #[serde(default)]
     body_truncated: bool,
     from: Option<Sender>,
-    #[serde(default)]
-    date: String,
+    date: Option<String>,
 }
 #[derive(Deserialize)]
 struct Sender {
@@ -171,7 +167,15 @@ impl GoogleSource {
             .messages
             .into_iter()
             .filter_map(|message| {
-                if message.gmail_message_id.is_empty() || message.gmail_thread_id.is_empty() {
+                let (Some(thread_id), Some(subject), Some(body_text)) =
+                    (message.gmail_thread_id, message.subject, message.body_text)
+                else {
+                    // Failed native hydration rows retain IDs but omit content.
+                    // Never admit those placeholders as immutable message events.
+                    invalid = true;
+                    return None;
+                };
+                if message.gmail_message_id.is_empty() || thread_id.is_empty() {
                     invalid = true;
                     return None;
                 }
@@ -183,10 +187,10 @@ impl GoogleSource {
                         sender.email
                     ));
                 }
-                if !message.date.is_empty() {
-                    text.push_str(&format!("Date: {}\n", message.date));
+                if let Some(date) = message.date.filter(|date| !date.is_empty()) {
+                    text.push_str(&format!("Date: {date}\n"));
                 }
-                text.push_str(&message.body_text);
+                text.push_str(&body_text);
                 if message.body_truncated {
                     text.push_str("\n[Excerpt; read the source for the full message.]");
                 }
@@ -196,9 +200,9 @@ impl GoogleSource {
                     source: SourceRef {
                         provider: key.provider.clone(),
                         account: key.account.clone(),
-                        thread_id: message.gmail_thread_id,
+                        thread_id,
                     },
-                    title: message.subject,
+                    title: subject,
                     text,
                 })
             })
@@ -373,6 +377,58 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn native_nullable_date_and_missing_date_preserve_the_same_message() {
+        let source = GoogleSource::new("google.alpha".into()).unwrap();
+        let native = r#"{"status":"executed","fields":{"status":"ok","messages":[{"gmail_message_id":"m1","gmail_thread_id":"t1","coverage":"complete","from":{"email":"sender@example.net","name":null},"subject":"Board revision","date":null,"body_text":"Please check R2","body_truncated":false}],"has_more":false,"failures":[]},"coverage":{"status":"complete","next_cursor":null}}"#;
+        let batch = source.normalize(output(native), source.window(None, 800_000).unwrap());
+        assert_eq!(batch.coverage, SourceCoverage::Complete);
+        assert_eq!(batch.events.len(), 1);
+        let event = &batch.events[0];
+        assert_eq!(event.id, "m1");
+        assert_eq!(event.source.thread_id, "t1");
+        assert_eq!(event.title, "Board revision");
+        assert_eq!(event.text, "From:  <sender@example.net>\nPlease check R2");
+
+        let replay = source.normalize(
+            output(&native.replace("\"date\":null,", "")),
+            source.window(None, 800_000).unwrap(),
+        );
+        assert_eq!(replay.coverage, SourceCoverage::Complete);
+        assert_eq!(replay.events[0].version, event.version);
+        assert_eq!(replay.events[0].text, event.text);
+        assert_eq!(replay.checkpoint, batch.checkpoint);
+    }
+
+    #[test]
+    fn native_failed_rows_retain_hydrated_events_without_advancing_the_cursor() {
+        let source = GoogleSource::new("google.alpha".into()).unwrap();
+        let checkpoint = SourceCheckpoint {
+            value: r#"{"account":"google.alpha","since":700000,"until":800001,"cursor":"current-page"}"#.into(),
+        };
+        let native = r#"{"status":"executed","fields":{"status":"partial","messages":[
+          {"gmail_message_id":"m1","gmail_thread_id":"t1","coverage":"complete","from":{"email":"sender@example.net","name":null},"subject":"Board revision","date":null,"body_text":"Please check R2","body_truncated":false},
+          {"gmail_message_id":"m2","gmail_thread_id":null,"coverage":"unknown","body_truncated":false,"failure":{"code":"execution"}},
+          {"gmail_message_id":"m3","gmail_thread_id":"t3","coverage":"unknown","body_truncated":false,"failure":{"code":"execution"}},
+          {"gmail_message_id":"m4","gmail_thread_id":"t4","coverage":"complete","subject":"Attachment only","body_text":"","body_truncated":false}
+        ],"has_more":true,"failures":[{"code":"execution"}]},"coverage":{"status":"unknown","next_cursor":"later-page"}}"#;
+        let batch = source.normalize(
+            output(native),
+            source.window(Some(&checkpoint), 900_000).unwrap(),
+        );
+        assert!(matches!(batch.coverage, SourceCoverage::Partial { .. }));
+        assert!(batch.checkpoint.is_none());
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(batch.events[0].id, "m1");
+        assert_eq!(
+            batch.events[0].text,
+            "From:  <sender@example.net>\nPlease check R2"
+        );
+        assert_eq!(batch.events[1].id, "m4");
+        assert_eq!(batch.events[1].title, "Attachment only");
+        assert_eq!(batch.events[1].text, "");
     }
 
     #[test]

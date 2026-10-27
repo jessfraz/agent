@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import { defineExtension, defineTool, ROOT_CONVERSATION_ID, type Extension, type ToolExecutionResult } from "@earendil-works/pi-durable";
+import { DEFAULT_MODEL } from "./models.js";
+import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { HostCommand } from "./generated/HostCommand.js";
 import type { HostResult } from "./generated/HostResult.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
 import { TaskError, TaskStore, type HostCall } from "./tasks.js";
 
-export type Execution = { cwd: string; hosts: WorkerHost[]; call: HostCall; role?: "worker" | "triage";
+export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; call: HostCall; role?: "worker" | "triage";
   notify?: (task: string | null, text: string) => void };
 /** A conversation can execute only through its currently attached CLI client. */
 export class Executions {
@@ -151,8 +153,12 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
             return output({ related_tasks: related, instruction: "Read and continue a matching task, or set new_task for a separate outcome." });
           }
           if (args.title === undefined || args.outcome === undefined) throw new TaskError("A new task needs a concise title and outcome");
+          const configured = args.host === undefined ? execution.hosts[0] : execution.hosts.find((host) => host.name === args.host);
+          if (configured === undefined) throw new TaskError("Choose a configured worker host");
+          const model = configured.launch?.model ?? execution.model ?? DEFAULT_MODEL;
+          await tasks.inference.preflight(model);
           const id = await api.memo("task_id", randomUUID(), context);
-          task = await tasks.create({ id, title: args.title, outcome: args.outcome, sources: args.sources ?? [] });
+          task = await tasks.create({ id, title: args.title, outcome: args.outcome, sources: args.sources ?? [], model });
         } else task = await tasks.get(args.task_id);
         if (task.worker.state === "bound" && args.cwd !== undefined && args.cwd !== task.worker.host.cwd) {
           throw new TaskError("Continue this task in its existing working directory");

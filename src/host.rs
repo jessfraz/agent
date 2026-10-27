@@ -248,8 +248,12 @@ fn worker_args(host: &WorkerHost, task_id: &TaskId, allocation_id: &str) -> Vec<
         "--allocation-id".into(),
         allocation_id.into(),
     ]);
-    if let Some(launch) = &host.launch {
-        args.extend(["--model".into(), launch.model.clone()]);
+    if let Some(model) = host
+        .launch
+        .as_ref()
+        .and_then(|launch| launch.model.as_ref())
+    {
+        args.extend(model.cli_args());
     }
     args
 }

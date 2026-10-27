@@ -7,6 +7,8 @@ import { join } from "node:path";
 import test from "node:test";
 import { AuthError, ChatGptAuth } from "../src/auth.js";
 import { errorEvent } from "../src/protocol.js";
+import { builtinModels } from "@earendil-works/pi-ai/providers/all";
+import { ConversationModels, DEFAULT_MODEL } from "../src/models.js";
 
 const SCOPE = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
 const CLIENT = "oaiapp_synthetic";
@@ -301,6 +303,12 @@ test("transient refresh failure retains tokens; invalid_grant transitions to nee
     });
     assert.equal((await f.auth.status()).state, "needs_sign_in");
     assert.equal(record((await saved(f.directory)).connection).tokens, undefined);
+    let environmentReads = 0;
+    const inference = new ConversationModels(builtinModels({ authContext: {
+      env: async () => { environmentReads += 1; return "sk-synthetic"; }, fileExists: async () => false,
+    } }), f.auth);
+    await assert.rejects(inference.preflight(DEFAULT_MODEL), authError("needs_sign_in"));
+    assert.equal(environmentReads, 0, "A failed stored credential must not switch to an environment key");
     f.provider.check();
   } finally { await f.close() }
 });

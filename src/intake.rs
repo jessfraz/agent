@@ -13,7 +13,8 @@ use tokio::{
 use crate::{
     config::ClientConfig,
     host,
-    protocol::{AuthStatus, RuntimeCommand, RuntimeEventKind, SourceState, WorkerHost},
+    models::ModelSelection,
+    protocol::{RuntimeCommand, RuntimeEventKind, SourceState, WorkerHost},
     runtime::FrameReader,
     service,
     sources::{self, SourceBatch, SourceCoverage},
@@ -21,7 +22,8 @@ use crate::{
 
 pub struct ContextBundle {
     pub instructions_file: PathBuf,
-    pub model: String,
+    pub context_repositories: Vec<PathBuf>,
+    pub model: ModelSelection,
     pub cwd: String,
     pub hosts: Vec<WorkerHost>,
 }
@@ -126,32 +128,22 @@ pub async fn cycle(directory: &Path, config: &ClientConfig, context: &ContextBun
             }
         }
     }
-    let signed_in = call(directory, RuntimeCommand::Status)
-        .await?
-        .iter()
-        .any(|event| {
-            matches!(
-                event,
-                RuntimeEventKind::AuthStatus {
-                    status: AuthStatus::Connected { .. }
-                }
-            )
-        });
-    if signed_in {
-        call(
-            directory,
-            RuntimeCommand::TriageSources {
-                instructions: crate::instructions::load(
-                    &context.instructions_file,
-                    Path::new(&context.cwd),
-                )?,
-                model: context.model.clone(),
-                cwd: context.cwd.clone(),
-                hosts: context.hosts.clone(),
-            },
-        )
-        .await?;
-    }
+    // The runtime checks the selected provider only when admitted work needs
+    // a model turn. ChatGPT status cannot gate other providers.
+    call(
+        directory,
+        RuntimeCommand::TriageSources {
+            instructions: crate::instructions::load_with_context(
+                &context.instructions_file,
+                Path::new(&context.cwd),
+                &context.context_repositories,
+            )?,
+            model: context.model.clone(),
+            cwd: context.cwd.clone(),
+            hosts: context.hosts.clone(),
+        },
+    )
+    .await?;
     Ok(())
 }
 

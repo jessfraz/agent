@@ -1,0 +1,3 @@
+# Use this on a worker or a CLI-only machine. The address below is invented.
+# Port 43187 is implicit. Workers and terminals share this configuration.
+coordinator = "tailscale://100.64.0.10"

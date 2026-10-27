@@ -1,3 +1,5 @@
+import { fixtureModel } from "../model.js";
+import { ConversationModels } from "../../src/models.js";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
@@ -14,7 +16,7 @@ await database.exec("PRAGMA synchronous = FULL");
 const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 });
 const models = createModels(); models.setProvider(faux.provider); const registry = createRegistry();
 const session = await Harness.open(await SqliteStorage.open(database), { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
-const tasks = new TaskStore(session); const executions = new Executions(); const sources = new SourceJournal(session, tasks);
+const tasks = new TaskStore(session, new ConversationModels(models)); const executions = new Executions(); const sources = new SourceJournal(session, tasks);
 const tools = createAppTools(tasks, executions); const sourceTools = createSourceTools(sources, executions);
 registry.install(tools.host); registry.install(tools.main); registry.install(sourceTools);
 await sources.admit({ source: { provider: "mail", account: "alpha" }, checkpoint: { value: "a1" }, coverage: { status: "complete" },
@@ -28,6 +30,6 @@ faux.setResponses([
   fauxAssistantMessage(fauxToolCall("dismiss_source_events", { keys: [first.key], reason: "First item accounted for" }), { stopReason: "toolUse" }),
   async () => { process.stdout.write("ADMITTED\n"); return new Promise(() => {}); },
 ]);
-await sources.triage({ type: "triage_sources", instructions: "Account for each event.", model: "fixture", cwd: "/workspace/example", hosts: [] },
+await sources.triage({ type: "triage_sources", instructions: "Account for each event.", model: fixtureModel, cwd: "/workspace/example", hosts: [] },
   (conversation) => executions.bind(conversation.id.toString(), { cwd: "/workspace/example", hosts: [], role: "triage", call: async () => ({ type: "written" }) }),
   [tools.host, tools.main, sourceTools]);

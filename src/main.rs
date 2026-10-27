@@ -15,13 +15,14 @@ use std::{
 use agent_cli::{
     config::{self, ClientConfig},
     host, instructions, intake,
+    models::{ModelProvider, ModelSelection, Reasoning},
     protocol::{AuthStatus, RuntimeCommand, RuntimeEventKind, TaskId, WorkerLaunch, WorkerRef},
     rex::{BlockId, RexClient, SessionId},
     runtime::FrameReader,
     service,
 };
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -64,8 +65,8 @@ enum Action {
     },
     Chat {
         prompt: Option<String>,
-        #[arg(long, default_value = "gpt-6.1-sol")]
-        model: String,
+        #[command(flatten)]
+        selection: ModelArgs,
     },
     /// Search and read stored task conversations.
     Tasks {
@@ -97,13 +98,52 @@ enum Action {
         agent_id: Option<String>,
         #[arg(long)]
         allocation_id: String,
-        #[arg(long, default_value = "gpt-6.1-sol")]
-        model: String,
+        #[command(flatten)]
+        selection: ModelArgs,
     },
     Mail {
         #[command(subcommand)]
         command: MailAction,
     },
+}
+
+#[derive(Args, Default)]
+struct ModelArgs {
+    #[arg(long, value_enum)]
+    provider: Option<ModelProvider>,
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    model: Option<String>,
+    #[arg(long, value_enum)]
+    reasoning: Option<Reasoning>,
+    #[arg(long, conflicts_with = "no_fast")]
+    fast: bool,
+    #[arg(long, conflicts_with = "fast")]
+    no_fast: bool,
+    #[arg(long, hide = true, conflicts_with = "reasoning")]
+    default_reasoning: bool,
+}
+
+impl ModelArgs {
+    fn resolve(self, defaults: &ModelSelection) -> Result<ModelSelection> {
+        let selection = ModelSelection {
+            provider: self.provider.unwrap_or(defaults.provider),
+            model_id: self.model.unwrap_or_else(|| defaults.model_id.clone()),
+            reasoning: if self.default_reasoning {
+                None
+            } else {
+                self.reasoning.or(defaults.reasoning)
+            },
+            fast: if self.fast {
+                true
+            } else if self.no_fast {
+                false
+            } else {
+                defaults.fast
+            },
+        };
+        selection.validate()?;
+        Ok(selection)
+    }
 }
 
 #[derive(Subcommand)]
@@ -162,7 +202,7 @@ async fn main() -> Result<()> {
     let mut arguments = Arguments::parse();
     let action = arguments.command.take().unwrap_or(Action::Chat {
         prompt: None,
-        model: "gpt-6.1-sol".into(),
+        selection: ModelArgs::default(),
     });
     match action {
         Action::Usage => {
@@ -226,9 +266,10 @@ async fn main() -> Result<()> {
                     .instructions
                     .clone()
                     .unwrap_or(instructions::default_path()?),
-                model: "gpt-6.1-sol".into(),
+                context_repositories: profile.context_repositories.clone(),
+                model: profile.model.clone(),
                 cwd: cwd.to_string_lossy().into_owned(),
-                hosts: config::worker_hosts(&profile, None, &cwd)?,
+                hosts: selected_hosts(&profile, None, &cwd, &profile.model)?,
             };
             let state = directory.clone();
             Some(WatchGuard(tokio::spawn(async move {
@@ -311,24 +352,36 @@ async fn main() -> Result<()> {
             task_id,
             agent_id,
             allocation_id,
-            model,
+            selection,
         } => RuntimeCommand::RunTask {
             task_id,
             agent_id,
             allocation_id,
             binding: local_worker_binding().await?,
-            instructions: instructions::load(&global, &cwd)?,
-            model,
+            instructions: instructions::load_with_context(
+                &global,
+                &cwd,
+                &config.context_repositories,
+            )?,
+            model: selection.resolve(&config.model)?,
             cwd: cwd.to_string_lossy().into_owned(),
         },
         Action::Chat {
             prompt: Some(input),
-            model,
-        } => chat_command(input, model, &global, &cwd, &config, coordinator.as_deref())?,
+            selection,
+        } => chat_command(
+            input,
+            selection.resolve(&config.model)?,
+            &global,
+            &cwd,
+            &config,
+            coordinator.as_deref(),
+        )?,
         Action::Chat {
             prompt: None,
-            model,
+            selection,
         } => {
+            let model = selection.resolve(&config.model)?;
             let _watch = watch(
                 &config,
                 coordinator.as_deref(),
@@ -411,31 +464,40 @@ async fn watch(
 
 fn chat_command(
     input: String,
-    model: String,
+    model: ModelSelection,
     global: &Path,
     cwd: &Path,
     config: &ClientConfig,
     coordinator: Option<&str>,
 ) -> Result<RuntimeCommand> {
-    let mut hosts = config::worker_hosts(config, coordinator, cwd)?;
-    for host in &mut hosts {
-        host.launch
-            .get_or_insert_with(|| WorkerLaunch {
-                state_dir: None,
-                runtime: None,
-                config: None,
-                instructions: None,
-                model: model.clone(),
-            })
-            .model = model.clone();
-    }
+    let hosts = selected_hosts(config, coordinator, cwd, &model)?;
     Ok(RuntimeCommand::Chat {
         input,
-        instructions: instructions::load(global, cwd)?,
+        instructions: instructions::load_with_context(global, cwd, &config.context_repositories)?,
         model,
         cwd: cwd.to_string_lossy().into_owned(),
         hosts,
     })
+}
+
+fn selected_hosts(
+    config: &ClientConfig,
+    coordinator: Option<&str>,
+    cwd: &Path,
+    model: &ModelSelection,
+) -> Result<Vec<agent_cli::protocol::WorkerHost>> {
+    let mut hosts = config::worker_hosts(config, coordinator, cwd)?;
+    for host in &mut hosts {
+        let launch = host.launch.get_or_insert(WorkerLaunch {
+            state_dir: None,
+            runtime: None,
+            config: None,
+            instructions: None,
+            model: None,
+        });
+        launch.model.get_or_insert_with(|| model.clone());
+    }
+    Ok(hosts)
 }
 
 fn worker_launch(
@@ -464,7 +526,7 @@ fn worker_launch(
                 .to_string_lossy()
                 .into_owned(),
         ),
-        model: "gpt-6.1-sol".into(),
+        model: None,
     })
 }
 
@@ -590,7 +652,7 @@ async fn connection(
         ));
     };
     if let Some(address) = coordinator.strip_prefix("tailscale://") {
-        let address = address.parse()?;
+        let address = config::tailnet_address(address)?;
         let policy = agent_cli::tailnet::PeerPolicy::new(&config.trusted_nodes)?;
         let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
         let stream = agent_cli::tailnet::connect(address, &policy, &daemon).await?;
@@ -661,7 +723,7 @@ async fn request(
         coordinator.and_then(|value| value.strip_prefix("tailscale://")),
     ) {
         (true, Some(address)) => {
-            let address: std::net::SocketAddr = address.parse()?;
+            let address = config::tailnet_address(address)?;
             let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
             address.ip() != agent_cli::tailnet::self_address(0, &daemon).await?.ip()
         }
@@ -832,7 +894,12 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Action, Arguments, local_service_command};
+    use crate::{Action, Arguments, ModelArgs, local_service_command, selected_hosts};
+    use agent_cli::{
+        config::ClientConfig,
+        models::{ModelProvider, ModelSelection, Reasoning},
+        protocol::{WorkerHost, WorkerLaunch},
+    };
     use clap::Parser;
     use std::path::Path;
 
@@ -879,7 +946,7 @@ mod tests {
         let program = Path::new("/example/agent");
         let script = Path::new("/example/runtime with spaces/bridge.js");
         let state = Path::new("/example/private state");
-        let config = Path::new("/example/private config.json");
+        let config = Path::new("/example/private config.toml");
         for selected in [None, Some(config)] {
             let command = local_service_command(program, script, state, selected);
             let native = command.as_std();
@@ -899,5 +966,131 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn model_flags_override_only_selected_defaults_and_keep_provider_values_typed() {
+        let defaults = ModelSelection {
+            provider: ModelProvider::Anthropic,
+            model_id: "example-model".into(),
+            reasoning: Some(Reasoning::High),
+            fast: true,
+        };
+        assert_eq!(ModelArgs::default().resolve(&defaults).unwrap(), defaults);
+        let parsed =
+            Arguments::try_parse_from(["agent", "chat", "--model", "new-model", "--no-fast"])
+                .unwrap();
+        let Some(Action::Chat { selection, .. }) = parsed.command else {
+            panic!("Expected chat");
+        };
+        assert_eq!(
+            selection.resolve(&defaults).unwrap(),
+            ModelSelection {
+                model_id: "new-model".into(),
+                fast: false,
+                ..defaults.clone()
+            }
+        );
+        for flags in [
+            vec!["--provider", "unknown"],
+            vec!["--reasoning", "extreme"],
+            vec!["--model", ""],
+            vec!["--fast", "--no-fast"],
+        ] {
+            assert!(Arguments::try_parse_from(["agent", "chat"].into_iter().chain(flags)).is_err());
+        }
+    }
+
+    #[test]
+    fn worker_model_arguments_roundtrip_without_remote_defaults_changing_the_selection() {
+        let remote = ModelSelection {
+            provider: ModelProvider::Anthropic,
+            model_id: "remote-model".into(),
+            reasoning: Some(Reasoning::High),
+            fast: true,
+        };
+        for reasoning in [None, Some(Reasoning::Off), Some(Reasoning::Max)] {
+            for fast in [false, true] {
+                let expected = ModelSelection {
+                    provider: ModelProvider::OpenAiCodex,
+                    model_id: "future-model".into(),
+                    reasoning,
+                    fast,
+                };
+                let argv = expected.cli_args();
+                let parsed = Arguments::try_parse_from(
+                    [
+                        "agent",
+                        "run-task",
+                        "11111111-1111-4111-8111-111111111111",
+                        "--allocation-id",
+                        "fixture",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .chain(argv),
+                )
+                .unwrap();
+                let Some(Action::RunTask { selection, .. }) = parsed.command else {
+                    panic!("Expected worker");
+                };
+                assert_eq!(selection.resolve(&remote).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn worker_hosts_inherit_the_selected_model_and_preserve_explicit_host_overrides() {
+        let selected = ModelSelection {
+            provider: ModelProvider::Google,
+            model_id: "example-gemini".into(),
+            ..ModelSelection::default()
+        };
+        let override_model = ModelSelection {
+            provider: ModelProvider::Anthropic,
+            model_id: "example-claude".into(),
+            ..ModelSelection::default()
+        };
+        let launch = WorkerLaunch {
+            state_dir: None,
+            runtime: None,
+            config: Some("/private/worker.toml".into()),
+            instructions: None,
+            model: Some(override_model.clone()),
+        };
+        let config = ClientConfig {
+            hosts: vec![
+                WorkerHost {
+                    name: "inherited".into(),
+                    rex_server: Some("https://worker.example.invalid".into()),
+                    coordinator: None,
+                    cwd: "/workspace".into(),
+                    agent_program: "agent".into(),
+                    launch: None,
+                },
+                WorkerHost {
+                    name: "override".into(),
+                    rex_server: Some("https://worker.example.invalid".into()),
+                    coordinator: None,
+                    cwd: "/workspace".into(),
+                    agent_program: "agent".into(),
+                    launch: Some(launch),
+                },
+            ],
+            ..ClientConfig::default()
+        };
+        let hosts = selected_hosts(&config, None, Path::new("/workspace"), &selected).unwrap();
+        assert_eq!(
+            hosts[0].launch.as_ref().unwrap().model.as_ref(),
+            Some(&selected)
+        );
+        assert_eq!(
+            hosts[1].launch.as_ref().unwrap().model.as_ref(),
+            Some(&override_model)
+        );
+        assert_eq!(
+            hosts[1].launch.as_ref().unwrap().config.as_deref(),
+            Some("/private/worker.toml")
+        );
     }
 }

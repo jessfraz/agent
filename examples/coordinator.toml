@@ -1,0 +1,29 @@
+# The coordinator owns shared settings, conversations and background intake.
+# Additional context repositories are optional and do not change the chat's cwd.
+context_repositories = []
+
+# Defaults for new work. Existing tasks keep their saved model selection.
+[model]
+provider = "openai"
+model_id = "gpt-6.1-sol"
+reasoning = "high"
+fast = false
+
+# Discover all Google mail accounts already configured in Switchboard.
+[[sources]]
+provider = "google"
+enabled = true
+
+# Each feed can be disabled without removing its configuration.
+[[sources]]
+provider = "google_calendar"
+enabled = true
+
+[[sources]]
+provider = "github"
+enabled = true
+
+# Messages reads local macOS history and preserves unread state.
+[[sources]]
+provider = "messages"
+enabled = false

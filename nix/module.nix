@@ -20,7 +20,7 @@ in {
     };
     configFile = lib.mkOption {
       type = lib.types.str;
-      description = "Absolute path to private runtime configuration, outside the Nix store.";
+      description = "Absolute path to private TOML settings, outside the Nix store.";
     };
     stateDirectory = lib.mkOption {
       type = lib.types.nullOr lib.types.str;

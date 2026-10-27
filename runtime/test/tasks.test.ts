@@ -1,3 +1,5 @@
+import { fixtureModel } from "./model.js";
+import { ConversationModels } from "../src/models.js";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
@@ -45,7 +47,7 @@ test("task agents own conversations and named terminals in one Rex session, then
     ]);
     let nativeCreates = 0;
     await app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: parent.worker.allocation_id,
-      binding, instructions: "", model: "fixture", cwd: host.cwd }, (conversation) => app.executions.bind(conversation.id.toString(), {
+      binding, instructions: "", model: fixtureModel, cwd: host.cwd }, (conversation) => app.executions.bind(conversation.id.toString(), {
         cwd: host.cwd, hosts: [host], call: async (command) => {
           assert.equal(command.type, "spawn_subagent");
           if (command.type !== "spawn_subagent") throw new Error("Expected child allocation");
@@ -68,7 +70,7 @@ test("task agents own conversations and named terminals in one Rex session, then
     const replacement = { ...binding, block_id: "block:77777777-7777-4777-8777-777777777777" };
     let resumed = 0;
     await app.tasks.run({ type: "run_task", task_id: task.id, agent_id: child.id, allocation_id: child.worker.allocation_id,
-      binding: childBinding, instructions: "", model: "fixture", cwd: host.cwd }, (conversation) => app.executions.bind(conversation.id.toString(), {
+      binding: childBinding, instructions: "", model: fixtureModel, cwd: host.cwd }, (conversation) => app.executions.bind(conversation.id.toString(), {
         cwd: host.cwd, hosts: [host], call: async () => { throw new Error("No direct child host effects expected"); },
       }), () => { throw new Error("Child results belong to the parent"); }, [app.tools.host, app.tools.worker], async (command) => {
         assert.equal(command.type, "resume_worker"); resumed += 1;
@@ -93,7 +95,7 @@ test("task agents own conversations and named terminals in one Rex session, then
       fauxAssistantMessage("Finished after review."),
     ]);
     await app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: parent.worker.allocation_id,
-      binding: replacement, instructions: "", model: "fixture", cwd: host.cwd }, (conversation) => app.executions.bind(conversation.id.toString(), {
+      binding: replacement, instructions: "", model: fixtureModel, cwd: host.cwd }, (conversation) => app.executions.bind(conversation.id.toString(), {
         cwd: host.cwd, hosts: [host], call: async () => { throw new Error("Parent result should reuse the conversation"); },
       }), () => {}, [app.tools.host, app.tools.worker]);
     assert.equal((await app.tasks.get(task.id)).state.state, "resolved");
@@ -108,7 +110,7 @@ async function open(directory: string) {
   const models = createModels(); models.setProvider(faux.provider);
   const registry = createRegistry();
   const session = await Harness.open(storage, { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
-  const tasks = new TaskStore(session);
+  const tasks = new TaskStore(session, new ConversationModels(models));
   const executions = new Executions();
   const tools = createAppTools(tasks, executions);
   registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker);
@@ -175,7 +177,7 @@ test("input arriving during recovered history finalization is drained by the att
     const saved = await app.tasks.get(task.id);
     if (saved.worker.state !== "bound") throw new Error("Missing binding");
     const command = { type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id,
-      binding, instructions: "", model: "fixture", cwd: host.cwd };
+      binding, instructions: "", model: fixtureModel, cwd: host.cwd };
     app.faux.setResponses([fauxAssistantMessage("Initial result")]);
     await app.tasks.run({ ...command, type: "run_task" }, () => () => {}, () => {});
     let historyStarted: () => void = () => {};
@@ -212,7 +214,7 @@ test("delegation persists the chosen repository cwd and bound tasks reuse it", a
   try {
     const root = await app.session.root(BACKGROUND_CONTEXT);
     const cwd = "/workspace/board"; let nativeCalls = 0;
-    const release = app.executions.bind(root.id.toString(), { cwd: host.cwd, hosts: [host], call: async (command) => {
+    const release = app.executions.bind(root.id.toString(), { model: fixtureModel, cwd: host.cwd, hosts: [host], call: async (command) => {
       assert.ok(command.type === "spawn_worker" || command.type === "resume_worker");
       if (command.type !== "spawn_worker" && command.type !== "resume_worker") throw new Error("Expected a task worker");
       assert.equal(command.host.cwd, cwd); nativeCalls += 1;
@@ -248,7 +250,7 @@ test("delegation persists the chosen repository cwd and bound tasks reuse it", a
         fauxAssistantMessage("Inspected the chosen repository."), fauxAssistantMessage("Continued the chosen repository."),
       ]);
       await app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: continued.worker.allocation_id,
-        binding, instructions: "Repository guidance", model: "fixture", cwd }, (conversation, workerHost) => {
+        binding, instructions: "Repository guidance", model: fixtureModel, cwd }, (conversation, workerHost) => {
         assert.equal(workerHost.cwd, cwd);
         return app.executions.bind(conversation.id.toString(), { cwd: workerHost.cwd, hosts: [workerHost], call: async (command) => {
           assert.equal(command.type, "exec"); if (command.type !== "exec") throw new Error("Expected repository operation");
@@ -310,10 +312,10 @@ test("resuming a task keeps its session and conversation while replacing an exit
     assert.equal(resumed.worker.binding.session_id, binding.session_id);
     app.faux.setResponses([fauxAssistantMessage("Continued the existing inspection.")]);
     await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: resumed.worker.allocation_id,
-      binding, instructions: "", model: "fixture", cwd: host.cwd }, () => () => {}, () => {}), /binding is not confirmed/);
+      binding, instructions: "", model: fixtureModel, cwd: host.cwd }, () => () => {}, () => {}), /binding is not confirmed/);
     assert.equal(app.faux.state.callCount, 0);
     assert.match((await app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: resumed.worker.allocation_id,
-      binding: replacement, instructions: "", model: "fixture", cwd: host.cwd }, () => () => {}, () => {})).text, /Continued/);
+      binding: replacement, instructions: "", model: fixtureModel, cwd: host.cwd }, () => () => {}, () => {})).text, /Continued/);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -349,7 +351,7 @@ test("worker host tools execute through the attached client while the main conve
     ]);
     const notices: string[] = [];
     const running = app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id,
-      binding, instructions: "Use verified source.", model: "fixture", cwd: host.cwd },
+      binding, instructions: "Use verified source.", model: fixtureModel, cwd: host.cwd },
     (conversation) => app.executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [], call: async (command) => {
       assert.deepEqual(command, { type: "exec", program: "inspect", args: ["literal value"], cwd: host.cwd, timeout_seconds: 300 });
       started(); return hostResult;
@@ -358,7 +360,7 @@ test("worker host tools execute through the attached client while the main conve
     await app.tasks.enqueue(task.id, "Also inspect the follow-up.");
     await app.tasks.dispatch(task.id, host, async () => { throw new Error("An active worker must be reused"); });
     await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id,
-      binding, instructions: "", model: "fixture", cwd: host.cwd }, () => () => {}, () => {}), /already has/);
+      binding, instructions: "", model: fixtureModel, cwd: host.cwd }, () => () => {}, () => {}), /already has/);
     const root = await app.session.root(BACKGROUND_CONTEXT);
     await root.configure({ model: { provider: "openai", modelId: "fixture" } }, BACKGROUND_CONTEXT);
     const main = await root.submit({ type: "input", content: "Are you available?" }, BACKGROUND_CONTEXT);
@@ -397,7 +399,7 @@ test("a killed coordinator recovers an admitted Pi submission even after app pen
     if (task.worker.state !== "bound") throw new Error("Missing persisted binding");
     app.faux.setResponses([fauxAssistantMessage("Recovered the original requested work.")]);
     const recovered = await app.tasks.run({ type: "run_task", task_id: id, allocation_id: task.worker.allocation_id,
-      binding: task.worker.binding, instructions: "Use verified source.", model: "fixture", cwd: host.cwd },
+      binding: task.worker.binding, instructions: "Use verified source.", model: fixtureModel, cwd: host.cwd },
     () => () => {}, () => {});
     assert.match(recovered.text, /Recovered the original/);
     const conversation = await app.tasks.conversation(task.conversation_id);
@@ -428,7 +430,7 @@ test("worker tools reject unrelated task writes and oversized reads while main m
     ]);
     let calls = 0;
     await app.tasks.run({ type: "run_task", task_id: own.id, allocation_id: task.worker.allocation_id,
-      binding, instructions: "Work on the own source.", model: "fixture", cwd: host.cwd },
+      binding, instructions: "Work on the own source.", model: fixtureModel, cwd: host.cwd },
     (conversation) => app.executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [], call: async () => {
       calls += 1; return { type: "written" };
     } }), () => {}, [app.tools.host, app.tools.worker]);
@@ -445,7 +447,7 @@ test("worker tools reject unrelated task writes and oversized reads while main m
       fauxAssistantMessage("Recorded verified completion."),
     ]);
     const root = await app.session.root(BACKGROUND_CONTEXT);
-    releaseMain = app.executions.bind(root.id.toString(), { cwd: host.cwd, hosts: [], call: async () => ({ type: "written" }) });
+    releaseMain = app.executions.bind(root.id.toString(), { model: fixtureModel, cwd: host.cwd, hosts: [], call: async () => ({ type: "written" }) });
     await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.tools.main] }, BACKGROUND_CONTEXT);
     const submission = await root.submit({ type: "input", content: "Record the verified completion." }, BACKGROUND_CONTEXT);
     assert.equal((await submission.wait(BACKGROUND_CONTEXT)).status, "done");

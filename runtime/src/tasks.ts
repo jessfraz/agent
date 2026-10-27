@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AssistantEntry, defineDoc, type Conversation, type ConversationId, type Cursor, type EntryRecord, type Extension, type Harness, type Tx } from "@earendil-works/pi-durable";
+import { ConversationModels, DEFAULT_MODEL, ModelError, savedHost, savedModel } from "./models.js";
+import type { ModelSelection } from "./generated/ModelSelection.js";
+import type { WorkerState } from "./generated/WorkerState.js";
 import type { HostCommand } from "./generated/HostCommand.js";
 import type { HostResult } from "./generated/HostResult.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
@@ -70,7 +73,24 @@ export class TaskStore {
   private scanning: Promise<void> | undefined;
   private resources: { attach(taskId: string): Promise<void> } | undefined;
   private outcomes: OutcomeSink | undefined;
-  constructor(readonly session: Harness) {}
+  constructor(readonly session: Harness, readonly inference = new ConversationModels()) { inference.bind(session); }
+  private savedWorker(worker: WorkerState): WorkerState {
+    return worker.state === "unassigned" ? worker : { ...worker, host: savedHost(worker.host) };
+  }
+  private savedTask(task: TaskRecord): TaskRecord {
+    return { ...task, model: savedModel(task.model), worker: this.savedWorker(task.worker),
+      agents: (task.agents ?? []).map((agent) => ({ ...agent, model: savedModel(agent.model), worker: this.savedWorker(agent.worker) })) };
+  }
+  async selection(id: string, fallback: ModelSelection, agentId?: string): Promise<ModelSelection> {
+    const task = await this.get(id); const actor = this.actor(task, agentId);
+    if (actor.model !== null) return actor.model;
+    const launch = actor.worker.state === "unassigned" ? null : actor.worker.host.launch?.model;
+    const selected = await this.inference.legacy(await this.conversation(actor.conversation_id), savedModel(launch) ?? fallback);
+    await this.update(id, (saved) => { this.actor(saved, agentId).model ??= selected; });
+    const model = this.actor(await this.get(id), agentId).model;
+    if (model === null) throw new ModelError("The task model did not commit");
+    return model;
+  }
   trackOutcomes(outcomes: OutcomeSink): void { this.outcomes = outcomes; }
   private outcome(task: TaskRecord, conversationId: string, entryId: string | null, callId: string | null,
     failure?: string): TaskOutcome {
@@ -125,7 +145,7 @@ export class TaskStore {
 
   async list(): Promise<TaskRecord[]> {
     const state = await this.session.snapshot(Tasks, BACKGROUND_CONTEXT);
-    return (state?.tasks ?? []).map((task) => ({ ...task, agents: task.agents ?? [] }))
+    return (state?.tasks ?? []).map((task) => this.savedTask(task))
       .sort((a, b) => b.updated_at - a.updated_at || a.id.localeCompare(b.id));
   }
   async get(id: string): Promise<TaskRecord> {
@@ -215,7 +235,7 @@ export class TaskStore {
     return scored.sort((a, b) => b.score - a.score || b.task.updated_at - a.task.updated_at)
       .slice(0, Math.min(20, Math.max(1, limit))).map((item) => item.task);
   }
-  async create(input: { id?: string; title: string; outcome: string; sources?: SourceRef[] }): Promise<TaskRecord> {
+  async create(input: { id?: string; title: string; outcome: string; sources?: SourceRef[]; model?: ModelSelection }): Promise<TaskRecord> {
     const id = input.id ?? randomUUID();
     if (input.title.trim().length === 0 || input.outcome.trim().length === 0) throw new TaskError("Task title and outcome are required");
     const native = await this.session.commit(async (tx) => {
@@ -223,7 +243,7 @@ export class TaskStore {
       if (index.tasks.some((task) => task.id === id)) return;
       const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
       index.tasks.push({
-        id, conversation_id: conversation.id.toString(), title: input.title.trim(), outcome: input.outcome.trim(),
+        id, model: input.model ?? null, conversation_id: conversation.id.toString(), title: input.title.trim(), outcome: input.outcome.trim(),
         summary: "", state: { state: "open" }, worker: { state: "unassigned" },
         sources: input.sources ?? [], pending: [], agents: [], updated_at: Date.now(),
       });
@@ -236,7 +256,7 @@ export class TaskStore {
     const index = await tx.doc(Tasks);
     const task = index.tasks.find((task) => task.id === id);
     if (task === undefined) throw new TaskError("Unknown task");
-    task.agents ??= [];
+    Object.assign(task, this.savedTask(task));
     change(task);
     task.updated_at = Date.now();
   }
@@ -261,11 +281,12 @@ export class TaskStore {
     if (running !== undefined) running.revision += 1;
     return task;
   }
-  async createAgent(taskId: string, input: { id: string; title: string; outcome: string; input: string; inputId: string }): Promise<TaskAgentRecord> {
+  async createAgent(taskId: string, input: { id: string; title: string; outcome: string; input: string; inputId: string; model?: ModelSelection }): Promise<TaskAgentRecord> {
     if (input.title.trim().length === 0 || input.title.length > 80 || input.outcome.trim().length === 0 ||
         input.outcome.length > 4000 || input.input.trim().length === 0 || Buffer.byteLength(input.input, "utf8") > 65_536) {
       throw new TaskError("An agent needs a title, bounded outcome, and instruction");
     }
+    const selected = input.model ?? await this.selection(taskId, DEFAULT_MODEL);
     await this.resources?.attach(taskId);
     const native = await this.session.commit(async (tx) => {
       const index = await tx.doc(Tasks);
@@ -275,7 +296,7 @@ export class TaskStore {
       if (task.agents.some((agent) => agent.id === input.id)) return;
       if (task.agents.filter((agent) => agent.state.state === "open").length >= 8) throw new TaskError("This task already has eight unfinished agents");
       const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
-      task.agents.push({ id: input.id, conversation_id: conversation.id.toString(), title: input.title.trim(),
+      task.agents.push({ id: input.id, model: selected, conversation_id: conversation.id.toString(), title: input.title.trim(),
         outcome: input.outcome.trim(), summary: "", state: { state: "open" }, worker: { state: "unassigned" },
         pending: [{ id: input.inputId, content: input.input }], updated_at: Date.now() });
       task.state = { state: "open" };
@@ -412,9 +433,9 @@ export class TaskStore {
     return outcome;
   }
   async run(input: Extract<RuntimeCommand, { type: "run_task" }>,
-    bind: (conversation: Conversation, host: WorkerHost) => () => void,
+    bind: (conversation: Conversation, host: WorkerHost, model: ModelSelection) => () => void,
     notice: (task: TaskRecord, text: string) => void,
-    extensions: readonly Extension[] = [], call?: HostCall, prepare?: () => Promise<void>): Promise<{ conversation_id: string; text: string }> {
+    extensions: readonly Extension[] = [], call?: HostCall, prepare?: (selection: ModelSelection) => Promise<void>): Promise<{ conversation_id: string; text: string }> {
     const actorKey = this.actorKey(input.task_id, input.agent_id);
     if (this.running.has(actorKey)) throw new TaskError("This task already has an attached worker");
     const active = { revision: 0 };
@@ -439,18 +460,19 @@ export class TaskStore {
         throw new TaskError("Worker binding is not confirmed for this task");
       }
       attached = true;
-      await prepare?.();
+      const selected = await this.selection(input.task_id, input.model, input.agent_id);
+      await prepare?.(selected);
+      this.inference.validate(selected);
       await this.resources?.attach(input.task_id);
       const conversation = await this.conversation(actor.conversation_id);
-      unbind = bind(conversation, actor.worker.host);
-      await conversation.configure({
-        model: { provider: "openai", modelId: input.model },
+      unbind = bind(conversation, actor.worker.host, selected);
+      await this.inference.configure(conversation, selected, {
         instructions: input.instructions + "\n\nTask outcome: " + actor.outcome +
           (input.agent_id === undefined
             ? "\nRecord verified progress, the next actor/check, or resolution evidence. Agents share this task's Rex session; wait for their results before resolving it."
             : "\nComplete this bounded assignment and call report_result with evidence or a concrete failure. The parent owns the overall task."),
         cwd: input.cwd, extensions,
-      }, BACKGROUND_CONTEXT);
+      });
       this.session.resume();
       while (true) {
         const revision = active.revision;

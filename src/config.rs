@@ -7,6 +7,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+use crate::models::ModelSelection;
 use crate::protocol::{WorkerHost, WorkerLaunch};
 use crate::sources::SourceConfig;
 
@@ -17,6 +18,10 @@ pub struct ClientConfig {
     pub path: Option<PathBuf>,
     #[serde(skip)]
     pub launch: Option<WorkerLaunch>,
+    #[serde(default)]
+    pub model: ModelSelection,
+    #[serde(default)]
+    pub context_repositories: Vec<PathBuf>,
     pub coordinator: Option<String>,
     pub coordinator_program: Option<String>,
     pub tailscale_socket: Option<PathBuf>,
@@ -35,6 +40,8 @@ impl Default for ClientConfig {
         Self {
             path: None,
             launch: None,
+            model: ModelSelection::default(),
+            context_repositories: Vec::new(),
             coordinator: None,
             coordinator_program: None,
             tailscale_socket: None,
@@ -57,12 +64,11 @@ pub fn load(explicit: Option<&Path>) -> Result<ClientConfig> {
             .map(PathBuf::from)
             .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
             .context("No configuration directory is available")?
-            .join("agent/config.json"),
+            .join("agent/config.toml"),
     };
-    let mut config: ClientConfig = match fs::read(&path) {
-        Ok(bytes) => {
-            serde_json::from_slice(&bytes).context("Invalid agent client configuration")?
-        }
+    let mut config: ClientConfig = match fs::read_to_string(&path) {
+        Ok(contents) => toml::from_str(&contents)
+            .with_context(|| format!("Invalid agent TOML configuration at {}", path.display()))?,
         Err(error) if error.kind() == io::ErrorKind::NotFound && explicit.is_none() => {
             ClientConfig::default()
         }
@@ -73,6 +79,11 @@ pub fn load(explicit: Option<&Path>) -> Result<ClientConfig> {
             Some(fs::canonicalize(&path).context("Could not resolve agent configuration")?);
     }
     let mut names = HashSet::new();
+    config.model.validate()?;
+    let home = dirs::home_dir();
+    for repository in &mut config.context_repositories {
+        *repository = context_repository_path(repository, home.as_deref())?;
+    }
     crate::tailnet::PeerPolicy::new(&config.trusted_nodes)?;
     crate::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
     ensure!(
@@ -80,6 +91,13 @@ pub fn load(explicit: Option<&Path>) -> Result<ClientConfig> {
         "Source polling interval must be between 10 and 3600 seconds"
     );
     for host in &config.hosts {
+        if let Some(model) = host
+            .launch
+            .as_ref()
+            .and_then(|launch| launch.model.as_ref())
+        {
+            model.validate()?;
+        }
         ensure!(
             !host.name.trim().is_empty() && names.insert(host.name.to_lowercase()),
             "Worker host names must be nonempty and unique"
@@ -102,23 +120,23 @@ pub fn load(explicit: Option<&Path>) -> Result<ClientConfig> {
     Ok(config)
 }
 
+fn context_repository_path(path: &Path, home: Option<&Path>) -> Result<PathBuf> {
+    let expanded = match path.strip_prefix("~") {
+        Ok(relative) => home
+            .context("No home directory is available for a context repository")?
+            .join(relative),
+        Err(_) => path.to_owned(),
+    };
+    ensure!(
+        expanded.is_absolute(),
+        "Context repositories need absolute paths or ~/ paths"
+    );
+    Ok(expanded)
+}
+
 pub fn validate_coordinator(value: &str) -> Result<()> {
     if let Some(address) = value.strip_prefix("tailscale://") {
-        let address: std::net::SocketAddr = address
-            .parse()
-            .context("Tailnet coordinator needs an IP address and port")?;
-        ensure!(
-            address.port() != 0,
-            "Tailnet coordinator needs a nonzero port"
-        );
-        let std::net::IpAddr::V4(ip) = address.ip() else {
-            anyhow::bail!("Use the coordinator's Tailscale IPv4 address");
-        };
-        let octets = ip.octets();
-        ensure!(
-            octets[0] == 100 && (64..=127).contains(&octets[1]),
-            "Coordinator address must be a Tailscale IP"
-        );
+        tailnet_address(address)?;
         return Ok(());
     }
     ensure!(
@@ -130,6 +148,29 @@ pub fn validate_coordinator(value: &str) -> Result<()> {
         "Coordinator must be an SSH host or user@host, without shell syntax"
     );
     Ok(())
+}
+
+pub fn tailnet_address(value: &str) -> Result<std::net::SocketAddr> {
+    use std::net::{Ipv4Addr, SocketAddr};
+    let address = match value.parse::<Ipv4Addr>() {
+        Ok(ip) => SocketAddr::from((ip, crate::tailnet::DEFAULT_PORT)),
+        Err(_) => value
+            .parse::<SocketAddr>()
+            .context("Use the coordinator's Tailscale IPv4 address, with an optional port")?,
+    };
+    ensure!(
+        address.port() != 0,
+        "Tailnet coordinator needs a nonzero port"
+    );
+    let std::net::IpAddr::V4(ip) = address.ip() else {
+        anyhow::bail!("Use the coordinator's Tailscale IPv4 address");
+    };
+    let octets = ip.octets();
+    ensure!(
+        octets[0] == 100 && (64..=127).contains(&octets[1]),
+        "Coordinator address must be a Tailscale IP"
+    );
+    Ok(address)
 }
 
 pub fn program() -> Result<PathBuf> {
@@ -172,7 +213,34 @@ pub fn worker_hosts(
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{load, validate_coordinator};
+    use crate::config::{context_repository_path, load, tailnet_address, validate_coordinator};
+
+    #[test]
+    fn checked_in_examples_use_the_real_configuration_contract() {
+        use crate::models::ModelProvider;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let coordinator = load(Some(&root.join("coordinator.toml"))).unwrap();
+        assert!(coordinator.coordinator.is_none());
+        assert_eq!(coordinator.model.provider, ModelProvider::OpenAi);
+        assert!(coordinator.sources.iter().any(|source| source.enabled()));
+        let client = load(Some(&root.join("client.toml"))).unwrap();
+        assert_eq!(
+            client.coordinator.as_deref(),
+            Some("tailscale://100.64.0.10")
+        );
+        assert!(client.sources.is_empty());
+        assert_eq!(tailnet_address("100.64.0.10").unwrap().port(), 43187);
+        assert_eq!(tailnet_address("100.64.0.10:50000").unwrap().port(), 50000);
+        for invalid in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "192.168.1.2",
+            "100.64.0.10:0",
+            "[::1]:43187",
+        ] {
+            assert!(tailnet_address(invalid).is_err());
+        }
+    }
     #[test]
     fn rejects_shell_syntax_and_duplicate_host_bindings() {
         assert!(validate_coordinator("owner@desktop").is_ok());
@@ -185,11 +253,104 @@ mod tests {
             assert!(validate_coordinator(value).is_err());
         }
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        std::fs::write(&path, r#"{"hosts":[
-          {"name":"Desktop","rex_server":null,"coordinator":null,"cwd":"/workspace","agent_program":"agent"},
-          {"name":"desktop","rex_server":null,"coordinator":null,"cwd":"/workspace","agent_program":"agent"}
-        ]}"#).unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[[hosts]]\nname='Desktop'\ncwd='/workspace'\nagent_program='agent'\n[[hosts]]\nname='desktop'\ncwd='/workspace'\nagent_program='agent'\n").unwrap();
         assert!(load(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn toml_settings_preserve_model_defaults_host_overrides_and_source_switches() {
+        use crate::models::{ModelProvider, Reasoning};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+          [model]
+          provider = 'anthropic'
+          model_id = 'example-model'
+          reasoning = 'high'
+          fast = true
+          [[hosts]]
+          name = 'worker'
+          cwd = '/workspace'
+          agent_program = 'agent'
+          [hosts.launch.model]
+          provider = 'google'
+          model_id = 'example-gemini'
+          [[sources]]
+          provider = 'github'
+          enabled = false
+          [[sources]]
+          provider = 'messages'
+        "#,
+        )
+        .unwrap();
+        let config = load(Some(&path)).unwrap();
+        assert_eq!(config.model.provider, ModelProvider::Anthropic);
+        assert_eq!(config.model.reasoning, Some(Reasoning::High));
+        assert!(config.model.fast);
+        assert_eq!(
+            config.hosts[0]
+                .launch
+                .as_ref()
+                .unwrap()
+                .model
+                .as_ref()
+                .unwrap()
+                .provider,
+            ModelProvider::Google
+        );
+        assert!(!config.sources[0].enabled());
+        assert!(config.sources[1].enabled());
+        assert_eq!(
+            config.path.as_ref().unwrap(),
+            &std::fs::canonicalize(&path).unwrap()
+        );
+    }
+
+    #[test]
+    fn explicit_malformed_or_unknown_toml_is_rejected_without_a_format_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        for invalid in [
+            "{\"model\": {\"model_id\": \"old-json\"}}",
+            "[model\n",
+            "[model]\nprovider='misspelled'",
+            "[model]\nmodel_id=' '",
+            "[[sources]]\nprovider='github'\nenabeld=false",
+            "unknown_setting=true",
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            let error = load(Some(&path)).err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Invalid agent TOML configuration")
+            );
+        }
+        assert!(load(Some(&directory.path().join("missing.toml"))).is_err());
+    }
+
+    #[test]
+    fn context_repository_paths_expand_the_current_host_home_and_reject_relative_paths() {
+        use std::path::Path;
+        assert_eq!(
+            context_repository_path(Path::new("~/context"), Some(Path::new("/example/user")))
+                .unwrap(),
+            Path::new("/example/user/context")
+        );
+        assert_eq!(
+            context_repository_path(Path::new("/workspace/context"), None).unwrap(),
+            Path::new("/workspace/context")
+        );
+        assert!(context_repository_path(Path::new("~/context"), None).is_err());
+        assert!(
+            context_repository_path(
+                Path::new("relative/context"),
+                Some(Path::new("/example/user"))
+            )
+            .is_err()
+        );
     }
 }

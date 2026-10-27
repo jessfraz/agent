@@ -220,6 +220,85 @@
         }
       ]
     },
+    "ModelProvider": {
+      "type": "string",
+      "enum": [
+        "amazon-bedrock",
+        "ant-ling",
+        "anthropic",
+        "google",
+        "google-vertex",
+        "openai",
+        "azure",
+        "openai-codex",
+        "radius",
+        "typesafe",
+        "nvidia",
+        "deepseek",
+        "github-copilot",
+        "xai",
+        "groq",
+        "cerebras",
+        "openrouter",
+        "vercel-ai-gateway",
+        "zai",
+        "zai-coding-cn",
+        "mistral",
+        "minimax",
+        "minimax-cn",
+        "moonshotai",
+        "moonshotai-cn",
+        "huggingface",
+        "fireworks",
+        "together",
+        "baseten",
+        "opencode",
+        "opencode-go",
+        "kimi-coding",
+        "meta",
+        "cloudflare-workers-ai",
+        "cloudflare-ai-gateway",
+        "qwen-token-plan",
+        "qwen-token-plan-cn",
+        "qwen-token-plan-individual",
+        "xiaomi",
+        "xiaomi-token-plan-cn",
+        "xiaomi-token-plan-ams",
+        "xiaomi-token-plan-sgp"
+      ]
+    },
+    "ModelSelection": {
+      "type": "object",
+      "properties": {
+        "fast": {
+          "type": "boolean"
+        },
+        "model_id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "provider": {
+          "$ref": "#/$defs/ModelProvider"
+        },
+        "reasoning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Reasoning"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "model_id",
+        "fast"
+      ]
+    },
     "NativeWorktreeIdentity": {
       "type": "object",
       "properties": {
@@ -249,6 +328,18 @@
         "git_dir",
         "branch",
         "head"
+      ]
+    },
+    "Reasoning": {
+      "type": "string",
+      "enum": [
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
       ]
     },
     "ResourceRecord": {
@@ -567,7 +658,7 @@
               "type": "string"
             },
             "model": {
-              "type": "string"
+              "$ref": "#/$defs/ModelSelection"
             },
             "type": {
               "type": "string",
@@ -637,7 +728,7 @@
               "type": "string"
             },
             "model": {
-              "type": "string"
+              "$ref": "#/$defs/ModelSelection"
             },
             "type": {
               "type": "string",
@@ -747,7 +838,7 @@
               "type": "string"
             },
             "model": {
-              "type": "string"
+              "$ref": "#/$defs/ModelSelection"
             },
             "task_id": {
               "$ref": "#/$defs/TaskId"
@@ -1016,7 +1107,15 @@
           ]
         },
         "model": {
-          "type": "string"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelSelection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "runtime": {
           "type": [
@@ -1030,10 +1129,7 @@
             "null"
           ]
         }
-      },
-      "required": [
-        "model"
-      ]
+      }
     },
     "WorkerRef": {
       "type": "object",

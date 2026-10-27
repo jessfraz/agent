@@ -1,3 +1,4 @@
+import { ConversationModels } from "../src/models.js";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -32,7 +33,7 @@ async function open(directory: string) {
   const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 });
   models.setProvider(faux.provider); const registry = createRegistry();
   const session = await Harness.open(storage, { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
-  const tasks = new TaskStore(session); const resources = new ResourceStore(session, tasks); tasks.guardResources(resources);
+  const tasks = new TaskStore(session, new ConversationModels(models)); const resources = new ResourceStore(session, tasks); tasks.guardResources(resources);
   const executions = new Executions(); const tools = createResourceTools(resources, tasks, executions); registry.install(tools);
   return { session, tasks, resources, executions, tools, faux };
 }

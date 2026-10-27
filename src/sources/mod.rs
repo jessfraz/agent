@@ -86,23 +86,49 @@ pub trait Source: Debug + Send + Sync {
 pub enum SourceConfig {
     /// Omitted namespaces discovers every configured Google account.
     Google {
+        #[serde(default = "source_enabled")]
+        enabled: bool,
         namespaces: Option<Vec<String>>,
     },
     #[serde(rename = "github")]
     GitHub {
+        #[serde(default = "source_enabled")]
+        enabled: bool,
         namespaces: Option<Vec<String>>,
     },
     GoogleCalendar {
+        #[serde(default = "source_enabled")]
+        enabled: bool,
         namespaces: Option<Vec<String>>,
     },
     Messages {
+        #[serde(default = "source_enabled")]
+        enabled: bool,
         namespaces: Option<Vec<String>>,
     },
     /// An authenticated Slack API CLI prefix, optionally through a read-only wrapper.
     Slack {
+        #[serde(default = "source_enabled")]
+        enabled: bool,
         command: Vec<String>,
         account: String,
     },
+}
+
+fn source_enabled() -> bool {
+    true
+}
+
+impl SourceConfig {
+    pub fn enabled(&self) -> bool {
+        match self {
+            Self::Google { enabled, .. }
+            | Self::GitHub { enabled, .. }
+            | Self::GoogleCalendar { enabled, .. }
+            | Self::Messages { enabled, .. }
+            | Self::Slack { enabled, .. } => *enabled,
+        }
+    }
 }
 
 pub struct SourceCatalog {
@@ -114,8 +140,11 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
     let mut sources: Vec<Box<dyn Source>> = Vec::new();
     let mut failures = Vec::new();
     for entry in config {
+        if !entry.enabled() {
+            continue;
+        }
         match entry {
-            SourceConfig::Google { namespaces } => {
+            SourceConfig::Google { namespaces, .. } => {
                 match google::GoogleSource::discover(namespaces.as_deref()).await {
                     Ok(discovered) => {
                         for source in discovered {
@@ -138,19 +167,19 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                     }
                 }
             }
-            SourceConfig::Slack { command, account } => {
-                match slack::SlackSource::new(command.clone(), account.clone()) {
-                    Ok(source) => sources.push(Box::new(source)),
-                    Err(_) => failures.push(SourceBatch::unavailable(
-                        SourceKey {
-                            provider: "slack".into(),
-                            account: account.clone(),
-                        },
-                        "Slack source configuration is invalid; coverage is unknown",
-                    )),
-                }
-            }
-            SourceConfig::GitHub { namespaces } => {
+            SourceConfig::Slack {
+                command, account, ..
+            } => match slack::SlackSource::new(command.clone(), account.clone()) {
+                Ok(source) => sources.push(Box::new(source)),
+                Err(_) => failures.push(SourceBatch::unavailable(
+                    SourceKey {
+                        provider: "slack".into(),
+                        account: account.clone(),
+                    },
+                    "Slack source configuration is invalid; coverage is unknown",
+                )),
+            },
+            SourceConfig::GitHub { namespaces, .. } => {
                 match github::GitHubSource::discover(namespaces.as_deref()).await {
                     Ok(discovered) => sources.extend(
                         discovered
@@ -173,7 +202,7 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                     }
                 }
             }
-            SourceConfig::Messages { namespaces } => {
+            SourceConfig::Messages { namespaces, .. } => {
                 match messages::MessagesSource::discover(namespaces.as_deref()).await {
                     Ok(discovered) => sources.extend(
                         discovered
@@ -196,7 +225,7 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                     }
                 }
             }
-            SourceConfig::GoogleCalendar { namespaces } => {
+            SourceConfig::GoogleCalendar { namespaces, .. } => {
                 match calendar::CalendarSource::discover(namespaces.as_deref()).await {
                     Ok(discovered) => {
                         for source in discovered {
@@ -263,4 +292,46 @@ fn now_seconds() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("System clock precedes the Unix epoch")?
         .as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::sources::{SourceConfig, configured};
+
+    #[tokio::test]
+    async fn disabled_sources_skip_discovery_and_account_setup() {
+        let sources = vec![
+            SourceConfig::Google {
+                enabled: false,
+                namespaces: Some(vec!["not-configured".into()]),
+            },
+            SourceConfig::GoogleCalendar {
+                enabled: false,
+                namespaces: Some(vec!["not-configured".into()]),
+            },
+            SourceConfig::GitHub {
+                enabled: false,
+                namespaces: Some(vec!["not-configured".into()]),
+            },
+            SourceConfig::Messages {
+                enabled: false,
+                namespaces: Some(vec!["not-configured".into()]),
+            },
+            SourceConfig::Slack {
+                enabled: false,
+                command: Vec::new(),
+                account: String::new(),
+            },
+        ];
+        let catalog = configured(&sources).await;
+        assert!(catalog.sources.is_empty());
+        assert!(catalog.failures.is_empty());
+        let invalid_enabled = configured(&[SourceConfig::Slack {
+            enabled: true,
+            command: Vec::new(),
+            account: String::new(),
+        }])
+        .await;
+        assert_eq!(invalid_enabled.failures.len(), 1);
+    }
 }

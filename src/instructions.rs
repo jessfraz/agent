@@ -16,6 +16,14 @@ pub fn default_path() -> Result<PathBuf> {
 }
 
 pub fn load(global: &Path, working_directory: &Path) -> Result<String> {
+    load_with_context(global, working_directory, &[])
+}
+
+pub fn load_with_context(
+    global: &Path,
+    working_directory: &Path,
+    repositories: &[PathBuf],
+) -> Result<String> {
     let mut sections = Vec::new();
     if let Some(contents) = read_optional(global)? {
         sections.push(format!("# User instructions\n\n{contents}"));
@@ -32,6 +40,25 @@ pub fn load(global: &Path, working_directory: &Path) -> Result<String> {
         .is_some_and(|directory| directory.join(".git").exists())
     {
         directories.truncate(1);
+    }
+    for repository in repositories {
+        anyhow::ensure!(
+            repository.is_dir(),
+            "Context repository is unavailable: {}",
+            repository.display()
+        );
+        let path = repository.join("AGENTS.md");
+        let contents = if path == global
+            || directories
+                .iter()
+                .any(|directory| directory.join("AGENTS.md") == path)
+        {
+            None
+        } else {
+            read_optional(&path)?
+        };
+        sections.push(format!("# Context repository: {}\n\nResolve this repository's relative paths against {}.\n\n{}",
+            repository.display(), repository.display(), contents.unwrap_or_default()));
     }
     for directory in directories.into_iter().rev() {
         let path = directory.join("AGENTS.md");
@@ -61,7 +88,7 @@ fn read_optional(path: &Path) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::instructions::load;
+    use crate::instructions::{load, load_with_context};
     use std::fs;
 
     #[test]
@@ -106,5 +133,38 @@ mod tests {
         assert!(updated.contains("Second version."));
         assert!(!updated.contains("First version."));
         assert!(!updated.contains("Unrelated parent."));
+    }
+
+    #[test]
+    fn context_repositories_supply_scoped_instructions_without_changing_the_task_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let context = root.path().join("context-repository");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&context).unwrap();
+        fs::create_dir(project.join(".git")).unwrap();
+        let global = root.path().join("global.md");
+        fs::write(&global, "Keep answers brief.").unwrap();
+        fs::write(
+            context.join("AGENTS.md"),
+            "Read relevant context facts and use existing provider tools.",
+        )
+        .unwrap();
+        fs::write(project.join("AGENTS.md"), "Run this project's tests.").unwrap();
+        let before = std::env::current_dir().unwrap();
+        let prompt = load_with_context(&global, &project, std::slice::from_ref(&context)).unwrap();
+        assert_eq!(std::env::current_dir().unwrap(), before);
+        assert!(prompt.contains(context.to_str().unwrap()));
+        assert!(
+            prompt.find("Keep answers brief.").unwrap()
+                < prompt.find("Read relevant context facts").unwrap()
+        );
+        assert!(
+            prompt.find("Read relevant context facts").unwrap()
+                < prompt.find("Run this project's tests.").unwrap()
+        );
+        assert!(
+            load_with_context(&global, &project, &[root.path().join("missing-context")]).is_err()
+        );
     }
 }

@@ -1,3 +1,4 @@
+import { DEFAULT_MODEL } from "../src/models.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { chmod, mkdtemp, readdir, rm } from "node:fs/promises";
@@ -12,7 +13,7 @@ test("real Pi bridge gives signed-out chat the login command before starting Pi 
   const directory = await mkdtemp(join(tmpdir(), "agent-bridge-"));
   await chmod(directory, 0o700);
   const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("../src/bridge.js", import.meta.url)), directory],
-    { stdio: ["pipe", "pipe", "pipe"] });
+    { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, OPENAI_API_KEY: "" } });
   try {
     let output = "";
     let errors = "";
@@ -26,7 +27,7 @@ test("real Pi bridge gives signed-out chat the login command before starting Pi 
       JSON.stringify({ version: 1, id: 1, command: { type: "status" } }),
       JSON.stringify({ version: 1, id: 2, command: { type: "invented" } }),
       JSON.stringify({ version: 1, id: 3, command: { type: "chat", input: "Hello", instructions: "",
-        model: "fixture", cwd: "/workspace/example", hosts: [] } }),
+        model: DEFAULT_MODEL, cwd: "/workspace/example", hosts: [] } }),
       "invalid json", "",
     ].join("\n"));
     const code = await exited;

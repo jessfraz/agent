@@ -1,3 +1,5 @@
+import { fixtureModel } from "./model.js";
+import { ConversationModels } from "../src/models.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -26,7 +28,7 @@ function batch(events: SourceEvent[], cursor: string, account = "alpha"): Source
   return { source: { provider: "mail", account }, events, checkpoint: { value: cursor }, coverage: { status: "complete" } };
 }
 const command: Extract<RuntimeCommand, { type: "triage_sources" }> = {
-  type: "triage_sources", instructions: "Be brief and act on authorized work.", model: "fixture", cwd: "/workspace/example", hosts: [],
+  type: "triage_sources", instructions: "Be brief and act on authorized work.", model: fixtureModel, cwd: "/workspace/example", hosts: [],
 };
 async function open(directory: string) {
   const database = await openNodeSqliteDatabase(join(directory, "session.sqlite"));
@@ -36,7 +38,7 @@ async function open(directory: string) {
   const models = createModels(); models.setProvider(faux.provider);
   const registry = createRegistry();
   const session = await Harness.open(storage, { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
-  const tasks = new TaskStore(session); const executions = new Executions(); const sources = new SourceJournal(session, tasks);
+  const tasks = new TaskStore(session, new ConversationModels(models)); const executions = new Executions(); const sources = new SourceJournal(session, tasks);
   const tools = createAppTools(tasks, executions); const sourceTools = createSourceTools(sources, executions);
   registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker); registry.install(sourceTools);
   const notices: { task: string | null; text: string }[] = [];
@@ -96,6 +98,35 @@ test("empty source coverage gaps do not cause a model call or an all-clear notif
     assert.equal(await app.sources.hasWork(), false); await app.triage();
     assert.equal(app.faux.state.callCount, 0); assert.equal(app.notices.length, 0);
     assert.equal((await app.sources.states()).find((state) => state.source.provider === "mail")?.coverage.status, "unavailable");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("new source judgments use current model settings and an invalid selection does not poison pending work", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-")); const app = await open(directory);
+  try {
+    await app.sources.admit(batch([event("first")], "a1"), null);
+    const first = await app.sources.events({ pending: true });
+    app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("dismiss_source_events", { keys: first.map((record) => record.key), reason: "Already handled" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Handled."),
+    ]);
+    await app.triage(); const calls = app.faux.state.callCount;
+    const next = fauxProvider({ provider: "anthropic", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 });
+    app.tasks.inference.models.setProvider(next.provider);
+    await app.sources.admit(batch([event("second")], "a2"), { value: "a1" });
+    const selected = { ...fixtureModel, provider: "anthropic" } satisfies import("../src/generated/ModelSelection.js").ModelSelection;
+    const run = (fast: boolean) => app.sources.triage({ ...command, model: { ...selected, fast } }, (conversation, model) => app.executions.bind(conversation.id.toString(), {
+      model, cwd: command.cwd, hosts: [], role: "triage", call: async () => ({ type: "written" }),
+    }), [app.tools.main, app.sourceTools]);
+    await assert.rejects(run(true), /Fast mode is unavailable/);
+    const second = await app.sources.events({ pending: true }); assert.equal(second.length, 1);
+    next.setResponses([
+      fauxAssistantMessage(fauxToolCall("dismiss_source_events", { keys: second.map((record) => record.key), reason: "Handled with current settings" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Handled."),
+    ]);
+    await run(false);
+    assert.equal(next.state.callCount, 2); assert.equal(app.faux.state.callCount, calls);
+    assert.equal(await app.sources.hasWork(), false);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 

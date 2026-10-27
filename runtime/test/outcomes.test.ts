@@ -1,3 +1,5 @@
+import { fixtureModel } from "./model.js";
+import { ConversationModels, DEFAULT_MODEL } from "../src/models.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -26,7 +28,7 @@ const binding: WorkerRef = { host_id: "11111111-1111-4111-8111-111111111111",
   window_id: "window:33333333-3333-4333-8333-333333333333",
   block_id: "block:44444444-4444-4444-8444-444444444444" };
 const triage: Extract<RuntimeCommand, { type: "triage_sources" }> = {
-  type: "triage_sources", instructions: "Finish authorized work and keep results brief.", model: "fixture", cwd: host.cwd, hosts: [host],
+  type: "triage_sources", instructions: "Finish authorized work and keep results brief.", model: fixtureModel, cwd: host.cwd, hosts: [host],
 };
 async function open(directory: string) {
   const database = await openNodeSqliteDatabase(join(directory, "session.sqlite"));
@@ -34,18 +36,18 @@ async function open(directory: string) {
   const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 });
   const models = createModels(); models.setProvider(faux.provider); const registry = createRegistry();
   const session = await Harness.open(await SqliteStorage.open(database), { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
-  const tasks = new TaskStore(session); const executions = new Executions(); const sources = new SourceJournal(session, tasks);
+  const tasks = new TaskStore(session, new ConversationModels(models)); const executions = new Executions(); const sources = new SourceJournal(session, tasks);
   const tools = createAppTools(tasks, executions); const sourceTools = createSourceTools(sources, executions);
   registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker); registry.install(sourceTools);
   async function prepare(title = "Example task") {
-    const task = await tasks.create({ title, outcome: "Verify the requested outcome",
+    const task = await tasks.create({ title, model: fixtureModel, outcome: "Verify the requested outcome",
       sources: [{ provider: "mail", account: "alpha", thread_id: "example-thread" }] });
     await tasks.enqueue(task.id, "Complete the requested work.");
     await tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
     const saved = await tasks.get(task.id);
     if (saved.worker.state !== "bound") throw new Error("Missing task binding");
     return { type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id,
-      binding, instructions: "", model: "fixture", cwd: host.cwd } satisfies Extract<RuntimeCommand, { type: "run_task" }>;
+      binding, instructions: "", model: fixtureModel, cwd: host.cwd } satisfies Extract<RuntimeCommand, { type: "run_task" }>;
   }
   async function run(command: Extract<RuntimeCommand, { type: "run_task" }>) {
     return tasks.run(command, (conversation) => executions.bind(conversation.id.toString(), {
@@ -198,9 +200,12 @@ test("child outcomes retain tool provenance and settle atomically with delivery 
 test("the real bridge admits a safe failed outcome when authentication fails before a model turn", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-outcomes-")); let app = await open(directory);
   try {
-    const command = await app.prepare(); await app.session.close(BACKGROUND_CONTEXT);
+    const command = await app.prepare();
+    await app.tasks.update(command.task_id, (task) => { task.model = DEFAULT_MODEL; });
+    command.model = DEFAULT_MODEL;
+    await app.session.close(BACKGROUND_CONTEXT);
     const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("../src/bridge.js", import.meta.url)), directory],
-      { stdio: ["pipe", "pipe", "pipe"] });
+      { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, OPENAI_API_KEY: "" } });
     let output = ""; let errors = "";
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => { output += chunk; });
     child.stderr.setEncoding("utf8").on("data", (chunk: string) => { errors += chunk; });
@@ -214,6 +219,7 @@ test("the real bridge admits a safe failed outcome when authentication fails bef
     const failed = await app.sources.events({ provider: "task_outcomes", pending: true }); assert.equal(failed.length, 1);
     assert.equal(failed[0]?.outcome?.state.state, "failed"); assert.equal(failed[0]?.outcome?.entry_id, null);
     assert.equal(await app.sources.hasWork(), true);
+    await app.tasks.update(command.task_id, (task) => { task.model = fixtureModel; });
     await assert.rejects(app.tasks.run(command, () => () => {}, () => {}, [], undefined,
       async () => { throw new Error("Secret-bearing auth diagnostic must not enter the outcome"); }));
     const repeated = await app.sources.events({ provider: "task_outcomes", pending: true });

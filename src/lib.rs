@@ -1,5 +1,6 @@
 pub mod config;
 pub mod host;
+pub mod models;
 pub mod protocol;
 pub mod resources;
 pub mod rex;
