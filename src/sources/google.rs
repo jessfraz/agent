@@ -227,7 +227,9 @@ impl GoogleSource {
             return batch;
         };
         match coverage.status.as_str() {
-            "complete" if !fields.has_more && coverage.next_cursor.is_none() => {
+            // Context coverage includes intentional body excerpts. Pagination
+            // decides whether every message in this window has been visited.
+            "complete" | "truncated" if !fields.has_more && coverage.next_cursor.is_none() => {
                 window.since = window.until.saturating_sub(120);
                 window.until = 0;
                 window.cursor = None;
@@ -305,7 +307,7 @@ mod tests {
             truncated: false,
         }
     }
-    const COMPLETE: &str = r#"{"status":"executed","fields":{"status":"ok","messages":[{"gmail_message_id":"m1","gmail_thread_id":"t1","subject":"Board revision","body_text":"Please check R2","body_truncated":true}],"has_more":false,"failures":[]},"coverage":{"status":"complete","next_cursor":null}}"#;
+    const COMPLETE: &str = r#"{"status":"executed","fields":{"status":"ok","messages":[{"gmail_message_id":"m1","gmail_thread_id":"t1","coverage":"complete","subject":"Board revision","body_text":"Please check R2","body_truncated":false,"attachments_omitted":0}],"has_more":false,"failures":[]},"coverage":{"status":"complete","next_cursor":null}}"#;
 
     #[test]
     fn discovers_every_google_account_and_rejects_wrong_provider_selection() {
@@ -332,6 +334,38 @@ mod tests {
         let next = source.window(batch.checkpoint.as_ref(), 800_100).unwrap();
         assert_eq!(next.since, 799_881);
         assert_eq!(next.until, 800_101);
+    }
+
+    #[test]
+    fn native_exhausted_page_with_body_excerpts_completes_the_window() {
+        let source = GoogleSource::new("google.alpha".into()).unwrap();
+        let native = r#"{"status":"executed","fields":{"status":"ok","messages":[
+          {"gmail_message_id":"m1","gmail_thread_id":"t1","coverage":"complete","subject":"Board revision","body_text":"Please check R2","body_truncated":false,"attachments_omitted":0},
+          {"gmail_message_id":"m2","gmail_thread_id":"t2","coverage":"truncated","subject":"Long message","body_text":"Message excerpt","body_truncated":true,"attachments_omitted":0}
+        ],"has_more":false,"failures":[]},"coverage":{"status":"truncated","next_cursor":null}}"#;
+        let batch = source.normalize(output(native), source.window(None, 800_000).unwrap());
+        assert_eq!(batch.coverage, SourceCoverage::Complete);
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(batch.events[0].text, "Please check R2");
+        assert_eq!(batch.events[1].id, "m2");
+        assert_eq!(batch.events[1].source.thread_id, "t2");
+        assert_eq!(
+            batch.events[1].text,
+            "Message excerpt\n[Excerpt; read the source for the full message.]"
+        );
+        let next = source.window(batch.checkpoint.as_ref(), 800_100).unwrap();
+        assert_eq!(next.since, 799_881);
+        assert_eq!(next.until, 800_101);
+        assert!(next.cursor.is_none());
+
+        let unknown = native.replace(
+            "\"status\":\"truncated\",\"next_cursor\":null",
+            "\"status\":\"unknown\",\"next_cursor\":null",
+        );
+        let batch = source.normalize(output(&unknown), source.window(None, 800_000).unwrap());
+        assert!(matches!(batch.coverage, SourceCoverage::Partial { .. }));
+        assert!(batch.checkpoint.is_none());
+        assert_eq!(batch.events.len(), 2);
     }
 
     #[test]
