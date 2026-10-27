@@ -251,9 +251,18 @@ pub async fn connect(peer: SocketAddr, policy: &PeerPolicy, daemon: &Daemon) -> 
 
 pub(crate) async fn listen(port: u16, daemon: &Daemon) -> Result<TcpListener> {
     let address = self_address(port, daemon).await?;
-    let socket = scoped_socket(tailnet_v4(address.ip())?)?;
+    listen_on(tailnet_v4(address.ip())?, address.port())
+}
+
+fn listen_on(address: Ipv4Addr, port: u16) -> Result<TcpListener> {
+    let socket = scoped_socket(address)?;
+    // Reclaim the endpoint from closed connections in TIME_WAIT; a live
+    // listener still excludes another owner of this interface and address.
     socket
-        .bind(address)
+        .set_reuseaddr(true)
+        .context("Could not enable coordinator address reuse")?;
+    socket
+        .bind(SocketAddr::new(address.into(), port))
         .context("Could not bind the Tailscale coordinator address")?;
     socket
         .listen(128)
@@ -606,21 +615,20 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn native_socket_retains_its_interface_scope() {
-        use crate::tailnet::{Interface, bind_interface};
+        use crate::tailnet::{Interface, listen_on};
         use std::os::fd::AsRawFd;
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
-            net::{TcpSocket, TcpStream},
+            net::TcpStream,
         };
         let interface = Interface::for_address(Ipv4Addr::LOCALHOST).unwrap();
-        let socket = TcpSocket::new_v4().unwrap();
-        bind_interface(&socket, &interface).unwrap();
+        let listener = listen_on(Ipv4Addr::LOCALHOST, 0).unwrap();
         let mut index = 0_u32;
         let mut size = std::mem::size_of_val(&index) as libc::socklen_t;
         assert_eq!(
             unsafe {
                 libc::getsockopt(
-                    socket.as_raw_fd(),
+                    listener.as_raw_fd(),
                     libc::IPPROTO_IP,
                     libc::IP_BOUND_IF,
                     std::ptr::from_mut(&mut index).cast(),
@@ -630,8 +638,6 @@ mod tests {
             0
         );
         assert_eq!(index, interface.index);
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let listener = socket.listen(1).unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();
@@ -640,6 +646,61 @@ mod tests {
         let mut received = [0_u8; 6];
         accepted.read_exact(&mut received).await.unwrap();
         assert_eq!(&received, b"scoped");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn listener_restarts_after_an_active_close_without_sharing_a_live_port() {
+        use crate::tailnet::listen_on;
+        use std::io::ErrorKind;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpStream,
+            time::{Duration, timeout},
+        };
+        let current = std::thread::current();
+        let name = current.name().unwrap();
+        if let Ok(expected) = std::env::var("AGENT_TAILNET_LIFECYCLE_TEST") {
+            assert_eq!(name, expected, "The child must run this exact test");
+        } else {
+            // Other tests fork before exec; isolate descriptor lifetime from
+            // their briefly inherited copies of this listener and connection.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env("AGENT_TAILNET_LIFECYCLE_TEST", name)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        timeout(Duration::from_secs(5), async {
+            let mut listener = listen_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+            let address = listener.local_addr().unwrap();
+            for _ in 0..2 {
+                let conflict = listen_on(Ipv4Addr::LOCALHOST, address.port()).unwrap_err();
+                assert_eq!(
+                    conflict.downcast_ref::<std::io::Error>().unwrap().kind(),
+                    ErrorKind::AddrInUse
+                );
+                let mut client = TcpStream::connect(address).await.unwrap();
+                let (mut accepted, _) = listener.accept().await.unwrap();
+                drop(listener);
+                // The server actively closes, leaving its endpoint in TIME_WAIT.
+                accepted.shutdown().await.unwrap();
+                assert_eq!(client.read_to_end(&mut Vec::new()).await.unwrap(), 0);
+                client.shutdown().await.unwrap();
+                assert_eq!(accepted.read_to_end(&mut Vec::new()).await.unwrap(), 0);
+                drop((accepted, client));
+                listener = listen_on(Ipv4Addr::LOCALHOST, address.port()).unwrap();
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
