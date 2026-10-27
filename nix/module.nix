@@ -66,7 +66,7 @@ in {
         ThrottleInterval = 10;
         ProcessType = "Background";
       };
-      environment.PATH = lib.makeBinPath cfg.extraPackages
+      environment.PATH = lib.makeBinPath ([cfg.package] ++ cfg.extraPackages)
         + ":/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin";
     };
   };
