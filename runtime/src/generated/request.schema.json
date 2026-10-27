@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RuntimeRequest",
+  "type": "object",
+  "properties": {
+    "command": {
+      "$ref": "#/$defs/RuntimeCommand"
+    },
+    "id": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "version",
+    "id",
+    "command"
+  ],
+  "$defs": {
+    "RuntimeCommand": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "login"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "status"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "logout"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            },
+            "instructions": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "chat"
+            }
+          },
+          "required": [
+            "type",
+            "input",
+            "instructions",
+            "model"
+          ]
+        }
+      ]
+    }
+  }
+}

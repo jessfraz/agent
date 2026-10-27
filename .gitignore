@@ -1,0 +1,9 @@
+/target/
+/result
+/runtime/node_modules/
+/runtime/dist/
+/local/
+/.env*
+!/.env.example
+*.log
+.DS_Store

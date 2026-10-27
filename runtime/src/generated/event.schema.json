@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RuntimeEvent",
+  "type": "object",
+  "properties": {
+    "event": {
+      "$ref": "#/$defs/RuntimeEventKind"
+    },
+    "id": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "version",
+    "id",
+    "event"
+  ],
+  "$defs": {
+    "AccountIdentity": {
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "issuer": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "issuer",
+        "subject"
+      ]
+    },
+    "AuthStatus": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "signed_out"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "account": {
+              "$ref": "#/$defs/AccountIdentity"
+            },
+            "expires_at": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "state": {
+              "type": "string",
+              "const": "connected"
+            }
+          },
+          "required": [
+            "state",
+            "account",
+            "expires_at"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "account": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AccountIdentity"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "state": {
+              "type": "string",
+              "const": "needs_sign_in"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        }
+      ]
+    },
+    "ErrorCode": {
+      "type": "string",
+      "enum": [
+        "invalid_request",
+        "authentication_required",
+        "authentication_failed",
+        "provider_unavailable",
+        "storage_unavailable",
+        "internal"
+      ]
+    },
+    "RuntimeEventKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "authorization_url"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "$ref": "#/$defs/AuthStatus"
+            },
+            "type": {
+              "type": "string",
+              "const": "auth_status"
+            }
+          },
+          "required": [
+            "type",
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "answer"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/ErrorCode"
+            },
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "failure"
+            }
+          },
+          "required": [
+            "type",
+            "code",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "done"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    }
+  }
+}
