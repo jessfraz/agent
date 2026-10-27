@@ -8,7 +8,7 @@
     "test": "node --test dist/test/*.test.js"
   },
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=26.12.1"
   },
   "dependencies": {
     "@earendil-works/chord": "1.4.0",
@@ -19,7 +19,7 @@
     "typebox": "1.3.27"
   },
   "devDependencies": {
-    "@types/node": "^22.19.0",
+    "@types/node": "^26.6.5",
     "typescript": "^7.0.2"
   }
 }
