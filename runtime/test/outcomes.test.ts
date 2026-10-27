@@ -21,7 +21,7 @@ import { TaskStore } from "../src/tasks.js";
 import { createSourceTools, SourceJournal } from "../src/sources.js";
 import { createAppTools, Executions } from "../src/tools.js";
 
-const host: WorkerHost = { name: "fixture", rex_server: null, coordinator: null,
+const host: WorkerHost = { host_id: null, name: "fixture", rex_server: null, coordinator: null,
   cwd: "/workspace/example", agent_program: "/example/agent" };
 const binding: WorkerRef = { host_id: "11111111-1111-4111-8111-111111111111",
   session_id: "session:22222222-2222-4222-8222-222222222222",

@@ -26,6 +26,11 @@ pub async fn execute(command: HostCommand) -> HostResult {
 
 async fn execute_inner(command: HostCommand) -> Result<HostResult> {
     match command {
+        HostCommand::OnNode { .. }
+        | HostCommand::ReadContext { .. }
+        | HostCommand::SearchContext { .. } => {
+            anyhow::bail!("This operation requires the coordinator's registered host broker")
+        }
         HostCommand::ResourceAllocate { request } => {
             require_local_host(&request.host_id).await?;
             Ok(HostResult::Resource {
@@ -136,7 +141,7 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             allocation_id,
             title,
         } => {
-            let client = RexClient::new(host.rex_server.clone());
+            let client = RexClient::new(None);
             let identity = client.whoami().await?;
             ensure!(
                 identity.host_id == HostId::parse(&parent.host_id)?,
@@ -189,7 +194,7 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             task_id,
             allocation_id,
         } => {
-            let client = RexClient::new(host.rex_server.clone());
+            let client = RexClient::new(None);
             let native = native_binding(&binding)?;
             let identity = client.whoami().await?;
             ensure!(
@@ -264,8 +269,14 @@ async fn spawn_worker(
     allocation_id: &str,
     title: &str,
 ) -> Result<HostResult> {
-    let client = RexClient::new(host.rex_server.clone());
+    let client = RexClient::new(None);
     let identity = client.whoami().await?;
+    ensure!(
+        host.host_id
+            .as_ref()
+            .is_none_or(|id| id == &identity.host_id.to_string()),
+        "Worker host differs from this node's native Rex identity"
+    );
     match client
         .create_session(
             title,

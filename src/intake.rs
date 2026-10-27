@@ -12,20 +12,16 @@ use tokio::{
 
 use crate::{
     config::ClientConfig,
-    host,
     models::ModelSelection,
-    protocol::{RuntimeCommand, RuntimeEventKind, SourceState, WorkerHost},
+    protocol::{RuntimeCommand, RuntimeEventKind, SourceState},
     runtime::FrameReader,
     service,
     sources::{self, SourceBatch, SourceCoverage},
 };
 
 pub struct ContextBundle {
-    pub instructions_file: PathBuf,
-    pub context_repositories: Vec<PathBuf>,
     pub model: ModelSelection,
     pub cwd: String,
-    pub hosts: Vec<WorkerHost>,
 }
 
 /// Source failures remain visible in durable coverage, and never stop other
@@ -133,14 +129,10 @@ pub async fn cycle(directory: &Path, config: &ClientConfig, context: &ContextBun
     call(
         directory,
         RuntimeCommand::TriageSources {
-            instructions: crate::instructions::load_with_context(
-                &context.instructions_file,
-                Path::new(&context.cwd),
-                &context.context_repositories,
-            )?,
+            instructions: String::new(),
             model: context.model.clone(),
             cwd: context.cwd.clone(),
-            hosts: context.hosts.clone(),
+            hosts: Vec::new(),
         },
     )
     .await?;
@@ -157,9 +149,7 @@ fn update_state(states: &mut Vec<SourceState>, state: SourceState) {
     }
 }
 
-/// This is an explicit execution client for the configured background host.
-/// It uses the same wire as interactive/Rex clients; it is never a fallback for
-/// another client's disconnected tool operation.
+/// Intake submits work to the owner; it never becomes an execution fallback.
 async fn call(directory: &Path, command: RuntimeCommand) -> Result<Vec<RuntimeEventKind>> {
     let stream = timeout(Duration::from_secs(5), service::connect(directory)).await??;
     let (reader, mut writer) = stream.into_split();
@@ -173,15 +163,8 @@ async fn call(directory: &Path, command: RuntimeCommand) -> Result<Vec<RuntimeEv
             .context("Coordinator closed the background check")?;
         let event: RuntimeEventKind = serde_json::from_slice(&frame)?;
         match event {
-            RuntimeEventKind::HostCall { call_id, command } => {
-                write(
-                    &mut writer,
-                    &RuntimeCommand::HostReply {
-                        call_id,
-                        result: host::execute(*command).await,
-                    },
-                )
-                .await?;
+            RuntimeEventKind::HostCall { .. } => {
+                bail!("Coordinator delegated an owned effect to source intake")
             }
             RuntimeEventKind::Failure { message, .. } => bail!(message),
             RuntimeEventKind::Done => return Ok(events),

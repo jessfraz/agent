@@ -178,7 +178,7 @@ test("the real model tool allocates only for its owning bound task", async () =>
     const task = await app.tasks.create({ title: "Review", outcome: "Inspect safely" });
     const binding = { host_id: hostId, session_id: "session:22222222-2222-4222-8222-222222222222",
       window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" };
-    const host = { name: "fixture", rex_server: null, coordinator: null, cwd: identity.primary, agent_program: "/example/agent" };
+    const host = { host_id: null, name: "fixture", rex_server: null, coordinator: null, cwd: identity.primary, agent_program: "/example/agent" };
     await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
     const conversation = await app.tasks.conversation(task.conversation_id);
     const release = app.executions.bind(conversation.id.toString(), { cwd: identity.primary, hosts: [host], call: async (command) => {

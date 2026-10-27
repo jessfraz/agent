@@ -1,12 +1,44 @@
 use crate::models::ModelSelection;
 use crate::resources::{CleanupPlan, ResourceRecord, ResourceReport, WorktreeAllocation};
-use crate::sources::{SourceBatch, SourceCheckpoint, SourceCoverage, SourceKey};
+use crate::sources::{SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage, SourceKey};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ContextRepository {
+    pub id: String,
+    pub root: String,
+    pub instructions: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct CoordinatorSettings {
+    pub model: ModelSelection,
+    pub instructions: String,
+    pub context_repositories: Vec<ContextRepository>,
+    pub sources: Vec<SourceConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct AgentNode {
+    pub host_id: String,
+    pub name: String,
+    pub rex_server: Option<String>,
+    pub agent_program: String,
+    pub home_directory: String,
+    pub coordinator: Option<String>,
+    pub launch: WorkerLaunch,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct CoordinatorBootstrap {
+    pub settings: CoordinatorSettings,
+    pub node: Option<AgentNode>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, JsonSchema, TS)]
 pub struct TaskId(#[ts(type = "string")] Uuid);
@@ -96,6 +128,19 @@ pub struct RuntimeRequest {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeCommand {
+    ConfigureCoordinator {
+        bootstrap: CoordinatorBootstrap,
+    },
+    RegisterNode {
+        node: AgentNode,
+    },
+    SetConnectedNodes {
+        host_ids: Vec<String>,
+    },
+    Environment,
+    ConnectWorker {
+        node: AgentNode,
+    },
     Watch,
     SourceStates,
     IngestSource {
@@ -118,7 +163,8 @@ pub enum RuntimeCommand {
     Chat {
         input: String,
         instructions: String,
-        model: ModelSelection,
+        model: Option<ModelSelection>,
+        origin_host_id: Option<String>,
         cwd: String,
         hosts: Vec<WorkerHost>,
     },
@@ -132,6 +178,13 @@ pub enum RuntimeCommand {
     },
     ReadTask {
         task_id: TaskId,
+    },
+    RevokeAllocation {
+        task_id: TaskId,
+        allocation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        agent_id: Option<String>,
     },
     RunTask {
         task_id: TaskId,
@@ -152,6 +205,8 @@ pub enum RuntimeCommand {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct WorkerHost {
+    #[serde(default)]
+    pub host_id: Option<String>,
     pub name: String,
     pub rex_server: Option<String>,
     pub coordinator: Option<String>,
@@ -307,6 +362,22 @@ pub struct SourceState {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostCommand {
+    OnNode {
+        host_id: String,
+        command: Box<HostCommand>,
+    },
+    ReadContext {
+        repository_id: String,
+        path: String,
+        offset: u32,
+        limit: u32,
+    },
+    SearchContext {
+        repository_id: String,
+        path: Option<String>,
+        query: String,
+        limit: u32,
+    },
     ResourceAllocate {
         request: WorktreeAllocation,
     },
@@ -365,6 +436,10 @@ pub enum HostCommand {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostResult {
+    ContextMatches {
+        matches: Vec<ContextMatch>,
+        truncated: bool,
+    },
     Resource {
         report: ResourceReport,
     },
@@ -391,6 +466,13 @@ pub enum HostResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ContextMatch {
+    pub path: String,
+    pub line: u32,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct RuntimeEvent {
     pub version: u32,
     pub id: u32,
@@ -400,6 +482,18 @@ pub struct RuntimeEvent {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEventKind {
+    Configured,
+    NodeRegistered {
+        host_id: String,
+    },
+    WorkerReady {
+        connection_id: String,
+    },
+    Environment {
+        settings: CoordinatorSettings,
+        nodes: Vec<AgentNode>,
+        online_host_ids: Vec<String>,
+    },
     Resources {
         resources: Vec<ResourceRecord>,
     },

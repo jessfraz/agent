@@ -1,4 +1,6 @@
 pub mod config;
+pub mod context;
+pub mod discovery;
 pub mod host;
 pub mod models;
 pub mod protocol;
@@ -7,6 +9,7 @@ pub mod rex;
 pub mod runtime;
 pub mod service;
 
+pub mod broker;
 pub mod callback;
 pub mod instructions;
 pub mod intake;

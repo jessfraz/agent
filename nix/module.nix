@@ -7,11 +7,11 @@
   cfg = config.services.agent;
 in {
   options.services.agent = {
-    enable = lib.mkEnableOption "the agent coordinator";
+    enable = lib.mkEnableOption "the agent service";
     role = lib.mkOption {
-      type = lib.types.enum ["coordinator" "client"];
+      type = lib.types.enum ["coordinator" "worker"];
       default = "coordinator";
-      description = "Coordinator owns conversations and sources; client only maintains its local resources.";
+      description = "Coordinator owns shared state and sources; worker registers its local Rex. CLI-only machines need no service.";
     };
     package = lib.mkOption {
       type = lib.types.package;
@@ -30,7 +30,7 @@ in {
     workingDirectory = lib.mkOption {
       type = lib.types.str;
       default = "/";
-      description = "Coordinator working directory.";
+      description = "Service working directory; task directories are selected at dispatch.";
     };
     tailnetPort = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.between 1 65535);
@@ -58,6 +58,7 @@ in {
         ProgramArguments = ["${cfg.package}/bin/agent" "--config" cfg.configFile]
           ++ lib.optionals (cfg.stateDirectory != null) ["--state-dir" cfg.stateDirectory]
           ++ [(if cfg.role == "coordinator" then "serve" else "maintain")]
+          ++ lib.optionals (cfg.role == "coordinator") ["--coordinator-only"]
           ++ lib.optionals (cfg.tailnetPort != null) ["--tailnet-port" (toString cfg.tailnetPort)];
         WorkingDirectory = cfg.workingDirectory;
         RunAtLoad = true;

@@ -86,6 +86,20 @@ pub struct RexIdentity {
     pub host_id: HostId,
     pub instance_id: Uuid,
     pub rex_version: String,
+    pub endpoint: Option<String>,
+    pub tailscale: Option<RexTailnet>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RexTailnet {
+    pub dns_name: Option<String>,
+    pub https: Option<RexHttps>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RexHttps {
+    pub state: String,
+    pub url: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionSummary {
@@ -569,6 +583,19 @@ impl CreateRequest {
                             shell: DirectShell::None,
                             command,
                             cwd: cwd.to_owned(),
+                            path_prepend: std::env::var_os("PATH")
+                                .map(|path| {
+                                    std::env::split_paths(&path)
+                                        .map(|directory| {
+                                            directory
+                                                .into_os_string()
+                                                .into_string()
+                                                .map_err(|_| RexError::InvalidInput)
+                                        })
+                                        .collect::<Result<Vec<_>, _>>()
+                                })
+                                .transpose()?
+                                .unwrap_or_default(),
                             exit: ExitPolicy {
                                 on_completion: false,
                             },
@@ -609,6 +636,7 @@ struct TerminalOptions {
     shell: DirectShell,
     command: Vec<String>,
     cwd: String,
+    path_prepend: Vec<String>,
     exit: ExitPolicy,
 }
 #[derive(Deserialize, Serialize)]
@@ -701,6 +729,12 @@ mod tests {
             [vec!["/tool/agent".to_owned()], args].concat()
         );
         assert_eq!(worker.options.cwd, "/workspace/project");
+        assert_eq!(
+            worker.options.path_prepend,
+            std::env::split_paths(&std::env::var_os("PATH").unwrap())
+                .map(|path| path.into_os_string().into_string().unwrap())
+                .collect::<Vec<_>>()
+        );
         assert!(!worker.options.exit.on_completion);
         assert!(CreateRequest::worker("Task", "tool", &[], Path::new("relative")).is_err());
     }

@@ -8,6 +8,7 @@ import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ErrorCode } from "./generated/ErrorCode.js";
+import { CoordinatorEnvironment, EnvironmentError } from "./environment.js";
 import { ConversationModels, ModelError } from "./models.js";
 import { ChatGptAuth } from "./auth.js";
 import { validRequest, validEvent, errorEvent } from "./protocol.js";
@@ -42,6 +43,7 @@ async function openApplication() {
   const registry = createRegistry();
   const harness = await Harness.open(storage, { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(harness, inference);
+  const environment = new CoordinatorEnvironment(harness); tasks.useEnvironment(environment);
   const executions = new Executions();
   const sources = new SourceJournal(harness, tasks);
   const tools = createAppTools(tasks, executions);
@@ -54,7 +56,7 @@ async function openApplication() {
   registry.install(tools.worker);
   registry.install(sourceTools);
   registry.install(resourceTools);
-  return { harness, tasks, executions, tools, sources, sourceTools, resources, resourceTools };
+  return { harness, tasks, environment, executions, tools, sources, sourceTools, resources, resourceTools };
 }
 let application: ReturnType<typeof openApplication> | undefined;
 function app(): ReturnType<typeof openApplication> { return application ??= openApplication(); }
@@ -64,6 +66,13 @@ async function handle(request: RuntimeRequest): Promise<void> {
   const { id, command } = request;
   try {
     switch (command.type) {
+      case "configure_coordinator":
+        await (await app()).environment.configure(command.bootstrap); emit(id, { type: "configured" }); break;
+      case "register_node":
+        await (await app()).environment.register(command.node); emit(id, { type: "node_registered", host_id: command.node.host_id }); break;
+      case "set_connected_nodes":
+        (await app()).environment.setConnected(command.host_ids); emit(id, { type: "configured" }); break;
+      case "environment": emit(id, await (await app()).environment.environment()); break;
       case "login": {
         try {
           emit(id, { type: "auth_status", status: await auth.login((url) => {
@@ -87,6 +96,12 @@ async function handle(request: RuntimeRequest): Promise<void> {
         emit(id, { type: "task", task: await tasks.get(command.task_id), history: await tasks.history(command.task_id) });
         break;
       }
+      case "revoke_allocation": {
+        const { tasks } = await app();
+        const task = await tasks.revokeAllocation(command.task_id, command.allocation_id, command.agent_id);
+        emit(id, { type: "task", task, history: await tasks.history(command.task_id) });
+        break;
+      }
       case "source_states": emit(id, { type: "sources", sources: await (await app()).sources.states() }); break;
       case "ingest_source": {
         const result = await (await app()).sources.admit(command.batch, command.expected_checkpoint);
@@ -94,10 +109,12 @@ async function handle(request: RuntimeRequest): Promise<void> {
         break;
       }
       case "triage_sources": {
-        const { sources, executions, tools, sourceTools, resourceTools } = await app();
+        const { sources, environment, executions, tools, sourceTools, resourceTools } = await app();
         if (await sources.hasWork()) {
-          await sources.triage(command, (conversation, model) => executions.bind(conversation.id.toString(), {
-            model, cwd: command.cwd, hosts: command.hosts, role: "triage", call: (operation) => hostRequests.call(id, operation),
+          const hosts = await environment.hosts(command.cwd, null, command.hosts);
+          const default_host = await environment.defaultHost(hosts);
+          await sources.triage({ ...command, hosts }, (conversation, model) => executions.bind(conversation.id.toString(), {
+            model, cwd: command.cwd, hosts, default_host, role: "triage", call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
             notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
           }), [tools.host, tools.main, sourceTools, resourceTools]);
         }
@@ -115,22 +132,26 @@ async function handle(request: RuntimeRequest): Promise<void> {
       }
       case "chat": {
         const turn = mainQueue.then(async () => {
-          await inference.preflight(command.model);
-          const { harness, tasks, executions, tools, sourceTools, resourceTools } = await app();
+          const selected = command.model ?? await (await app()).environment.model(null);
+          await inference.preflight(selected);
+          const { harness, tasks, environment, executions, tools, sourceTools, resourceTools } = await app();
+          const hosts = await environment.hosts(command.cwd, command.origin_host_id, command.hosts);
+          const default_host = await environment.defaultHost(hosts);
           const root = await harness.root(BACKGROUND_CONTEXT);
           await root.waitForIdle(BACKGROUND_CONTEXT);
           const release = executions.bind(root.id.toString(), {
-            model: command.model, cwd: command.cwd, hosts: command.hosts, call: (operation) => hostRequests.call(id, operation),
+            model: selected, cwd: command.cwd, hosts, default_host, call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
             notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
           });
           try {
             const related = await tasks.search(command.input);
             const relatedContext = related.length === 0 ? "" : "\n\nRelated existing tasks (read and reuse the matching task):\n" +
               JSON.stringify(related.map((task) => ({ id: task.id, title: task.title, outcome: task.outcome, state: task.state, summary: task.summary })));
-            const hostsContext = "\n\nConfigured worker hosts (first is default): " +
-              JSON.stringify(command.hosts.map((host) => ({ name: host.name, cwd: host.cwd })));
-            await inference.configure(root, command.model, {
-              instructions: command.instructions + relatedContext + hostsContext, cwd: command.cwd, extensions: [tools.host, tools.main, sourceTools, resourceTools] });
+            const hostsContext = "\n\nConnected worker hosts: " +
+              JSON.stringify({ default_host_id: default_host?.host_id ?? null, origin_host_id: command.origin_host_id, project_cwd: command.cwd,
+                hosts: hosts.map((host) => ({ host_id: host.host_id, name: host.name, cwd: host.cwd })) });
+            await inference.configure(root, selected, {
+              instructions: (await environment.instructions(command.instructions)) + relatedContext + hostsContext, cwd: command.cwd, extensions: [tools.host, tools.main, sourceTools, resourceTools] });
             const submission = await root.submit({ type: "input", content: command.input }, BACKGROUND_CONTEXT);
             const settled = await submission.wait(BACKGROUND_CONTEXT);
             if (settled.type !== "input" || settled.status !== "done") throw new TaskError("The model turn did not complete; its state is retained");
@@ -148,7 +169,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
       default: throw new TaskError("This request is handled by the coordinator");
     }
   } catch (error) {
-    if (error instanceof TaskError || error instanceof ModelError) failure(id, "invalid_request", error.message);
+    if (error instanceof TaskError || error instanceof ModelError || error instanceof EnvironmentError) failure(id, "invalid_request", error.message);
     else emit(id, errorEvent(error));
   } finally {
     hostRequests.finish(id);

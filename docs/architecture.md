@@ -37,11 +37,26 @@ both directions at the wire boundary. Stored resource records describe intent
 and evidence; native handles and ownership must be checked again before effects.
 
 ```text
-  laptop CLI -- verified Tailscale -- desktop coordinator
-       |                                 |
-  laptop Rex                         Pi Durable store
-                                         |
-                                    desktop Rex
+  phone CLI in Rex    laptop CLI     desktop CLI
+          \               |              /
+           +--------------+-------------+
+                          |
+                 desktop coordinator
+                 + main conversation
+                 + Pi Durable / SQLite
+                 + shared settings / context repos
+                 + source polling / task routing
+                          |
+                 broker of host effects
+                   /              \
+          local execution     reverse worker connection
+                 |                 |
+            desktop Rex       laptop agent -> local Rex
+            + Task A          + Task C
+            | + Build         | + Investigation
+            | + Review        | + Checks
+            + Task B          + Task D
+              + Follow-up       + Implementation
 ```
 
 One selected coordinator is the only writer and source poller. Clients and
@@ -50,12 +65,37 @@ lifetime; the coordinator owns application state and routing. Reusing a Rex
 connection could replace transport, but would still require this process.
 A process lock is inherited by the Pi child, so losing its Rust supervisor does
 not admit a second writer.
+
+Workers connect to the coordinator and announce their actual Rex host ID,
+name, executable and local launch paths. Agent reuses Rex's shared host
+inventory when available; each node can announce its own native Rex metadata
+even when that inventory is empty. User settings contain one coordinator
+address, not a duplicated list of machines. `agent nodes` exposes the registry
+and current connections. Saved metadata survives a restart; online status
+requires a live connection.
+
+The coordinator runs unqualified main/triage effects locally. Work targeted at
+a registered machine travels down that worker's existing connection and uses
+its local Rex socket. Task effects remain attached to their owning worker.
+Disconnects never silently move an effect onto the coordinator. Connection
+generations prevent an old connection's cleanup from removing its replacement;
+an unanswered effect is uncertain and is not replayed automatically.
+
+Coordinator TOML owns model defaults, source choices and context repositories.
+Clients send their project directory and scoped instructions, without loading
+the coordinator's repositories themselves. The coordinator adds global Codex
+instructions and context guidance; bounded read/search tools resolve relative
+paths against its canonical repository roots. A context repository does not
+change the chat's project directory. Node registration refreshes executable
+and configuration paths when a task resumes, while preserving that task's
+model selection and working directory.
 Local clients use a private Unix socket. Remote clients use Tailscale with live
 peer identity checks, or an existing SSH connection. Empty `trusted_nodes`
 allows only authorized, untagged peers of the same user. An explicit list pins
 exact stable node IDs instead, including tagged servers whose owner is the
 shared tagged-device identity. Check the connected /32 against native WhoIs
-metadata in both cases; names, tags and user-supplied claims do not grant access.
+metadata in both cases; names, tags and user-supplied claims do not grant
+access.
 
 The MVP does not replicate the store or recover onto another Mac. If the
 coordinator is down, the client reports that it is unavailable. Copying a live
@@ -96,8 +136,8 @@ Rex server restart recovery remains an open question below.
 ```
 
 Background sources implement a transport-neutral Rust trait in
-`sources/mod.rs`, with sibling CLI adapters for mail, calendars, GitHub, Messages
-and Slack. CLIs own authentication and refresh. An API adapter, such as a future
+`sources/mod.rs`, with sibling CLI adapters for mail, calendars, GitHub,
+Messages and Slack. CLIs own authentication and refresh. An API adapter, such as a future
 Home Assistant source, returns the same normalized events, checkpoint and
 coverage. The coordinator rediscovers configured accounts, polls bounded pages
 and preserves separate cursors and
@@ -137,11 +177,16 @@ or partial. Retained submodule archives remain in the receipt.
 
 ## Installation and private data
 
-Nix pins the Rust CLI and Pi runtime. The nix-darwin module runs one coordinator
-as a user service and references a private configuration file outside the Nix
-store. Provider credentials and personal instructions stay in their existing
-private locations. The public repository contains generic examples and
-synthetic test data.
+Nix pins the Rust CLI and Pi runtime. The nix-darwin module runs a coordinator
+or worker as a user service and references a private TOML file outside the Nix
+store. CLI-only machines need no service. Provider credentials and personal
+instructions stay in their existing private locations. The public repository
+contains generic examples and synthetic test data.
+
+The initial terminal interface is a small Rust interactive CLI. Pi Durable
+provides the headless conversation engine; a richer TUI can replace the client
+later without changing ownership of conversations or tasks. See
+[setup](setup.md) for the commands and service configuration.
 
 App-owned ChatGPT OAuth credentials are validated, stored privately and
 refreshed through the issued client registration. Codex credentials are not
@@ -167,7 +212,8 @@ versions reversible and measure whether accepted changes improve outcomes.
 
 Speech-to-text is a separate Rust input trait with sibling provider modules.
 Transcription produces ordinary coordinator input, retaining conversation and
-task ownership. Follow the current [OpenAI transcription guide](https://developers.openai.com/api/docs/guides/transcription)
+task ownership. Follow the current
+[OpenAI transcription guide](https://developers.openai.com/api/docs/guides/transcription)
 when selecting recorded or streaming input. Pi's existing inference interfaces
 remain the model boundary.
 

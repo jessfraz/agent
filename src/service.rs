@@ -9,7 +9,10 @@ use std::{
     time::Duration,
 };
 
-use crate::protocol::{RuntimeCommand, RuntimeEventKind};
+use crate::{
+    broker::Broker,
+    protocol::{CoordinatorBootstrap, HostCommand, RuntimeCommand, RuntimeEventKind},
+};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use tokio::{
@@ -61,7 +64,36 @@ pub async fn serve_tailnet(
     policy: crate::tailnet::PeerPolicy,
     daemon: crate::tailnet::Daemon,
 ) -> Result<()> {
-    serve_with_transport(script, state, Some(port), policy, daemon, shutdown_signal()).await
+    serve_with_transport(
+        script,
+        state,
+        Some(port),
+        policy,
+        daemon,
+        None,
+        shutdown_signal(),
+    )
+    .await
+}
+
+pub async fn serve_configured(
+    script: &Path,
+    state: &Path,
+    port: Option<u16>,
+    policy: crate::tailnet::PeerPolicy,
+    daemon: crate::tailnet::Daemon,
+    bootstrap: CoordinatorBootstrap,
+) -> Result<()> {
+    serve_with_transport(
+        script,
+        state,
+        port,
+        policy,
+        daemon,
+        Some(bootstrap),
+        shutdown_signal(),
+    )
+    .await
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -84,6 +116,7 @@ async fn serve_until(
         None,
         crate::tailnet::PeerPolicy::new(&[])?,
         crate::tailnet::Daemon::default(),
+        None,
         shutdown,
     )
     .await
@@ -95,10 +128,36 @@ async fn serve_with_transport(
     port: Option<u16>,
     policy: crate::tailnet::PeerPolicy,
     daemon: crate::tailnet::Daemon,
+    bootstrap: Option<CoordinatorBootstrap>,
     shutdown: impl Future<Output = Result<()>>,
 ) -> Result<()> {
     // Claim the writer before deciding an old socket is stale.
     let owner = Runtime::start(script, state)?;
+    let broker = match Broker::new(bootstrap.as_ref()) {
+        Ok(broker) => Arc::new(broker),
+        Err(error) => {
+            owner.close().await?;
+            return Err(error);
+        }
+    };
+    if let Some(bootstrap) = bootstrap {
+        let host_ids = bootstrap
+            .node
+            .as_ref()
+            .map(|node| node.host_id.clone())
+            .into_iter()
+            .collect();
+        if let Err(error) = async {
+            crate::broker::control(&owner, RuntimeCommand::ConfigureCoordinator { bootstrap })
+                .await?;
+            crate::broker::control(&owner, RuntimeCommand::SetConnectedNodes { host_ids }).await
+        }
+        .await
+        {
+            owner.close().await?;
+            return Err(error);
+        }
+    }
     let (listener, socket) = match SocketOwner::bind(state.join(SOCKET_NAME)) {
         Ok(bound) => bound,
         Err(error) => {
@@ -129,7 +188,8 @@ async fn serve_with_transport(
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
                     let runtime = owner.clone();
-                    clients.spawn(async move { handle(stream, runtime).await });
+                    let broker = broker.clone();
+                    clients.spawn(async move { handle(stream, runtime, broker).await });
                 }
                 Err(error) => break Err(error.into()),
             },
@@ -147,8 +207,9 @@ async fn serve_with_transport(
                     let runtime = owner.clone();
                     let policy = policy.clone();
                     let daemon = daemon.clone();
+                    let broker = broker.clone();
                     clients.spawn(async move {
-                        authenticated(stream, runtime, crate::tailnet::validate_connection(local, peer, &policy, &daemon)).await
+                        authenticated(stream, runtime, broker, crate::tailnet::validate_connection(local, peer, &policy, &daemon)).await
                     });
                 }
                 Err(error) => break Err(error.into()),
@@ -177,7 +238,10 @@ async fn serve_with_transport(
     result
 }
 
-async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(writer: &mut W, value: &T) -> Result<()> {
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
+    writer: &mut W,
+    value: &T,
+) -> Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
     writer.write_all(&bytes).await?;
@@ -188,13 +252,18 @@ async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(writer: &mut W, value:
 async fn authenticated<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     runtime: Arc<Runtime>,
+    broker: Arc<Broker>,
     authorization: impl Future<Output = Result<()>>,
 ) -> Result<()> {
     authorization.await?;
-    handle(stream, runtime).await
+    handle(stream, runtime, broker).await
 }
 
-async fn handle<S: AsyncRead + AsyncWrite + Unpin>(stream: S, runtime: Arc<Runtime>) -> Result<()> {
+async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    runtime: Arc<Runtime>,
+    broker: Arc<Broker>,
+) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = FrameReader::new(BufReader::new(reader));
     let initial = reader
@@ -204,6 +273,18 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(stream: S, runtime: Arc<Runti
     let command: RuntimeCommand =
         serde_json::from_slice(&initial).context("Client sent an invalid command")?;
     let login = matches!(command, RuntimeCommand::Login);
+    ensure!(
+        !matches!(
+            command,
+            RuntimeCommand::ConfigureCoordinator { .. }
+                | RuntimeCommand::RegisterNode { .. }
+                | RuntimeCommand::SetConnectedNodes { .. }
+        ),
+        "Coordinator metadata is owned by its local service"
+    );
+    if let RuntimeCommand::ConnectWorker { node } = command {
+        return broker.worker(reader, writer, &runtime, node).await;
+    }
     if matches!(command, RuntimeCommand::Watch) {
         let mut notices = runtime.subscribe();
         loop {
@@ -220,15 +301,22 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(stream: S, runtime: Arc<Runti
             }
         }
     }
+    let attached = matches!(command, RuntimeCommand::RunTask { .. });
     let mut call = runtime.request(command).await?;
     let mut input_closed = false;
+    let mut output_closed = false;
     let mut host_calls = HashSet::new();
     let result: Result<()> = async {
         loop {
             tokio::select! {
                 event = call.events.recv() => {
                     let event = event.context("Coordinator closed before completing the request")?;
-                    if let RuntimeEventKind::HostCall { call_id, .. } = &event {
+                    if let RuntimeEventKind::HostCall { call_id, command } = &event {
+                        if !attached || matches!(**command, HostCommand::ReadContext { .. } | HostCommand::SearchContext { .. }) {
+                            let result = broker.execute((**command).clone()).await;
+                            runtime.reply(call.request_id, call_id.clone(), result).await?;
+                            continue;
+                        }
                         if input_closed {
                             runtime.reply(call.request_id, call_id.clone(), disconnected()).await?;
                             continue;
@@ -236,7 +324,11 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(stream: S, runtime: Arc<Runti
                         host_calls.insert(call_id.clone());
                     }
                     let done = matches!(event, RuntimeEventKind::Done);
-                    write_frame(&mut writer, &event).await?;
+                    if !output_closed && let Err(error) = write_frame(&mut writer, &event).await {
+                        if attached { return Err(error); }
+                        input_closed = true;
+                        output_closed = true;
+                    }
                     if done { return Ok(()); }
                 }
                 frame = reader.next_frame(), if !input_closed => {
@@ -352,7 +444,7 @@ mod tests {
           },60);
         } else if(typeof command.target==='string') {
           writeFileSync(join(process.argv[2],'callback.json'),JSON.stringify({id,target:command.target}));
-        } else if(command.type==='logout') {
+        } else if(command.type==='run_task'||command.type==='logout') {
           emit(id,{type:'host_call',call_id:'11111111-1111-4111-8111-111111111111',command:{
             type:'exec',program:'/bin/echo',args:['synthetic'],cwd:'/',timeout_seconds:1}});
         } else if(command.type==='host_reply') {
@@ -361,6 +453,23 @@ mod tests {
         else { finish(id); }
       });
     "#;
+
+    fn attached_command() -> RuntimeCommand {
+        RuntimeCommand::RunTask {
+            task_id: crate::protocol::TaskId::new(),
+            agent_id: None,
+            allocation_id: "fixture".into(),
+            binding: crate::protocol::WorkerRef {
+                host_id: "11111111-1111-4111-8111-111111111111".into(),
+                session_id: "fixture".into(),
+                window_id: "fixture".into(),
+                block_id: "fixture".into(),
+            },
+            instructions: String::new(),
+            model: crate::models::ModelSelection::default(),
+            cwd: "/".into(),
+        }
+    }
 
     struct Running {
         directory: tempfile::TempDir,
@@ -497,16 +606,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_requests_execute_owned_effects_without_delegating_to_the_sending_cli() {
+        let service = Running::start().await;
+        let mut client = service.client().await;
+        write_frame(&mut client, &RuntimeCommand::Logout)
+            .await
+            .unwrap();
+        let mut reader = FrameReader::new(BufReader::new(client));
+        let event: RuntimeEventKind =
+            serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(event, RuntimeEventKind::AuthStatus { .. }));
+        let event: RuntimeEventKind =
+            serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(event, RuntimeEventKind::Done));
+        let result: HostResult =
+            serde_json::from_slice(&fs::read(service.wait_for("reply.json").await).unwrap())
+                .unwrap();
+        assert!(
+            matches!(result,HostResult::Process{exit_code:0,stdout,..} if stdout=="synthetic\n")
+        );
+        drop(reader);
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_clients_cannot_mutate_authoritative_node_connectivity() {
+        let service = Running::start().await;
+        let mut client = service.client().await;
+        write_frame(
+            &mut client,
+            &RuntimeCommand::SetConnectedNodes {
+                host_ids: vec!["forged".into()],
+            },
+        )
+        .await
+        .unwrap();
+        let mut reader = FrameReader::new(BufReader::new(client));
+        assert!(reader.next_frame().await.unwrap().is_none());
+        assert!(!service.directory.path().join("admitted").exists());
+        drop(reader);
+        service.stop().await;
+    }
+
+    #[tokio::test]
     async fn host_replies_are_scoped_to_their_own_client() {
         let service = Running::start().await;
         let mut first = service.client().await;
         let mut second = service.client().await;
-        write_frame(&mut first, &RuntimeCommand::Logout)
-            .await
-            .unwrap();
-        write_frame(&mut second, &RuntimeCommand::Logout)
-            .await
-            .unwrap();
+        write_frame(&mut first, &attached_command()).await.unwrap();
+        write_frame(&mut second, &attached_command()).await.unwrap();
         let (first_read, mut first_write) = first.into_split();
         let (second_read, mut second_write) = second.into_split();
         let mut first_read = FrameReader::new(BufReader::new(first_read));
@@ -610,9 +758,14 @@ mod tests {
         let (server, _) = listener.accept().await.unwrap();
         let rejected_runtime = runtime.clone();
         let rejected = tokio::spawn(async move {
-            authenticated(server, rejected_runtime, async {
-                anyhow::bail!("Rejected synthetic peer");
-            })
+            authenticated(
+                server,
+                rejected_runtime,
+                Arc::new(crate::broker::Broker::new(None).unwrap()),
+                async {
+                    anyhow::bail!("Rejected synthetic peer");
+                },
+            )
             .await
         });
         let _ = write_frame(&mut denied_client, &RuntimeCommand::Status).await;
@@ -627,10 +780,15 @@ mod tests {
             .unwrap();
         let (server, _) = listener.accept().await.unwrap();
         let allowed_runtime = runtime.clone();
-        let allowed =
-            tokio::spawn(
-                async move { authenticated(server, allowed_runtime, async { Ok(()) }).await },
-            );
+        let allowed = tokio::spawn(async move {
+            authenticated(
+                server,
+                allowed_runtime,
+                Arc::new(crate::broker::Broker::new(None).unwrap()),
+                async { Ok(()) },
+            )
+            .await
+        });
         status(allowed_client).await;
         allowed.await.unwrap().unwrap();
         assert!(directory.path().join("admitted").exists());
@@ -686,9 +844,7 @@ mod tests {
         assert_eq!(results, 1);
         fs::remove_file(callback).unwrap();
         let mut other = service.client().await;
-        write_frame(&mut other, &RuntimeCommand::Logout)
-            .await
-            .unwrap();
+        write_frame(&mut other, &attached_command()).await.unwrap();
         let (other_read, mut other_write) = other.into_split();
         let mut other = FrameReader::new(BufReader::new(other_read));
         other.next_frame().await.unwrap().unwrap();
@@ -711,9 +867,7 @@ mod tests {
     async fn disconnected_executor_gets_no_fallback_host_execution() {
         let service = Running::start().await;
         let mut client = service.client().await;
-        write_frame(&mut client, &RuntimeCommand::Logout)
-            .await
-            .unwrap();
+        write_frame(&mut client, &attached_command()).await.unwrap();
         let mut reader = FrameReader::new(BufReader::new(client));
         let event: RuntimeEventKind =
             serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();

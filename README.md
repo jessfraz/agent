@@ -8,103 +8,98 @@ ChatGPT plan sign-in, persistent conversations and workers in
 work before starting another task.
 
 ```text
-  phone CLI / laptop CLI / desktop CLI
-                    |
-          main conversation
-          Pi Durable + SQLite
-                    |
-       find and reuse the matching task
-                    |
-            execution host
-           /              \
-  desktop Rex              laptop Rex
-  |                        |
-  + Fix login              + Update dependencies
-  | + Implementation       | + Implementation
-  | + Review               | + Checks
-  |                        |
-  + Track shipment         + Investigate slow build
-    + Follow-up              + Investigation
-                             + Review
-
-  mail / Slack -> durable inbox -> related task -> brief update
+  phone CLI via Rex    laptop CLI    desktop CLI
+           \              |             /
+            +-------------+------------+
+                          |
+                   desktop coordinator
+                   Pi Durable + SQLite
+                   settings + context
+                   mail / Slack / feeds
+                          |
+               find and reuse the right task
+                          |
+           +--------------+---------------+
+           |                              |
+      desktop agent                  laptop agent
+      local Rex                      local Rex
+      |                              |
+      + Fix login                    + Update dependencies
+      | + Implementation             | + Implementation
+      | + Review                     | + Checks
+      |                              |
+      + Track shipment               + Investigate slow build
+        + Follow-up                    + Investigation
+                                       + Review
 ```
 
-Each task gets one named Rex session on the machine doing the work. Its
-subagents get named terminals inside that session. The main chat receives
-results, so switching between task chats is optional. Phone access uses the
-existing Rex phone CLI.
-
-Rex owns terminals and sessions. The coordinator owns conversations, tasks and
-background intake. Only one machine runs the coordinator; the others connect
-to it over Tailscale.
+Every chat uses the coordinator. Each task gets one named Rex session on its
+execution machine; its subagents get named terminals inside that session.
+Results return to the main chat, so visiting task sessions is optional. Worker
+connections share metadata, not duplicate executions. Offline workers retain
+their tasks; automatic transfer to another machine comes later.
 
 For example, JLCPCB emails about a missing fabrication file. The agent finds
-the existing hardware task, attaches the email and continues that task's Rex
-session on its owning machine. The main chat gets a brief update with the
-result or the decision needed to move it forward.
+the existing hardware task, attaches the email and continues its Rex session.
+The main chat gets a brief result or the decision needed to move it forward.
+
+On the coordinator:
 
 ```sh
 nix profile add github:jessfraz/agent
-agent login
-agent chat
-agent usage
-agent tasks list
-agent sources
-agent mail accounts
+agent init
+agent serve
 ```
 
-Install the same package on both machines. Put private configuration in
-`~/.config/agent/config.toml`, using the commented
-[coordinator](examples/coordinator.toml) or [client](examples/client.toml)
-example. On the coordinator, run `agent serve` (port 43187 by default).
-Other machines set `coordinator` to its `tailscale://IP:43187` address. Both
-ends require Tailscale; the listener binds only to its native Tailscale
-interface. By default, only authorized, untagged devices of the same user are
-trusted. Tagged servers use an explicit `trusted_nodes` list of Tailscale stable
-node IDs on both ends. A nonempty list replaces same-user trust. Existing SSH
-hosts are also supported.
-Set `tailscale_socket` when a machine has both GUI and system daemons;
-the explicit socket selects the daemon used for every identity check.
+On another machine, with its own Rex and Tailscale already installed:
 
-Rex, Tailscale and provider CLIs remain separately installed. Google accounts
-come from Switchboard; selecting the Google source with `namespaces: null`
-discovers all configured Google namespaces. Slack uses a configured read-only
-CLI command. Calendar and GitHub sources use the existing `gws` and `gh` CLIs
-through Switchboard. Remove an entry from `sources` to disable it; an empty list
-disables intake. Failed reads remain visible as coverage gaps. Only the selected
-coordinator polls sources and owns conversation state.
+```sh
+nix profile add github:jessfraz/agent
+agent init --coordinator tailscale://100.64.0.10
+agent serve
+```
 
-The same TOML file sets a typed provider, model, optional reasoning level and
-fast mode. Pi supplies the provider catalog and inference. ChatGPT is the
-default; other providers use Pi's native environment or ambient credentials.
-Unsupported reasoning or fast-mode choices produce an error. New tasks inherit
-the current defaults; resumed tasks retain their saved selection.
+That address is invented. Port 43187 is the default. Leave each service running
+or use the Nix service below. Then, in another terminal, sign in once on the
+coordinator with `agent login`. A CLI-only machine uses the same settings and
+skips `agent serve`. On any connected machine:
 
-Add `{"provider":"messages","namespaces":null}` to `sources` to enable the
-read-only `messages` CLI on macOS.
-Configured Switchboard Messages namespaces take precedence; otherwise it reads
-the local account. It reconciles locally available history from the last seven
-days and preserves unread state. Older outages need a separate history import.
+```sh
+agent chat
+agent nodes
+agent tasks list
+agent sources
+agent usage
+```
 
-The CLI reads `$CODEX_HOME/AGENTS.md` or `~/.codex/AGENTS.md`, then scoped
-project instructions, before user turns and worker startup. Credentials,
-configuration and conversation data stay outside this repository. `agent usage`
-reads the installed Codex account's quota; it cannot report a separate allowance
-for this app.
+[Setup](docs/setup.md) covers services, trust and provider CLIs. Commented TOML
+examples show the [coordinator](examples/coordinator.toml) and
+[worker or client](examples/client.toml) settings. Only the coordinator needs
+model defaults, background sources and optional context repositories. Context
+is available without changing the directory where chat started. Hosts announce
+their own identity and launch paths, using Rex's host inventory when available.
 
-Owned worktrees have a durable inventory: `agent resources list` shows them;
+The CLI loads `$CODEX_HOME/AGENTS.md` or `~/.codex/AGENTS.md` and project
+instructions. Pi supplies inference and conversation machinery. ChatGPT is the
+default; other providers use Pi's environment or ambient credentials. New tasks
+inherit the coordinator's typed model, reasoning and fast-mode settings;
+resumed tasks retain their saved selection. `agent usage` reads the installed
+Codex account's quota and cannot report a separate allowance for this app.
+
+Sources use existing authenticated CLIs: Google mail and calendars through
+Switchboard and `gws`, GitHub through Switchboard and `gh`, a configured Slack
+CLI, and the read-only macOS `messages` CLI. Each can be disabled. Failed reads
+remain visible as coverage gaps. Task outcomes are built in.
+
+Tasks can own multiple worktrees. `agent resources list` shows their inventory;
 `agent resources collect` uses the installed guarded `git cleanup` workflow.
-Collection requires merged, clean, inactive work and preserves held or partial
-results for inspection. Tasks can own multiple worktrees; the inventory groups
-them by task and retains each checkout's path, host and cleanup state. An
-unavailable cleanup helper leaves work held.
-The coordinator checks every five minutes; other hosts run `agent maintain`
-against that coordinator to collect their local resources.
+Only merged, clean, inactive work is eligible. Missing helpers, uncertain
+ownership and partial results stay visible. Services check local resources
+every five minutes.
 
-The [architecture](docs/architecture.md) covers ownership, source intake and
-later recovery, import, speech input and reviewed learning. The
-[nix-darwin module](nix/module.nix) runs the coordinator as a user service.
+The [architecture](docs/architecture.md) describes ownership and later recovery,
+history import, speech input and reviewed learning. Private settings,
+credentials and conversations stay outside this repository.
 
 For development:
 
@@ -114,5 +109,5 @@ make runtime check
 nix build
 ```
 
-Rust generates the runtime's TypeScript bindings and JSON schemas. CI runs
-behavior tests and package builds on Linux and macOS without personal accounts.
+Rust generates TypeScript bindings and JSON schemas. CI runs behavior tests
+and package builds on Linux and macOS without personal accounts.

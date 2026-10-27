@@ -14,9 +14,13 @@ use std::{
 
 use agent_cli::{
     config::{self, ClientConfig},
-    host, instructions, intake,
+    context::ContextStore,
+    discovery, host, instructions, intake,
     models::{ModelProvider, ModelSelection, Reasoning},
-    protocol::{AuthStatus, RuntimeCommand, RuntimeEventKind, TaskId, WorkerLaunch, WorkerRef},
+    protocol::{
+        AuthStatus, CoordinatorBootstrap, CoordinatorSettings, RuntimeCommand, RuntimeEventKind,
+        TaskId, WorkerLaunch, WorkerRef,
+    },
     rex::{BlockId, RexClient, SessionId},
     runtime::FrameReader,
     service,
@@ -52,12 +56,16 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Create private TOML settings without overwriting an existing file.
+    Init,
     Login,
     Status,
     Logout,
     Usage,
     /// Show background source coverage and checkpoints.
     Sources,
+    /// Show shared settings and registered machines.
+    Nodes,
     /// Inspect owned worktrees or collect eligible merged worktrees.
     Resources {
         #[command(subcommand)]
@@ -73,7 +81,7 @@ enum Action {
         #[command(subcommand)]
         command: TasksAction,
     },
-    /// Run the local coordinator in the foreground.
+    /// Run this machine's coordinator or registered worker service.
     Serve {
         #[arg(long, default_value_t = agent_cli::tailnet::DEFAULT_PORT, value_parser = clap::value_parser!(u16).range(1..))]
         tailnet_port: u16,
@@ -81,8 +89,10 @@ enum Action {
         local_only: bool,
         #[arg(long)]
         no_sources: bool,
+        #[arg(long, hide = true)]
+        coordinator_only: bool,
     },
-    /// Collect eligible owned worktrees on this client; never polls sources.
+    /// Keep this worker connected and collect eligible owned worktrees.
     Maintain {
         #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u16).range(60..=3600))]
         interval_seconds: u16,
@@ -124,6 +134,14 @@ struct ModelArgs {
 }
 
 impl ModelArgs {
+    fn is_empty(&self) -> bool {
+        self.provider.is_none()
+            && self.model.is_none()
+            && self.reasoning.is_none()
+            && !self.fast
+            && !self.no_fast
+            && !self.default_reasoning
+    }
     fn resolve(self, defaults: &ModelSelection) -> Result<ModelSelection> {
         let selection = ModelSelection {
             provider: self.provider.unwrap_or(defaults.provider),
@@ -149,8 +167,20 @@ impl ModelArgs {
 #[derive(Subcommand)]
 enum TasksAction {
     List,
-    Search { query: String },
-    Read { task_id: TaskId },
+    Search {
+        query: String,
+    },
+    Read {
+        task_id: TaskId,
+    },
+    /// Revoke one interrupted or uncertain allocation by its exact ID.
+    Recover {
+        task_id: TaskId,
+        #[arg(long)]
+        allocation_id: String,
+        #[arg(long)]
+        agent_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -205,6 +235,16 @@ async fn main() -> Result<()> {
         selection: ModelArgs::default(),
     });
     match action {
+        Action::Init => {
+            let path = arguments
+                .config
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(config::default_path)?;
+            config::initialize(&path, arguments.coordinator.as_deref())?;
+            println!("Created {}", path.display());
+            return Ok(());
+        }
         Action::Usage => {
             let usage = usage::read(None).await?;
             if arguments.json {
@@ -245,49 +285,6 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/dist/src/bridge.js")
         });
-    // Service entrypoints always own the explicitly selected local state, even
-    // when this machine's ordinary client profile points elsewhere.
-    if let Action::Serve {
-        tailnet_port,
-        local_only,
-        no_sources,
-    } = action
-    {
-        let mut profile = config::load(arguments.config.as_deref())?;
-        let policy = agent_cli::tailnet::PeerPolicy::new(&profile.trusted_nodes)?;
-        let daemon = agent_cli::tailnet::Daemon::new(profile.tailscale_socket.as_deref())?;
-        let _sources = if no_sources {
-            None
-        } else {
-            profile.launch = Some(worker_launch(&arguments, &profile, &directory, &script)?);
-            let cwd = env::current_dir()?;
-            let context = intake::ContextBundle {
-                instructions_file: arguments
-                    .instructions
-                    .clone()
-                    .unwrap_or(instructions::default_path()?),
-                context_repositories: profile.context_repositories.clone(),
-                model: profile.model.clone(),
-                cwd: cwd.to_string_lossy().into_owned(),
-                hosts: selected_hosts(&profile, None, &cwd, &profile.model)?,
-            };
-            let state = directory.clone();
-            Some(WatchGuard(tokio::spawn(async move {
-                let _ = intake::run(state, profile, context).await;
-            })))
-        };
-        return if local_only {
-            service::serve(&script, &directory).await
-        } else {
-            service::serve_tailnet(&script, &directory, tailnet_port, policy, daemon).await
-        };
-    }
-    if matches!(action, Action::Rpc) {
-        return service::relay(
-            local_connection(&script, &directory, arguments.config.as_deref()).await?,
-        )
-        .await;
-    }
     let mut config = config::load(arguments.config.as_deref())?;
     config.launch = Some(worker_launch(&arguments, &config, &directory, &script)?);
     let coordinator = arguments
@@ -298,45 +295,111 @@ async fn main() -> Result<()> {
     if let Some(value) = &coordinator {
         config::validate_coordinator(value)?;
     }
-    let global = arguments
-        .instructions
-        .clone()
-        .unwrap_or(instructions::default_path()?);
     let cwd = env::current_dir()?;
+    if let Action::Serve {
+        tailnet_port,
+        local_only,
+        no_sources,
+        coordinator_only,
+    } = action
+    {
+        ensure!(
+            !coordinator_only || coordinator.is_none(),
+            "The coordinator service cannot use a worker configuration"
+        );
+        if coordinator.is_some() {
+            ensure!(
+                !local_only,
+                "A worker profile cannot start a second local coordinator"
+            );
+            return worker_service(&config, coordinator.as_deref(), &script, &directory, 300).await;
+        }
+        let policy = agent_cli::tailnet::PeerPolicy::new(&config.trusted_nodes)?;
+        let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
+        let contexts = ContextStore::load(&config.context_repositories)?;
+        let global = arguments
+            .instructions
+            .clone()
+            .unwrap_or(instructions::default_path()?);
+        let node = match discovery::local_node(
+            None,
+            config
+                .launch
+                .clone()
+                .context("Missing local launch metadata")?,
+            config.node_name.as_deref(),
+        )
+        .await
+        {
+            Ok(node) => Some(node),
+            Err(_) => {
+                eprintln!(
+                    "Local Rex is unavailable; this coordinator has no local worker until restarted."
+                );
+                None
+            }
+        };
+        let bootstrap = CoordinatorBootstrap {
+            settings: CoordinatorSettings {
+                model: config.model.clone(),
+                instructions: instructions::global(&global)?,
+                context_repositories: contexts.repositories().to_vec(),
+                sources: config.sources.clone(),
+            },
+            node,
+        };
+        let _sources = if no_sources {
+            None
+        } else {
+            let context = intake::ContextBundle {
+                model: config.model.clone(),
+                cwd: cwd.to_string_lossy().into_owned(),
+            };
+            let state = directory.clone();
+            Some(WatchGuard(tokio::spawn(async move {
+                let _ = intake::run(state, config, context).await;
+            })))
+        };
+        return service::serve_configured(
+            &script,
+            &directory,
+            (!local_only).then_some(tailnet_port),
+            policy,
+            daemon,
+            bootstrap,
+        )
+        .await;
+    }
+    if matches!(action, Action::Rpc) {
+        ensure!(
+            coordinator.is_none(),
+            "RPC must run on the selected coordinator"
+        );
+        return service::relay(
+            local_connection(&script, &directory, arguments.config.as_deref()).await?,
+        )
+        .await;
+    }
     if let Action::Maintain { interval_seconds } = action {
         ensure!(
             coordinator.is_some(),
-            "Client maintenance requires a selected remote coordinator"
+            "Worker service requires a selected remote coordinator"
         );
-        loop {
-            let identity = RexClient::new(None).whoami().await;
-            let collected = match identity {
-                Ok(identity) => {
-                    request(
-                        &arguments,
-                        &config,
-                        coordinator.as_deref(),
-                        &script,
-                        &directory,
-                        RuntimeCommand::CollectResources {
-                            host_id: identity.host_id.to_string(),
-                        },
-                    )
-                    .await
-                }
-                Err(error) => Err(error.into()),
-            };
-            if collected.is_err() {
-                eprintln!("Resource maintenance could not complete; saved ownership is retained.");
-            }
-            sleep(Duration::from_secs(interval_seconds.into())).await;
-        }
+        return worker_service(
+            &config,
+            coordinator.as_deref(),
+            &script,
+            &directory,
+            interval_seconds,
+        )
+        .await;
     }
     let command = match action {
         Action::Login => RuntimeCommand::Login,
         Action::Status => RuntimeCommand::Status,
         Action::Logout => RuntimeCommand::Logout,
         Action::Sources => RuntimeCommand::SourceStates,
+        Action::Nodes => RuntimeCommand::Environment,
         Action::Resources { command } => match command {
             ResourcesAction::List => RuntimeCommand::ListResources,
             ResourcesAction::Collect => RuntimeCommand::CollectResources {
@@ -347,6 +410,15 @@ async fn main() -> Result<()> {
             TasksAction::List => RuntimeCommand::ListTasks,
             TasksAction::Search { query } => RuntimeCommand::SearchTasks { query },
             TasksAction::Read { task_id } => RuntimeCommand::ReadTask { task_id },
+            TasksAction::Recover {
+                task_id,
+                allocation_id,
+                agent_id,
+            } => RuntimeCommand::RevokeAllocation {
+                task_id,
+                allocation_id,
+                agent_id,
+            },
         },
         Action::RunTask {
             task_id,
@@ -358,30 +430,44 @@ async fn main() -> Result<()> {
             agent_id,
             allocation_id,
             binding: local_worker_binding().await?,
-            instructions: instructions::load_with_context(
-                &global,
-                &cwd,
-                &config.context_repositories,
+            instructions: instructions::project(&cwd)?,
+            model: selection.resolve(
+                &environment(&config, coordinator.as_deref(), &script, &directory)
+                    .await?
+                    .model,
             )?,
-            model: selection.resolve(&config.model)?,
             cwd: cwd.to_string_lossy().into_owned(),
         },
         Action::Chat {
             prompt: Some(input),
             selection,
-        } => chat_command(
-            input,
-            selection.resolve(&config.model)?,
-            &global,
-            &cwd,
-            &config,
-            coordinator.as_deref(),
-        )?,
+        } => {
+            chat_command(
+                input,
+                selected_model(
+                    selection,
+                    &config,
+                    coordinator.as_deref(),
+                    &script,
+                    &directory,
+                )
+                .await?,
+                &cwd,
+            )
+            .await?
+        }
         Action::Chat {
             prompt: None,
             selection,
         } => {
-            let model = selection.resolve(&config.model)?;
+            let model = selected_model(
+                selection,
+                &config,
+                coordinator.as_deref(),
+                &script,
+                &directory,
+            )
+            .await?;
             let _watch = watch(
                 &config,
                 coordinator.as_deref(),
@@ -404,14 +490,7 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
                 if !line.trim().is_empty() {
-                    let command = chat_command(
-                        line,
-                        model.clone(),
-                        &global,
-                        &cwd,
-                        &config,
-                        coordinator.as_deref(),
-                    )?;
+                    let command = chat_command(line, model.clone(), &cwd).await?;
                     request(
                         &arguments,
                         &config,
@@ -462,42 +541,194 @@ async fn watch(
     })))
 }
 
-fn chat_command(
-    input: String,
-    model: ModelSelection,
-    global: &Path,
-    cwd: &Path,
+async fn exchange(
     config: &ClientConfig,
     coordinator: Option<&str>,
-) -> Result<RuntimeCommand> {
-    let hosts = selected_hosts(config, coordinator, cwd, &model)?;
-    Ok(RuntimeCommand::Chat {
-        input,
-        instructions: instructions::load_with_context(global, cwd, &config.context_repositories)?,
-        model,
-        cwd: cwd.to_string_lossy().into_owned(),
-        hosts,
-    })
+    script: &Path,
+    directory: &Path,
+    command: RuntimeCommand,
+) -> Result<Vec<RuntimeEventKind>> {
+    let mut wire = connection(config, coordinator, script, directory, false).await?;
+    write_command(&mut *wire.writer, &command).await?;
+    let mut reader = FrameReader::new(BufReader::new(wire.reader));
+    let mut events = Vec::new();
+    loop {
+        let frame = reader
+            .next_frame()
+            .await?
+            .context("Coordinator disconnected")?;
+        let event: RuntimeEventKind = serde_json::from_slice(&frame)?;
+        match event {
+            RuntimeEventKind::Done => return Ok(events),
+            RuntimeEventKind::Failure { message, .. } => bail!(message),
+            RuntimeEventKind::HostCall { .. } => {
+                bail!("Coordinator unexpectedly delegated an owned effect to a CLI client")
+            }
+            event => events.push(event),
+        }
+    }
 }
 
-fn selected_hosts(
+async fn environment(
     config: &ClientConfig,
     coordinator: Option<&str>,
-    cwd: &Path,
-    model: &ModelSelection,
-) -> Result<Vec<agent_cli::protocol::WorkerHost>> {
-    let mut hosts = config::worker_hosts(config, coordinator, cwd)?;
-    for host in &mut hosts {
-        let launch = host.launch.get_or_insert(WorkerLaunch {
-            state_dir: None,
-            runtime: None,
-            config: None,
-            instructions: None,
-            model: None,
-        });
-        launch.model.get_or_insert_with(|| model.clone());
+    script: &Path,
+    directory: &Path,
+) -> Result<CoordinatorSettings> {
+    exchange(
+        config,
+        coordinator,
+        script,
+        directory,
+        RuntimeCommand::Environment,
+    )
+    .await?
+    .into_iter()
+    .find_map(|event| match event {
+        RuntimeEventKind::Environment { settings, .. } => Some(settings),
+        _ => None,
+    })
+    .context("Coordinator returned no shared settings")
+}
+
+async fn selected_model(
+    selection: ModelArgs,
+    config: &ClientConfig,
+    coordinator: Option<&str>,
+    script: &Path,
+    directory: &Path,
+) -> Result<Option<ModelSelection>> {
+    if selection.is_empty() {
+        return Ok(None);
     }
-    Ok(hosts)
+    Ok(Some(
+        selection.resolve(
+            &environment(config, coordinator, script, directory)
+                .await?
+                .model,
+        )?,
+    ))
+}
+
+async fn worker_service(
+    config: &ClientConfig,
+    coordinator: Option<&str>,
+    script: &Path,
+    directory: &Path,
+    interval: u16,
+) -> Result<()> {
+    ensure!(
+        coordinator.is_some(),
+        "A worker needs a selected coordinator"
+    );
+    let mut delay = 1;
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+    loop {
+        let attempt = async {
+            let node = discovery::local_node(
+                coordinator,
+                config
+                    .launch
+                    .clone()
+                    .context("Missing worker launch metadata")?,
+                config.node_name.as_deref(),
+            )
+            .await?;
+            let mut wire = connection(config, coordinator, script, directory, false).await?;
+            write_command(
+                &mut *wire.writer,
+                &RuntimeCommand::ConnectWorker { node: node.clone() },
+            )
+            .await?;
+            let mut reader = FrameReader::new(BufReader::new(wire.reader));
+            let frame = reader
+                .next_frame()
+                .await?
+                .context("Coordinator closed the worker registration")?;
+            ensure!(
+                matches!(
+                    serde_json::from_slice::<RuntimeEventKind>(&frame)?,
+                    RuntimeEventKind::WorkerReady { .. }
+                ),
+                "Coordinator did not accept this worker"
+            );
+            delay = 1;
+            eprintln!("Worker connected as {}.", node.name);
+            // Collection uses another request while this connection continues
+            // serving its effects. Doing both on one loop would deadlock.
+            let profile = config.clone();
+            let target = coordinator.map(str::to_owned);
+            let runtime = script.to_owned();
+            let state = directory.to_owned();
+            let _collection = WatchGuard(tokio::spawn(async move {
+                loop {
+                    if exchange(
+                        &profile,
+                        target.as_deref(),
+                        &runtime,
+                        &state,
+                        RuntimeCommand::CollectResources {
+                            host_id: node.host_id.clone(),
+                        },
+                    )
+                    .await
+                    .is_err()
+                    {
+                        eprintln!(
+                            "Worker cleanup could not complete; saved ownership is retained."
+                        );
+                    }
+                    sleep(Duration::from_secs(interval.into())).await;
+                }
+            }));
+            let mut effects = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    completed = effects.join_next(), if !effects.is_empty() => {
+                        let (call_id,result) = completed.context("Worker effect queue closed")??;
+                        write_command(&mut *wire.writer, &RuntimeCommand::HostReply {call_id,result}).await?;
+                    }
+                    frame = reader.next_frame(), if effects.len() < 32 => {
+                        let frame = frame?.context("Coordinator closed the worker connection")?;
+                        let event: RuntimeEventKind = serde_json::from_slice(&frame)?;
+                        let RuntimeEventKind::HostCall {call_id,command} = event else { bail!("Unexpected event on the registered worker connection"); };
+                        effects.spawn(async move { (call_id,host::execute(*command).await) });
+                    }
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::select! {
+            result = attempt => { if result.is_err() { eprintln!("Worker connection unavailable; retrying in {delay}s. Saved work is retained."); } }
+            signal = &mut shutdown => { signal?; return Ok(()); }
+        }
+        tokio::select! {
+            _ = sleep(Duration::from_secs(delay)) => {}
+            signal = &mut shutdown => {signal?;return Ok(());}
+        }
+        delay = (delay * 2).min(30);
+    }
+}
+
+async fn chat_command(
+    input: String,
+    model: Option<ModelSelection>,
+    cwd: &Path,
+) -> Result<RuntimeCommand> {
+    Ok(RuntimeCommand::Chat {
+        input,
+        instructions: instructions::project(cwd)?,
+        model,
+        origin_host_id: RexClient::new(None)
+            .whoami()
+            .await
+            .ok()
+            .map(|identity| identity.host_id.to_string()),
+        cwd: cwd.to_string_lossy().into_owned(),
+        hosts: Vec::new(),
+    })
 }
 
 fn worker_launch(
@@ -717,6 +948,7 @@ async fn request(
     command: RuntimeCommand,
 ) -> Result<()> {
     let login = matches!(command, RuntimeCommand::Login);
+    let attached = matches!(command, RuntimeCommand::RunTask { .. });
     let mut wire = connection(config, coordinator, script, directory, login).await?;
     let relay_needed = match (
         login,
@@ -755,6 +987,10 @@ async fn request(
             serde_json::from_slice(&frame).context("Coordinator returned an invalid event")?;
         match event {
             RuntimeEventKind::HostCall { call_id, command } => {
+                ensure!(
+                    attached,
+                    "Only an attached task worker may execute coordinator host calls"
+                );
                 let result = host::execute(*command).await;
                 write_command(
                     &mut *wire.writer,
@@ -886,6 +1122,24 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
             }
         }
         RuntimeEventKind::Task { task, history } => println!("{}\n\n{history}", task.title),
+        RuntimeEventKind::Environment {
+            nodes,
+            online_host_ids,
+            ..
+        } => {
+            for node in nodes {
+                println!(
+                    "{}  {}  {}",
+                    node.host_id,
+                    node.name,
+                    if online_host_ids.contains(&node.host_id) {
+                        "online"
+                    } else {
+                        "offline"
+                    }
+                );
+            }
+        }
         RuntimeEventKind::Notice { text, .. } => println!("{text}"),
         _ => {}
     }
@@ -894,14 +1148,93 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Action, Arguments, ModelArgs, local_service_command, selected_hosts};
-    use agent_cli::{
-        config::ClientConfig,
-        models::{ModelProvider, ModelSelection, Reasoning},
-        protocol::{WorkerHost, WorkerLaunch},
-    };
+    use crate::{Action, Arguments, ModelArgs, local_service_command};
+    use agent_cli::models::{ModelProvider, ModelSelection, Reasoning};
     use clap::Parser;
     use std::path::Path;
+
+    #[tokio::test]
+    async fn plain_chat_uses_server_defaults_and_partial_overrides_fetch_the_selected_coordinator()
+    {
+        use agent_cli::{
+            config::ClientConfig,
+            protocol::{CoordinatorSettings, RuntimeCommand, RuntimeEventKind},
+            runtime::FrameReader,
+        };
+        use tokio::{
+            io::{AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let config = ClientConfig {
+            model: ModelSelection {
+                provider: ModelProvider::Google,
+                model_id: "client-stale".into(),
+                ..ModelSelection::default()
+            },
+            ..ClientConfig::default()
+        };
+        assert!(
+            crate::selected_model(
+                ModelArgs::default(),
+                &config,
+                None,
+                Path::new("/unused-runtime"),
+                directory.path()
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = FrameReader::new(BufReader::new(reader));
+            let command: RuntimeCommand =
+                serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(command, RuntimeCommand::Environment));
+            let event = RuntimeEventKind::Environment {
+                settings: CoordinatorSettings {
+                    model: ModelSelection {
+                        provider: ModelProvider::Anthropic,
+                        model_id: "server-model".into(),
+                        reasoning: Some(Reasoning::High),
+                        fast: false,
+                    },
+                    instructions: String::new(),
+                    context_repositories: vec![],
+                    sources: vec![],
+                },
+                nodes: vec![],
+                online_host_ids: vec![],
+            };
+            let mut frame = serde_json::to_vec(&event).unwrap();
+            frame.push(b'\n');
+            writer.write_all(&frame).await.unwrap();
+            writer.write_all(b"{\"type\":\"done\"}\n").await.unwrap();
+        });
+        let selection = ModelArgs {
+            model: Some("override-model".into()),
+            fast: true,
+            ..ModelArgs::default()
+        };
+        let actual = crate::selected_model(
+            selection,
+            &config,
+            None,
+            Path::new("/unused-runtime"),
+            directory.path(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual.provider, ModelProvider::Anthropic);
+        assert_eq!(actual.reasoning, Some(Reasoning::High));
+        assert_eq!(actual.model_id, "override-model");
+        assert!(actual.fast);
+        server.await.unwrap();
+    }
 
     #[test]
     fn serve_defaults_to_the_tailnet_port_and_rejects_invalid_or_conflicting_overrides() {
@@ -1037,60 +1370,5 @@ mod tests {
                 assert_eq!(selection.resolve(&remote).unwrap(), expected);
             }
         }
-    }
-
-    #[test]
-    fn worker_hosts_inherit_the_selected_model_and_preserve_explicit_host_overrides() {
-        let selected = ModelSelection {
-            provider: ModelProvider::Google,
-            model_id: "example-gemini".into(),
-            ..ModelSelection::default()
-        };
-        let override_model = ModelSelection {
-            provider: ModelProvider::Anthropic,
-            model_id: "example-claude".into(),
-            ..ModelSelection::default()
-        };
-        let launch = WorkerLaunch {
-            state_dir: None,
-            runtime: None,
-            config: Some("/private/worker.toml".into()),
-            instructions: None,
-            model: Some(override_model.clone()),
-        };
-        let config = ClientConfig {
-            hosts: vec![
-                WorkerHost {
-                    name: "inherited".into(),
-                    rex_server: Some("https://worker.example.invalid".into()),
-                    coordinator: None,
-                    cwd: "/workspace".into(),
-                    agent_program: "agent".into(),
-                    launch: None,
-                },
-                WorkerHost {
-                    name: "override".into(),
-                    rex_server: Some("https://worker.example.invalid".into()),
-                    coordinator: None,
-                    cwd: "/workspace".into(),
-                    agent_program: "agent".into(),
-                    launch: Some(launch),
-                },
-            ],
-            ..ClientConfig::default()
-        };
-        let hosts = selected_hosts(&config, None, Path::new("/workspace"), &selected).unwrap();
-        assert_eq!(
-            hosts[0].launch.as_ref().unwrap().model.as_ref(),
-            Some(&selected)
-        );
-        assert_eq!(
-            hosts[1].launch.as_ref().unwrap().model.as_ref(),
-            Some(&override_model)
-        );
-        assert_eq!(
-            hosts[1].launch.as_ref().unwrap().config.as_deref(),
-            Some("/private/worker.toml")
-        );
     }
 }

@@ -81,7 +81,7 @@ pub trait Source: Debug + Send + Sync {
     async fn poll(&self, checkpoint: Option<&SourceCheckpoint>) -> Result<SourceBatch>;
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceConfig {
     /// Omitted namespaces discovers every configured Google account.

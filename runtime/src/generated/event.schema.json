@@ -44,6 +44,45 @@
         "subject"
       ]
     },
+    "AgentNode": {
+      "type": "object",
+      "properties": {
+        "agent_program": {
+          "type": "string"
+        },
+        "coordinator": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "home_directory": {
+          "type": "string"
+        },
+        "host_id": {
+          "type": "string"
+        },
+        "launch": {
+          "$ref": "#/$defs/WorkerLaunch"
+        },
+        "name": {
+          "type": "string"
+        },
+        "rex_server": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "host_id",
+        "name",
+        "agent_program",
+        "home_directory",
+        "launch"
+      ]
+    },
     "AuthStatus": {
       "oneOf": [
         {
@@ -133,6 +172,54 @@
         "fingerprint"
       ]
     },
+    "ContextRepository": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "instructions": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "root",
+        "instructions"
+      ]
+    },
+    "CoordinatorSettings": {
+      "type": "object",
+      "properties": {
+        "context_repositories": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContextRepository"
+          }
+        },
+        "instructions": {
+          "type": "string"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelSelection"
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SourceConfig"
+          }
+        }
+      },
+      "required": [
+        "model",
+        "instructions",
+        "context_repositories",
+        "sources"
+      ]
+    },
     "ErrorCode": {
       "type": "string",
       "enum": [
@@ -146,6 +233,90 @@
     },
     "HostCommand": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "command": {
+              "$ref": "#/$defs/HostCommand"
+            },
+            "host_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "on_node"
+            }
+          },
+          "required": [
+            "type",
+            "host_id",
+            "command"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "limit": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "offset": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "path": {
+              "type": "string"
+            },
+            "repository_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "read_context"
+            }
+          },
+          "required": [
+            "type",
+            "repository_id",
+            "path",
+            "offset",
+            "limit"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "limit": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "query": {
+              "type": "string"
+            },
+            "repository_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "search_context"
+            }
+          },
+          "required": [
+            "type",
+            "repository_id",
+            "query",
+            "limit"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -707,6 +878,80 @@
         {
           "type": "object",
           "properties": {
+            "type": {
+              "type": "string",
+              "const": "configured"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "host_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "node_registered"
+            }
+          },
+          "required": [
+            "type",
+            "host_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "connection_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "worker_ready"
+            }
+          },
+          "required": [
+            "type",
+            "connection_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "nodes": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/AgentNode"
+              }
+            },
+            "online_host_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "settings": {
+              "$ref": "#/$defs/CoordinatorSettings"
+            },
+            "type": {
+              "type": "string",
+              "const": "environment"
+            }
+          },
+          "required": [
+            "type",
+            "settings",
+            "nodes",
+            "online_host_ids"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "resources": {
               "type": "array",
               "items": {
@@ -949,6 +1194,144 @@
       },
       "required": [
         "value"
+      ]
+    },
+    "SourceConfig": {
+      "oneOf": [
+        {
+          "description": "Omitted namespaces discovers every configured Google account.",
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "namespaces": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "provider": {
+              "type": "string",
+              "const": "google"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "provider"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "namespaces": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "provider": {
+              "type": "string",
+              "const": "github"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "provider"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "namespaces": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "provider": {
+              "type": "string",
+              "const": "google_calendar"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "provider"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "namespaces": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "provider": {
+              "type": "string",
+              "const": "messages"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "provider"
+          ]
+        },
+        {
+          "description": "An authenticated Slack API CLI prefix, optionally through a read-only wrapper.",
+          "type": "object",
+          "properties": {
+            "account": {
+              "type": "string"
+            },
+            "command": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "provider": {
+              "type": "string",
+              "const": "slack"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "provider",
+            "command",
+            "account"
+          ]
+        }
       ]
     },
     "SourceCoverage": {
@@ -1340,6 +1723,13 @@
         },
         "cwd": {
           "type": "string"
+        },
+        "host_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "launch": {
           "anyOf": [

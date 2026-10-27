@@ -42,7 +42,7 @@ pub struct Runtime {
 
 enum CommandMessage {
     Request {
-        command: RuntimeCommand,
+        command: Box<RuntimeCommand>,
         admitted: oneshot::Sender<Result<RuntimeCall>>,
     },
     Reply {
@@ -141,12 +141,16 @@ impl Runtime {
                 RuntimeCommand::HostReply { .. }
                     | RuntimeCommand::OAuthCallback { .. }
                     | RuntimeCommand::Watch
+                    | RuntimeCommand::ConnectWorker { .. }
             ),
             "Transport control commands do not create Pi requests"
         );
         let (admitted, receiver) = oneshot::channel();
         self.commands
-            .send(CommandMessage::Request { command, admitted })
+            .send(CommandMessage::Request {
+                command: Box::new(command),
+                admitted,
+            })
             .await
             .context("Pi runtime is closed")?;
         receiver
@@ -263,6 +267,7 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
             tokio::select! {
                 message = commands.recv() => match message {
                     Some(CommandMessage::Request { command, admitted }) => {
+                        let command = *command;
                         let login = matches!(command, RuntimeCommand::Login);
                         let id = next_id;
                         next_id = id.checked_add(1).context("Runtime request IDs exhausted")?;

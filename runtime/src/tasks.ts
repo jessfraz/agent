@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AssistantEntry, defineDoc, type Conversation, type ConversationId, type Cursor, type EntryRecord, type Extension, type Harness, type Tx } from "@earendil-works/pi-durable";
+import type { CoordinatorEnvironment } from "./environment.js";
 import { ConversationModels, DEFAULT_MODEL, ModelError, savedHost, savedModel } from "./models.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { WorkerState } from "./generated/WorkerState.js";
@@ -73,7 +74,20 @@ export class TaskStore {
   private scanning: Promise<void> | undefined;
   private resources: { attach(taskId: string): Promise<void> } | undefined;
   private outcomes: OutcomeSink | undefined;
+  private environment: CoordinatorEnvironment | undefined;
   constructor(readonly session: Harness, readonly inference = new ConversationModels()) { inference.bind(session); }
+  useEnvironment(environment: CoordinatorEnvironment): void { this.environment = environment; }
+  async instructions(project: string): Promise<string> { return this.environment?.instructions(project) ?? project; }
+  async context(id: string): Promise<void> {
+    if (this.environment === undefined) throw new TaskError("Coordinator context is not configured.");
+    await this.environment.context(id);
+  }
+  async workerHost(id: string, agentId?: string): Promise<WorkerHost> {
+    const task = await this.get(id); const actor = this.actor(task, agentId);
+    if (actor.worker.state === "unassigned") throw new TaskError("This task has no execution host.");
+    return await this.environment?.deployment(actor.worker.host,
+      actor.worker.state === "bound" ? actor.worker.binding.host_id : undefined, actor.model ?? task.model) ?? actor.worker.host;
+  }
   private savedWorker(worker: WorkerState): WorkerState {
     return worker.state === "unassigned" ? worker : { ...worker, host: savedHost(worker.host) };
   }
@@ -287,6 +301,8 @@ export class TaskStore {
       throw new TaskError("An agent needs a title, bounded outcome, and instruction");
     }
     const selected = input.model ?? await this.selection(taskId, DEFAULT_MODEL);
+    const owner = await this.get(taskId);
+    if (owner.worker.state === "bound") await this.workerHost(taskId);
     await this.resources?.attach(taskId);
     const native = await this.session.commit(async (tx) => {
       const index = await tx.doc(Tasks);
@@ -312,8 +328,8 @@ export class TaskStore {
     const task = await this.get(taskId);
     const existing = this.actor(task, agentId);
     if (existing.worker.state === "bound") return task;
-    const parent = task.worker;
-    if (parent.state !== "bound") throw new TaskError("A bound task worker must own the agent's Rex session");
+    if (task.worker.state !== "bound") throw new TaskError("A bound task worker must own the agent's Rex session");
+    const parent = { ...task.worker, host: await this.workerHost(taskId) };
     const allocation_id = randomUUID();
     let title = "";
     await this.update(taskId, (saved) => {
@@ -327,6 +343,7 @@ export class TaskStore {
     catch { result = { type: "creation_uncertain", session_id: parent.binding.session_id }; }
     return this.update(taskId, (saved) => {
       const agent = this.actor(saved, agentId);
+      this.requireAllocation(agent.worker, allocation_id);
       if (result.type === "spawned" && result.binding.host_id === parent.binding.host_id &&
           result.binding.session_id === parent.binding.session_id) {
         agent.worker = { state: "bound", allocation_id, host: parent.host, binding: result.binding };
@@ -364,6 +381,22 @@ export class TaskStore {
     return task.agents.every((agent) => agent.state.state !== "open" && agent.pending.length === 0 &&
       agent.worker.state !== "allocating" && agent.worker.state !== "uncertain" && !this.running.has(this.actorKey(task.id, agent.id)));
   }
+  /** Revoke admission before replacement; this never deletes a native session or retries input. */
+  async revokeAllocation(id: string, allocationId: string, agentId?: string): Promise<TaskRecord> {
+    return this.update(id, (task) => {
+      if (this.running.has(this.actorKey(id, agentId))) throw new TaskError("An attached worker must finish before its allocation can be revoked");
+      const actor = this.actor(task, agentId);
+      if ((actor.worker.state !== "allocating" && actor.worker.state !== "uncertain") || actor.worker.allocation_id !== allocationId) {
+        throw new TaskError("Only this exact unresolved allocation can be revoked");
+      }
+      actor.worker = { state: "unassigned" };
+    });
+  }
+  private requireAllocation(worker: WorkerState, allocationId: string): void {
+    if (worker.state !== "allocating" || worker.allocation_id !== allocationId) {
+      throw new TaskError("Worker allocation changed; its late creation result was ignored");
+    }
+  }
   async dispatch(id: string, host: WorkerHost, call: HostCall): Promise<TaskRecord> {
     await this.resources?.attach(id);
     const current = await this.get(id);
@@ -372,8 +405,10 @@ export class TaskStore {
       throw new TaskError("Worker allocation needs reconciliation; no duplicate session was created");
     }
     if (current.worker.state === "bound") {
-      if (current.worker.host.name !== host.name) throw new TaskError("Continue this task on its owning host");
-      const previous = current.worker;
+      const sameHost = host.host_id === undefined || host.host_id === null ? current.worker.host.name === host.name
+        : current.worker.binding.host_id === host.host_id;
+      if (!sameHost) throw new TaskError("Continue this task on its owning host");
+      const previous = { ...current.worker, host: await this.workerHost(id) };
       const claimed = await this.session.commit(async (tx) => {
         const index = await tx.doc(Tasks);
         const task = index.tasks.find((task) => task.id === id);
@@ -389,6 +424,7 @@ export class TaskStore {
         binding: previous.binding, task_id: id }); }
       catch { result = { type: "creation_uncertain", session_id: previous.binding.session_id }; }
       return this.update(id, (task) => {
+        this.requireAllocation(task.worker, previous.allocation_id);
         if (result.type === "spawned" && result.binding.session_id === previous.binding.session_id &&
             result.binding.host_id === previous.binding.host_id) {
           task.worker = { ...previous, binding: result.binding };
@@ -397,6 +433,7 @@ export class TaskStore {
           host: previous.host, session_id: previous.binding.session_id };
       });
     }
+    host = await this.environment?.deployment(host, undefined, current.model) ?? host;
     const allocation_id = randomUUID();
     const claimed = await this.session.commit(async (tx) => {
       const index = await tx.doc(Tasks);
@@ -411,10 +448,14 @@ export class TaskStore {
     let result: HostResult;
     try { result = await call({ type: "spawn_worker", host, task_id: id, allocation_id, title: current.title }); }
     catch {
-      await this.update(id, (task) => { task.worker = { state: "uncertain", allocation_id, host, session_id: null }; });
+      await this.update(id, (task) => {
+        this.requireAllocation(task.worker, allocation_id);
+        task.worker = { state: "uncertain", allocation_id, host, session_id: null };
+      });
       throw new TaskError("Worker creation could not be confirmed; reconcile it before retrying");
     }
     return this.update(id, (task) => {
+      this.requireAllocation(task.worker, allocation_id);
       if (result.type === "spawned") task.worker = { state: "bound", allocation_id, host, binding: result.binding };
       else task.worker = { state: "uncertain", allocation_id, host,
         session_id: result.type === "creation_uncertain" ? result.session_id : null };
@@ -467,7 +508,7 @@ export class TaskStore {
       const conversation = await this.conversation(actor.conversation_id);
       unbind = bind(conversation, actor.worker.host, selected);
       await this.inference.configure(conversation, selected, {
-        instructions: input.instructions + "\n\nTask outcome: " + actor.outcome +
+        instructions: (await this.instructions(input.instructions)) + "\n\nTask outcome: " + actor.outcome +
           (input.agent_id === undefined
             ? "\nRecord verified progress, the next actor/check, or resolution evidence. Agents share this task's Rex session; wait for their results before resolving it."
             : "\nComplete this bounded assignment and call report_result with evidence or a concrete failure. The parent owns the overall task."),

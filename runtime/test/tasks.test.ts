@@ -21,7 +21,7 @@ import type { HostResult } from "../src/generated/HostResult.js";
 import type { WorkerHost } from "../src/generated/WorkerHost.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
 
-const host: WorkerHost = { name: "fixture", rex_server: null, coordinator: null,
+const host: WorkerHost = { host_id: null, name: "fixture", rex_server: null, coordinator: null,
   cwd: "/workspace/example", agent_program: "/example/agent" };
 const binding: WorkerRef = {
   host_id: "11111111-1111-4111-8111-111111111111",
@@ -292,6 +292,105 @@ test("an interrupted create stays uncertain after reopen and cannot create a sec
     await assert.rejects(app.tasks.dispatch(task.id, host, async () => { calls += 1; return { type: "spawned", binding }; }), /reconciliation/);
     assert.equal(calls, 0); assert.equal((await app.tasks.get(task.id)).worker.state, "uncertain");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("exact allocation revocation preserves pending work and rejects stale worker admission after reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-recovery-")); let app = await open(directory);
+  try {
+    const source = { provider: "mail", account: "fixture", thread_id: "thread-one" };
+    const task = await app.tasks.create({ title: "Recover startup", outcome: "Finish the retained assignment", model: fixtureModel, sources: [source] });
+    await app.tasks.enqueue(task.id, "Keep this input exactly once.", "original-input");
+    await assert.rejects(app.tasks.dispatch(task.id, host, async () => { throw new Error("Lost startup reply"); }), /could not be confirmed/);
+    const uncertain = await app.tasks.get(task.id); if (uncertain.worker.state !== "uncertain") throw new Error("Expected uncertainty");
+    await assert.rejects(app.tasks.revokeAllocation(task.id, "different-allocation"), /exact unresolved allocation/);
+    await app.tasks.revokeAllocation(task.id, uncertain.worker.allocation_id);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const retained = await app.tasks.get(task.id);
+    assert.deepEqual(retained.worker, { state: "unassigned" }); assert.equal(retained.conversation_id, task.conversation_id);
+    assert.deepEqual(retained.pending, uncertain.pending); assert.deepEqual(retained.model, fixtureModel); assert.deepEqual(retained.sources, [source]);
+    await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: uncertain.worker.allocation_id,
+      binding, instructions: "", cwd: host.cwd, model: fixtureModel }, () => { throw new Error("A stale worker must never attach"); }, () => {}), /binding is not confirmed/);
+    assert.equal(app.faux.state.callCount, 0); assert.deepEqual((await app.tasks.get(task.id)).pending, uncertain.pending);
+    await assert.rejects(app.tasks.revokeAllocation(task.id, uncertain.worker.allocation_id), /exact unresolved allocation/);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+for (const transition of ["spawn", "spawn-error", "resume", "resume-error"]) {
+  test(`a late ${transition} result cannot resurrect a revoked allocation or overwrite its replacement`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-recovery-")); const app = await open(directory);
+    let release: () => void = () => {};
+    try {
+      const task = await app.tasks.create({ title: "Fence startup", outcome: "Keep exactly one admitted worker", model: fixtureModel });
+      await app.tasks.enqueue(task.id, "Keep the same original input.");
+      if (transition.startsWith("resume")) await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+      let entered: () => void = () => {};
+      const started = new Promise<void>((resolve) => { entered = resolve; });
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const original = app.tasks.dispatch(task.id, host, async () => {
+        entered(); await gate;
+        if (transition.endsWith("error")) throw new Error("Late transport failure");
+        return { type: "spawned", binding };
+      });
+      void original.catch(() => {}); await started;
+      const allocating = await app.tasks.get(task.id); if (allocating.worker.state !== "allocating") throw new Error("Expected allocation");
+      await app.tasks.revokeAllocation(task.id, allocating.worker.allocation_id);
+      const replacementBinding = { ...binding, session_id: "session:88888888-8888-4888-8888-888888888888" };
+      const replacement = await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding: replacementBinding }));
+      assert.equal(replacement.worker.state, "bound");
+      release(); await assert.rejects(original, /late creation result was ignored/);
+      const current = await app.tasks.get(task.id);
+      assert.deepEqual(current.worker, replacement.worker); assert.equal(current.pending.length, 1);
+      await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: allocating.worker.allocation_id,
+        binding, instructions: "", cwd: host.cwd, model: fixtureModel }, () => { throw new Error("No old attachment"); }, () => {}), /binding is not confirmed/);
+      assert.equal(app.faux.state.callCount, 0);
+    } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+}
+
+test("revoking a child allocation fences late terminal creation without changing its parent", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-recovery-")); const app = await open(directory);
+  let release: () => void = () => {};
+  try {
+    const task = await app.tasks.create({ title: "Parent", outcome: "Finish after review", model: fixtureModel });
+    await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    const child = await app.tasks.createAgent(task.id, { id: "review", title: "Review", outcome: "Review the change", input: "Inspect the evidence.", inputId: "review-input" });
+    let entered: () => void = () => {};
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const original = app.tasks.dispatchAgent(task.id, child.id, async () => { entered(); await gate; return { type: "spawned", binding }; });
+    void original.catch(() => {}); await started;
+    const allocated = (await app.tasks.get(task.id)).agents[0]; assert.ok(allocated);
+    if (allocated.worker.state !== "allocating") throw new Error("Expected child allocation");
+    await app.tasks.revokeAllocation(task.id, allocated.worker.allocation_id, child.id);
+    const replacement = await app.tasks.dispatchAgent(task.id, child.id, async () => ({ type: "spawned",
+      binding: { ...binding, block_id: "block:88888888-8888-4888-8888-888888888888" } }));
+    release(); await assert.rejects(original, /late creation result was ignored/);
+    const current = await app.tasks.get(task.id);
+    assert.deepEqual(current.worker, replacement.worker); assert.deepEqual(current.agents[0]?.worker, replacement.agents[0]?.worker);
+    assert.deepEqual(current.agents[0]?.pending, child.pending); assert.deepEqual(current.agents[0]?.model, fixtureModel);
+  } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("allocation recovery rejects an attached run before changing its worker or input", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-recovery-")); const app = await open(directory);
+  let release: () => void = () => {}; let running: Promise<unknown> | undefined;
+  try {
+    const task = await app.tasks.create({ title: "Running task", outcome: "Finish the attached turn", model: fixtureModel });
+    const saved = await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    if (saved.worker.state !== "bound") throw new Error("Expected worker");
+    await app.tasks.enqueue(task.id, "Finish the active assignment.");
+    let attached: () => void = () => {};
+    const started = new Promise<void>((resolve) => { attached = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    app.faux.setResponses([fauxAssistantMessage("The attached assignment completed.")]);
+    running = app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id,
+      binding, instructions: "", cwd: host.cwd, model: fixtureModel }, () => () => {}, () => {}, [], undefined,
+      async () => { attached(); await gate; });
+    await started;
+    await assert.rejects(app.tasks.revokeAllocation(task.id, saved.worker.allocation_id), /attached worker must finish/);
+    assert.deepEqual((await app.tasks.get(task.id)).worker, saved.worker); assert.equal((await app.tasks.get(task.id)).pending.length, 1);
+    release(); await running;
+  } finally { release(); await running; await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("resuming a task keeps its session and conversation while replacing an exited worker binding", async () => {

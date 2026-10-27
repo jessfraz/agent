@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     env, fs, io,
     path::{Path, PathBuf},
 };
@@ -8,10 +7,10 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::models::ModelSelection;
-use crate::protocol::{WorkerHost, WorkerLaunch};
+use crate::protocol::WorkerLaunch;
 use crate::sources::SourceConfig;
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     #[serde(skip)]
@@ -27,8 +26,7 @@ pub struct ClientConfig {
     pub tailscale_socket: Option<PathBuf>,
     #[serde(default)]
     pub trusted_nodes: Vec<String>,
-    #[serde(default)]
-    pub hosts: Vec<WorkerHost>,
+    pub node_name: Option<String>,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
     #[serde(default = "default_poll_interval")]
@@ -46,7 +44,7 @@ impl Default for ClientConfig {
             coordinator_program: None,
             tailscale_socket: None,
             trusted_nodes: Vec::new(),
-            hosts: Vec::new(),
+            node_name: None,
             sources: Vec::new(),
             poll_interval_seconds: default_poll_interval(),
         }
@@ -57,14 +55,55 @@ fn default_poll_interval() -> u64 {
     60
 }
 
+pub fn default_path() -> Result<PathBuf> {
+    Ok(env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+        .context("No configuration directory is available")?
+        .join("agent/config.toml"))
+}
+
+pub fn initialize(path: &Path, coordinator: Option<&str>) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    #[derive(Serialize)]
+    struct WorkerConfig<'a> {
+        coordinator: &'a str,
+    }
+    let contents = match coordinator {
+        Some(value) => {
+            validate_coordinator(value)?;
+            toml::to_string_pretty(&WorkerConfig { coordinator: value })?
+        }
+        None => include_str!("../examples/coordinator.toml").to_owned(),
+    };
+    // Run the same strict parser before publishing a configuration template.
+    let _: ClientConfig = toml::from_str(&contents)?;
+    if let Some(parent) = path.parent() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "Could not create {}; existing configuration is never overwritten",
+                path.display()
+            )
+        })?;
+    use std::io::Write;
+    file.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
 pub fn load(explicit: Option<&Path>) -> Result<ClientConfig> {
     let path = match explicit {
         Some(path) => path.to_owned(),
-        None => env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
-            .context("No configuration directory is available")?
-            .join("agent/config.toml"),
+        None => default_path()?,
     };
     let mut config: ClientConfig = match fs::read_to_string(&path) {
         Ok(contents) => toml::from_str(&contents)
@@ -78,7 +117,6 @@ pub fn load(explicit: Option<&Path>) -> Result<ClientConfig> {
         config.path =
             Some(fs::canonicalize(&path).context("Could not resolve agent configuration")?);
     }
-    let mut names = HashSet::new();
     config.model.validate()?;
     let home = dirs::home_dir();
     for repository in &mut config.context_repositories {
@@ -90,29 +128,11 @@ pub fn load(explicit: Option<&Path>) -> Result<ClientConfig> {
         (10..=3600).contains(&config.poll_interval_seconds),
         "Source polling interval must be between 10 and 3600 seconds"
     );
-    for host in &config.hosts {
-        if let Some(model) = host
-            .launch
-            .as_ref()
-            .and_then(|launch| launch.model.as_ref())
-        {
-            model.validate()?;
-        }
+    if let Some(name) = &config.node_name {
         ensure!(
-            !host.name.trim().is_empty() && names.insert(host.name.to_lowercase()),
-            "Worker host names must be nonempty and unique"
+            !name.trim().is_empty() && name.len() <= 128 && !name.chars().any(char::is_control),
+            "Node name must be readable and at most 128 bytes"
         );
-        ensure!(
-            Path::new(&host.cwd).is_absolute(),
-            "Worker host directories must be absolute"
-        );
-        ensure!(
-            !host.agent_program.is_empty(),
-            "Worker host needs an agent program"
-        );
-        if let Some(coordinator) = &host.coordinator {
-            validate_coordinator(coordinator)?;
-        }
     }
     if let Some(coordinator) = &config.coordinator {
         validate_coordinator(coordinator)?;
@@ -183,37 +203,37 @@ pub fn program() -> Result<PathBuf> {
     })
 }
 
-pub fn worker_hosts(
-    config: &ClientConfig,
-    coordinator: Option<&str>,
-    cwd: &Path,
-) -> Result<Vec<WorkerHost>> {
-    if !config.hosts.is_empty() {
-        return Ok(config
-            .hosts
-            .iter()
-            .cloned()
-            .map(|mut host| {
-                if host.rex_server.is_none() && host.launch.is_none() {
-                    host.launch = config.launch.clone();
-                }
-                host
-            })
-            .collect());
-    }
-    Ok(vec![WorkerHost {
-        name: "local".into(),
-        rex_server: None,
-        coordinator: coordinator.map(str::to_owned),
-        cwd: cwd.to_string_lossy().into_owned(),
-        agent_program: program()?.to_string_lossy().into_owned(),
-        launch: config.launch.clone(),
-    }])
-}
-
 #[cfg(test)]
 mod tests {
     use crate::config::{context_repository_path, load, tailnet_address, validate_coordinator};
+
+    #[test]
+    fn initialization_publishes_real_private_settings_and_never_overwrites() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        for coordinator in [None, Some("tailscale://100.64.0.10")] {
+            let path = directory.path().join(if coordinator.is_some() {
+                "worker/config.toml"
+            } else {
+                "coordinator/config.toml"
+            });
+            crate::config::initialize(&path, coordinator).unwrap();
+            let config = load(Some(&path)).unwrap();
+            assert_eq!(config.coordinator.as_deref(), coordinator);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let original = std::fs::read(&path).unwrap();
+            assert!(crate::config::initialize(&path, Some("tailscale://100.64.0.11")).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        assert!(
+            crate::config::initialize(&directory.path().join("bad.toml"), Some("127.0.0.1;bad"))
+                .is_err()
+        );
+        assert!(!directory.path().join("bad.toml").exists());
+    }
 
     #[test]
     fn checked_in_examples_use_the_real_configuration_contract() {
@@ -242,7 +262,7 @@ mod tests {
         }
     }
     #[test]
-    fn rejects_shell_syntax_and_duplicate_host_bindings() {
+    fn rejects_shell_syntax_and_obsolete_manual_host_bindings() {
         assert!(validate_coordinator("owner@desktop").is_ok());
         for value in [
             "-oProxyCommand=bad",
@@ -259,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn toml_settings_preserve_model_defaults_host_overrides_and_source_switches() {
+    fn toml_settings_preserve_model_defaults_and_source_switches() {
         use crate::models::{ModelProvider, Reasoning};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -271,13 +291,6 @@ mod tests {
           model_id = 'example-model'
           reasoning = 'high'
           fast = true
-          [[hosts]]
-          name = 'worker'
-          cwd = '/workspace'
-          agent_program = 'agent'
-          [hosts.launch.model]
-          provider = 'google'
-          model_id = 'example-gemini'
           [[sources]]
           provider = 'github'
           enabled = false
@@ -290,17 +303,6 @@ mod tests {
         assert_eq!(config.model.provider, ModelProvider::Anthropic);
         assert_eq!(config.model.reasoning, Some(Reasoning::High));
         assert!(config.model.fast);
-        assert_eq!(
-            config.hosts[0]
-                .launch
-                .as_ref()
-                .unwrap()
-                .model
-                .as_ref()
-                .unwrap()
-                .provider,
-            ModelProvider::Google
-        );
         assert!(!config.sources[0].enabled());
         assert!(config.sources[1].enabled());
         assert_eq!(
