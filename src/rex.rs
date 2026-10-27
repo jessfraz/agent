@@ -99,6 +99,11 @@ pub struct WorkerBinding {
     pub block_id: BlockId,
     pub revision: u64,
 }
+
+pub enum WorkerResume {
+    Running,
+    Started(WorkerBinding),
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionView {
     pub session_id: SessionId,
@@ -175,6 +180,72 @@ impl RexClient {
         Ok(result.sessions)
     }
 
+    pub async fn create_worker_window(
+        &self,
+        session: &SessionId,
+        title: &str,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+    ) -> Result<WorkerBinding, RexError> {
+        let request = CreateRequest::worker(title, program, args, cwd)?;
+        let [mut window] = request.initial_windows;
+        window.layout.block.label = title.to_owned();
+        let receipt = self
+            .api(
+                "session.new_window",
+                &NewWindowRequest {
+                    session_id: session.clone(),
+                    window_label: title.to_owned(),
+                    layout: window.layout,
+                    focus: false,
+                },
+            )
+            .await
+            .map_err(|_| RexError::CreationUncertain {
+                session_id: Some(session.clone()),
+            })?;
+        let window: CreatedWindow =
+            serde_json::from_slice(&receipt).map_err(|_| RexError::CreationUncertain {
+                session_id: Some(session.clone()),
+            })?;
+        let [block] = window.block_ids.as_slice() else {
+            return Err(RexError::CreationUncertain {
+                session_id: Some(session.clone()),
+            });
+        };
+        Ok(WorkerBinding {
+            session_id: session.clone(),
+            window_id: window.window_id,
+            block_id: block.clone(),
+            revision: window.revision,
+        })
+    }
+
+    pub async fn promote_session(&self, session: &SessionId) -> Result<(), RexError> {
+        let sessions = self.list_sessions().await?;
+        if sessions
+            .first()
+            .is_some_and(|first| first.session_id == *session)
+        {
+            return Ok(());
+        }
+        let before = sessions
+            .iter()
+            .find(|other| other.session_id != *session)
+            .map(|other| other.session_id.clone());
+        self.api(
+            "session.move",
+            &MoveSession {
+                session_id: session.clone(),
+                before_session_id: before,
+            },
+        )
+        .await
+        .map_err(read_failure)?;
+        Ok(())
+    }
+
     pub async fn inspect_session(&self, session: &SessionId) -> Result<SessionView, RexError> {
         let output = self
             .api(
@@ -210,6 +281,118 @@ impl RexClient {
                 _ => RexError::CreationUncertain { session_id: None },
             })?;
         decode_creation(&output)
+    }
+
+    /// Reuse the task session after its previous execution has exited.
+    pub async fn resume_worker(
+        &self,
+        binding: &WorkerBinding,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+    ) -> Result<WorkerResume, RexError> {
+        let process_request = ProcessRequest {
+            session_id: binding.session_id.clone(),
+            block_id: binding.block_id.clone(),
+            args: Empty {},
+        };
+        for attempt in 0..20 {
+            let process: TerminalProcess = decode(
+                &self
+                    .api("com.superlogical.terminal.process", &process_request)
+                    .await
+                    .map_err(read_failure)?,
+            )?;
+            if process.child.is_none() {
+                break;
+            }
+            if attempt == 19 {
+                return Ok(WorkerResume::Running);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let request = CreateRequest::worker("Worker", program, args, cwd)?;
+        let [window] = request.initial_windows;
+        let receipt = self
+            .api(
+                "session.new_window",
+                &NewWindowRequest {
+                    session_id: binding.session_id.clone(),
+                    window_label: window.window_label,
+                    layout: window.layout,
+                    focus: false,
+                },
+            )
+            .await
+            .map_err(|_| RexError::CreationUncertain {
+                session_id: Some(binding.session_id.clone()),
+            })?;
+        let window: CreatedWindow =
+            serde_json::from_slice(&receipt).map_err(|_| RexError::CreationUncertain {
+                session_id: Some(binding.session_id.clone()),
+            })?;
+        let [block] = window.block_ids.as_slice() else {
+            return Err(RexError::CreationUncertain {
+                session_id: Some(binding.session_id.clone()),
+            });
+        };
+        let replacement = WorkerBinding {
+            session_id: binding.session_id.clone(),
+            window_id: window.window_id,
+            block_id: block.clone(),
+            revision: window.revision,
+        };
+        // Once creation succeeded, every later failure must retain uncertainty
+        // about this same session rather than authorize another allocation.
+        let verified = async {
+            let identity = self.whoami().await?;
+            self.inspect_session(&replacement.session_id)
+                .await?
+                .verify_binding(&replacement, &identity.host_id)
+        }
+        .await;
+        if verified.is_err() {
+            return Err(RexError::CreationUncertain {
+                session_id: Some(binding.session_id.clone()),
+            });
+        }
+        // Its history remains in Pi. Close only the exact exited pane recorded
+        // for this task, after a replacement exists in the same session.
+        let cleanup = async {
+            let process: TerminalProcess = decode(
+                &self
+                    .api("com.superlogical.terminal.process", &process_request)
+                    .await
+                    .map_err(read_failure)?,
+            )?;
+            if process.child.is_none() {
+                self.api(
+                    "block.close",
+                    &BlockRequest {
+                        session_id: binding.session_id.clone(),
+                        block_id: binding.block_id.clone(),
+                    },
+                )
+                .await
+                .map_err(read_failure)?;
+                let view = self.inspect_session(&binding.session_id).await?;
+                if view
+                    .windows
+                    .iter()
+                    .flat_map(|window| &window.layers)
+                    .flat_map(|layer| &layer.blocks)
+                    .any(|block| block.block_id.as_ref() == Some(&binding.block_id))
+                {
+                    return Err(RexError::BindingMismatch);
+                }
+            }
+            Ok::<_, RexError>(())
+        }
+        .await;
+        if cleanup.is_err() {
+            eprintln!("Previous Rex worker pane remains; its replacement is running.");
+        }
+        Ok(WorkerResume::Started(replacement))
     }
 
     async fn api<T: Serialize>(&self, method: &str, request: &T) -> Result<Vec<u8>, CallFailure> {
@@ -316,6 +499,40 @@ struct SessionList {
 struct SessionRequest {
     session_id: SessionId,
 }
+
+#[derive(Serialize)]
+struct ProcessRequest {
+    session_id: SessionId,
+    block_id: BlockId,
+    args: Empty,
+}
+#[derive(Deserialize)]
+struct TerminalProcess {
+    child: Option<TerminalChild>,
+}
+#[derive(Deserialize)]
+struct TerminalChild {
+    #[serde(rename = "pid")]
+    _pid: u32,
+}
+#[derive(Serialize)]
+struct BlockRequest {
+    session_id: SessionId,
+    block_id: BlockId,
+}
+#[derive(Serialize)]
+struct NewWindowRequest {
+    session_id: SessionId,
+    window_label: String,
+    layout: SingleBlock,
+    focus: bool,
+}
+#[derive(Serialize)]
+struct MoveSession {
+    session_id: SessionId,
+    before_session_id: Option<SessionId>,
+}
+
 #[derive(Deserialize, Serialize)]
 struct CreateRequest {
     label: String,

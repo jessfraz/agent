@@ -34,7 +34,7 @@ test("real Pi bridge reports signed-out state and rejects invalid commands", asy
       assert.ok(validEvent(event));
       return event;
     });
-    assert.deepEqual(events.slice(0, 2), [
+    assert.deepEqual(events.filter((event) => event.id === 1), [
       { version: 1, id: 1, event: { type: "auth_status", status: { state: "signed_out" } } },
       { version: 1, id: 1, event: { type: "done" } },
     ]);

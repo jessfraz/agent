@@ -104,6 +104,35 @@
         }
       ]
     },
+    "CleanupPlan": {
+      "type": "object",
+      "properties": {
+        "fingerprint": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "identity": {
+          "$ref": "#/$defs/NativeWorktreeIdentity"
+        },
+        "path": {
+          "type": "string"
+        },
+        "resource_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "id",
+        "resource_id",
+        "identity",
+        "path",
+        "fingerprint"
+      ]
+    },
     "ErrorCode": {
       "type": "string",
       "enum": [
@@ -115,8 +144,624 @@
         "internal"
       ]
     },
+    "HostCommand": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "request": {
+              "$ref": "#/$defs/WorktreeAllocation"
+            },
+            "type": {
+              "type": "string",
+              "const": "resource_allocate"
+            }
+          },
+          "required": [
+            "type",
+            "request"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "record": {
+              "$ref": "#/$defs/ResourceRecord"
+            },
+            "type": {
+              "type": "string",
+              "const": "resource_inspect"
+            }
+          },
+          "required": [
+            "type",
+            "record"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "record": {
+              "$ref": "#/$defs/ResourceRecord"
+            },
+            "type": {
+              "type": "string",
+              "const": "resource_plan_cleanup"
+            }
+          },
+          "required": [
+            "type",
+            "record"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "plan": {
+              "$ref": "#/$defs/CleanupPlan"
+            },
+            "record": {
+              "$ref": "#/$defs/ResourceRecord"
+            },
+            "type": {
+              "type": "string",
+              "const": "resource_collect"
+            }
+          },
+          "required": [
+            "type",
+            "record",
+            "plan"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "program": {
+              "type": "string"
+            },
+            "timeout_seconds": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "exec"
+            }
+          },
+          "required": [
+            "type",
+            "program",
+            "args",
+            "cwd",
+            "timeout_seconds"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "limit": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "offset": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "read_file"
+            }
+          },
+          "required": [
+            "type",
+            "path",
+            "offset",
+            "limit"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "write_file"
+            }
+          },
+          "required": [
+            "type",
+            "path",
+            "content"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "new": {
+              "type": "string"
+            },
+            "old": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "edit_file"
+            }
+          },
+          "required": [
+            "type",
+            "path",
+            "old",
+            "new"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allocation_id": {
+              "type": "string"
+            },
+            "host": {
+              "$ref": "#/$defs/WorkerHost"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "spawn_worker"
+            }
+          },
+          "required": [
+            "type",
+            "host",
+            "task_id",
+            "allocation_id",
+            "title"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agent_id": {
+              "type": "string"
+            },
+            "allocation_id": {
+              "type": "string"
+            },
+            "host": {
+              "$ref": "#/$defs/WorkerHost"
+            },
+            "parent": {
+              "$ref": "#/$defs/WorkerRef"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "spawn_subagent"
+            }
+          },
+          "required": [
+            "type",
+            "host",
+            "parent",
+            "task_id",
+            "agent_id",
+            "allocation_id",
+            "title"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allocation_id": {
+              "type": "string"
+            },
+            "binding": {
+              "$ref": "#/$defs/WorkerRef"
+            },
+            "host": {
+              "$ref": "#/$defs/WorkerHost"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            },
+            "type": {
+              "type": "string",
+              "const": "resume_worker"
+            }
+          },
+          "required": [
+            "type",
+            "host",
+            "binding",
+            "task_id",
+            "allocation_id"
+          ]
+        }
+      ]
+    },
+    "NativeWorktreeIdentity": {
+      "type": "object",
+      "properties": {
+        "branch": {
+          "type": "string"
+        },
+        "common_dir": {
+          "type": "string"
+        },
+        "git_dir": {
+          "type": "string"
+        },
+        "head": {
+          "type": "string"
+        },
+        "primary": {
+          "type": "string"
+        },
+        "top": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "primary",
+        "top",
+        "common_dir",
+        "git_dir",
+        "branch",
+        "head"
+      ]
+    },
+    "ResourceRecord": {
+      "type": "object",
+      "properties": {
+        "branch": {
+          "type": "string"
+        },
+        "consumers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskId"
+          }
+        },
+        "host_id": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/ResourceState"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        }
+      },
+      "required": [
+        "id",
+        "host_id",
+        "task_id",
+        "repository",
+        "branch",
+        "consumers",
+        "state"
+      ]
+    },
+    "ResourceState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "allocating"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/NativeWorktreeIdentity"
+            },
+            "state": {
+              "type": "string",
+              "const": "ready"
+            }
+          },
+          "required": [
+            "state",
+            "identity"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/NativeWorktreeIdentity"
+            },
+            "plan_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "state": {
+              "type": "string",
+              "const": "retiring"
+            }
+          },
+          "required": [
+            "state",
+            "identity",
+            "plan_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "identity": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/NativeWorktreeIdentity"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "const": "held"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/NativeWorktreeIdentity"
+            },
+            "state": {
+              "type": "string",
+              "const": "removed"
+            }
+          },
+          "required": [
+            "state",
+            "identity"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "branch_absent": {
+              "type": "boolean"
+            },
+            "identity": {
+              "$ref": "#/$defs/NativeWorktreeIdentity"
+            },
+            "path_absent": {
+              "type": "boolean"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "registry_absent": {
+              "type": "boolean"
+            },
+            "state": {
+              "type": "string",
+              "const": "partial"
+            }
+          },
+          "required": [
+            "state",
+            "identity",
+            "path_absent",
+            "registry_absent",
+            "branch_absent",
+            "reason"
+          ]
+        }
+      ]
+    },
     "RuntimeEventKind": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "resources": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ResourceRecord"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "resources"
+            }
+          },
+          "required": [
+            "type",
+            "resources"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "sources": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SourceState"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "sources"
+            }
+          },
+          "required": [
+            "type",
+            "sources"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "checkpoint_advanced": {
+              "type": "boolean"
+            },
+            "new_events": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "state": {
+              "$ref": "#/$defs/SourceState"
+            },
+            "type": {
+              "type": "string",
+              "const": "source_admitted"
+            }
+          },
+          "required": [
+            "type",
+            "new_events",
+            "checkpoint_advanced",
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TaskId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "notice"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "command": {
+              "$ref": "#/$defs/HostCommand"
+            },
+            "type": {
+              "type": "string",
+              "const": "host_call"
+            }
+          },
+          "required": [
+            "type",
+            "call_id",
+            "command"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "tasks": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TaskRecord"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "tasks"
+            }
+          },
+          "required": [
+            "type",
+            "tasks"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "history": {
+              "type": "string"
+            },
+            "task": {
+              "$ref": "#/$defs/TaskRecord"
+            },
+            "type": {
+              "type": "string",
+              "const": "task"
+            }
+          },
+          "required": [
+            "type",
+            "task",
+            "history"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -201,6 +846,584 @@
             "type"
           ]
         }
+      ]
+    },
+    "SourceCheckpoint": {
+      "description": "Opaque to the caller and meaningful only to the matching provider/account.",
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "value"
+      ]
+    },
+    "SourceCoverage": {
+      "description": "Coverage concerns the adapter's documented polling window, not an archive of\neverything visible to the account. Excerpts retain a source for deeper reads.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "complete"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "more"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "partial"
+            }
+          },
+          "required": [
+            "status",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "status",
+            "message"
+          ]
+        }
+      ]
+    },
+    "SourceKey": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "account"
+      ]
+    },
+    "SourceRef": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "account",
+        "thread_id"
+      ]
+    },
+    "SourceState": {
+      "type": "object",
+      "properties": {
+        "checked_at": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "checkpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceCheckpoint"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "coverage": {
+          "$ref": "#/$defs/SourceCoverage"
+        },
+        "source": {
+          "$ref": "#/$defs/SourceKey"
+        }
+      },
+      "required": [
+        "source",
+        "coverage",
+        "checked_at"
+      ]
+    },
+    "TaskAgentRecord": {
+      "type": "object",
+      "properties": {
+        "conversation_id": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "pending": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskInput"
+          }
+        },
+        "state": {
+          "$ref": "#/$defs/TaskAgentState"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "worker": {
+          "$ref": "#/$defs/WorkerState"
+        }
+      },
+      "required": [
+        "id",
+        "conversation_id",
+        "title",
+        "outcome",
+        "summary",
+        "state",
+        "worker",
+        "pending",
+        "updated_at"
+      ]
+    },
+    "TaskAgentState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "open"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "done"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "const": "failed"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "TaskId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "TaskInput": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "content"
+      ]
+    },
+    "TaskRecord": {
+      "type": "object",
+      "properties": {
+        "agents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskAgentRecord"
+          }
+        },
+        "conversation_id": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/TaskId"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "pending": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskInput"
+          }
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SourceRef"
+          }
+        },
+        "state": {
+          "$ref": "#/$defs/TaskState"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "worker": {
+          "$ref": "#/$defs/WorkerState"
+        }
+      },
+      "required": [
+        "id",
+        "conversation_id",
+        "title",
+        "outcome",
+        "summary",
+        "state",
+        "worker",
+        "sources",
+        "pending",
+        "agents",
+        "updated_at"
+      ]
+    },
+    "TaskState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "open"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "actor": {
+              "type": "string"
+            },
+            "next_check": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "type": "string",
+              "const": "waiting"
+            }
+          },
+          "required": [
+            "state",
+            "actor"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "evidence": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "const": "resolved"
+            }
+          },
+          "required": [
+            "state",
+            "evidence"
+          ]
+        }
+      ]
+    },
+    "WorkerHost": {
+      "type": "object",
+      "properties": {
+        "agent_program": {
+          "type": "string"
+        },
+        "coordinator": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "launch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerLaunch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "rex_server": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "cwd",
+        "agent_program"
+      ]
+    },
+    "WorkerLaunch": {
+      "type": "object",
+      "properties": {
+        "config": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instructions": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "runtime": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "model"
+      ]
+    },
+    "WorkerRef": {
+      "type": "object",
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "host_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "window_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "host_id",
+        "session_id",
+        "window_id",
+        "block_id"
+      ]
+    },
+    "WorkerState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "unassigned"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allocation_id": {
+              "type": "string"
+            },
+            "host": {
+              "$ref": "#/$defs/WorkerHost"
+            },
+            "state": {
+              "type": "string",
+              "const": "allocating"
+            }
+          },
+          "required": [
+            "state",
+            "allocation_id",
+            "host"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allocation_id": {
+              "type": "string"
+            },
+            "binding": {
+              "$ref": "#/$defs/WorkerRef"
+            },
+            "host": {
+              "$ref": "#/$defs/WorkerHost"
+            },
+            "state": {
+              "type": "string",
+              "const": "bound"
+            }
+          },
+          "required": [
+            "state",
+            "allocation_id",
+            "host",
+            "binding"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allocation_id": {
+              "type": "string"
+            },
+            "host": {
+              "$ref": "#/$defs/WorkerHost"
+            },
+            "session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "type": "string",
+              "const": "uncertain"
+            }
+          },
+          "required": [
+            "state",
+            "allocation_id",
+            "host"
+          ]
+        }
+      ]
+    },
+    "WorktreeAllocation": {
+      "type": "object",
+      "properties": {
+        "allocation_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "host_id": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        }
+      },
+      "required": [
+        "host_id",
+        "task_id",
+        "allocation_id",
+        "repository",
+        "branch"
       ]
     }
   }

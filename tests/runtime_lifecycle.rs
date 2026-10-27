@@ -1,19 +1,38 @@
 use std::{
     fs::{self, OpenOptions},
     io::ErrorKind,
-    os::unix::fs::PermissionsExt,
-    process::{Command, Stdio},
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
-struct Orphan(libc::pid_t);
+struct Supervisor(Option<Child>);
+
+impl Supervisor {
+    fn stop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            child.wait().unwrap();
+        }
+    }
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+struct Orphan(Option<libc::pid_t>);
 
 impl Drop for Orphan {
     fn drop(&mut self) {
         // This PID belongs to the fixture we started, never a discovered process.
-        unsafe {
-            libc::kill(self.0, libc::SIGTERM);
+        if let Some(pid) = self.0.take() {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
         }
     }
 }
@@ -41,22 +60,23 @@ fn killing_supervisor_preserves_lock_until_pi_child_exits() {
             .arg(state.path())
             .arg("--runtime")
             .arg(&script)
-            .arg("status")
+            .args(["serve", "--no-sources"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         command
     };
-    let mut supervisor = command().spawn().unwrap();
+    let mut supervisor = Supervisor(Some(command().spawn().unwrap()));
     let deadline = Instant::now() + Duration::from_secs(5);
     let pid_path = state.path().join("child-pid");
-    while !pid_path.exists() {
-        assert!(Instant::now() < deadline, "Child did not start");
+    let socket = state.path().join("agent.sock");
+    while !pid_path.exists() || !socket.exists() {
+        assert!(Instant::now() < deadline, "Coordinator did not start");
         thread::sleep(Duration::from_millis(10));
     }
-    let orphan = Orphan(fs::read_to_string(pid_path).unwrap().parse().unwrap());
-    supervisor.kill().unwrap();
-    supervisor.wait().unwrap();
+    let orphan = Orphan(Some(fs::read_to_string(pid_path).unwrap().parse().unwrap()));
+    let original_socket = fs::metadata(&socket).unwrap();
+    supervisor.stop();
     let competing = command().output().unwrap();
     assert!(!competing.status.success());
     assert!(
@@ -64,6 +84,9 @@ fn killing_supervisor_preserves_lock_until_pi_child_exits() {
             .unwrap()
             .contains("Another agent process owns")
     );
+    let preserved_socket = fs::metadata(socket).unwrap();
+    assert_eq!(preserved_socket.ino(), original_socket.ino());
+    assert_eq!(preserved_socket.dev(), original_socket.dev());
     let lock = OpenOptions::new()
         .read(true)
         .write(true)

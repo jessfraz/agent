@@ -23,8 +23,565 @@
     "command"
   ],
   "$defs": {
+    "CleanupPlan": {
+      "type": "object",
+      "properties": {
+        "fingerprint": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "identity": {
+          "$ref": "#/$defs/NativeWorktreeIdentity"
+        },
+        "path": {
+          "type": "string"
+        },
+        "resource_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "id",
+        "resource_id",
+        "identity",
+        "path",
+        "fingerprint"
+      ]
+    },
+    "CleanupReceipt": {
+      "type": "object",
+      "properties": {
+        "branch_deleted": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "primary_worktree": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retained_submodules": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "worktree_removed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "status",
+        "worktree_removed",
+        "summary"
+      ]
+    },
+    "HostResult": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "report": {
+              "$ref": "#/$defs/ResourceReport"
+            },
+            "type": {
+              "type": "string",
+              "const": "resource"
+            }
+          },
+          "required": [
+            "type",
+            "report"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "exit_code": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "stderr": {
+              "type": "string"
+            },
+            "stdout": {
+              "type": "string"
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "type": {
+              "type": "string",
+              "const": "process"
+            }
+          },
+          "required": [
+            "type",
+            "exit_code",
+            "stdout",
+            "stderr",
+            "truncated"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string"
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "type": {
+              "type": "string",
+              "const": "file"
+            }
+          },
+          "required": [
+            "type",
+            "content",
+            "truncated"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "written"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "binding": {
+              "$ref": "#/$defs/WorkerRef"
+            },
+            "type": {
+              "type": "string",
+              "const": "spawned"
+            }
+          },
+          "required": [
+            "type",
+            "binding"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "creation_uncertain"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "failed"
+            }
+          },
+          "required": [
+            "type",
+            "message"
+          ]
+        }
+      ]
+    },
+    "NativeWorktreeIdentity": {
+      "type": "object",
+      "properties": {
+        "branch": {
+          "type": "string"
+        },
+        "common_dir": {
+          "type": "string"
+        },
+        "git_dir": {
+          "type": "string"
+        },
+        "head": {
+          "type": "string"
+        },
+        "primary": {
+          "type": "string"
+        },
+        "top": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "primary",
+        "top",
+        "common_dir",
+        "git_dir",
+        "branch",
+        "head"
+      ]
+    },
+    "ResourceRecord": {
+      "type": "object",
+      "properties": {
+        "branch": {
+          "type": "string"
+        },
+        "consumers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskId"
+          }
+        },
+        "host_id": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/ResourceState"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        }
+      },
+      "required": [
+        "id",
+        "host_id",
+        "task_id",
+        "repository",
+        "branch",
+        "consumers",
+        "state"
+      ]
+    },
+    "ResourceReport": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "record": {
+              "$ref": "#/$defs/ResourceRecord"
+            },
+            "type": {
+              "type": "string",
+              "const": "observed"
+            }
+          },
+          "required": [
+            "type",
+            "record"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "plan": {
+              "$ref": "#/$defs/CleanupPlan"
+            },
+            "record": {
+              "$ref": "#/$defs/ResourceRecord"
+            },
+            "type": {
+              "type": "string",
+              "const": "planned"
+            }
+          },
+          "required": [
+            "type",
+            "record",
+            "plan"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "receipt": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CleanupReceipt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "record": {
+              "$ref": "#/$defs/ResourceRecord"
+            },
+            "type": {
+              "type": "string",
+              "const": "collected"
+            }
+          },
+          "required": [
+            "type",
+            "record"
+          ]
+        }
+      ]
+    },
+    "ResourceState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "allocating"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/NativeWorktreeIdentity"
+            },
+            "state": {
+              "type": "string",
+              "const": "ready"
+            }
+          },
+          "required": [
+            "state",
+            "identity"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/NativeWorktreeIdentity"
+            },
+            "plan_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "state": {
+              "type": "string",
+              "const": "retiring"
+            }
+          },
+          "required": [
+            "state",
+            "identity",
+            "plan_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "identity": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/NativeWorktreeIdentity"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "const": "held"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/NativeWorktreeIdentity"
+            },
+            "state": {
+              "type": "string",
+              "const": "removed"
+            }
+          },
+          "required": [
+            "state",
+            "identity"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "branch_absent": {
+              "type": "boolean"
+            },
+            "identity": {
+              "$ref": "#/$defs/NativeWorktreeIdentity"
+            },
+            "path_absent": {
+              "type": "boolean"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "registry_absent": {
+              "type": "boolean"
+            },
+            "state": {
+              "type": "string",
+              "const": "partial"
+            }
+          },
+          "required": [
+            "state",
+            "identity",
+            "path_absent",
+            "registry_absent",
+            "branch_absent",
+            "reason"
+          ]
+        }
+      ]
+    },
     "RuntimeCommand": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "watch"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "source_states"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "batch": {
+              "$ref": "#/$defs/SourceBatch"
+            },
+            "expected_checkpoint": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SourceCheckpoint"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "ingest_source"
+            }
+          },
+          "required": [
+            "type",
+            "batch"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "target": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "oauth_callback"
+            }
+          },
+          "required": [
+            "type",
+            "target"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "hosts": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/WorkerHost"
+              }
+            },
+            "instructions": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "triage_sources"
+            }
+          },
+          "required": [
+            "type",
+            "instructions",
+            "model",
+            "cwd",
+            "hosts"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -64,6 +621,15 @@
         {
           "type": "object",
           "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "hosts": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/WorkerHost"
+              }
+            },
             "input": {
               "type": "string"
             },
@@ -82,9 +648,414 @@
             "type",
             "input",
             "instructions",
-            "model"
+            "model",
+            "cwd",
+            "hosts"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "search_tasks"
+            }
+          },
+          "required": [
+            "type",
+            "query"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "list_tasks"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "list_resources"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "host_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "collect_resources"
+            }
+          },
+          "required": [
+            "type",
+            "host_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            },
+            "type": {
+              "type": "string",
+              "const": "read_task"
+            }
+          },
+          "required": [
+            "type",
+            "task_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agent_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "allocation_id": {
+              "type": "string"
+            },
+            "binding": {
+              "$ref": "#/$defs/WorkerRef"
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "instructions": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            },
+            "type": {
+              "type": "string",
+              "const": "run_task"
+            }
+          },
+          "required": [
+            "type",
+            "task_id",
+            "allocation_id",
+            "binding",
+            "instructions",
+            "model",
+            "cwd"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "result": {
+              "$ref": "#/$defs/HostResult"
+            },
+            "type": {
+              "type": "string",
+              "const": "host_reply"
+            }
+          },
+          "required": [
+            "type",
+            "call_id",
+            "result"
           ]
         }
+      ]
+    },
+    "SourceBatch": {
+      "type": "object",
+      "properties": {
+        "checkpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceCheckpoint"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "coverage": {
+          "$ref": "#/$defs/SourceCoverage"
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SourceEvent"
+          }
+        },
+        "source": {
+          "$ref": "#/$defs/SourceKey"
+        }
+      },
+      "required": [
+        "source",
+        "events",
+        "coverage"
+      ]
+    },
+    "SourceCheckpoint": {
+      "description": "Opaque to the caller and meaningful only to the matching provider/account.",
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "value"
+      ]
+    },
+    "SourceCoverage": {
+      "description": "Coverage concerns the adapter's documented polling window, not an archive of\neverything visible to the account. Excerpts retain a source for deeper reads.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "complete"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "more"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "partial"
+            }
+          },
+          "required": [
+            "status",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "status",
+            "message"
+          ]
+        }
+      ]
+    },
+    "SourceEvent": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/SourceRef"
+        },
+        "text": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "version",
+        "source",
+        "title",
+        "text"
+      ]
+    },
+    "SourceKey": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "account"
+      ]
+    },
+    "SourceRef": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "account",
+        "thread_id"
+      ]
+    },
+    "TaskId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "WorkerHost": {
+      "type": "object",
+      "properties": {
+        "agent_program": {
+          "type": "string"
+        },
+        "coordinator": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "launch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerLaunch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "rex_server": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "cwd",
+        "agent_program"
+      ]
+    },
+    "WorkerLaunch": {
+      "type": "object",
+      "properties": {
+        "config": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instructions": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "runtime": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "model"
+      ]
+    },
+    "WorkerRef": {
+      "type": "object",
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "host_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "window_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "host_id",
+        "session_id",
+        "window_id",
+        "block_id"
       ]
     }
   }

@@ -128,19 +128,22 @@ async function callbackListener(signal: AbortSignal, port: number, expectedState
   const result = new Promise<URL>((resolve, reject) => { resolveUrl = resolve; rejectUrl = reject });
   void result.catch(() => {});
   let redirect = new URL("http://127.0.0.1/auth/callback");
-  const server = createServer((request, response) => {
+  let accepting = true;
+  const accept = (target: string): boolean => {
     let url: URL;
-    try { url = new URL(request.url ?? "/", redirect) }
-    catch { response.writeHead(400).end(); return }
-    if (url.searchParams.get("state") !== expectedState) {
+    try { url = new URL(target, redirect) } catch { return false }
+    if (!accepting || signal.aborted || url.origin !== redirect.origin ||
+        url.pathname !== redirect.pathname || url.searchParams.get("state") !== expectedState) return false;
+    accepting = false;
+    resolveUrl(url);
+    return true;
+  };
+  const server = createServer((request, response) => {
+    if (request.method !== "GET" || !accept(request.url ?? "/")) {
       response.writeHead(400).end("Unrecognized authorization response."); return;
-    }
-    if (request.method !== "GET" || url.origin !== redirect.origin || url.pathname !== redirect.pathname) {
-      response.writeHead(404).end(); return;
     }
     response.writeHead(200, { "content-type": "text/plain", "cache-control": "no-store" });
     response.end("Authorization response received. Return to agent.");
-    resolveUrl(url);
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -152,7 +155,8 @@ async function callbackListener(signal: AbortSignal, port: number, expectedState
   const abort = () => rejectUrl(new AuthError("cancelled", "ChatGPT sign-in cancelled."));
   signal.addEventListener("abort", abort, { once: true });
   if (signal.aborted) abort();
-  return { redirect, result, async close() {
+  return { redirect, result, accept, async close() {
+    accepting = false;
     signal.removeEventListener("abort", abort);
     await new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections() });
   } };
@@ -163,6 +167,7 @@ export class ChatGptAuth {
   private readonly issuer: URL;
   private readonly callbackPort: number;
   private queue: Promise<void> = Promise.resolve();
+  private pendingCallback: ((target: string) => boolean) | undefined;
   constructor(private readonly stateDir: string, options: AuthOptions = {}) {
     this.issuer = options.testIssuer ?? new URL("https://auth.openai.com");
     if (options.testIssuer !== undefined && (this.issuer.protocol !== "http:" || this.issuer.hostname !== "127.0.0.1")) {
@@ -174,6 +179,11 @@ export class ChatGptAuth {
     const result = this.queue.then(operation);
     this.queue = result.then(() => {}, () => {});
     return result;
+  }
+  /** Only the authenticated active Login stream may call this ingress. It must
+   * not queue behind login(), which is itself waiting for this response. */
+  forwardCallback(target: string): boolean {
+    return this.pendingCallback?.(target) ?? false;
   }
   private async read(): Promise<SavedAuth> {
     try {
@@ -230,6 +240,7 @@ export class ChatGptAuth {
       try {
         const expectedState = oidc.randomState();
         listener = await callbackListener(pendingSignal, this.callbackPort, expectedState);
+        this.pendingCallback = listener.accept;
         const config = await this.configuration(previous?.clientId ?? "dynamic_agent_client", pendingSignal);
         const verifier = oidc.randomPKCECodeVerifier();
         const nonce = oidc.randomNonce();
@@ -294,7 +305,7 @@ export class ChatGptAuth {
       } catch (error) {
         if (pendingSignal.aborted) throw new AuthError("cancelled", "ChatGPT sign-in cancelled.");
         throw safeFailure(error, "exchange", "Could not complete ChatGPT token exchange.");
-      } finally { await listener?.close() }
+      } finally { this.pendingCallback = undefined; await listener?.close() }
     });
   }
   credential(): Promise<OAuthCredential> {
