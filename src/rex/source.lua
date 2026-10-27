@@ -1,24 +1,29 @@
 -- Agent Messages reads run under Rex Server's macOS permission identity.
 -- One bounded, read-only job slot; no sessions, terminals, or persistent queue.
 local job = nil
-local maximum = 16 * 1024 * 1024
+local maximum = 32 * 1024 * 1024
 local chunk_size = 64 * 1024
 
 rex.action{
   name = "agent_messages_start",
   title = "Agent: start a Messages read",
-  args = { id = "string", program = "string", argv = "array", path = "string" },
+  args = { id = "string", program = "string", argv = "array", path = "string", timeout_seconds = "integer" },
   run = function(_, args)
-    if job and job.id == args.id then return { id = job.id } end
-    if job and job.handle:running() then error("A Messages read is still running") end
-    local next_job = { id = args.id, parts = {}, bytes = 0, overflow = false }
+    if job and job.cancelled and not job.handle:running() then job = nil end
+    if job and job.id == args.id then return { state = "started", id = job.id } end
+    -- Keep a completed capture until its owner releases it. A vanished owner
+    -- cannot reserve the slot forever after the helper's own deadline.
+    if job and (job.handle:running() or os.time() < job.expires) then return { state = "busy" } end
+    if args.timeout_seconds < 1 or args.timeout_seconds > 65535 then error("Invalid Messages timeout") end
+    local next_job = { id = args.id, parts = {}, bytes = 0, overflow = false,
+      expires = os.time() + args.timeout_seconds + 30 }
     local command = { args.program, "messages-read", "--" }
     for _, arg in ipairs(args.argv) do
       if type(arg) ~= "string" then error("Messages arguments must be strings") end
       command[#command + 1] = arg
     end
     local handle, err = rex.exec.start(command, {
-      cwd = "/", env = { PATH = args.path }, detach = true, timeout = 915,
+      cwd = "/", env = { PATH = args.path }, detach = true, timeout = args.timeout_seconds + 15,
       stderr = false,
       stdout = function(data)
         if next_job.bytes + #data > maximum then
@@ -33,7 +38,7 @@ rex.action{
     if not handle then error(err or "Messages helper could not start") end
     next_job.handle = handle
     job = next_job
-    return { id = job.id }
+    return { state = "started", id = job.id }
   end,
 }
 
@@ -74,6 +79,7 @@ rex.action{
   args = { id = "string" },
   run = function(_, args)
     if job and job.id == args.id then
+      job.cancelled = true
       if job.handle:running() then job.handle:kill("SIGTERM")
       else job = nil end
     end

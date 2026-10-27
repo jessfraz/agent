@@ -74,6 +74,9 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
                 !program.is_empty() && Path::new(&cwd).is_absolute(),
                 "Command needs a program and absolute working directory"
             );
+            if crate::sources::messages_read::is_read(&program, &args) {
+                return crate::rex::source::execute(program, args, cwd, timeout_seconds).await;
+            }
             run_process(
                 &program,
                 &args,

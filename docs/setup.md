@@ -121,7 +121,11 @@ failure is not an empty inbox.
 Messages reads run headlessly through the local Rex Server, using its macOS
 Full Disk Access grant. Enable access for Rex Server once in System Settings;
 agent binaries do not need their own grant. No sessions or terminals are created
-for polling. `messages doctor` checks database access and schema support.
+for polling. The agent's literal `messages doctor`, `messages chats`, and
+`messages read` commands, including their Switchboard equivalents, use the
+same reader. Their working directory, deadline, diagnostics and output limits
+are preserved. Commands run directly in an unrelated shell still use that
+shell's macOS permission context.
 
 With Messages enabled, `agent serve` installs the small Rex action module once.
 Existing Rex configuration is preserved. An unchanged module causes no reload
