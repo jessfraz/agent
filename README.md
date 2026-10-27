@@ -49,6 +49,7 @@ The MVP will add named Rex task workers and durable mail follow-through, with
 existing task lookup before creation. One selected coordinator owns the store;
 cross-device replication, takeover, history import and reviewed learning come
 later. Do not run simultaneous coordinators over a copied SQLite database.
+See the [remaining MVP design](docs/architecture.md).
 
 Run `make runtime check` inside the Nix shell. Tests use local issuers and
 synthetic accounts; CI never needs personal credentials.
