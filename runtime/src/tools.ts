@@ -91,14 +91,14 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
   const host = defineExtension({ name: "host-tools", tools: [
     defineTool({ name: "exec", description: "Run a program and literal arguments. Main defaults to the coordinator; name a connected host for other machines. Workers use their owning host.",
       parameters: Type.Object({ program: Type.String({ minLength: 1 }), args: Type.Array(Type.String()),
-        cwd: Type.Optional(Type.String()), host: Type.Optional(Type.String()), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })) }),
+        cwd: Type.Optional(Type.String()), host: Type.Optional(Type.String()), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 65535 })) }),
       async execute(args, api) {
         const execution = executions.get(api.conversationId.toString());
         if (args.host !== undefined && execution.role === "worker") throw new TaskError("Task commands run on their owning host.");
         const chosen = args.host === undefined ? undefined : execution.hosts.find((host) => host.host_id === args.host || host.name === args.host);
         if (args.host !== undefined && chosen === undefined) throw new TaskError("Choose a connected worker host.");
         const command: HostCommand = { type: "exec", program: args.program, args: args.args,
-          cwd: args.cwd ?? chosen?.cwd ?? execution.default_host?.cwd ?? execution.cwd, timeout_seconds: args.timeout_seconds ?? 300 };
+          cwd: args.cwd ?? chosen?.cwd ?? execution.default_host?.cwd ?? execution.cwd, timeout_seconds: args.timeout_seconds ?? 900 };
         return hostOutput(await execution.call(chosen?.host_id === null || chosen?.host_id === undefined ? command
           : { type: "on_node", host_id: chosen.host_id, command }));
       } }),

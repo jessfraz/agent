@@ -138,14 +138,16 @@ test("native model tools route main execution explicitly and expose coordinator 
       app.faux.setResponses([
         fauxAssistantMessage(fauxToolCall("exec", { program: "pwd", args: [] }), { stopReason: "toolUse" }),
         fauxAssistantMessage(fauxToolCall("exec", { program: "pwd", args: [], host: laptop.host_id }), { stopReason: "toolUse" }),
+        fauxAssistantMessage(fauxToolCall("exec", { program: "pwd", args: [], timeout_seconds: 65535 }), { stopReason: "toolUse" }),
         fauxAssistantMessage(fauxToolCall("read_context", { repository_id: "operations", path: "playbooks/mail.md" }), { stopReason: "toolUse" }),
         fauxAssistantMessage(fauxToolCall("search_context", { repository_id: "operations", query: "brief", path: "context", limit: 5 }), { stopReason: "toolUse" }),
         fauxAssistantMessage("The coordinator context and project are available."),
       ]);
       assert.equal((await (await root.submit({ type: "input", content: "Inspect the shared context and this project." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
       assert.deepEqual(commands, [
-        { type: "on_node", host_id: coordinator.host_id, command: { type: "exec", program: "pwd", args: [], cwd: coordinator.home_directory, timeout_seconds: 300 } },
-        { type: "on_node", host_id: laptop.host_id, command: { type: "exec", program: "pwd", args: [], cwd: "/home/laptop/project", timeout_seconds: 300 } },
+        { type: "on_node", host_id: coordinator.host_id, command: { type: "exec", program: "pwd", args: [], cwd: coordinator.home_directory, timeout_seconds: 900 } },
+        { type: "on_node", host_id: laptop.host_id, command: { type: "exec", program: "pwd", args: [], cwd: "/home/laptop/project", timeout_seconds: 900 } },
+        { type: "on_node", host_id: coordinator.host_id, command: { type: "exec", program: "pwd", args: [], cwd: coordinator.home_directory, timeout_seconds: 65535 } },
         { type: "read_context", repository_id: "operations", path: "playbooks/mail.md", offset: 0, limit: 64000 },
         { type: "search_context", repository_id: "operations", query: "brief", path: "context", limit: 5 },
       ]);
@@ -172,13 +174,20 @@ test("native model tools route main execution explicitly and expose coordinator 
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("routed host operations retain the native operation deadline", async (context) => {
+test("routed host operations retain long requested deadlines and release their expired replies", async (context) => {
   context.mock.timers.enable({ apis: ["setTimeout"] });
   let callId = "";
   const requests = new HostRequests((_request, id) => { callId = id; });
-  const operation = requests.call(1, { type: "on_node", host_id: laptop.host_id,
-    command: { type: "exec", program: "work", args: [], cwd: "/workspace/example", timeout_seconds: 300 } });
-  context.mock.timers.tick(30_001);
-  assert.equal(requests.reply(1, callId, { type: "written" }), true, "Wrapping a command must not shorten its deadline to thirty seconds");
-  assert.deepEqual(await operation, { type: "written" });
+  for (const timeout_seconds of [900,65535]) {
+    const operation = requests.call(1, { type: "on_node", host_id: laptop.host_id,
+      command: { type: "exec", program: "work", args: [], cwd: "/workspace/example", timeout_seconds } });
+    context.mock.timers.tick(timeout_seconds*1000+9999);
+    assert.equal(requests.reply(1, callId, { type: "written" }), true, "The complete requested duration and transport grace remain available");
+    assert.deepEqual(await operation, { type: "written" });
+  }
+  const expired=requests.call(2,{type:"on_node",host_id:laptop.host_id,command:{type:"exec",program:"work",args:[],cwd:"/workspace/example",timeout_seconds:1}});
+  const rejected=assert.rejects(expired,/did not confirm/);
+  context.mock.timers.tick(11000);
+  await rejected;
+  assert.equal(requests.reply(2,callId,{type:"written"}),false,"A late reply cannot complete an expired operation");
 });

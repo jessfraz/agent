@@ -1,6 +1,7 @@
 //! GitHub notification intake through the existing Switchboard GitHub CLI.
 //! Includes read threads in a seven-day initial window, then overlaps settled
 //! windows by two minutes. GitHub's notification feed is not a repository archive.
+//! The native CLI owns pagination; returned updates need not be in time order.
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -33,8 +34,6 @@ struct Window {
     account: String,
     since: u64,
     until: u64,
-    before: u64,
-    page: u32,
     not_before: u64,
 }
 #[derive(Deserialize, Serialize)]
@@ -73,6 +72,11 @@ struct Subject {
 struct Page {
     notifications: Vec<Notification>,
     has_next: bool,
+    poll_interval: u64,
+}
+struct Scan {
+    notifications: Vec<Notification>,
+    exhausted: bool,
     poll_interval: u64,
 }
 
@@ -131,8 +135,6 @@ impl GitHubSource {
                 account: self.namespace.clone(),
                 since: now.saturating_sub(7 * 86_400),
                 until: 0,
-                before: 0,
-                page: 1,
                 not_before: 0,
             },
         };
@@ -140,16 +142,11 @@ impl GitHubSource {
             window.account == self.namespace,
             "GitHub checkpoint belongs to another account"
         );
-        if window.until == 0 {
-            window.until = now.saturating_add(1);
-        }
-        if window.before == 0 {
-            window.before = window.until;
-        }
+        // Every native scan starts from the last committed baseline. Legacy
+        // before/page fields are ignored rather than carrying their stuck keyset.
+        window.until = now.saturating_add(1);
         ensure!(
-            window.since < window.before
-                && window.before <= window.until
-                && (1..=100).contains(&window.page),
+            window.since < window.until,
             "GitHub checkpoint window is invalid"
         );
         Ok(window)
@@ -157,12 +154,6 @@ impl GitHubSource {
 
     fn normalize(&self, output: ReadOutput, mut window: Window, now: u64) -> SourceBatch {
         let key = self.key();
-        if output.truncated {
-            return SourceBatch::unavailable(
-                key,
-                "GitHub helper output was truncated; checkpoint retained",
-            );
-        }
         let Ok(envelope) = serde_json::from_str::<Envelope>(&output.stdout) else {
             return SourceBatch::unavailable(
                 key,
@@ -172,15 +163,14 @@ impl GitHubSource {
         let Some(fields) = envelope.fields else {
             return SourceBatch::unavailable(key, "GitHub result has no notification coverage");
         };
-        let Ok(page) = parse_page(&fields.stdout_text) else {
+        let Ok(scan) = parse_scan(&fields.stdout_text) else {
             return SourceBatch::unavailable(
                 key,
                 "GitHub notifications could not be read completely; checkpoint retained",
             );
         };
-        let mut invalid = page.notifications.len() > 50;
-        let mut oldest = None;
-        let events = page
+        let mut invalid = false;
+        let events = scan
             .notifications
             .into_iter()
             .filter_map(|notification| {
@@ -190,20 +180,17 @@ impl GitHubSource {
                     invalid = true;
                     return None;
                 };
-                let Ok(updated) = parse_timestamp(&notification.updated_at) else {
+                if parse_timestamp(&notification.updated_at).is_err() {
                     invalid = true;
                     return None;
-                };
+                }
                 if notification.id.is_empty()
-                    || updated < window.since
-                    || updated >= window.before
                     || repository.full_name.is_empty()
                     || subject.title.is_empty()
                 {
                     invalid = true;
                     return None;
                 }
-                oldest = Some(oldest.map_or(updated, |previous: u64| previous.min(updated)));
                 let mut text = format!(
                     "Repository: {}\nType: {}\nReason: {}\nUpdated: {}\nSubject: {}",
                     repository.full_name,
@@ -219,8 +206,7 @@ impl GitHubSource {
                     text.push_str(&format!("\nLatest comment API: {url}"));
                 }
                 let title = format!("{}: {}", repository.full_name, subject.title);
-                // Journal versions identify all normalized content; pagination
-                // continues to use the native updated_at clock.
+                // Updated time is provenance, never a pagination key.
                 let mut digest = Sha256::new();
                 for part in [&title, &text] {
                     digest.update((part.len() as u64).to_be_bytes());
@@ -252,32 +238,15 @@ impl GitHubSource {
             || envelope.status != "executed"
             || fields.status != "ok"
             || invalid
+            || output.truncated
+            || !scan.exhausted
         {
             return batch;
         }
-        window.not_before = now.saturating_add(page.poll_interval.max(60));
-        if page.has_next {
-            if window.page == 100 {
-                return batch;
-            }
-            let Some(before) = oldest.map(|updated| updated.saturating_add(1)) else {
-                return batch;
-            };
-            if before >= window.before {
-                return batch;
-            }
-            // Offset pages skip records when other notifications are updated.
-            // Re-read the boundary second instead; unpageable ties remain a gap.
-            window.before = before;
-            window.page += 1;
-            batch.coverage = SourceCoverage::More;
-        } else {
-            window.since = window.until.saturating_sub(120);
-            window.until = 0;
-            window.before = 0;
-            window.page = 1;
-            batch.coverage = SourceCoverage::Complete;
-        }
+        window.not_before = now.saturating_add(scan.poll_interval.max(60));
+        window.since = window.until.saturating_sub(120);
+        window.until = 0;
+        batch.coverage = SourceCoverage::Complete;
         if let Ok(value) = serde_json::to_string(&window) {
             batch.checkpoint = Some(SourceCheckpoint { value });
         }
@@ -318,15 +287,13 @@ impl Source for GitHubSource {
         // before capture so repository metadata cannot crowd out notifications.
         let argv = vec![
             "switchboard".into(), "github.cli.read".into(), "--ns".into(), self.namespace.clone(), "--json".into(), "--".into(),
-            "api".into(), "notifications".into(), "--method".into(), "GET".into(), "--include".into(),
+            "api".into(), "notifications".into(), "--method".into(), "GET".into(), "--include".into(), "--paginate".into(),
             "-F".into(), "all=true".into(), "-F".into(), "per_page=50".into(),
             "-F".into(), format!("since={}", utc_timestamp(window.since)?),
-            "-F".into(), format!("before={}", utc_timestamp(window.before)?),
-            "-F".into(), "page=1".into(),
             "--jq".into(), "map({id,updated_at,reason,repository:{full_name:.repository.full_name},subject:{title:.subject.title,url:.subject.url,latest_comment_url:.subject.latest_comment_url,type:.subject.type}})".into(),
         ];
         Ok(match read_command(&argv).await {
-            Ok(output) => self.normalize(output, window, now),
+            Ok(output) => self.normalize(output, window, now_seconds()?),
             Err(_) => SourceBatch::unavailable(
                 self.key(),
                 "GitHub helper could not run; check scoped read-only authorization",
@@ -335,7 +302,37 @@ impl Source for GitHubSource {
     }
 }
 
-fn parse_page(output: &str) -> Result<Page> {
+/// `gh --include --paginate` emits one HTTP header block and JSON array per
+/// page. Keep earlier pages when a later response or projection fails.
+fn parse_scan(output: &str) -> Result<Scan> {
+    let mut scan = Scan {
+        notifications: Vec::new(),
+        exhausted: false,
+        poll_interval: 60,
+    };
+    let mut remaining = output.trim_start();
+    let mut parsed_page = false;
+    loop {
+        let (page, tail) = match parse_page(remaining) {
+            Ok(page) => page,
+            Err(_) if parsed_page => return Ok(scan),
+            Err(error) => return Err(error),
+        };
+        parsed_page = true;
+        scan.notifications.extend(page.notifications);
+        scan.poll_interval = scan.poll_interval.max(page.poll_interval);
+        remaining = tail.trim_start();
+        if remaining.is_empty() {
+            scan.exhausted = !page.has_next;
+            return Ok(scan);
+        }
+        if !page.has_next {
+            return Ok(scan);
+        }
+    }
+}
+
+fn parse_page(output: &str) -> Result<(Page, &str)> {
     let (headers, body) = output
         .split_once("\r\n\r\n")
         .or_else(|| output.split_once("\n\n"))
@@ -380,11 +377,16 @@ fn parse_page(output: &str) -> Result<Page> {
             }
         }
     }
-    Ok(Page {
-        notifications: serde_json::from_str(body).context("Invalid GitHub notification array")?,
-        has_next,
-        poll_interval,
-    })
+    let mut json = serde_json::Deserializer::from_str(body).into_iter::<Vec<Notification>>();
+    let notifications = json.next().context("Missing GitHub notification array")??;
+    Ok((
+        Page {
+            notifications,
+            has_next,
+            poll_interval,
+        },
+        &body[json.byte_offset()..],
+    ))
 }
 
 fn utc_timestamp(seconds: u64) -> Result<String> {
@@ -430,15 +432,88 @@ mod tests {
         }
     }
 
+    fn paginated(pages: &[ReadOutput]) -> ReadOutput {
+        let stdout_text = pages
+            .iter()
+            .map(|page| {
+                serde_json::from_str::<Envelope>(&page.stdout)
+                    .unwrap()
+                    .fields
+                    .unwrap()
+                    .stdout_text
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        ReadOutput {
+            exit_code: 0,
+            truncated: false,
+            stdout: serde_json::to_string(&Envelope {
+                status: "executed".into(),
+                fields: Some(Fields {
+                    status: "ok".into(),
+                    stdout_text,
+                }),
+            })
+            .unwrap(),
+        }
+    }
+
     #[test]
-    fn native_cli_notification_preserves_identity_version_and_frozen_window() {
+    fn native_paginated_scan_accepts_nonmonotonic_rows_and_migrates_the_legacy_checkpoint() {
         let source = source();
+        let checkpoint = crate::sources::SourceCheckpoint {
+            value: r#"{"account":"github.example","since":1699395200,"until":1700000001,"before":1699995601,"page":2,"not_before":0}"#.into(),
+        };
+        let newer = NOTIFICATION
+            .replace("123456", "123457")
+            .replace("21:00:00Z", "23:00:00Z");
         let batch = source.normalize(
-            output(NOTIFICATION, true),
+            paginated(&[output(NOTIFICATION, true), output(&newer, false)]),
+            source.window(Some(&checkpoint), 1_710_000_000).unwrap(),
+            1_710_000_000,
+        );
+        assert_eq!(batch.coverage, SourceCoverage::Complete);
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(batch.events[1].id, "123457");
+        let saved: Window = serde_json::from_str(&batch.checkpoint.unwrap().value).unwrap();
+        assert_eq!(saved.since, 1_710_000_001 - 120);
+        assert_eq!(saved.until, 0);
+        assert_eq!(saved.not_before, 1_710_000_120);
+    }
+
+    #[test]
+    fn native_paginated_late_failure_retains_the_baseline_without_forging_completion() {
+        let source = source();
+        // Switchboard returns provider_failed without fields when gh fails on a
+        // later page. Previously admitted events remain in the durable journal.
+        let scan = ReadOutput {
+            exit_code: 1,
+            truncated: false,
+            stdout: serde_json::to_string(&Envelope {
+                status: "error".into(),
+                fields: None,
+            })
+            .unwrap(),
+        };
+        let batch = source.normalize(
+            scan,
             source.window(None, 1_700_000_000).unwrap(),
             1_700_000_000,
         );
-        assert_eq!(batch.coverage, SourceCoverage::More);
+        assert!(batch.events.is_empty());
+        assert!(matches!(batch.coverage, SourceCoverage::Unavailable { .. }));
+        assert!(batch.checkpoint.is_none());
+    }
+
+    #[test]
+    fn native_cli_notification_preserves_identity_version_and_scan_start_cutoff() {
+        let source = source();
+        let batch = source.normalize(
+            output(NOTIFICATION, false),
+            source.window(None, 1_700_000_000).unwrap(),
+            1_700_000_000,
+        );
+        assert_eq!(batch.coverage, SourceCoverage::Complete);
         let event = &batch.events[0];
         assert_eq!(event.id, "123456");
         assert_eq!(event.source.thread_id, "123456");
@@ -449,9 +524,8 @@ mod tests {
         let next = source
             .window(batch.checkpoint.as_ref(), 1_710_000_000)
             .unwrap();
-        assert_eq!(next.page, 2);
-        assert_eq!(next.until, 1_700_000_001);
-        assert_eq!(next.before, 1_699_995_601);
+        assert_eq!(next.since, 1_700_000_001 - 120);
+        assert_eq!(next.until, 1_710_000_001);
         assert_eq!(next.not_before, 1_700_000_120);
         assert!(
             GitHubSource::new("github.other".into())
@@ -466,7 +540,7 @@ mod tests {
         let source = source();
         let normalize = |body: &str| {
             source.normalize(
-                output(body, true),
+                output(body, false),
                 source.window(None, 1_700_000_000).unwrap(),
                 1_700_000_000,
             )
@@ -515,7 +589,6 @@ mod tests {
         let saved: Window = serde_json::from_str(&batch.checkpoint.unwrap().value).unwrap();
         assert_eq!(saved.since, 1_700_000_001 - 120);
         assert_eq!(saved.until, 0);
-        assert_eq!(saved.page, 1);
         assert_eq!(
             utc_timestamp(1_700_000_000).unwrap(),
             "2023-11-14T22:13:20Z"
@@ -523,31 +596,24 @@ mod tests {
     }
 
     #[test]
-    fn updated_notifications_cannot_shift_offset_pages_and_timestamp_ties_remain_a_gap() {
+    fn native_pagination_requires_the_final_page_even_when_an_earlier_page_is_valid() {
         let source = source();
-        let first = source.normalize(
+        let missing = source.normalize(
             output(NOTIFICATION, true),
             source.window(None, 1_700_000_000).unwrap(),
             1_700_000_000,
         );
-        let window = source
-            .window(first.checkpoint.as_ref(), 1_700_000_200)
-            .unwrap();
-        // Re-reading the boundary second does not skip other notifications after
-        // a previously seen thread moves to a newer update outside this window.
-        let older = NOTIFICATION
-            .replace("123456", "123457")
-            .replace("21:00:00Z", "20:59:59Z");
-        let second = source.normalize(output(&older, true), window, 1_700_000_200);
-        let next = source
-            .window(second.checkpoint.as_ref(), 1_700_000_400)
-            .unwrap();
-        assert_eq!(next.before, 1_699_995_600);
-        assert_eq!(next.until, 1_700_000_001);
-        let tied = source.normalize(output(&older, true), next, 1_700_000_400);
-        assert!(matches!(tied.coverage, SourceCoverage::Partial { .. }));
-        assert!(tied.checkpoint.is_none());
-        assert_eq!(tied.events[0].id, "123457");
+        assert!(matches!(missing.coverage, SourceCoverage::Partial { .. }));
+        assert!(missing.checkpoint.is_none());
+        assert_eq!(missing.events[0].id, "123456");
+        let complete = source.normalize(
+            paginated(&[output(NOTIFICATION, true), output("[]", false)]),
+            source.window(None, 1_700_000_000).unwrap(),
+            1_700_000_000,
+        );
+        assert_eq!(complete.coverage, SourceCoverage::Complete);
+        assert_eq!(complete.events.len(), 1);
+        assert!(complete.checkpoint.is_some());
     }
 
     #[test]
@@ -570,7 +636,8 @@ mod tests {
             source.window(None, 1_700_000_000).unwrap(),
             1_700_000_000,
         );
-        assert!(matches!(batch.coverage, SourceCoverage::Unavailable { .. }));
+        assert!(matches!(batch.coverage, SourceCoverage::Partial { .. }));
+        assert_eq!(batch.events.len(), 1);
         assert!(batch.checkpoint.is_none());
         let mut denied = output("[]", false);
         denied.stdout = denied.stdout.replace("200 OK", "403 Forbidden");
@@ -586,11 +653,6 @@ mod tests {
             source.window(None, 1_700_000_000).unwrap(),
             1_700_000_000,
         );
-        assert!(matches!(batch.coverage, SourceCoverage::Partial { .. }));
-        assert!(batch.checkpoint.is_none());
-        let mut window = source.window(None, 1_700_000_000).unwrap();
-        window.page = 100;
-        let batch = source.normalize(output(NOTIFICATION, true), window, 1_700_000_000);
         assert!(matches!(batch.coverage, SourceCoverage::Partial { .. }));
         assert!(batch.checkpoint.is_none());
     }
@@ -639,13 +701,7 @@ mod tests {
             .pop()
             .unwrap();
         let batch = source.poll(None).await.unwrap();
-        assert!(
-            matches!(
-                batch.coverage,
-                SourceCoverage::Complete | SourceCoverage::More
-            ),
-            "Native notification coverage was incomplete"
-        );
+        assert_eq!(batch.coverage, SourceCoverage::Complete);
         assert!(batch.checkpoint.is_some());
         eprintln!(
             "Native GitHub CLI read verified: {} notifications normalized with durable checkpoint candidate.",

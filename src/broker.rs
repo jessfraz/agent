@@ -149,11 +149,17 @@ impl Broker {
         let Some(sender) = sender else {
             return unavailable();
         };
+        let deadline = match &command {
+            HostCommand::Exec {
+                timeout_seconds, ..
+            } => Duration::from_secs(u64::from(*timeout_seconds) + 10),
+            _ => Duration::from_secs(305),
+        };
         let (reply, received) = oneshot::channel();
         if sender.send(Effect { command, reply }).await.is_err() {
             return unavailable();
         }
-        match timeout(Duration::from_secs(305), received).await {
+        match timeout(deadline, received).await {
             Ok(Ok(result)) => result,
             _ => unavailable(),
         }
@@ -519,6 +525,93 @@ mod tests {
             HostResult::Failed { .. }
         ));
         assert_eq!(fs::read_to_string(marker).unwrap(), "x");
+        close(runtime).await;
+    }
+
+    #[tokio::test]
+    async fn remote_exec_reply_wait_follows_its_requested_deadline_and_never_replays() {
+        let (directory, runtime) = runtime().await;
+        let broker = Arc::new(Broker::new(None).unwrap());
+        let id = "44444444-4444-4444-8444-444444444444";
+        let mut worker = Worker::connect(broker.clone(), runtime.clone(), id).await;
+        let marker = directory.path().join("must-not-run-on-coordinator");
+        let pending = {
+            let broker = broker.clone();
+            let marker = marker.clone();
+            tokio::spawn(async move {
+                broker
+                    .execute(effect(
+                        id,
+                        HostCommand::WriteFile {
+                            path: marker.to_str().unwrap().into(),
+                            content: "fallback".into(),
+                        },
+                    ))
+                    .await
+            })
+        };
+        // This first request is answered immediately, exercising the actual
+        // connected worker before withholding an Exec reply.
+        let RuntimeEventKind::HostCall { call_id, .. } = event(&mut worker.reader).await else {
+            panic!("Expected file effect")
+        };
+        write_frame(
+            &mut worker.writer,
+            &RuntimeCommand::HostReply {
+                call_id,
+                result: HostResult::Written,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(pending.await.unwrap(), HostResult::Written));
+        let pending = {
+            let broker = broker.clone();
+            let marker = marker.clone();
+            tokio::spawn(async move {
+                broker
+                    .execute(effect(
+                        id,
+                        HostCommand::Exec {
+                            program: "/bin/sh".into(),
+                            args: vec![
+                                "-c".into(),
+                                "printf fallback > \"$1\"".into(),
+                                "fixture".into(),
+                                marker.to_str().unwrap().into(),
+                            ],
+                            cwd: "/".into(),
+                            timeout_seconds: 1,
+                        },
+                    ))
+                    .await
+            })
+        };
+        let RuntimeEventKind::HostCall { call_id, .. } = event(&mut worker.reader).await else {
+            panic!("Expected Exec effect")
+        };
+        let result=timeout(Duration::from_secs(13),pending).await.expect("The requested one-second deadline plus transport grace must replace the old fixed305-second wait").unwrap();
+        assert!(matches!(result,HostResult::Failed {message} if message.contains("not replayed")));
+        assert!(
+            !marker.exists(),
+            "The coordinator must not run the timed-out effect"
+        );
+        assert!(
+            timeout(Duration::from_millis(20), worker.reader.next_frame())
+                .await
+                .is_err(),
+            "An unanswered effect must never be replayed"
+        );
+        write_frame(
+            &mut worker.writer,
+            &RuntimeCommand::HostReply {
+                call_id,
+                result: HostResult::Written,
+            },
+        )
+        .await
+        .unwrap();
+        worker.close().await;
         close(runtime).await;
     }
 

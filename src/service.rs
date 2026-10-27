@@ -446,7 +446,7 @@ mod tests {
           writeFileSync(join(process.argv[2],'callback.json'),JSON.stringify({id,target:command.target}));
         } else if(command.type==='run_task'||command.type==='logout') {
           emit(id,{type:'host_call',call_id:'11111111-1111-4111-8111-111111111111',command:{
-            type:'exec',program:'/bin/echo',args:['synthetic'],cwd:'/',timeout_seconds:1}});
+            type:'exec',program:'node',args:['--eval','process.stdout.write("synthetic\\n")'],cwd:'/',timeout_seconds:60}});
         } else if(command.type==='host_reply') {
           writeFileSync(join(process.argv[2],'reply.json'),JSON.stringify(command.result)); finish(id);
         } else if(command.type==='list_tasks') { process.exit(0); }
@@ -623,7 +623,8 @@ mod tests {
             serde_json::from_slice(&fs::read(service.wait_for("reply.json").await).unwrap())
                 .unwrap();
         assert!(
-            matches!(result,HostResult::Process{exit_code:0,stdout,..} if stdout=="synthetic\n")
+            matches!(&result,HostResult::Process{exit_code:0,stdout,..} if stdout=="synthetic\n"),
+            "{result:?}"
         );
         drop(reader);
         service.stop().await;

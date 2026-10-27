@@ -118,6 +118,9 @@ needs its account and command prefix. The source command must be available in
 the service's PATH. `agent sources` reports coverage and checkpoints; an access
 failure is not an empty inbox.
 
+Messages also uses macOS Full Disk Access permissions for the process running
+the CLI. `messages doctor` checks local database access and schema support.
+
 `agent usage` reads quota from the installed, signed-in Codex app-server. Its
 reported account should match the intended plan. This integration does not
 expose a separate quota for agent, and requires Codex independently.

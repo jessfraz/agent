@@ -15,6 +15,8 @@ use crate::{
     rex::{BlockId, HostId, RexClient, RexError, SessionId, WindowId, WorkerBinding, WorkerResume},
 };
 
+pub const DEFAULT_TIMEOUT_SECONDS: u16 = 15 * 60;
+
 pub async fn execute(command: HostCommand) -> HostResult {
     match execute_inner(command).await {
         Ok(result) => result,
@@ -67,10 +69,7 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             cwd,
             timeout_seconds,
         } => {
-            ensure!(
-                (1..=300).contains(&timeout_seconds),
-                "Command timeout must be between 1 and 300 seconds"
-            );
+            ensure!(timeout_seconds > 0, "Command timeout must be positive");
             ensure!(
                 !program.is_empty() && Path::new(&cwd).is_absolute(),
                 "Command needs a program and absolute working directory"
@@ -80,6 +79,7 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
                 &args,
                 Path::new(&cwd),
                 Duration::from_secs(timeout_seconds.into()),
+                256 * 1024,
             )
             .await
         }
@@ -415,11 +415,12 @@ async fn exited_unreaped(pid: libc::pid_t) -> Result<()> {
     }
 }
 
-async fn run_process(
+pub(crate) async fn run_process(
     program: &str,
     args: &[String],
     cwd: &Path,
     deadline: Duration,
+    output_limit: usize,
 ) -> Result<HostResult> {
     let mut child = Command::new(program)
         .args(args)
@@ -445,8 +446,8 @@ async fn run_process(
         .stderr
         .take()
         .context("Command error pipe is unavailable")?;
-    let mut output = tokio::spawn(captured(stdout, 256 * 1024));
-    let mut errors = tokio::spawn(captured(stderr, 256 * 1024));
+    let mut output = tokio::spawn(captured(stdout, output_limit));
+    let mut errors = tokio::spawn(captured(stderr, output_limit));
     let finished = timeout(deadline, exited_unreaped(group.0)).await;
     group.terminate();
     let status = timeout(Duration::from_secs(3), child.wait())
@@ -517,6 +518,33 @@ mod tests {
         assert_eq!(stdout, "$(literal)");
         assert_eq!(stderr, "failure");
         assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn ordinary_commands_accept_fifteen_minutes_and_the_positive_wire_domain() {
+        for timeout_seconds in [900, u16::MAX] {
+            let result = execute(HostCommand::Exec {
+                program: "node".into(),
+                args: vec!["--eval".into(), "process.stdout.write('ready\\n')".into()],
+                cwd: "/".into(),
+                timeout_seconds,
+            })
+            .await;
+            assert!(
+                matches!(result,HostResult::Process {exit_code:0,stdout,..} if stdout=="ready\n"),
+                "A quick command should accept timeout {timeout_seconds}"
+            );
+        }
+        assert!(matches!(
+            execute(HostCommand::Exec {
+                program: "node".into(),
+                args: vec![],
+                cwd: "/".into(),
+                timeout_seconds: 0
+            })
+            .await,
+            HostResult::Failed { .. }
+        ));
     }
 
     #[tokio::test]

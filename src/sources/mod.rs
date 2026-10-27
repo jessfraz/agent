@@ -9,7 +9,8 @@ pub mod slack;
 
 use std::{
     fmt::Debug,
-    time::{SystemTime, UNIX_EPOCH},
+    path::Path,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -19,7 +20,7 @@ use ts_rs::TS;
 
 use crate::{
     host,
-    protocol::{HostCommand, HostResult, SourceRef},
+    protocol::{HostResult, SourceRef},
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
@@ -264,13 +265,14 @@ pub(crate) async fn read_command(argv: &[String]) -> Result<ReadOutput> {
         .split_first()
         .context("Source helper command is empty")?;
     ensure!(!program.is_empty(), "Source helper program is empty");
-    match host::execute(HostCommand::Exec {
-        program: program.clone(),
-        args: args.to_vec(),
-        cwd: "/".into(),
-        timeout_seconds: 30,
-    })
-    .await
+    match host::run_process(
+        program,
+        args,
+        Path::new("/"),
+        Duration::from_secs(host::DEFAULT_TIMEOUT_SECONDS.into()),
+        crate::runtime::MAX_FRAME_BYTES / 2,
+    )
+    .await?
     {
         HostResult::Process {
             exit_code,
@@ -297,6 +299,44 @@ fn now_seconds() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use crate::sources::{SourceConfig, configured};
+
+    #[tokio::test]
+    async fn source_commands_capture_native_pages_beyond_the_model_output_budget_and_report_their_own_limit()
+     {
+        use crate::{
+            host,
+            protocol::{HostCommand, HostResult},
+            runtime::MAX_FRAME_BYTES,
+            sources::read_command,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native-output");
+        std::fs::write(&path, vec![b'x'; 512 * 1024]).unwrap();
+        let command = vec![
+            "node".into(),
+            "--eval".into(),
+            "process.stdout.write(require('node:fs').readFileSync(process.argv[1]))".into(),
+            path.to_str().unwrap().into(),
+        ];
+        let source = read_command(&command).await.unwrap();
+        assert_eq!(source.exit_code, 0);
+        assert!(!source.truncated);
+        assert_eq!(source.stdout.len(), 512 * 1024);
+        let interactive = host::execute(HostCommand::Exec {
+            program: command[0].clone(),
+            args: command[1..].to_vec(),
+            cwd: "/".into(),
+            timeout_seconds: 900,
+        })
+        .await;
+        assert!(
+            matches!(interactive,HostResult::Process {exit_code:0,stdout,truncated:true,..} if stdout.len()==256*1024)
+        );
+        std::fs::write(&path, vec![b'x'; MAX_FRAME_BYTES / 2 + 1]).unwrap();
+        let source = read_command(&command).await.unwrap();
+        assert!(source.truncated);
+        assert_eq!(source.stdout.len(), MAX_FRAME_BYTES / 2);
+    }
 
     #[tokio::test]
     async fn disabled_sources_skip_discovery_and_account_setup() {
