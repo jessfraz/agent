@@ -777,4 +777,266 @@ mod tests {
             ]
         );
     }
+
+    #[derive(Deserialize)]
+    struct NativeWindows {
+        windows: Vec<NamedWindow>,
+    }
+    #[derive(Deserialize)]
+    struct NamedWindow {
+        window_id: WindowId,
+        label: String,
+    }
+    #[derive(Deserialize)]
+    struct NativeProcess {
+        child: Option<TerminalChild>,
+        last_exit: Option<NativeExit>,
+    }
+    #[derive(Deserialize)]
+    struct NativeExit {
+        exit_code: i32,
+    }
+
+    async fn assert_native_output(
+        client: &RexClient,
+        binding: &WorkerBinding,
+        marker: &str,
+    ) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let process: NativeProcess = decode(
+                &client
+                    .api(
+                        "com.superlogical.terminal.process",
+                        &ProcessRequest {
+                            session_id: binding.session_id.clone(),
+                            block_id: binding.block_id.clone(),
+                            args: Empty {},
+                        },
+                    )
+                    .await
+                    .map_err(read_failure)?,
+            )?;
+            if process.child.is_none()
+                && let Some(exit) = process.last_exit
+            {
+                anyhow::ensure!(
+                    exit.exit_code == 0,
+                    "Native marker process did not exit successfully"
+                );
+                break;
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "Native marker process did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let output = client
+            .run(vec![
+                "capture".to_owned(),
+                "-s".to_owned(),
+                binding.session_id.to_string(),
+                "-b".to_owned(),
+                binding.block_id.to_string(),
+                "--trim".to_owned(),
+                "--unwrap".to_owned(),
+            ])
+            .await
+            .map_err(read_failure)?;
+        anyhow::ensure!(
+            String::from_utf8(output)?.contains(marker),
+            "Native terminal did not show the marker"
+        );
+        Ok(())
+    }
+
+    async fn close_test_session(client: &RexClient, session: &SessionId) -> anyhow::Result<()> {
+        // One exact native kill, followed by independent state readback even if its reply was lost.
+        let killed = client
+            .run(vec!["kill".to_owned(), session.to_string()])
+            .await;
+        let absent = !client
+            .list_sessions()
+            .await?
+            .iter()
+            .any(|item| item.session_id == *session);
+        anyhow::ensure!(absent, "The test-created Rex session remains after cleanup");
+        if killed.is_err() {
+            eprintln!(
+                "Native kill reply was unavailable; independent listing verified test-session removal."
+            );
+        }
+        Ok(())
+    }
+
+    /// Opt-in only: creates and removes one synthetic session on the selected running Rex server.
+    /// Set AGENT_TEST_REX_SERVER for a remote server; omit it for the local server.
+    #[tokio::test]
+    #[ignore = "requires a running Rex server; creates and removes one synthetic session"]
+    async fn live_native_rex_worker_contract() -> anyhow::Result<()> {
+        let client = RexClient::new(std::env::var("AGENT_TEST_REX_SERVER").ok());
+        let identity = client.whoami().await?;
+        let before = client.list_sessions().await?;
+        let title = format!("agent-rex-contract-{}", Uuid::new_v4());
+        let marker = "agent-rex-contract-marker";
+        let args = vec![format!("{marker}\n")];
+        let binding = match client
+            .create_session(&title, "/usr/bin/printf", &args, Path::new("/tmp"))
+            .await
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                // Reconcile this unique test label without issuing a second create.
+                let candidates: Vec<_> = client
+                    .list_sessions()
+                    .await?
+                    .into_iter()
+                    .filter(|item| {
+                        item.label == title
+                            && !before.iter().any(|old| old.session_id == item.session_id)
+                    })
+                    .collect();
+                anyhow::ensure!(
+                    candidates.len() <= 1,
+                    "Could not identify the single test allocation for cleanup"
+                );
+                if let Some(created) = candidates.first() {
+                    close_test_session(&client, &created.session_id).await?;
+                }
+                return Err(error.into());
+            }
+        };
+        let result = tokio::time::timeout(Duration::from_secs(120), async {
+            let view = client.inspect_session(&binding.session_id).await?;
+            view.verify_binding(&binding, &identity.host_id)?;
+            anyhow::ensure!(
+                view.label.as_deref() == Some(&title),
+                "Native task session label changed"
+            );
+            assert_native_output(&client, &binding, marker).await?;
+
+            let review = client
+                .create_worker_window(
+                    &binding.session_id,
+                    "Review",
+                    "/usr/bin/printf",
+                    &args,
+                    Path::new("/tmp"),
+                )
+                .await?;
+            anyhow::ensure!(
+                review.session_id == binding.session_id
+                    && review.window_id != binding.window_id
+                    && review.block_id != binding.block_id,
+                "The task agent did not get a separate terminal in the same session"
+            );
+            let view = client.inspect_session(&binding.session_id).await?;
+            view.verify_binding(&binding, &identity.host_id)?;
+            view.verify_binding(&review, &identity.host_id)?;
+            anyhow::ensure!(
+                view.windows.len() == 2,
+                "Expected one parent and one agent window"
+            );
+            let labels: NativeWindows = decode(
+                &client
+                    .run(vec![
+                        "window".to_owned(),
+                        "ls".to_owned(),
+                        "-s".to_owned(),
+                        binding.session_id.to_string(),
+                        "--json".to_owned(),
+                    ])
+                    .await
+                    .map_err(read_failure)?,
+            )?;
+            anyhow::ensure!(
+                labels
+                    .windows
+                    .iter()
+                    .any(|window| window.window_id == binding.window_id && window.label == "Worker")
+                    && labels
+                        .windows
+                        .iter()
+                        .any(|window| window.window_id == review.window_id
+                            && window.label == "Review"),
+                "Native window labels do not identify their work"
+            );
+            anyhow::ensure!(
+                view.windows
+                    .iter()
+                    .flat_map(|window| &window.layers)
+                    .flat_map(|layer| &layer.blocks)
+                    .any(|block| block.block_id.as_ref() == Some(&review.block_id)
+                        && block.label.as_deref() == Some("Review")),
+                "Native agent terminal label is missing"
+            );
+            assert_native_output(&client, &review, marker).await?;
+
+            let resumed = match client
+                .resume_worker(&binding, "/usr/bin/printf", &args, Path::new("/tmp"))
+                .await?
+            {
+                WorkerResume::Started(resumed) => resumed,
+                WorkerResume::Running => {
+                    anyhow::bail!("An exited parent was incorrectly reported as running")
+                }
+            };
+            anyhow::ensure!(
+                resumed.session_id == binding.session_id && resumed.block_id != binding.block_id,
+                "Parent resume allocated a different task session"
+            );
+            let view = client.inspect_session(&binding.session_id).await?;
+            view.verify_binding(&resumed, &identity.host_id)?;
+            view.verify_binding(&review, &identity.host_id)?;
+            anyhow::ensure!(
+                view.windows.len() == 2
+                    && !view
+                        .windows
+                        .iter()
+                        .flat_map(|window| &window.layers)
+                        .flat_map(|layer| &layer.blocks)
+                        .any(|block| block.block_id.as_ref() == Some(&binding.block_id)),
+                "Parent resume left its exited owned terminal behind"
+            );
+            assert_native_output(&client, &resumed, marker).await?;
+
+            client
+                .api(
+                    "session.move",
+                    &MoveSession {
+                        session_id: binding.session_id.clone(),
+                        before_session_id: None,
+                    },
+                )
+                .await
+                .map_err(read_failure)?;
+            client.promote_session(&binding.session_id).await?;
+            let sessions = client.list_sessions().await?;
+            anyhow::ensure!(
+                sessions
+                    .first()
+                    .is_some_and(|session| session.session_id == binding.session_id),
+                "Promoted task is not first in the native sidebar"
+            );
+            anyhow::ensure!(
+                sessions
+                    .iter()
+                    .filter(|session| session.label == title)
+                    .count()
+                    == 1,
+                "Native task session was duplicated"
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        let cleanup = close_test_session(&client, &binding.session_id).await;
+        cleanup?;
+        result
+            .map_err(|_| anyhow::anyhow!("Native Rex contract exceeded its two-minute limit"))??;
+        eprintln!(
+            "Native Rex contract verified: three successful marker processes, two named windows in one session, parent reuse, sidebar promotion, and independent cleanup readback."
+        );
+        Ok(())
+    }
 }

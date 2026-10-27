@@ -173,12 +173,75 @@ fn parse(bytes: &[u8]) -> Option<Response> {
 #[cfg(test)]
 mod tests {
     use crate::callback::{CallbackRelay, parse};
-    use std::time::Duration;
+    use std::{io::ErrorKind, net::SocketAddr, time::Duration};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
         time::timeout,
     };
+
+    fn run_in_own_process() -> bool {
+        let current = std::thread::current();
+        let name = current
+            .name()
+            .expect("The test harness names its test thread");
+        if let Ok(expected) = std::env::var("AGENT_CALLBACK_TEST_PROCESS") {
+            assert_eq!(
+                name, expected,
+                "The isolated process must run its exact named test"
+            );
+            return false;
+        }
+        // Other tests fork in pre_exec. CLOEXEC cannot close their inherited
+        // copy until exec, so give socket lifetime assertions one process owner.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env("AGENT_CALLBACK_TEST_PROCESS", name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    async fn response_and_close(stream: &mut TcpStream) -> String {
+        let mut response = String::new();
+        timeout(Duration::from_secs(1), stream.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        stream.shutdown().await.unwrap();
+        response
+    }
+
+    async fn assert_listener_closed(address: SocketAddr) {
+        let error = timeout(Duration::from_secs(1), TcpStream::connect(address))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ConnectionRefused);
+    }
+
+    async fn complete_login(relay: &mut CallbackRelay, address: SocketAddr, code: &str) {
+        let mut browser = TcpStream::connect(address).await.unwrap();
+        browser.write_all(format!("GET /auth/callback?code={code}&state=expected HTTP/1.1\r\nHost:127.0.0.1:1455\r\n\r\n").as_bytes())
+            .await.unwrap();
+        let target = timeout(Duration::from_secs(1), relay.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            target,
+            format!("http://127.0.0.1:1455/auth/callback?code={code}&state=expected")
+        );
+        let response = response_and_close(&mut browser).await;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with("Authorization response received. Return to agent."));
+    }
 
     #[test]
     fn parser_rejects_foreign_hosts_methods_bodies_and_paths() {
@@ -195,6 +258,9 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_relay_survives_invalid_requests_and_cancelled_reads_then_closes() {
+        if run_in_own_process() {
+            return;
+        }
         let mut relay = CallbackRelay::bind_at("127.0.0.1:0".parse().unwrap()).unwrap();
         let address = relay.listener.local_addr().unwrap();
         let mut bad = TcpStream::connect(address).await.unwrap();
@@ -211,8 +277,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let mut response = String::new();
-        bad.read_to_string(&mut response).await.unwrap();
+        let response = response_and_close(&mut bad).await;
         assert!(response.starts_with("HTTP/1.1 400"));
         valid
             .write_all(b"Host:127.0.0.1:1455\r\n\r\n")
@@ -225,12 +290,37 @@ mod tests {
                 .unwrap(),
             "http://127.0.0.1:1455/auth/callback?code=synthetic&state=expected"
         );
+        let response = response_and_close(&mut valid).await;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with("Authorization response received. Return to agent."));
         drop(bad);
         drop(valid);
         drop(relay);
-        // The reactor can retain deregistration work until it is polled.
-        // Reuse our exact ephemeral port, independent of parallel test runs.
-        tokio::time::sleep(Duration::from_millis(1)).await;
-        CallbackRelay::bind_at(address).unwrap();
+        assert_listener_closed(address).await;
+    }
+
+    #[tokio::test]
+    async fn consecutive_logins_reuse_the_address_but_never_share_a_live_listener() {
+        if run_in_own_process() {
+            return;
+        }
+        let mut relay = CallbackRelay::bind_at("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = relay.listener.local_addr().unwrap();
+        let competing = match CallbackRelay::bind_at(address) {
+            Ok(_) => panic!("Concurrent callback listeners must never share the port"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            competing.downcast_ref::<std::io::Error>().unwrap().kind(),
+            ErrorKind::AddrInUse
+        );
+        complete_login(&mut relay, address, "first").await;
+        drop(relay);
+        assert_listener_closed(address).await;
+
+        let mut next = CallbackRelay::bind_at(address).unwrap();
+        complete_login(&mut next, address, "second").await;
+        drop(next);
+        assert_listener_closed(address).await;
     }
 }
