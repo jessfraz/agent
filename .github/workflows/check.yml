@@ -2,20 +2,48 @@ name: check
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
+    name: Check (${{ matrix.os }})
+    timeout-minutes: 25
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: DeterminateSystems/nix-installer-action@v23
-      - run: nix develop --command make runtime check
-      - run: git diff --exit-code
-      - run: nix build
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.npm
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'runtime/package-lock.json') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'runtime/package-lock.json') }}-
+      - name: Validate workflows
+        run: nix develop --command actionlint
+      - name: Check Rust and runtime
+        run: nix develop --command make runtime check
+      - name: Check generated bindings
+        run: git diff --exit-code
+      - name: Evaluate flake
+        run: nix flake check --no-build --all-systems
+      - name: Build packaged CLI
+        run: nix build
+      - name: Smoke test package
+        run: ./result/bin/agent --version

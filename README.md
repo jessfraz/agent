@@ -2,54 +2,78 @@
 
 An agent, regrettably.
 
-A Rust CLI around [Pi Durable](https://github.com/earendil-works/pi), using a
-ChatGPT plan and existing provider CLIs. Personal configuration and runtime
-data stay outside the repository.
-
-The first slice provides app-owned ChatGPT sign-in, persistent conversation
-storage, quota reads through an installed Codex account, and mail reads across
-configured Switchboard Google accounts. Rex task routing is being added next.
+A Rust CLI around [Pi Durable](https://github.com/earendil-works/pi), with
+ChatGPT plan sign-in, persistent conversations and workers in
+[Rex](https://www.superlogical.com/rex). One main conversation finds existing
+work before starting another task.
 
 ```text
-  agent CLI -> Rust owner -> typed protocol -> Pi Durable -> local SQLite
-                   |                              |
-            existing provider CLIs        ChatGPT plan connection
+  phone CLI / laptop CLI / desktop CLI
+                    |
+          selected coordinator
+          Pi Durable + SQLite
+            /             \
+     desktop Rex        laptop Rex
+     task session       task session
+     + Implementation   + Implementation
+     + Review           + Checks
+     + Checks
+
+  mail / Slack -> durable inbox -> related task -> brief update
 ```
 
-Rust owns the wire types and generates TypeScript bindings and JSON schemas.
-Pi owns conversation storage and model turns. A small OIDC adapter validates
-identity tokens, retains the issued client registration, and refreshes the
-app's own credentials. It never copies Codex credentials or falls back to an
-API key. `agent usage` reads account quota through Codex's supported app-server;
-it labels that source and reports the app-specific allowance as unavailable.
+Each task gets one named Rex session on the machine doing the work. Its
+subagents get named terminals inside that session. The main chat receives
+results, so switching between task chats is optional. Phone access uses the
+existing Rex phone CLI.
 
-Run locally:
+```sh
+nix profile add github:jessfraz/agent
+agent login
+agent chat
+agent usage
+agent tasks list
+agent sources
+agent mail accounts
+```
+
+Install the same package on both machines. Put private configuration in
+`~/.config/agent/config.json`, using [this example](examples/config.json) as a
+starting point. On the coordinator, run `agent serve --tailnet-port 43187`.
+Other machines set `coordinator` to its `tailscale://IP:43187` address. Both
+ends require Tailscale under the same user; the listener binds only to its
+native Tailscale interface. Existing SSH hosts are also supported.
+
+Rex, Tailscale and provider CLIs remain separately installed. Google accounts
+come from Switchboard; selecting the Google source with `namespaces: null`
+discovers all configured Google namespaces. Slack uses a configured read-only
+CLI command. Failed reads remain visible as coverage gaps. Only the selected
+coordinator polls sources and owns conversation state.
+
+The CLI reads `$CODEX_HOME/AGENTS.md` or `~/.codex/AGENTS.md`, then scoped
+project instructions, before each turn. Credentials, configuration and
+conversation data stay outside this repository. `agent usage` reads the
+installed Codex account's quota; it cannot report a separate allowance for
+this app.
+
+Owned worktrees have a durable inventory: `agent resources list` shows them;
+`agent resources collect` uses the installed guarded `git cleanup` workflow.
+Collection requires merged, clean, inactive work and preserves held or partial
+results for inspection. An unavailable cleanup helper leaves work held.
+The coordinator checks every five minutes; other hosts run `agent maintain`
+against that coordinator to collect their local resources.
+
+The [architecture](docs/architecture.md) covers ownership, source intake and
+later recovery, import, speech input and reviewed learning. The
+[nix-darwin module](nix/module.nix) runs the coordinator as a user service.
+
+For development:
 
 ```sh
 nix develop
-make build
-target/debug/agent login
-target/debug/agent chat
-target/debug/agent usage
-target/debug/agent mail accounts
-target/debug/agent mail search 'newer_than:1d'
+make runtime check
+nix build
 ```
 
-`nix run` builds the packaged CLI and Pi runtime. Install the same package on
-each device. Google access uses existing Switchboard configuration and sessions;
-account identifiers and provider credentials do not belong in this repository.
-Mail cursors are account-specific, and failed reads retain their coverage gaps.
-
-The CLI loads `$CODEX_HOME/AGENTS.md` or `~/.codex/AGENTS.md`, plus scoped project
-instructions, before each turn. It reads those private files in place. State
-lives in the OS application-data directory, or an explicit `--state-dir`, with
-private permissions and a writer lock inherited by the Pi child.
-
-The MVP will add named Rex task workers and durable mail follow-through, with
-existing task lookup before creation. One selected coordinator owns the store;
-cross-device replication, takeover, history import and reviewed learning come
-later. Do not run simultaneous coordinators over a copied SQLite database.
-See the [remaining MVP design](docs/architecture.md).
-
-Run `make runtime check` inside the Nix shell. Tests use local issuers and
-synthetic accounts; CI never needs personal credentials.
+Rust generates the runtime's TypeScript bindings and JSON schemas. CI runs
+behavior tests and package builds on Linux and macOS without personal accounts.

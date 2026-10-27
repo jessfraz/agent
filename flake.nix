@@ -7,6 +7,7 @@
     systems = ["aarch64-darwin" "x86_64-linux" "aarch64-linux"];
     eachSystem = nixpkgs.lib.genAttrs systems;
   in {
+    darwinModules.default = import ./nix/module.nix {inherit self;};
     packages = eachSystem (system: let
       pkgs = import nixpkgs {inherit system;};
       runtime = pkgs.buildNpmPackage {
@@ -23,10 +24,16 @@
         npmDeps = pkgs.importNpmLock {npmRoot = ./runtime;};
         npmConfigHook = pkgs.importNpmLock.npmConfigHook;
         npmFlags = ["--ignore-scripts"];
+        postBuild = ''
+          npm prune --omit=dev --ignore-scripts --offline
+        '';
         installPhase = ''
-          mkdir -p "$out/lib/agent-runtime/src"
-          cp -r dist node_modules package.json "$out/lib/agent-runtime/"
-          cp -r src/generated "$out/lib/agent-runtime/src/"
+          runHook preInstall
+          mkdir -p "$out/lib/agent-runtime/dist" "$out/lib/agent-runtime/src/generated"
+          cp -r dist/src "$out/lib/agent-runtime/dist/"
+          cp -r node_modules package.json "$out/lib/agent-runtime/"
+          cp src/generated/*.schema.json "$out/lib/agent-runtime/src/generated/"
+          runHook postInstall
         '';
       };
       cli = pkgs.rustPlatform.buildRustPackage {
@@ -39,11 +46,11 @@
         cargoLock.lockFile = ./Cargo.lock;
         cargoBuildFlags = ["--bin" "agent"];
         nativeBuildInputs = [pkgs.makeWrapper];
-        nativeCheckInputs = [pkgs.nodejs_22];
+        nativeCheckInputs = [pkgs.nodejs_22 pkgs.git pkgs.lsof];
         postInstall = ''
           wrapProgram "$out/bin/agent" \
             --set AGENT_RUNTIME_PATH "${runtime}/lib/agent-runtime/dist/src/bridge.js" \
-            --prefix PATH : "${pkgs.nodejs_22}/bin"
+            --prefix PATH : "${pkgs.lib.makeBinPath [pkgs.nodejs_22 pkgs.git pkgs.lsof pkgs.openssh]}"
         '';
       };
     in {
@@ -54,13 +61,14 @@
       default = {
         type = "app";
         program = "${self.packages.${system}.default}/bin/agent";
+        meta.description = "An agent CLI with durable conversations and Rex workers";
       };
     });
     devShells = eachSystem (system: let
       pkgs = import nixpkgs {inherit system;};
     in {
       default = pkgs.mkShell {
-        packages = with pkgs; [cargo rustc rustfmt clippy nodejs_22 pkg-config];
+        packages = with pkgs; [cargo rustc rustfmt clippy nodejs_22 pkg-config git lsof actionlint];
       };
     });
   };

@@ -1,0 +1,21 @@
+{
+  "coordinator": null,
+  "hosts": [
+    {
+      "name": "desktop",
+      "rex_server": "https://desktop-rex.example.ts.net",
+      "coordinator": null,
+      "cwd": "/workspace",
+      "agent_program": "agent"
+    },
+    {
+      "name": "laptop",
+      "rex_server": "https://laptop-rex.example.ts.net",
+      "coordinator": "tailscale://100.64.0.10:43187",
+      "cwd": "/workspace",
+      "agent_program": "agent"
+    }
+  ],
+  "sources": [{ "provider": "google", "namespaces": null }],
+  "poll_interval_seconds": 60
+}
