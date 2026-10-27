@@ -225,3 +225,7 @@ Rex server restart behavior needs investigation: what persists, how bindings
 become stale, and how to reattach without duplicate workers. Conversation
 recovery and terminal recovery are separate. Automatic restart recovery is not
 part of the MVP.
+
+macOS packaging also needs a stable executable identity for Full Disk Access
+across Nix upgrades. A launchd coordinator has its own permission context;
+Rex Server's grant covers its terminals, not the separate coordinator service.

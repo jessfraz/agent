@@ -534,8 +534,18 @@ impl Source for MessagesSource {
             self.normalize(output, window)
         }
         .await;
-        Ok(result.unwrap_or_else(|_| SourceBatch::unavailable(self.key(),
-            "Messages local history is unavailable; check its configured CLI and local read access")))
+        Ok(result.unwrap_or_else(|_| {
+            let process = std::env::current_exe().map_or_else(
+                |_| "the process running agent".to_owned(),
+                |path| path.display().to_string(),
+            );
+            SourceBatch::unavailable(
+                self.key(),
+                format!(
+                    "Messages local history is unavailable; check CLI setup and macOS Full Disk Access for {process}"
+                ),
+            )
+        }))
     }
 }
 

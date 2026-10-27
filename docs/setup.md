@@ -120,6 +120,10 @@ failure is not an empty inbox.
 
 Messages also uses macOS Full Disk Access permissions for the process running
 the CLI. `messages doctor` checks local database access and schema support.
+A standalone launchd coordinator runs outside Rex Server's permission context.
+A successful check in a Rex terminal does not prove that the service can read
+Messages. Authorize the service's process separately before enabling this source.
+Nix upgrades change executable paths, so access may need to be granted again.
 
 `agent usage` reads quota from the installed, signed-in Codex app-server. Its
 reported account should match the intended plan. This integration does not

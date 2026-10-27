@@ -24,7 +24,14 @@ struct Window {
     account: String,
     since_day: u64,
     until_day: u64,
-    page: u32,
+    // Legacy page checkpoints replay their frozen window once. Native message
+    // identity deduplicates that replay; page offsets cannot become cursors.
+    #[serde(default = "first_cursor")]
+    cursor: String,
+}
+
+fn first_cursor() -> String {
+    "*".into()
 }
 
 #[derive(Deserialize)]
@@ -39,8 +46,7 @@ struct Messages {
 }
 #[derive(Deserialize)]
 struct Paging {
-    page: u32,
-    pages: u32,
+    next_cursor: Option<String>,
 }
 #[derive(Deserialize)]
 struct Message {
@@ -86,7 +92,7 @@ impl SlackSource {
                 account: self.account.clone(),
                 since_day: day.saturating_sub(3),
                 until_day: 0,
-                page: 1,
+                cursor: first_cursor(),
             },
         };
         ensure!(
@@ -97,7 +103,9 @@ impl SlackSource {
             window.until_day = day.saturating_add(2);
         }
         ensure!(
-            window.since_day < window.until_day && (1..=100).contains(&window.page),
+            window.since_day < window.until_day
+                && !window.cursor.is_empty()
+                && !window.cursor.chars().any(char::is_control),
             "Slack checkpoint window is invalid"
         );
         Ok(window)
@@ -164,21 +172,24 @@ impl SlackSource {
                 message: "Slack search coverage is incomplete; checkpoint retained".into(),
             },
         };
-        if !response.ok || output.exit_code != 0 || invalid || messages.paging.page != window.page {
+        if !response.ok || output.exit_code != 0 || invalid {
             return batch;
         }
-        if messages.paging.pages > window.page {
-            if window.page == 100 {
-                return batch;
-            }
-            window.page += 1;
+        let Some(next) = messages.paging.next_cursor else {
+            return batch;
+        };
+        if next == window.cursor || next == "*" || next.chars().any(char::is_control) {
+            return batch;
+        }
+        if !next.is_empty() {
+            window.cursor = next;
             batch.coverage = SourceCoverage::More;
         } else {
             // Keep overlap relative to the window being completed, not the time
             // its last page arrived, so a slow multi-day scan cannot skip ahead.
             window.since_day = window.until_day.saturating_sub(5);
             window.until_day = 0;
-            window.page = 1;
+            window.cursor = first_cursor();
             batch.coverage = SourceCoverage::Complete;
         }
         if let Ok(value) = serde_json::to_string(&window) {
@@ -210,7 +221,7 @@ impl Source for SlackSource {
             "sort=timestamp".into(),
             "sort_dir=asc".into(),
             "count=25".into(),
-            format!("page={}", window.page),
+            format!("cursor={}", window.cursor),
         ]);
         Ok(match read_command(&args).await {
             Ok(output) => self.normalize(output, window),
@@ -243,12 +254,28 @@ fn utc_date(day: u64) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use serde::{Deserialize, Serialize};
+
     use crate::sources::{
-        ReadOutput, SourceCoverage,
+        ReadOutput, Source, SourceCheckpoint, SourceCoverage,
         slack::{SlackSource, utc_date},
     };
 
-    const RESPONSE: &str = r#"{"ok":true,"messages":{"matches":[{"ts":"1700000000.000001","thread_ts":"1699999999.000002","text":"Review the board","channel":{"id":"CEXAMPLE","name":"engineering"}}],"paging":{"page":1,"pages":2}}}"#;
+    const RESPONSE: &str = r#"{"ok":true,"messages":{"matches":[{"ts":"1700000000.000001","thread_ts":"1699999999.000002","text":"Review the board","channel":{"id":"CEXAMPLE","name":"engineering"}}],"paging":{"count":25,"total":3700,"next_cursor":"native-next"},"pagination":{"total_count":3700,"per_page":25,"next_cursor":"native-next","first":0,"last":0}}}"#;
+    #[derive(Serialize)]
+    struct LegacyCheckpoint {
+        account: String,
+        since_day: u64,
+        until_day: u64,
+        page: u32,
+    }
+    #[derive(Deserialize)]
+    struct CursorCheckpoint {
+        account: String,
+        since_day: u64,
+        until_day: u64,
+        cursor: String,
+    }
     fn source() -> SlackSource {
         SlackSource::new(vec!["slack-read".into()], "workspace-example".into()).unwrap()
     }
@@ -261,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn native_search_preserves_identity_and_frozen_page_window() {
+    fn native_search_preserves_identity_and_frozen_cursor_window() {
         let source = source();
         let batch = source.normalize(
             output(RESPONSE),
@@ -276,7 +303,9 @@ mod tests {
         let next = source
             .window(batch.checkpoint.as_ref(), 1_710_000_000)
             .unwrap();
-        assert_eq!(next.page, 2);
+        let saved: CursorCheckpoint =
+            serde_json::from_str(&batch.checkpoint.as_ref().unwrap().value).unwrap();
+        assert_eq!(saved.cursor, "native-next");
         assert_eq!(next.until_day, 1_700_000_000 / 86_400 + 2);
         assert!(
             SlackSource::new(vec!["slack-read".into()], "other-example".into())
@@ -289,7 +318,7 @@ mod tests {
     #[test]
     fn completion_keeps_overlap_and_failure_does_not_advance() {
         let source = source();
-        let complete = RESPONSE.replace("\"pages\":2", "\"pages\":1");
+        let complete = RESPONSE.replace("native-next", "");
         let batch = source.normalize(
             output(&complete),
             source.window(None, 1_700_000_000).unwrap(),
@@ -306,6 +335,103 @@ mod tests {
         assert_eq!(failed.events.len(), 1);
         assert!(matches!(failed.coverage, SourceCoverage::Partial { .. }));
         assert!(failed.checkpoint.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_page_one_hundred_restarts_its_frozen_window_with_native_cursor_pagination() {
+        let complete = RESPONSE.replace("native-next", "");
+        let script = format!(
+            r#"const args = process.argv.slice(2);
+if (args.some((arg) => arg.startsWith('page='))) process.exit(21);
+if (!args.includes('query=after:2026-10-24 before:2026-10-29')) process.exit(22);
+const cursor = args.find((arg) => arg.startsWith('cursor='))?.slice(7);
+if (cursor === '*') process.stdout.write(JSON.stringify({RESPONSE}));
+else if (cursor === 'native-next') process.stdout.write(JSON.stringify({complete}));
+else process.exit(23);"#
+        );
+        let source = SlackSource::new(
+            vec![
+                "node".into(),
+                "--input-type=module".into(),
+                "-e".into(),
+                script,
+                "fixture".into(),
+            ],
+            "workspace-example".into(),
+        )
+        .unwrap();
+        let legacy = SourceCheckpoint {
+            value: serde_json::to_string(&LegacyCheckpoint {
+                account: "workspace-example".into(),
+                since_day: 20_750,
+                until_day: 20_755,
+                page: 100,
+            })
+            .unwrap(),
+        };
+        let first = source.poll(Some(&legacy)).await.unwrap();
+        assert_eq!(
+            first.coverage,
+            SourceCoverage::More,
+            "A legacy page100 checkpoint must replay its frozen window in cursor mode"
+        );
+        assert_eq!(first.events.len(), 1);
+        let checkpoint = first.checkpoint.unwrap();
+        let saved: CursorCheckpoint = serde_json::from_str(&checkpoint.value).unwrap();
+        assert_eq!(saved.account, "workspace-example");
+        assert_eq!(saved.since_day, 20_750);
+        assert_eq!(saved.until_day, 20_755);
+        assert_eq!(saved.cursor, "native-next");
+        // A new adapter process continues the opaque native checkpoint.
+        let reopened = SlackSource::new(source.command.clone(), source.account.clone()).unwrap();
+        let final_page = reopened.poll(Some(&checkpoint)).await.unwrap();
+        assert_eq!(final_page.coverage, SourceCoverage::Complete);
+        let saved: CursorCheckpoint =
+            serde_json::from_str(&final_page.checkpoint.unwrap().value).unwrap();
+        assert_eq!(saved.since_day, 20_750);
+        assert_eq!(saved.until_day, 0);
+        assert_eq!(saved.cursor, "*");
+    }
+
+    #[test]
+    fn native_cursor_failures_preserve_events_without_advancing_the_checkpoint() {
+        let source = source();
+        for response in [
+            RESPONSE.replace("\"ok\":true", "\"ok\":false"),
+            RESPONSE.replace("\"next_cursor\":\"native-next\"", "\"next_cursor\":null"),
+            RESPONSE.replace("native-next", "*"),
+        ] {
+            let batch = source.normalize(
+                output(&response),
+                source.window(None, 1_700_000_000).unwrap(),
+            );
+            assert_eq!(batch.events.len(), 1);
+            assert!(matches!(batch.coverage, SourceCoverage::Partial { .. }));
+            assert!(batch.checkpoint.is_none());
+        }
+        let first = source.normalize(
+            output(RESPONSE),
+            source.window(None, 1_700_000_000).unwrap(),
+        );
+        let repeated = source.normalize(
+            output(RESPONSE),
+            source
+                .window(first.checkpoint.as_ref(), 1_700_000_000)
+                .unwrap(),
+        );
+        assert_eq!(repeated.events.len(), 1);
+        assert!(matches!(repeated.coverage, SourceCoverage::Partial { .. }));
+        assert!(repeated.checkpoint.is_none());
+        let mut failed = output(RESPONSE);
+        failed.exit_code = 1;
+        let batch = source.normalize(failed, source.window(None, 1_700_000_000).unwrap());
+        assert_eq!(batch.events.len(), 1);
+        assert!(batch.checkpoint.is_none());
+        let mut truncated = output(RESPONSE);
+        truncated.truncated = true;
+        let batch = source.normalize(truncated, source.window(None, 1_700_000_000).unwrap());
+        assert!(matches!(batch.coverage, SourceCoverage::Unavailable { .. }));
+        assert!(batch.checkpoint.is_none());
     }
 
     #[test]
