@@ -1,5 +1,6 @@
 {
   "coordinator": null,
+  "trusted_nodes": [],
   "hosts": [
     {
       "name": "desktop",

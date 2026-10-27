@@ -20,6 +20,8 @@ pub struct ClientConfig {
     pub coordinator: Option<String>,
     pub coordinator_program: Option<String>,
     #[serde(default)]
+    pub trusted_nodes: Vec<String>,
+    #[serde(default)]
     pub hosts: Vec<WorkerHost>,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
@@ -34,6 +36,7 @@ impl Default for ClientConfig {
             launch: None,
             coordinator: None,
             coordinator_program: None,
+            trusted_nodes: Vec::new(),
             hosts: Vec::new(),
             sources: Vec::new(),
             poll_interval_seconds: default_poll_interval(),
@@ -68,6 +71,7 @@ pub fn load(explicit: Option<&Path>) -> Result<ClientConfig> {
             Some(fs::canonicalize(&path).context("Could not resolve agent configuration")?);
     }
     let mut names = HashSet::new();
+    crate::tailnet::PeerPolicy::new(&config.trusted_nodes)?;
     ensure!(
         (10..=3600).contains(&config.poll_interval_seconds),
         "Source polling interval must be between 10 and 3600 seconds"

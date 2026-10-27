@@ -37,7 +37,7 @@ both directions at the wire boundary. Stored resource records describe intent
 and evidence; native handles and ownership must be checked again before effects.
 
 ```text
-  laptop CLI -- same-user Tailscale -- desktop coordinator
+  laptop CLI -- verified Tailscale -- desktop coordinator
        |                                 |
   laptop Rex                         Pi Durable store
                                          |
@@ -48,7 +48,11 @@ One selected coordinator is the only writer and source poller. Clients and
 workers on either machine use that same store. A process lock is inherited by
 the Pi child, so losing its Rust supervisor does not admit a second writer.
 Local clients use a private Unix socket. Remote clients use Tailscale with live
-peer identity checks, or an existing SSH connection.
+peer identity checks, or an existing SSH connection. Empty `trusted_nodes`
+allows only authorized, untagged peers of the same user. An explicit list pins
+exact stable node IDs instead, including tagged servers whose owner is the
+shared tagged-device identity. Check the connected /32 against native WhoIs
+metadata in both cases; names, tags and user-supplied claims do not grant access.
 
 The MVP does not replicate the store or recover onto another Mac. If the
 coordinator is down, the client reports that it is unavailable. Copying a live

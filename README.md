@@ -41,8 +41,11 @@ Install the same package on both machines. Put private configuration in
 `~/.config/agent/config.json`, using [this example](examples/config.json) as a
 starting point. On the coordinator, run `agent serve --tailnet-port 43187`.
 Other machines set `coordinator` to its `tailscale://IP:43187` address. Both
-ends require Tailscale under the same user; the listener binds only to its
-native Tailscale interface. Existing SSH hosts are also supported.
+ends require Tailscale; the listener binds only to its native Tailscale
+interface. By default, only authorized, untagged devices of the same user are
+trusted. Tagged servers use an explicit `trusted_nodes` list of Tailscale stable
+node IDs on both ends. A nonempty list replaces same-user trust. Existing SSH
+hosts are also supported.
 
 Rex, Tailscale and provider CLIs remain separately installed. Google accounts
 come from Switchboard; selecting the Google source with `namespaces: null`

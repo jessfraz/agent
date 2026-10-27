@@ -210,10 +210,11 @@ async fn main() -> Result<()> {
         no_sources,
     } = action
     {
+        let mut profile = config::load(arguments.config.as_deref())?;
+        let policy = agent_cli::tailnet::PeerPolicy::new(&profile.trusted_nodes)?;
         let _sources = if no_sources {
             None
         } else {
-            let mut profile = config::load(arguments.config.as_deref())?;
             profile.launch = Some(worker_launch(&arguments, &profile, &directory, &script)?);
             let cwd = env::current_dir()?;
             let context = intake::ContextBundle {
@@ -231,7 +232,7 @@ async fn main() -> Result<()> {
             })))
         };
         return match tailnet_port {
-            Some(port) => service::serve_tailnet(&script, &directory, port).await,
+            Some(port) => service::serve_tailnet(&script, &directory, port, policy).await,
             None => service::serve(&script, &directory).await,
         };
     }
@@ -573,7 +574,8 @@ async fn connection(
     };
     if let Some(address) = coordinator.strip_prefix("tailscale://") {
         let address = address.parse()?;
-        let stream = agent_cli::tailnet::connect(address).await?;
+        let policy = agent_cli::tailnet::PeerPolicy::new(&config.trusted_nodes)?;
+        let stream = agent_cli::tailnet::connect(address, &policy).await?;
         let (reader, writer) = stream.into_split();
         return Ok(Wire {
             reader: Box::new(reader),

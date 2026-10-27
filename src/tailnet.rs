@@ -1,6 +1,7 @@
-//! Same-user Tailscale transport. Never bind a wildcard or ordinary LAN address.
+//! Tailscale transport with explicit peer trust. Never bind a wildcard or ordinary LAN address.
 
 use std::{
+    collections::BTreeSet,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::NonZeroU64,
@@ -48,7 +49,50 @@ struct Whois {
 struct PeerNode {
     user: NonZeroU64,
     addresses: Vec<String>,
+    #[serde(rename = "StableID")]
+    stable_id: Option<String>,
+    tags: Option<Vec<String>>,
+    #[serde(default)]
     machine_authorized: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerPolicy {
+    trust: PeerTrust,
+}
+
+#[derive(Clone, Debug)]
+enum PeerTrust {
+    SameUser,
+    Explicit(BTreeSet<String>),
+}
+
+impl PeerPolicy {
+    pub fn new(stable_node_ids: &[String]) -> Result<Self> {
+        if stable_node_ids.is_empty() {
+            return Ok(Self {
+                trust: PeerTrust::SameUser,
+            });
+        }
+        let mut nodes = BTreeSet::new();
+        for id in stable_node_ids {
+            ensure!(
+                !id.is_empty()
+                    && id.len() <= 128
+                    && !id
+                        .chars()
+                        .any(|character| character.is_whitespace() || character.is_control()),
+                "Trusted Tailscale stable node IDs require 1 to 128 bytes without whitespace or control characters"
+            );
+            ensure!(
+                nodes.insert(id.clone()),
+                "Trusted Tailscale stable node IDs must be unique"
+            );
+        }
+        Ok(Self {
+            trust: PeerTrust::Explicit(nodes),
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -84,18 +128,41 @@ fn current_address(status: &Status) -> Result<Ipv4Addr> {
         .context("Tailscale has no active self IPv4 address")
 }
 
-fn authorize(status: &Status, peer: SocketAddr, whois: &Whois) -> Result<()> {
+fn authorize(status: &Status, peer: SocketAddr, whois: &Whois, policy: &PeerPolicy) -> Result<()> {
     current_address(status)?;
     let address = tailnet_v4(peer.ip())?;
     ensure!(
-        whois.node.machine_authorized,
-        "Tailscale peer is not authorized"
+        whois.node.user == whois.user_profile.id,
+        "Tailscale peer user does not match its identity profile"
     );
-    ensure!(
-        whois.node.user == status.this_node.owner
-            && whois.user_profile.id == status.this_node.owner,
-        "Tailscale peer belongs to a different user"
-    );
+    match &policy.trust {
+        PeerTrust::SameUser => {
+            ensure!(
+                whois.node.machine_authorized,
+                "Tailscale peer is not authorized"
+            );
+            ensure!(
+                whois.node.tags.as_ref().is_none_or(Vec::is_empty),
+                "Tagged Tailscale peers require an explicit stable node ID"
+            );
+            ensure!(
+                whois.node.user == status.this_node.owner,
+                "Tailscale peer belongs to a different user"
+            );
+        }
+        PeerTrust::Explicit(nodes) => {
+            // A reachable WireGuard peer plus its pinned control-plane identity
+            // is the authority. Tags and their synthetic owner grant no trust.
+            ensure!(
+                whois
+                    .node
+                    .stable_id
+                    .as_ref()
+                    .is_some_and(|id| nodes.contains(id)),
+                "Tailscale peer stable node ID is not explicitly trusted"
+            );
+        }
+    }
     let exact = whois.node.addresses.iter().any(|prefix| {
         let Some((ip, bits)) = prefix.split_once('/') else {
             return false;
@@ -115,14 +182,18 @@ pub async fn self_address(port: u16) -> Result<SocketAddr> {
 }
 
 /// Validate the actual connected IP, never a forwarded header or caller label.
-pub async fn validate_peer(peer: SocketAddr) -> Result<()> {
+pub async fn validate_peer(peer: SocketAddr, policy: &PeerPolicy) -> Result<()> {
     tailnet_v4(peer.ip())?;
     let status: Status = invoke(&["status", "--json"]).await?;
     let whois: Whois = invoke(&["whois", "--json", &peer.to_string()]).await?;
-    authorize(&status, peer, &whois)
+    authorize(&status, peer, &whois, policy)
 }
 
-pub(crate) async fn validate_connection(local: SocketAddr, peer: SocketAddr) -> Result<()> {
+pub(crate) async fn validate_connection(
+    local: SocketAddr,
+    peer: SocketAddr,
+    policy: &PeerPolicy,
+) -> Result<()> {
     tailnet_v4(peer.ip())?;
     let status: Status = invoke(&["status", "--json"]).await?;
     ensure!(
@@ -130,15 +201,15 @@ pub(crate) async fn validate_connection(local: SocketAddr, peer: SocketAddr) -> 
         "Coordinator listener is no longer the active Tailscale address"
     );
     let whois: Whois = invoke(&["whois", "--json", &peer.to_string()]).await?;
-    authorize(&status, peer, &whois)
+    authorize(&status, peer, &whois, policy)
 }
 
-pub async fn connect(peer: SocketAddr) -> Result<TcpStream> {
+pub async fn connect(peer: SocketAddr, policy: &PeerPolicy) -> Result<TcpStream> {
     tailnet_v4(peer.ip())?;
     let status: Status = invoke(&["status", "--json"]).await?;
     let address = current_address(&status)?;
     let whois: Whois = invoke(&["whois", "--json", &peer.to_string()]).await?;
-    authorize(&status, peer, &whois)?;
+    authorize(&status, peer, &whois, policy)?;
     let socket = scoped_socket(address)?;
     socket.bind(SocketAddr::new(address.into(), 0))?;
     timeout(Duration::from_secs(8), socket.connect(peer))
@@ -301,7 +372,8 @@ async fn invoke<T: DeserializeOwned>(args: &[&str]) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use crate::tailnet::{
-        PeerNode, SelfNode, Status, UserProfile, Whois, authorize, current_address, tailnet_v4,
+        PeerNode, PeerPolicy, SelfNode, Status, UserProfile, Whois, authorize, current_address,
+        tailnet_v4,
     };
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -323,6 +395,8 @@ mod tests {
             node: PeerNode {
                 user: NonZeroU64::new(42).unwrap(),
                 addresses: vec!["100.64.10.2/32".into()],
+                stable_id: Some("nSyntheticPeer".into()),
+                tags: None,
                 machine_authorized: true,
             },
             user_profile: UserProfile {
@@ -333,21 +407,22 @@ mod tests {
 
     #[test]
     fn requires_running_self_address_and_same_verified_peer_owner() {
+        let policy = PeerPolicy::new(&[]).unwrap();
         let peer: SocketAddr = "100.64.10.2:12345".parse().unwrap();
         let mut current = status();
         let mut peer_identity = whois();
-        assert!(authorize(&current, peer, &peer_identity).is_ok());
+        assert!(authorize(&current, peer, &peer_identity, &policy).is_ok());
         peer_identity.node.user = NonZeroU64::new(43).unwrap();
-        assert!(authorize(&current, peer, &peer_identity).is_err());
+        assert!(authorize(&current, peer, &peer_identity, &policy).is_err());
         peer_identity = whois();
         peer_identity.user_profile.id = NonZeroU64::new(43).unwrap();
-        assert!(authorize(&current, peer, &peer_identity).is_err());
+        assert!(authorize(&current, peer, &peer_identity, &policy).is_err());
         peer_identity = whois();
         peer_identity.node.addresses = vec!["100.64.10.3/32".into()];
-        assert!(authorize(&current, peer, &peer_identity).is_err());
+        assert!(authorize(&current, peer, &peer_identity, &policy).is_err());
         peer_identity = whois();
         peer_identity.node.machine_authorized = false;
-        assert!(authorize(&current, peer, &peer_identity).is_err());
+        assert!(authorize(&current, peer, &peer_identity, &policy).is_err());
         current.backend_state = "NeedsLogin".into();
         assert!(current_address(&current).is_err());
         current = status();
@@ -387,7 +462,15 @@ mod tests {
             "Node":{"User":42,"Addresses":["100.64.10.2/32"],"MachineAuthorized":true,"Name":"synthetic.example"},
             "UserProfile":{"ID":42,"LoginName":"user@example.com"}
         }"#).unwrap();
-        assert!(authorize(&status, "100.64.10.2:1234".parse().unwrap(), &peer).is_ok());
+        assert!(
+            authorize(
+                &status,
+                "100.64.10.2:1234".parse().unwrap(),
+                &peer,
+                &PeerPolicy::new(&[]).unwrap()
+            )
+            .is_ok()
+        );
         assert!(
             serde_json::from_str::<Status>(
                 r#"{
@@ -397,6 +480,96 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn peer_policy_validates_unique_bounded_opaque_stable_node_ids() {
+        assert!(PeerPolicy::new(&[]).is_ok());
+        assert!(PeerPolicy::new(&["nSyntheticPeer".into()]).is_ok());
+        for ids in [
+            vec![String::new()],
+            vec!["  ".into()],
+            vec!["nSynthetic Peer".into()],
+            vec!["nSyntheticPeer\n".into()],
+            vec!["x".repeat(129)],
+            vec!["nSyntheticPeer".into(), "nSyntheticPeer".into()],
+        ] {
+            assert!(PeerPolicy::new(&ids).is_err());
+        }
+    }
+
+    fn tagged_native_identity() -> Whois {
+        serde_json::from_str(r#"{
+            "Node":{"StableID":"nSyntheticTagged","User":99,"Addresses":["100.64.10.2/32"],"Tags":["tag:fixture-server"]},
+            "UserProfile":{"ID":99,"LoginName":"tagged-devices"}
+        }"#).unwrap()
+    }
+
+    #[test]
+    fn explicitly_pinned_native_tagged_identity_does_not_require_local_owner_or_optional_approval_field()
+     {
+        let peer: SocketAddr = "100.64.10.2:12345".parse().unwrap();
+        let current = status();
+        let mut native = tagged_native_identity();
+        let policy = PeerPolicy::new(&["nSyntheticTagged".into()]).unwrap();
+        assert!(
+            !native.node.machine_authorized,
+            "Native omitempty approval metadata defaults to false"
+        );
+        assert!(authorize(&current, peer, &native, &policy).is_ok());
+        assert!(authorize(&current, peer, &native, &PeerPolicy::new(&[]).unwrap()).is_err());
+        native.node.user = current.this_node.owner;
+        native.user_profile.id = current.this_node.owner;
+        native.node.machine_authorized = true;
+        assert!(
+            authorize(&current, peer, &native, &PeerPolicy::new(&[]).unwrap()).is_err(),
+            "Tags never inherit same-user trust"
+        );
+        native.node.tags = Some(vec![]);
+        assert!(authorize(&current, peer, &native, &PeerPolicy::new(&[]).unwrap()).is_ok());
+        native.node.machine_authorized = false;
+        assert!(authorize(&current, peer, &native, &PeerPolicy::new(&[]).unwrap()).is_err());
+    }
+
+    #[test]
+    fn explicit_trust_rejects_wrong_or_missing_nodes_even_with_matching_user_or_tags() {
+        let peer: SocketAddr = "100.64.10.2:12345".parse().unwrap();
+        let current = status();
+        let policy = PeerPolicy::new(&["nSyntheticTagged".into()]).unwrap();
+        let mut identity = whois();
+        assert!(
+            authorize(&current, peer, &identity, &policy).is_err(),
+            "Explicit trust has no same-user fallback"
+        );
+        identity = tagged_native_identity();
+        identity.node.stable_id = Some("nOtherTagged".into());
+        assert!(
+            authorize(&current, peer, &identity, &policy).is_err(),
+            "Tag ownership is not an allowlist"
+        );
+        for missing in [None, Some(String::new())] {
+            identity.node.stable_id = missing;
+            assert!(authorize(&current, peer, &identity, &policy).is_err());
+        }
+        identity = tagged_native_identity();
+        identity.user_profile.id = current.this_node.owner;
+        assert!(
+            authorize(&current, peer, &identity, &policy).is_err(),
+            "Native profile must still match the node owner"
+        );
+    }
+
+    #[test]
+    fn explicit_node_trust_still_requires_the_exact_connected_host_address() {
+        let peer: SocketAddr = "100.64.10.2:12345".parse().unwrap();
+        let policy = PeerPolicy::new(&["nSyntheticTagged".into()]).unwrap();
+        let mut identity = tagged_native_identity();
+        for address in ["100.64.10.3/32", "100.64.10.2/24", "100.64.10.2", "::1/128"] {
+            identity.node.addresses = vec![address.into()];
+            assert!(authorize(&status(), peer, &identity, &policy).is_err());
+        }
+        identity.node.addresses = vec!["100.64.10.2/32".into()];
+        assert!(authorize(&status(), peer, &identity, &policy).is_ok());
     }
 
     #[cfg(target_os = "macos")]
@@ -449,15 +622,16 @@ mod tests {
         // Five bounded native identity reads plus connection setup can take
         // longer than one CLI read while the local daemon is cold.
         timeout(Duration::from_secs(60), async {
+            let policy = PeerPolicy::new(&[]).unwrap();
             eprintln!("native smoke: binding");
             let listener = listen(0).await.unwrap();
             let address = listener.local_addr().unwrap();
             eprintln!("native smoke: connecting");
-            let mut client = connect(address).await.unwrap();
+            let mut client = connect(address, &policy).await.unwrap();
             eprintln!("native smoke: accepting");
             let (mut accepted, peer) = listener.accept().await.unwrap();
             eprintln!("native smoke: validating");
-            validate_connection(accepted.local_addr().unwrap(), peer)
+            validate_connection(accepted.local_addr().unwrap(), peer, &policy)
                 .await
                 .unwrap();
             eprintln!("native smoke: exchanging");
