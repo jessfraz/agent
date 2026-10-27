@@ -112,6 +112,12 @@ explicit next actor/check, or resolution evidence. Brief updates include the
 proposed action when the user needs to decide; authorization already given in
 the conversation carries forward.
 
+Task outcomes are a built-in source, admitted in the same transaction as task
+changes. They retain conversation, entry and tool-call provenance. Unfinished
+work and failures enter the same triage path as incoming events. Published
+resolutions and waits, and child results delivered to their parent, settle
+without another model alert. Linking an outcome never reopens its task.
+
 ## Resources
 
 Worktree allocation, ownership, active consumers and cleanup evidence live in

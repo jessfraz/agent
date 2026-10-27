@@ -10,14 +10,22 @@ work before starting another task.
 ```text
   phone CLI / laptop CLI / desktop CLI
                     |
-          selected coordinator
+          main conversation
           Pi Durable + SQLite
-            /             \
-     desktop Rex        laptop Rex
-     task session       task session
-     + Implementation   + Implementation
-     + Review           + Checks
-     + Checks
+                    |
+       find and reuse the matching task
+                    |
+            execution host
+           /              \
+  desktop Rex              laptop Rex
+  |                        |
+  + Fix login              + Update dependencies
+  | + Implementation       | + Implementation
+  | + Review               | + Checks
+  |                        |
+  + Track shipment         + Investigate slow build
+    + Follow-up              + Investigation
+                             + Review
 
   mail / Slack -> durable inbox -> related task -> brief update
 ```
@@ -30,6 +38,11 @@ existing Rex phone CLI.
 Rex owns terminals and sessions. The coordinator owns conversations, tasks and
 background intake. Only one machine runs the coordinator; the others connect
 to it over Tailscale.
+
+For example, JLCPCB emails about a missing fabrication file. The agent finds
+the existing hardware task, attaches the email and continues that task's Rex
+session on its owning machine. The main chat gets a brief update with the
+result or the decision needed to move it forward.
 
 ```sh
 nix profile add github:jessfraz/agent

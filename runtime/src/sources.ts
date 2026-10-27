@@ -1,25 +1,28 @@
 import { createHash, randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Type } from "typebox";
-import { defineDoc, defineExtension, defineTool, ROOT_CONVERSATION_ID, type Conversation, type Cursor, type EntryRecord,
-  type Extension, type Harness, type ToolExecutionResult } from "@earendil-works/pi-durable";
+import { defineDoc, defineExtension, defineTool, ROOT_CONVERSATION_ID, type Conversation,
+  type Extension, type Harness, type Tx, type ToolExecutionResult } from "@earendil-works/pi-durable";
 import type { SourceBatch } from "./generated/SourceBatch.js";
 import type { SourceCheckpoint } from "./generated/SourceCheckpoint.js";
 import type { SourceEvent } from "./generated/SourceEvent.js";
 import type { SourceKey } from "./generated/SourceKey.js";
 import type { SourceState } from "./generated/SourceState.js";
+import type { TaskOutcome } from "./generated/TaskOutcome.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { publishMainNotice, TaskError, TaskStore } from "./tasks.js";
 import { Executions } from "./tools.js";
 
 type Decision = { type: "task"; task_id: string } | { type: "dismissed"; reason: string };
-type StoredEvent = { key: string; event: SourceEvent; decision: Decision | null };
+type StoredEvent = { key: string; event: SourceEvent; decision: Decision | null; outcome?: TaskOutcome };
 type DueTask = { id: string; next_check: string };
 type TriageWork = { id: string; events: string[]; due: DueTask[]; attempt: number; content: string | null };
 type Journal = { sources: SourceState[]; events: StoredEvent[]; conversation_id: string | null; active: TriageWork | null };
+const OUTCOMES: SourceKey = { provider: "task_outcomes", account: "local" };
+function outcomeState(): SourceState { return { source: OUTCOMES, checkpoint: null, coverage: { status: "complete" }, checked_at: 0 }; }
 const Sources = defineDoc<Journal>({
   kind: "agent.sources", scope: "session", version: 1,
-  initial: () => ({ sources: [], events: [], conversation_id: null, active: null }), checkpointWhen: () => true,
+  initial: () => ({ sources: [outcomeState()], events: [], conversation_id: null, active: null }), checkpointWhen: () => true,
 });
 function sameSource(left: SourceKey, right: SourceKey): boolean {
   return left.provider === right.provider && left.account === right.account;
@@ -36,9 +39,60 @@ function sameEvent(left: SourceEvent, right: SourceEvent): boolean {
 /** Admission and checkpoints share Pi's atomic commit boundary. */
 export class SourceJournal {
   private triaging = false;
-  constructor(readonly session: Harness, readonly tasks: TaskStore) {}
+  constructor(readonly session: Harness, readonly tasks: TaskStore) { tasks.trackOutcomes(this); }
+  /** Called inside the task mutation's transaction, never from a polling CLI. */
+  async recordIn(tx: Tx, outcome: TaskOutcome, settled: boolean, attemptId?: string): Promise<void> {
+    const journal = await tx.doc(Sources);
+    const event: SourceEvent = { id: outcome.task_id + ":" + outcome.conversation_id,
+      version: createHash("sha256").update(JSON.stringify([outcome, attemptId ?? null])).digest("hex"),
+      source: { ...OUTCOMES, thread_id: outcome.task_id }, title: "Task " + outcome.state.state,
+      text: JSON.stringify(outcome) };
+    const key = eventKey(event);
+    if (journal.events.some((record) => record.key === key)) return;
+    for (const record of journal.events) {
+      if (record.decision === null && record.outcome?.task_id === outcome.task_id &&
+          record.outcome.conversation_id === outcome.conversation_id) {
+        record.decision = { type: "dismissed", reason: "Superseded by a newer outcome from the same task conversation" };
+      }
+    }
+    journal.events.push({ key, event, outcome,
+      decision: settled ? { type: "dismissed", reason: "Already handled by the coordinator" } : null });
+    const previous = journal.sources.find((state) => sameSource(state.source, OUTCOMES));
+    const state = { ...outcomeState(), checked_at: Date.now() };
+    if (previous === undefined) journal.sources.push(state); else Object.assign(previous, state);
+  }
+  async publishedIn(tx: Tx, outcome: TaskOutcome, parent: boolean): Promise<void> {
+    if (!parent && (outcome.state.state === "progress" || outcome.state.state === "failed")) return;
+    const journal = await tx.doc(Sources);
+    const record = [...journal.events].reverse().find((record) => record.decision === null && record.outcome !== undefined &&
+      JSON.stringify(record.outcome) === JSON.stringify(outcome));
+    if (record !== undefined) record.decision = { type: "dismissed", reason: parent ? "Delivered to the parent task"
+      : "Published to the main conversation; follow-up is owned by task state" };
+  }
+  async published(outcome: TaskOutcome): Promise<void> {
+    await this.session.commit((tx) => this.publishedIn(tx, outcome, false), BACKGROUND_CONTEXT);
+  }
+  private async settlePublished(): Promise<void> {
+    const root = await this.session.root(BACKGROUND_CONTEXT);
+    await this.session.commit(async (tx) => {
+      const journal = await tx.doc(Sources);
+      for (const record of journal.events) {
+        const outcome = record.outcome;
+        if (record.decision !== null || outcome === undefined || outcome.entry_id === null ||
+            (outcome.state.state !== "resolved" && outcome.state.state !== "waiting")) continue;
+        if (await tx.submissionByRequest(root.id, "notice:" + outcome.entry_id) !== undefined) {
+          record.decision = { type: "dismissed", reason: "Publication recovered from the main conversation" };
+        }
+      }
+    }, BACKGROUND_CONTEXT);
+  }
+  private ready(record: StoredEvent): boolean {
+    return record.decision === null && (record.outcome === undefined || !this.tasks.isRunning(record.outcome.task_id));
+  }
   async states(): Promise<SourceState[]> {
-    return [...((await this.session.snapshot(Sources, BACKGROUND_CONTEXT))?.sources ?? [])];
+    const states = [...((await this.session.snapshot(Sources, BACKGROUND_CONTEXT))?.sources ?? [])];
+    if (!states.some((state) => sameSource(state.source, OUTCOMES))) states.unshift(outcomeState());
+    return states;
   }
   async events(options: { keys?: readonly string[]; provider?: string; account?: string; thread_id?: string;
     query?: string; limit?: number; pending?: boolean } = {}): Promise<StoredEvent[]> {
@@ -56,6 +110,7 @@ export class SourceJournal {
   async admit(batch: SourceBatch, expected: SourceCheckpoint | null): Promise<{
     new_events: number; checkpoint_advanced: boolean; state: SourceState;
   }> {
+    if (batch.source.provider === OUTCOMES.provider) throw new TaskError("Task outcomes are admitted by the owned task lifecycle");
     for (const event of batch.events) {
       if (!sameSource(event.source, batch.source) || event.id.length === 0 || event.version.length === 0) {
         throw new TaskError("Source event identity does not match its account stream");
@@ -101,7 +156,8 @@ export class SourceJournal {
       });
       if (decision.type === "task") {
         await this.tasks.updateIn(tx, decision.task_id, (task) => {
-          for (const { event } of records) {
+          for (const { event, outcome } of records) {
+            if (outcome !== undefined) continue;
             if (!task.sources.some((source) => sameSource(source, event.source) && source.thread_id === event.source.thread_id)) {
               task.sources.push(event.source);
             }
@@ -112,9 +168,10 @@ export class SourceJournal {
     }, BACKGROUND_CONTEXT);
   }
   async hasWork(): Promise<boolean> {
+    await this.settlePublished();
     const journal = await this.session.snapshot(Sources, BACKGROUND_CONTEXT);
     if (journal?.active !== null && journal?.active !== undefined) return true;
-    if (journal?.events.some((record) => record.decision === null)) return true;
+    if (journal?.events.some((record) => this.ready(record))) return true;
     return (await this.due()).length > 0;
   }
   private async due(): Promise<DueTask[]> {
@@ -124,11 +181,12 @@ export class SourceJournal {
       ? [{ id: task.id, next_check: task.state.next_check }] : []);
   }
   private async claim(): Promise<{ work: TriageWork; conversation: string } | null> {
+    await this.settlePublished();
     const due = await this.due();
     await this.session.commit(async (tx) => {
       const journal = await tx.doc(Sources);
       if (journal.active !== null) return;
-      const events = journal.events.filter((record) => record.decision === null).slice(0, 20).map((record) => record.key);
+      const events = journal.events.filter((record) => this.ready(record)).slice(0, 20).map((record) => record.key);
       if (events.length === 0 && due.length === 0) return;
       if (journal.conversation_id === null) {
         const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
@@ -208,15 +266,7 @@ export class SourceJournal {
     if (new Set(keys).size !== records.length) throw new TaskError("Notification refers to unknown source events");
     if (taskId !== null) await this.tasks.get(taskId);
     const conversation = await this.tasks.conversation(conversationId);
-    let cursor: Cursor | undefined;
-    let origin: EntryRecord | undefined;
-    do {
-      const page = await conversation.entries({ order: "descending" }, 100, cursor, BACKGROUND_CONTEXT);
-      origin = page.items.find((entry) => entry.model?.some((message) => message.role === "assistant" &&
-        message.content.some((part) => part.type === "toolCall" && part.id === callId)));
-      cursor = page.next;
-    } while (origin === undefined && cursor !== undefined);
-    if (origin === undefined) throw new TaskError("Notification model provenance is unavailable");
+    const origin = await this.tasks.origin(conversation, callId);
     await publishMainNotice(this.session, conversation, origin, taskId, records.map((record) => record.event.source),
       { key: callId, text, events: records.map((record) => record.event) });
     emit(taskId, text);

@@ -111,12 +111,11 @@ async function handle(request: RuntimeRequest): Promise<void> {
         break;
       }
       case "run_task": {
-        await auth.credential();
         const { tasks, executions, tools, sourceTools, resourceTools } = await app();
         const answer = await tasks.run(command, (conversation, host) => executions.bind(conversation.id.toString(), {
           cwd: command.cwd, hosts: [host], role: "worker", call: (operation) => hostRequests.call(id, operation),
         }), (task, text) => emit(id, { type: "notice", task_id: task.id, text: `${task.title}: ${text}` }),
-        [tools.host, tools.worker, sourceTools, resourceTools], (operation) => hostRequests.call(id, operation));
+        [tools.host, tools.worker, sourceTools, resourceTools], (operation) => hostRequests.call(id, operation), async () => { await auth.credential(); });
         emit(id, { type: "answer", ...answer });
         break;
       }

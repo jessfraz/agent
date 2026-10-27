@@ -6,6 +6,8 @@ import type { HostResult } from "./generated/HostResult.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import type { SourceRef } from "./generated/SourceRef.js";
 import type { SourceEvent } from "./generated/SourceEvent.js";
+import type { TaskOutcome } from "./generated/TaskOutcome.js";
+import type { TaskState } from "./generated/TaskState.js";
 import type { TaskRecord } from "./generated/TaskRecord.js";
 import type { TaskAgentRecord } from "./generated/TaskAgentRecord.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
@@ -19,6 +21,11 @@ const Tasks = defineDoc<TaskIndex>({
 });
 
 export class TaskError extends Error {}
+export type OutcomeSink = {
+  recordIn(tx: Tx, outcome: TaskOutcome, settled: boolean, attemptId?: string): Promise<void>;
+  published(outcome: TaskOutcome): Promise<void>;
+  publishedIn(tx: Tx, outcome: TaskOutcome, parent: boolean): Promise<void>;
+};
 /** Mirror user-visible final text, never tool calls, so a later "yes" has context. */
 export async function publishMainNotice(session: Harness, conversation: Conversation, entry: EntryRecord,
   taskId: string | null = null, sources: readonly SourceRef[] = [],
@@ -62,7 +69,42 @@ export class TaskStore {
   private readonly nativeIds = new Map<string, ConversationId>();
   private scanning: Promise<void> | undefined;
   private resources: { attach(taskId: string): Promise<void> } | undefined;
+  private outcomes: OutcomeSink | undefined;
   constructor(readonly session: Harness) {}
+  trackOutcomes(outcomes: OutcomeSink): void { this.outcomes = outcomes; }
+  private outcome(task: TaskRecord, conversationId: string, entryId: string | null, callId: string | null,
+    failure?: string): TaskOutcome {
+    return { task_id: task.id, conversation_id: conversationId, entry_id: entryId, tool_call_id: callId,
+      summary: task.summary, sources: task.sources.map((source) => ({ ...source })),
+      state: failure === undefined ? task.state.state === "open" ? { state: "progress" } : { ...task.state }
+        : { state: "failed", reason: failure } };
+  }
+  async origin(conversation: Conversation, callId: string): Promise<EntryRecord> {
+    let cursor: Cursor | undefined;
+    do {
+      const page = await conversation.entries({ order: "descending" }, 100, cursor, BACKGROUND_CONTEXT);
+      const entry = page.items.find((entry) => entry.model?.some((message) => message.role === "assistant" &&
+        message.content.some((part) => part.type === "toolCall" && part.id === callId)));
+      if (entry !== undefined) return entry;
+      cursor = page.next;
+    } while (cursor !== undefined);
+    throw new TaskError("Task outcome model provenance is unavailable");
+  }
+  async record(id: string, input: { summary: string; state: TaskState; sources?: SourceRef[] },
+    provenance: { conversation_id: string; call_id: string; settled: boolean }): Promise<TaskRecord> {
+    const origin = await this.origin(await this.conversation(provenance.conversation_id), provenance.call_id);
+    await this.session.commit(async (tx) => {
+      const index = await tx.doc(Tasks);
+      const task = index.tasks.find((task) => task.id === id);
+      if (task === undefined) throw new TaskError("Unknown task");
+      task.agents ??= [];
+      if (input.state.state === "resolved" && !this.canResolve(task)) throw new TaskError("Wait for unfinished task agents before resolving the task");
+      task.summary = input.summary.slice(-4000); task.state = input.state; task.updated_at = Date.now();
+      for (const source of input.sources ?? []) if (!task.sources.some((saved) => related(saved, source))) task.sources.push(source);
+      await this.outcomes?.recordIn(tx, this.outcome(task, provenance.conversation_id, origin.id.toString(), provenance.call_id), provenance.settled);
+    }, BACKGROUND_CONTEXT);
+    return this.get(id);
+  }
   guardResources(resources: { attach(taskId: string): Promise<void> }): void { this.resources = resources; }
   isRunning(id: string): boolean { return [...this.running.keys()].some((actor) => actor === id || actor.startsWith(id + ":")); }
   private actorKey(id: string, agentId?: string): string { return agentId === undefined ? id : id + ":" + agentId; }
@@ -157,7 +199,9 @@ export class TaskStore {
     const tokens = (key(query).match(/[\p{L}\p{N}]+/gu) ?? []).filter((token) => token.length > 1 && !stop.includes(token));
     const scored: { task: TaskRecord; score: number }[] = [];
     for (const task of await this.list()) {
-      const sourceMatch = sources.some((source) => task.sources.some((saved) => related(saved, source)));
+      const sourceMatch = sources.some((source) =>
+        (source.provider === "task_outcomes" && source.account === "local" && source.thread_id === task.id) ||
+        task.sources.some((saved) => related(saved, source)));
       const title = key([task.title, task.outcome, ...task.agents.flatMap((agent) => [agent.title, agent.outcome])].join(" "));
       const summary = key([task.summary, ...task.agents.map((agent) => agent.summary)].join(" "));
       let score = sourceMatch ? 1000 : 0;
@@ -200,15 +244,19 @@ export class TaskStore {
     await this.session.commit((tx) => this.updateIn(tx, id, change), BACKGROUND_CONTEXT);
     return this.get(id);
   }
-  async enqueue(id: string, content: string, inputId: string = randomUUID()): Promise<TaskRecord> {
+  async enqueue(id: string, content: string, inputId: string = randomUUID(), delivered?: TaskOutcome): Promise<TaskRecord> {
     if (content.trim().length === 0 || Buffer.byteLength(content, "utf8") > 65_536) throw new TaskError("Task input must contain 1 to 65536 UTF-8 bytes");
     await this.resources?.attach(id);
-    const task = await this.update(id, (task) => {
-      const previous = task.pending.find((input) => input.id === inputId);
-      if (previous !== undefined && previous.content !== content) throw new TaskError("A task input ID cannot be reused with different content");
-      if (previous === undefined) task.pending.push({ id: inputId, content });
-      task.state = { state: "open" };
-    });
+    await this.session.commit(async (tx) => {
+      await this.updateIn(tx, id, (task) => {
+        const previous = task.pending.find((input) => input.id === inputId);
+        if (previous !== undefined && previous.content !== content) throw new TaskError("A task input ID cannot be reused with different content");
+        if (previous === undefined) task.pending.push({ id: inputId, content });
+        task.state = { state: "open" };
+      });
+      if (delivered !== undefined) await this.outcomes?.publishedIn(tx, delivered, true);
+    }, BACKGROUND_CONTEXT);
+    const task = await this.get(id);
     const running = this.running.get(id);
     if (running !== undefined) running.revision += 1;
     return task;
@@ -264,14 +312,24 @@ export class TaskStore {
       } else agent.worker = { state: "uncertain", allocation_id, host: parent.host, session_id: parent.binding.session_id };
     });
   }
-  async reportAgent(taskId: string, agentId: string, summary: string, failure?: string): Promise<TaskRecord> {
-    return this.update(taskId, (task) => {
-      const agent = task.agents.find((item) => item.id === agentId);
-      if (agent === undefined) throw new TaskError("Unknown task agent");
+  async reportAgent(taskId: string, agentId: string, summary: string, failure?: string,
+    provenance?: { conversation_id: string; call_id: string }): Promise<TaskRecord> {
+    const origin = provenance === undefined ? undefined
+      : await this.origin(await this.conversation(provenance.conversation_id), provenance.call_id);
+    await this.session.commit(async (tx) => {
+      const index = await tx.doc(Tasks);
+      const task = index.tasks.find((task) => task.id === taskId);
+      const agent = task?.agents.find((item) => item.id === agentId);
+      if (task === undefined || agent === undefined) throw new TaskError("Unknown task agent");
       agent.summary = summary.slice(-4000);
       agent.state = failure === undefined ? { state: "done" } : { state: "failed", reason: failure };
-      agent.updated_at = Date.now();
-    });
+      agent.updated_at = Date.now(); task.updated_at = Date.now();
+      const outcome: TaskOutcome = { ...this.outcome(task, agent.conversation_id, origin?.id.toString() ?? null,
+        provenance?.call_id ?? null, failure), summary: agent.summary,
+        state: failure === undefined ? { state: "progress" } : { state: "failed", reason: failure } };
+      await this.outcomes?.recordIn(tx, outcome, false);
+    }, BACKGROUND_CONTEXT);
+    return this.get(taskId);
   }
   async waitAgents(taskId: string, timeoutMs: number): Promise<TaskAgentRecord[]> {
     const deadline = Date.now() + timeoutMs;
@@ -341,17 +399,32 @@ export class TaskStore {
         session_id: result.type === "creation_uncertain" ? result.session_id : null };
     });
   }
+  private async finishOutcome(id: string, conversationId: string, entryId: string, answer: string): Promise<TaskOutcome> {
+    let outcome: TaskOutcome | undefined;
+    await this.session.commit(async (tx) => {
+      await this.updateIn(tx, id, (task) => {
+        task.summary = answer.slice(-4000);
+        outcome = this.outcome(task, conversationId, entryId, null);
+      });
+      if (outcome !== undefined) await this.outcomes?.recordIn(tx, outcome, false);
+    }, BACKGROUND_CONTEXT);
+    if (outcome === undefined) throw new TaskError("Task outcome did not commit");
+    return outcome;
+  }
   async run(input: Extract<RuntimeCommand, { type: "run_task" }>,
     bind: (conversation: Conversation, host: WorkerHost) => () => void,
     notice: (task: TaskRecord, text: string) => void,
-    extensions: readonly Extension[] = [], call?: HostCall): Promise<{ conversation_id: string; text: string }> {
+    extensions: readonly Extension[] = [], call?: HostCall, prepare?: () => Promise<void>): Promise<{ conversation_id: string; text: string }> {
     const actorKey = this.actorKey(input.task_id, input.agent_id);
     if (this.running.has(actorKey)) throw new TaskError("This task already has an attached worker");
     const active = { revision: 0 };
+    const attemptId = randomUUID();
     this.running.set(actorKey, active);
     let unbind: (() => void) | undefined;
     let attached = false;
     let answer = "";
+    let finalOutcome: TaskOutcome | undefined;
+    let answerEntry: EntryRecord | undefined;
     try {
       const deadline = Date.now() + 10_000;
       let task = await this.get(input.task_id);
@@ -365,10 +438,11 @@ export class TaskStore {
           !sameBinding(actor.worker.binding, input.binding)) {
         throw new TaskError("Worker binding is not confirmed for this task");
       }
+      attached = true;
+      await prepare?.();
       await this.resources?.attach(input.task_id);
       const conversation = await this.conversation(actor.conversation_id);
       unbind = bind(conversation, actor.worker.host);
-      attached = true;
       await conversation.configure({
         model: { provider: "openai", modelId: input.model },
         instructions: input.instructions + "\n\nTask outcome: " + actor.outcome +
@@ -395,8 +469,12 @@ export class TaskStore {
               const page = await conversation.entries({ order: "descending" }, 100, cursor, BACKGROUND_CONTEXT);
               const previous = page.items.find((entry) => AssistantEntry.is(entry));
               if (previous !== undefined) {
-                answer = text(previous);
-                if (input.agent_id === undefined) await publishMainNotice(this.session, conversation, previous, task.id, task.sources);
+                answer = text(previous); answerEntry = previous;
+                if (input.agent_id === undefined) {
+                  finalOutcome = await this.finishOutcome(task.id, conversation.id.toString(), previous.id.toString(), answer);
+                  await publishMainNotice(this.session, conversation, previous, task.id, task.sources);
+                  await this.outcomes?.published(finalOutcome);
+                }
                 break;
               }
               cursor = page.next;
@@ -421,8 +499,12 @@ export class TaskStore {
           throw new TaskError("The worker turn did not complete; its conversation is retained");
         }
         const entry = await conversation.commit((tx) => tx.entry(settled.answer), BACKGROUND_CONTEXT);
-        answer = entry === undefined ? "" : text(entry);
-        if (entry !== undefined && input.agent_id === undefined) await publishMainNotice(this.session, conversation, entry, task.id, task.sources);
+        answer = entry === undefined ? "" : text(entry); answerEntry = entry;
+        if (entry !== undefined && input.agent_id === undefined) {
+          finalOutcome = await this.finishOutcome(task.id, conversation.id.toString(), entry.id.toString(), answer);
+          await publishMainNotice(this.session, conversation, entry, task.id, task.sources);
+          await this.outcomes?.published(finalOutcome);
+        }
         task = await this.update(task.id, (current) => {
           const currentActor = this.actor(current, input.agent_id);
           if (input.agent_id === undefined || currentActor.state.state === "open") currentActor.summary = answer.slice(-4000);
@@ -432,11 +514,25 @@ export class TaskStore {
       if (input.agent_id !== undefined) {
         const agent = this.actor(await this.get(input.task_id), input.agent_id);
         if (agent.state.state === "open") await this.reportAgent(input.task_id, input.agent_id, answer, "Agent finished without report_result");
+        const saved = await this.get(input.task_id);
+        const finished = this.actor(saved, input.agent_id);
+        const childOutcome = { ...this.outcome(saved, finished.conversation_id, answerEntry?.id.toString() ?? null, null),
+          summary: finished.summary, state: finished.state.state === "failed"
+            ? { state: "failed", reason: finished.state.reason } : { state: "progress" } } satisfies TaskOutcome;
+        finalOutcome = childOutcome;
+        await this.session.commit(async (tx) => this.outcomes?.recordIn(tx, childOutcome, false), BACKGROUND_CONTEXT);
       }
       return { conversation_id: conversation.id.toString(), text: answer };
     } catch (error) {
-      if (attached && input.agent_id !== undefined) {
-        await this.reportAgent(input.task_id, input.agent_id, answer, "Agent execution did not complete; its conversation is retained");
+      if (attached) {
+        if (input.agent_id !== undefined) {
+          await this.reportAgent(input.task_id, input.agent_id, answer, "Agent execution did not complete; its conversation is retained");
+        }
+        const task = await this.get(input.task_id);
+        const failed = this.outcome(task, this.actor(task, input.agent_id).conversation_id, null, null,
+          "Worker execution did not complete; inspect the retained task and its pending input");
+        finalOutcome = failed;
+        await this.session.commit(async (tx) => this.outcomes?.recordIn(tx, failed, false, attemptId), BACKGROUND_CONTEXT);
       }
       throw error;
     } finally {
@@ -450,7 +546,7 @@ export class TaskStore {
             agent_id: agent.id, title: agent.title, state: agent.state, summary: agent.summary,
             conversation_id: agent.conversation_id,
           });
-          await this.enqueue(task.id, result, "agent-result:" + agent.id + ":" + createHash("sha256").update(result).digest("hex"));
+          await this.enqueue(task.id, result, "agent-result:" + agent.id + ":" + createHash("sha256").update(result).digest("hex"), finalOutcome);
           if (call !== undefined && task.worker.state === "bound") await this.dispatch(task.id, task.worker.host, call);
         }
       } finally { if (this.running.get(actorKey) === active) this.running.delete(actorKey); }

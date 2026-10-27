@@ -128,16 +128,8 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
       if (args.state.state === "waiting" && args.state.next_check !== null && !Number.isFinite(Date.parse(args.state.next_check))) {
         throw new TaskError("The next check must be an ISO timestamp or null");
       }
-      return output(await tasks.update(task.id, (saved) => {
-        if (args.state.state === "resolved" && !tasks.canResolve(saved)) throw new TaskError("Wait for unfinished task agents before resolving the task");
-        saved.summary = args.summary.slice(-4000);
-        saved.state = args.state;
-        for (const source of args.sources ?? []) {
-          if (!saved.sources.some((item) => item.provider === source.provider && item.account === source.account && item.thread_id === source.thread_id)) {
-            saved.sources.push(source);
-          }
-        }
-      }));
+      return output(await tasks.record(task.id, args, { conversation_id: api.conversationId.toString(),
+        call_id: api.callId, settled: api.conversationId === ROOT_CONVERSATION_ID || execution.role === "triage" }));
     } });
   const main = defineExtension({ name: "task-main", tools: [
     defineTool({ name: "search_tasks", description: "Find related existing work before creating a task. Source references are account-specific.",
@@ -209,7 +201,8 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         executions.get(api.conversationId.toString());
         const owner = await tasks.owner(api.conversationId.toString());
         if (owner.agent === undefined) throw new TaskError("Only a task agent can report an agent result");
-        return output(await tasks.reportAgent(owner.task.id, owner.agent.id, args.summary, args.failure));
+        return output(await tasks.reportAgent(owner.task.id, owner.agent.id, args.summary, args.failure,
+          { conversation_id: api.conversationId.toString(), call_id: api.callId }));
       } }),
   ] });
   return { host, main, worker };

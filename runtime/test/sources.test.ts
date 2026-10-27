@@ -59,7 +59,7 @@ test("source admission advances two successive checkpoints, deduplicates exact v
     assert.equal(second.state.checkpoint?.value, "a2");
     await app.sources.admit(batch([event("one", "beta")], "b1", "beta"), null);
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
-    assert.equal((await app.sources.states()).length, 2);
+    assert.equal((await app.sources.states()).length, 3);
     assert.equal((await app.sources.events({ pending: true })).length, 2);
     assert.equal((await app.sources.events({ account: "alpha" })).length, 1);
     assert.notEqual((await app.sources.events({ account: "alpha" }))[0]?.key, (await app.sources.events({ account: "beta" }))[0]?.key);
@@ -85,7 +85,7 @@ test("stale and incomplete reads retain new events without rolling back canonica
     await assert.rejects(app.sources.admit(batch([event("wrong", "beta")], "bad"), { value: "a1" }), /identity/);
     await assert.rejects(app.sources.admit(batch([event("new"), { ...event("one"), text: "Conflicting same version" }], "bad"), { value: "a1" }), /reused/);
     assert.equal((await app.sources.events({ query: "new" })).length, 0);
-    assert.equal((await app.sources.states())[0]?.checkpoint?.value, "a1");
+    assert.equal((await app.sources.states()).find((state) => state.source.provider === "mail")?.checkpoint?.value, "a1");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -95,7 +95,7 @@ test("empty source coverage gaps do not cause a model call or an all-clear notif
     await app.sources.admit({ ...batch([], "unused"), checkpoint: null, coverage: { status: "unavailable", message: "Read unavailable" } }, null);
     assert.equal(await app.sources.hasWork(), false); await app.triage();
     assert.equal(app.faux.state.callCount, 0); assert.equal(app.notices.length, 0);
-    assert.equal((await app.sources.states())[0]?.coverage.status, "unavailable");
+    assert.equal((await app.sources.states()).find((state) => state.source.provider === "mail")?.coverage.status, "unavailable");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -189,7 +189,7 @@ test("partial source judgment resumes its exact admitted Pi input after a proces
     assert.equal((await lines[Symbol.asyncIterator]().next()).value, "ADMITTED");
     child.kill("SIGKILL"); await new Promise<void>((resolve) => child.once("close", () => resolve())); lines.close();
     app = await open(directory);
-    assert.equal((await app.sources.states())[0]?.checkpoint?.value, "a1");
+    assert.equal((await app.sources.states()).find((state) => state.source.provider === "mail")?.checkpoint?.value, "a1");
     assert.equal((await app.sources.events()).length, 2);
     const keys = (await app.sources.events({ pending: true })).map((record) => record.key);
     assert.equal(keys.length, 1);

@@ -263,6 +263,33 @@ pub struct TaskInput {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct TaskOutcome {
+    pub task_id: TaskId,
+    pub conversation_id: String,
+    pub entry_id: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub summary: String,
+    pub sources: Vec<SourceRef>,
+    pub state: TaskOutcomeState,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TaskOutcomeState {
+    Progress,
+    Waiting {
+        actor: String,
+        next_check: Option<String>,
+    },
+    Resolved {
+        evidence: String,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct SourceState {
     pub source: SourceKey,
     pub checkpoint: Option<SourceCheckpoint>,
