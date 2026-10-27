@@ -144,8 +144,16 @@ mod tests {
     }
 
     fn producer(directory: &Path, script: &str) -> String {
+        let output = std::process::Command::new("node")
+            .args(["--print", "process.execPath"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let executable = String::from_utf8(output.stdout).unwrap();
+        let executable = executable.trim();
+        assert!(Path::new(executable).is_absolute());
         let program = directory.join("messages");
-        std::fs::write(&program, format!("#!/usr/bin/env node\n{script}\n")).unwrap();
+        std::fs::write(&program, format!("#!{executable}\n{script}\n")).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         program.to_str().unwrap().to_owned()
     }
