@@ -231,6 +231,38 @@
         "internal"
       ]
     },
+    "HistoryMessage": {
+      "type": "object",
+      "properties": {
+        "continuation": {
+          "type": "boolean"
+        },
+        "entry_id": {
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/HistoryRole"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_id",
+        "role",
+        "text",
+        "continuation"
+      ]
+    },
+    "HistoryRole": {
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "thinking",
+        "tool"
+      ]
+    },
     "HostCommand": {
       "oneOf": [
         {
@@ -581,6 +613,66 @@
             "binding",
             "task_id",
             "allocation_id"
+          ]
+        }
+      ]
+    },
+    "ModelActivity": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "thinking"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "tool_started"
+            }
+          },
+          "required": [
+            "type",
+            "call_id",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "tool_finished"
+            }
+          },
+          "required": [
+            "type",
+            "call_id",
+            "name"
           ]
         }
       ]
@@ -1148,6 +1240,119 @@
             "type",
             "conversation_id",
             "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "messages": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/HistoryMessage"
+              }
+            },
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "history"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id",
+            "messages"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "task_ready"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id",
+            "title"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "worker_idle"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "input_id": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "input_rejected"
+            }
+          },
+          "required": [
+            "type",
+            "input_id",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "activity": {
+              "$ref": "#/$defs/ModelActivity"
+            },
+            "type": {
+              "type": "string",
+              "const": "activity"
+            }
+          },
+          "required": [
+            "type",
+            "activity"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "$ref": "#/$defs/HistoryMessage"
+            },
+            "type": {
+              "type": "string",
+              "const": "message"
+            }
+          },
+          "required": [
+            "type",
+            "message"
           ]
         },
         {

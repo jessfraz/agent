@@ -1,0 +1,111 @@
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { JsonValue } from "@earendil-works/chord";
+import { watchEvents, type Conversation, type Cursor, type EntryRecord, type Harness } from "@earendil-works/pi-durable";
+import type { HistoryMessage } from "./generated/HistoryMessage.js";
+import type { HistoryRole } from "./generated/HistoryRole.js";
+import type { ModelActivity } from "./generated/ModelActivity.js";
+import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
+
+function object(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function json(value: unknown): value is JsonValue {
+  return value === null || typeof value === "string" || typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value)) ||
+    (Array.isArray(value) ? value.every(json) : object(value) && Object.values(value).every(json));
+}
+function cursor(value: string | null, conversationId: string): Cursor | undefined {
+  if (value === null) return undefined;
+  const decoded: unknown = JSON.parse(value);
+  if (!object(decoded) || decoded.conversation_id !== conversationId || !object(decoded.cursor) || !json(decoded.cursor)) {
+    throw new Error("History cursor does not belong to this conversation");
+  }
+  return decoded.cursor;
+}
+function* chunks(value: string): Generator<string> {
+  for (let offset = 0; offset < value.length;) {
+    let end = Math.min(offset + 8192, value.length);
+    const last = value.charCodeAt(end - 1);
+    if (end < value.length && last >= 0xd800 && last <= 0xdbff) end -= 1;
+    yield value.slice(offset, end); offset = end;
+  }
+}
+export function transcript(entry: EntryRecord): HistoryMessage[] {
+  const messages: HistoryMessage[] = [];
+  const add = (role: HistoryRole, value: string) => {
+    let continuation = false;
+    for (const text of chunks(value)) {
+      messages.push({ entry_id: entry.id.toString(), role, text, continuation }); continuation = true;
+    }
+  };
+  for (const message of entry.model ?? []) {
+    if (message.role === "system") continue;
+    if (message.role === "toolResult") { add("tool", `${message.toolName} finished`); continue; }
+    if (typeof message.content === "string") { add(message.role, message.content); continue; }
+    for (const part of message.content) {
+      if (part.type === "text") add(message.role, part.text);
+      else if (part.type === "thinking") add("thinking", part.thinking);
+      else if (part.type === "toolCall") add("tool", part.name);
+      else if (part.type === "image") add("user", "[image]");
+    }
+  }
+  return messages;
+}
+
+/** Native fork-aware pages, rendered without loading history back into model input. */
+export async function history(conversation: Conversation, value: string | null): Promise<Extract<RuntimeEventKind, { type: "history" }>[]> {
+  const id = conversation.id.toString();
+  const page = await conversation.entries({ order: "descending" }, 20, cursor(value, id), BACKGROUND_CONTEXT);
+  const next_cursor = page.next === undefined ? null : JSON.stringify({ conversation_id: id, cursor: page.next });
+  const frames: Extract<RuntimeEventKind, { type: "history" }>[] = [];
+  let messages: HistoryMessage[] = []; let size = 0;
+  for (const message of [...page.items].reverse().flatMap(transcript)) {
+    if (size + message.text.length > 65_536) {
+      frames.push({ type: "history", conversation_id: id, messages, next_cursor: null }); messages = []; size = 0;
+    }
+    messages.push(message); size += message.text.length;
+  }
+  frames.push({ type: "history", conversation_id: id, messages, next_cursor });
+  return frames;
+}
+
+/** Only provider-exposed thinking text and tool identities cross this boundary. */
+export async function activity(session: Harness, conversation: Conversation, emit: (event: ModelActivity) => void,
+  message?: (message: HistoryMessage) => void): Promise<() => Promise<void>> {
+  const stream = await watchEvents(session, conversation.id, BACKGROUND_CONTEXT);
+  const thinking = new Map<number, string>();
+  const update = (index: number, text: string) => {
+    const previous = thinking.get(index) ?? "";
+    const append = text.startsWith(previous) ? text.slice(previous.length) : "\n" + text;
+    thinking.set(index, text);
+    for (const chunk of chunks(append)) emit({ type: "thinking", text: chunk });
+  };
+  stream.start(async (events) => {
+    for (const event of events) {
+      if (event.type === "message_start") {
+        thinking.clear();
+        if (event.message.role === "assistant") event.message.content.forEach((part, index) => {
+          if (part.type === "thinking") update(index, part.thinking);
+        });
+      } else if (event.type === "message_update") {
+        for (const change of event.changes) {
+          if (change.type === "thinking_delta") update(change.contentIndex, (thinking.get(change.contentIndex) ?? "") + change.delta);
+          else if ((change.type === "thinking_start" || change.type === "block") && change.block.type === "thinking") update(change.contentIndex, change.block.thinking);
+          else if (change.type === "message") change.message.content.forEach((part, index) => {
+            if (part.type === "thinking") update(index, part.thinking);
+          });
+        }
+      } else if (event.type === "message_end") {
+        const commentary = event.entry.model?.some((item) => item.role === "assistant" && item.stopReason === "toolUse") === true;
+        for (const item of transcript(event.entry)) if (item.role === "user" || (commentary && item.role === "assistant")) message?.(item);
+        for (const message of event.entry.model ?? []) if (message.role === "assistant") message.content.forEach((part, index) => {
+          if (part.type === "thinking") update(index, part.thinking);
+        });
+      } else if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
+        emit({ type: event.type === "tool_execution_start" ? "tool_started" : "tool_finished",
+          call_id: event.toolCallId, name: event.toolName });
+      }
+    }
+  });
+  return async () => { await stream.stop(); };
+}

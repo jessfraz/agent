@@ -11,7 +11,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
-import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { createModels, fauxAssistantMessage, fauxProvider, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import { createRegistry, Harness, ToolResultEntry, UserEntry } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { TaskStore } from "../src/tasks.js";
@@ -20,6 +20,9 @@ import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import type { WorkerHost } from "../src/generated/WorkerHost.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
+import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
+import type { ModelActivity } from "../src/generated/ModelActivity.js";
+import { activity, history } from "../src/transcript.js";
 
 const host: WorkerHost = { host_id: null, name: "fixture", rex_server: null, coordinator: null,
   cwd: "/workspace/example", agent_program: "/example/agent" };
@@ -29,6 +32,132 @@ const binding: WorkerRef = {
   window_id: "window:33333333-3333-4333-8333-333333333333",
   block_id: "block:44444444-4444-4444-8444-444444444444",
 };
+
+test("an interactive task serializes local and chief inputs, wakes while idle and reopens its actual history", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-interactive-")); let app = await open(directory);
+  const controller = new AbortController(); let running: Promise<unknown> | undefined;
+  let stop: (() => Promise<void>) | undefined; let releaseTurn = () => {}; let releaseAdmission = () => {};
+  try {
+    const task = await app.tasks.create({ title: "Interactive work", outcome: "Retain and finish follow-ups" });
+    await app.tasks.enqueue(task.id, "Initial chief instruction");
+    await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    const saved = await app.tasks.get(task.id); assert.ok(saved.worker.state === "bound");
+    const command: Extract<RuntimeCommand, { type: "run_task" }> = { type: "run_task", task_id: task.id,
+      allocation_id: saved.worker.allocation_id, binding, instructions: "Current instructions", model: fixtureModel, cwd: host.cwd, interactive: true };
+    const answers: string[] = []; const live: ModelActivity[] = []; const inputs: string[] = []; let idleCount = 0; let wake = () => {};
+    const idle = async (count: number) => { while (idleCount < count) await new Promise<void>((resolve) => { wake = resolve; }); };
+    app.faux.setResponses([fauxAssistantMessage([fauxThinking("Published reasoning summary."), { type: "text", text: "Initial answer" }]),
+      fauxAssistantMessage("Chief follow-up answer")]);
+    running = app.tasks.run(command, () => () => {}, () => {}, [], undefined, undefined, {
+      signal: controller.signal,
+      async ready(conversation) { assert.equal(conversation.id.toString(), task.conversation_id); stop = await activity(app.session, conversation, (event) => live.push(event),
+        (message) => { if (message.role === "user") inputs.push(message.text); }); },
+      answer(_id, text) { answers.push(text); }, idle() { idleCount += 1; wake(); },
+    });
+    assert.equal(await Promise.race([idle(1).then(() => "idle"), running.then(() => "exited")]), "idle", "The task tab must remain attached after its first answer");
+    assert.equal(app.tasks.isRunning(task.id), false, "An idle UI is a lease, not unfinished work");
+    await assert.rejects(app.tasks.run(command, () => () => {}, () => {}), /attached worker/);
+    await app.tasks.enqueue(task.id, "Chief follow-up while the tab is idle");
+    await app.tasks.dispatch(task.id, host, async () => { throw new Error("An attached worker must wake without another Rex session"); });
+    await idle(2);
+    let started = () => {};
+    const startedTurn = new Promise<void>((resolve) => { started = resolve; });
+    const gate = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    app.faux.setResponses([async () => { started(); await gate; return fauxAssistantMessage("Local follow-up answer"); },
+      fauxAssistantMessage("Queued chief answer")]);
+    let admitStarted = () => {};
+    const admitting = new Promise<void>((resolve) => { admitStarted = resolve; });
+    const admissionGate = new Promise<void>((resolve) => { releaseAdmission = resolve; }); let failOne = true;
+    app.tasks.guardResources({ async attach() {
+      if (failOne) { failOne = false; admitStarted(); await admissionGate; throw new Error("Resource admission refused"); }
+    } });
+    const refused = app.tasks.enqueue(task.id, "This refused input must not hide another active turn", "refused");
+    await admitting;
+    assert.equal(app.tasks.isRunning(task.id), true, "The admission guard protects work while the resource check is still pending");
+    await app.tasks.input(command, "Reply typed directly in the task tab", "local-input");
+    await startedTurn;
+    releaseAdmission(); await assert.rejects(refused, /Resource admission refused/);
+    assert.equal(app.tasks.isRunning(task.id), true, "A refused concurrent admission cannot clear another turn's busy guard");
+    await app.tasks.enqueue(task.id, "Chief input while the local turn runs", "chief-input");
+    assert.equal(app.tasks.isRunning(task.id), true);
+    releaseTurn(); await idle(3);
+    assert.deepEqual(answers, ["Initial answer", "Chief follow-up answer", "Local follow-up answer", "Queued chief answer"]);
+    controller.abort(); await running; running = undefined; await stop?.(); stop = undefined;
+    assert.equal(live.flatMap((event) => event.type === "thinking" ? [event.text] : []).join(""), "Published reasoning summary.");
+    assert.deepEqual(inputs, ["Initial chief instruction", "Chief follow-up while the tab is idle", "Reply typed directly in the task tab", "Chief input while the local turn runs"]);
+    await assert.rejects(app.tasks.input(command, "Late detached input", "late"), /no longer attached/);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const reopened = await app.tasks.get(task.id); assert.equal(reopened.conversation_id, task.conversation_id);
+    const frames = await history(await app.tasks.conversation(reopened.conversation_id), null);
+    const visible = frames.flatMap((frame) => frame.messages);
+    assert.deepEqual(visible.filter((message) => message.role === "user").map((message) => message.text),
+      ["Initial chief instruction", "Chief follow-up while the tab is idle", "Reply typed directly in the task tab", "Chief input while the local turn runs"]);
+    assert.deepEqual(visible.filter((message) => message.role === "assistant").map((message) => message.text), answers);
+    assert.equal(app.faux.state.callCount, 0, "Rendering stored history must not run a model");
+  } finally {
+    releaseAdmission(); releaseTurn(); controller.abort(); await running?.catch(() => {}); await stop?.();
+    await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an idle interactive child delivers its result and accepts another assignment without blocking parent resolution", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-interactive-child-")); const app = await open(directory);
+  const controller = new AbortController(); let running: Promise<unknown> | undefined;
+  try {
+    const task = await app.tasks.create({ title: "Parent", outcome: "Complete after review" });
+    await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    const child = await app.tasks.createAgent(task.id, { id: "review", title: "Review", outcome: "Review the change",
+      input: "Review the first change", inputId: "review-first", model: fixtureModel });
+    const childBinding = { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" };
+    await app.tasks.dispatchAgent(task.id, child.id, async () => ({ type: "spawned", binding: childBinding }));
+    const saved = (await app.tasks.get(task.id)).agents[0]; assert.ok(saved?.worker.state === "bound");
+    const command: Extract<RuntimeCommand, { type: "run_task" }> = { type: "run_task", task_id: task.id, agent_id: child.id,
+      allocation_id: saved.worker.allocation_id, binding: childBinding, instructions: "", model: fixtureModel, cwd: host.cwd, interactive: true };
+    app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("report_result", { summary: "Review passed" }), { stopReason: "toolUse" }), fauxAssistantMessage("First review complete"),
+      fauxAssistantMessage(fauxToolCall("report_result", { summary: "Review passed" }), { stopReason: "toolUse" }), fauxAssistantMessage("Second review complete"),
+    ]);
+    let idleCount = 0; let wake = () => {};
+    const idle = async (count: number) => { while (idleCount < count) await new Promise<void>((resolve) => { wake = resolve; }); };
+    running = app.tasks.run(command, (conversation) => app.executions.bind(conversation.id.toString(), {
+      cwd: host.cwd, hosts: [host], call: async () => { throw new Error("No Rex effects expected"); },
+    }), () => {}, [app.tools.worker], undefined, undefined, {
+      signal: controller.signal, async ready() {}, answer() {}, idle() { idleCount += 1; wake(); },
+    });
+    await idle(1);
+    assert.equal((await app.tasks.get(task.id)).pending.length, 1, "The parent gets the result before the tab closes");
+    assert.equal((await app.tasks.waitAgents(task.id, 0))[0]?.state.state, "done");
+    assert.equal(app.tasks.canResolve(await app.tasks.get(task.id)), true);
+    await app.tasks.continueAgent(task.id, child.id, "Review the second change", "review-second");
+    await idle(2);
+    assert.equal((await app.tasks.get(task.id)).pending.length, 2);
+    assert.equal(app.tasks.canResolve(await app.tasks.get(task.id)), true);
+    controller.abort(); await running; running = undefined;
+    assert.equal((await app.tasks.get(task.id)).pending.length, 2, "Detach does not publish the child result again");
+    await assert.rejects(app.tasks.continueAgent(task.id, child.id, "Detached follow-up", "review-third"), /no longer attached/);
+  } finally { controller.abort(); await running?.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("detaching before a child's first turn preserves its pending assignment without publishing a fake result", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-detached-child-")); const app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "Parent", outcome: "Complete after review" });
+    await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    const child = await app.tasks.createAgent(task.id, { id: "review", title: "Review", outcome: "Review the change",
+      input: "Keep this assignment pending", inputId: "review-pending", model: fixtureModel });
+    const childBinding = { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" };
+    await app.tasks.dispatchAgent(task.id, child.id, async () => ({ type: "spawned", binding: childBinding }));
+    const saved = (await app.tasks.get(task.id)).agents[0]; assert.ok(saved?.worker.state === "bound");
+    const controller = new AbortController(); controller.abort();
+    await app.tasks.run({ type: "run_task", task_id: task.id, agent_id: child.id,
+      allocation_id: saved.worker.allocation_id, binding: childBinding, instructions: "", model: fixtureModel, cwd: host.cwd, interactive: true },
+    () => () => {}, () => {}, [], undefined, undefined, { signal: controller.signal, async ready() {}, answer() {}, idle() {} });
+    const retained = await app.tasks.get(task.id);
+    assert.equal(retained.pending.length, 0); assert.equal(retained.agents[0]?.pending.length, 1);
+    assert.equal(retained.agents[0]?.state.state, "open"); assert.equal(app.faux.state.callCount, 0);
+    assert.equal(app.tasks.isRunning(task.id), false);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
 
 test("task agents own conversations and named terminals in one Rex session, then wake their parent", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-child-")); let app = await open(directory);

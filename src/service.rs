@@ -302,6 +302,13 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     let attached = matches!(command, RuntimeCommand::RunTask { .. });
+    let interactive = matches!(
+        command,
+        RuntimeCommand::RunTask {
+            interactive: Some(true),
+            ..
+        }
+    );
     let mut call = runtime.request(command).await?;
     let mut input_closed = false;
     let mut output_closed = false;
@@ -334,6 +341,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                 frame = reader.next_frame(), if !input_closed => {
                     let Some(bytes) = frame? else {
                         input_closed = true;
+                        if interactive { runtime.worker_control(call.request_id, RuntimeCommand::DetachWorker).await?; }
                         for call_id in host_calls.drain() {
                             runtime.reply(call.request_id, call_id, disconnected()).await?;
                         }
@@ -348,6 +356,9 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                         }
                         RuntimeCommand::OAuthCallback { target } if login => {
                             runtime.callback(call.request_id, target).await?;
+                        }
+                        command @ (RuntimeCommand::WorkerInput { .. } | RuntimeCommand::DetachWorker) if interactive => {
+                            runtime.worker_control(call.request_id, command).await?;
                         }
                         _ => anyhow::bail!("An active client may only reply to its host calls"),
                     }
@@ -444,6 +455,14 @@ mod tests {
           },60);
         } else if(typeof command.target==='string') {
           writeFileSync(join(process.argv[2],'callback.json'),JSON.stringify({id,target:command.target}));
+        } else if(command.type==='run_task'&&command.interactive) {
+          emit(id,{type:'task_ready',conversation_id:'persisted-task',title:'Interactive fixture'});
+          emit(id,{type:'worker_idle'});
+        } else if(command.type==='worker_input') {
+          writeFileSync(join(process.argv[2],'worker-input.json'),JSON.stringify({id,input:command.input}));
+          emit(id,{type:'answer',conversation_id:'persisted-task',text:command.input}); emit(id,{type:'worker_idle'});
+        } else if(command.type==='detach_worker') {
+          writeFileSync(join(process.argv[2],'worker-detached'),String(id)); emit(id,{type:'done'});
         } else if(command.type==='run_task'||command.type==='logout') {
           emit(id,{type:'host_call',call_id:'11111111-1111-4111-8111-111111111111',command:{
             type:'exec',program:'node',args:['--eval','process.stdout.write("synthetic\\n")'],cwd:'/',timeout_seconds:60}});
@@ -468,6 +487,7 @@ mod tests {
             instructions: String::new(),
             model: crate::models::ModelSelection::default(),
             cwd: "/".into(),
+            interactive: None,
         }
     }
 
@@ -602,6 +622,66 @@ mod tests {
         let frame = reader.next_frame().await.unwrap().unwrap();
         let event: RuntimeEventKind = serde_json::from_slice(&frame).unwrap();
         assert!(matches!(event, RuntimeEventKind::Done));
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn interactive_input_and_eof_stay_on_the_attached_request_and_release_it() {
+        let service = Running::start().await;
+        let mut client = service.client().await;
+        let mut command = attached_command();
+        if let RuntimeCommand::RunTask { interactive, .. } = &mut command {
+            *interactive = Some(true);
+        }
+        write_frame(&mut client, &command).await.unwrap();
+        let (reader, mut writer) = client.into_split();
+        let mut reader = FrameReader::new(BufReader::new(reader));
+        let ready: RuntimeEventKind =
+            serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
+        assert!(
+            matches!(ready, RuntimeEventKind::TaskReady { conversation_id, .. } if conversation_id == "persisted-task")
+        );
+        reader.next_frame().await.unwrap().unwrap();
+        write_frame(
+            &mut writer,
+            &RuntimeCommand::WorkerInput {
+                input_id: "input-one".into(),
+                input: "A reply in the existing tab".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let answer: RuntimeEventKind =
+            serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
+        assert!(
+            matches!(answer, RuntimeEventKind::Answer { conversation_id, text } if conversation_id == "persisted-task" && text == "A reply in the existing tab")
+        );
+        reader.next_frame().await.unwrap().unwrap();
+        writer.shutdown().await.unwrap();
+        let done = timeout(Duration::from_secs(1), reader.next_frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<RuntimeEventKind>(&done).unwrap(),
+            RuntimeEventKind::Done
+        ));
+        #[derive(serde::Deserialize)]
+        struct Input {
+            id: u32,
+            input: String,
+        }
+        let admitted: Input =
+            serde_json::from_slice(&fs::read(service.wait_for("worker-input.json").await).unwrap())
+                .unwrap();
+        assert_eq!(admitted.input, "A reply in the existing tab");
+        assert_eq!(
+            fs::read_to_string(service.wait_for("worker-detached").await).unwrap(),
+            admitted.id.to_string()
+        );
+        status(service.client().await).await;
+        drop((reader, writer));
         service.stop().await;
     }
 

@@ -39,6 +39,10 @@ Results return to the main chat, so visiting task sessions is optional. Worker
 connections share metadata, not duplicate executions. Offline workers retain
 their tasks; automatic transfer to another machine comes later.
 
+Rex task tabs open directly into chat and accept replies after a turn finishes.
+`agent` reopens the main conversation. Both show recent saved history;
+`/history` reads older pages and `/exit` detaches without deleting history.
+
 For example, JLCPCB emails about a missing fabrication file. The agent finds
 the existing hardware task, attaches the email and continues its Rex session.
 The main chat gets a brief result or the decision needed to move it forward.

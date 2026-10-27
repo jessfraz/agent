@@ -328,7 +328,7 @@ impl RexClient {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let request = CreateRequest::worker("Worker", program, args, cwd)?;
+        let request = CreateRequest::worker("Chat", program, args, cwd)?;
         let [window] = request.initial_windows;
         let receipt = self
             .api(
@@ -577,11 +577,11 @@ impl CreateRequest {
         Ok(Self {
             label: title.to_owned(),
             initial_windows: [InitialWindow {
-                window_label: "Worker".to_owned(),
+                window_label: "Chat".to_owned(),
                 layout: SingleBlock {
                     block: WorkerBlock {
                         flavor: TerminalFlavor::Shell,
-                        label: "Worker".to_owned(),
+                        label: "Chat".to_owned(),
                         options: TerminalOptions {
                             shell: DirectShell::None,
                             command,
@@ -725,7 +725,7 @@ mod tests {
         let decoded: CreateRequest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded.initial_windows.len(), 1);
         let worker = &decoded.initial_windows[0].layout.block;
-        assert_eq!(worker.label, "Worker");
+        assert_eq!(worker.label, "Chat");
         assert!(matches!(worker.options.shell, DirectShell::None));
         assert_eq!(
             worker.options.command,

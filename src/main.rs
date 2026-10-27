@@ -380,17 +380,8 @@ async fn main() -> Result<()> {
             );
             return worker_service(&config, coordinator.as_deref(), &script, &directory, 300).await;
         }
-        if !no_sources
-            && config.sources.iter().any(|source| {
-                matches!(
-                    source,
-                    agent_cli::sources::SourceConfig::Messages { enabled: true, .. }
-                )
-            })
-            && let Err(error) =
-                agent_cli::rex::install::install(agent_cli::rex::source::MODULE).await
-        {
-            eprintln!("Messages Rex setup is unavailable: {error}");
+        if !no_sources {
+            configure_messages(&config.sources).await;
         }
         let policy = agent_cli::tailnet::PeerPolicy::new(&config.trusted_nodes)?;
         let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
@@ -515,6 +506,7 @@ async fn main() -> Result<()> {
                     .model,
             )?,
             cwd: cwd.to_string_lossy().into_owned(),
+            interactive: Some(true),
         },
         Action::Chat {
             prompt: Some(input),
@@ -554,6 +546,19 @@ async fn main() -> Result<()> {
                 arguments.json,
             )
             .await?;
+            let mut history_cursor = request(
+                &arguments,
+                &config,
+                coordinator.as_deref(),
+                &script,
+                &directory,
+                RuntimeCommand::ReadHistory {
+                    task_id: None,
+                    agent_id: None,
+                    cursor: None,
+                },
+            )
+            .await?;
             let mut input = BufReader::new(tokio::io::stdin()).lines();
             loop {
                 if !arguments.json && std::io::stdin().is_terminal() {
@@ -566,6 +571,28 @@ async fn main() -> Result<()> {
                 };
                 if line.trim() == "/exit" {
                     return Ok(());
+                }
+                if line.trim() == "/history" {
+                    if history_cursor.is_none() {
+                        if !arguments.json {
+                            println!("No older history.");
+                        }
+                    } else {
+                        history_cursor = request(
+                            &arguments,
+                            &config,
+                            coordinator.as_deref(),
+                            &script,
+                            &directory,
+                            RuntimeCommand::ReadHistory {
+                                task_id: None,
+                                agent_id: None,
+                                cursor: history_cursor,
+                            },
+                        )
+                        .await?;
+                    }
+                    continue;
                 }
                 if !line.trim().is_empty() {
                     let command = chat_command(line, model.clone(), &cwd).await?;
@@ -592,6 +619,7 @@ async fn main() -> Result<()> {
         command,
     )
     .await
+    .map(|_| ())
 }
 
 async fn watch(
@@ -688,6 +716,18 @@ async fn selected_model(
     ))
 }
 
+async fn configure_messages(sources: &[agent_cli::sources::SourceConfig]) {
+    if sources.iter().any(|source| {
+        matches!(
+            source,
+            agent_cli::sources::SourceConfig::Messages { enabled: true, .. }
+        )
+    }) && let Err(error) = agent_cli::rex::install::install(agent_cli::rex::source::MODULE).await
+    {
+        eprintln!("Messages Rex setup is unavailable: {error}");
+    }
+}
+
 async fn worker_service(
     config: &ClientConfig,
     coordinator: Option<&str>,
@@ -713,6 +753,8 @@ async fn worker_service(
                 config.node_name.as_deref(),
             )
             .await?;
+            let settings = environment(config, coordinator, script, directory).await?;
+            configure_messages(&settings.sources).await;
             let mut wire = connection(config, coordinator, script, directory, false).await?;
             write_command(
                 &mut *wire.writer,
@@ -1024,9 +1066,27 @@ async fn request(
     script: &Path,
     directory: &Path,
     command: RuntimeCommand,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let login = matches!(command, RuntimeCommand::Login);
     let attached = matches!(command, RuntimeCommand::RunTask { .. });
+    let mut interactive = matches!(
+        command,
+        RuntimeCommand::RunTask {
+            interactive: Some(true),
+            ..
+        }
+    );
+    let history_target = match &command {
+        RuntimeCommand::RunTask {
+            task_id, agent_id, ..
+        } => Some((task_id.clone(), agent_id.clone())),
+        _ => None,
+    };
+    let mut ready = false;
+    let mut history_cursor = None;
+    let mut input = BufReader::new(tokio::io::stdin()).lines();
+    let mut operations = tokio::task::JoinSet::new();
+    let mut thinking = false;
     let mut wire = connection(config, coordinator, script, directory, login).await?;
     let relay_needed = match (
         login,
@@ -1060,6 +1120,42 @@ async fn request(
                 write_command(&mut *wire.writer, &RuntimeCommand::OAuthCallback { target: target? }).await?;
                 continue;
             }
+            line = input.next_line(), if interactive && ready => {
+                let line = line?;
+                if line.as_deref().is_none_or(|line| line.trim() == "/exit") {
+                    write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?;
+                    interactive = false;
+                } else if let Some(line) = line {
+                    if line.trim() == "/history" {
+                        if let Some((task_id, agent_id)) = &history_target {
+                            if history_cursor.is_none() {
+                                if !arguments.json { println!("No older history."); }
+                            } else {
+                                history_cursor = Box::pin(request(arguments, config, coordinator, script, directory,
+                                    RuntimeCommand::ReadHistory { task_id: Some(task_id.clone()), agent_id: agent_id.clone(), cursor: history_cursor })).await?;
+                            }
+                        }
+                    } else if !line.trim().is_empty() {
+                        write_command(&mut *wire.writer, &RuntimeCommand::WorkerInput {
+                            input_id: uuid::Uuid::new_v4().to_string(), input: line,
+                        }).await?;
+                    }
+                }
+                continue;
+            }
+            signal = tokio::signal::ctrl_c(), if interactive => {
+                signal?;
+                write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?;
+                interactive = false;
+                continue;
+            }
+            completed = operations.join_next(), if !operations.is_empty() => {
+                if let Some(completed) = completed {
+                    let (call_id, result) = completed.context("Host execution task stopped")?;
+                    write_command(&mut *wire.writer, &RuntimeCommand::HostReply { call_id, result }).await?;
+                }
+                continue;
+            }
         };
         let event: RuntimeEventKind =
             serde_json::from_slice(&frame).context("Coordinator returned an invalid event")?;
@@ -1069,12 +1165,7 @@ async fn request(
                     attached,
                     "Only an attached task worker may execute coordinator host calls"
                 );
-                let result = host::execute(*command).await;
-                write_command(
-                    &mut *wire.writer,
-                    &RuntimeCommand::HostReply { call_id, result },
-                )
-                .await?;
+                operations.spawn(async move { (call_id, host::execute(*command).await) });
             }
             RuntimeEventKind::AuthorizationUrl { url } => {
                 ensure!(
@@ -1092,8 +1183,62 @@ async fn request(
                 failure = Some(message);
             }
             RuntimeEventKind::Done => break,
-            RuntimeEventKind::Notice { text, .. } if !arguments.json => eprintln!("{text}"),
+            RuntimeEventKind::TaskReady { ref title, .. } => {
+                ready = true;
+                outcome = true;
+                if arguments.json {
+                    display(&event, true)?;
+                } else {
+                    println!("{title}\n");
+                }
+            }
+            RuntimeEventKind::History {
+                ref next_cursor, ..
+            } => {
+                history_cursor = next_cursor.clone();
+                outcome = true;
+                display(&event, arguments.json)?;
+            }
+            RuntimeEventKind::WorkerIdle => {
+                if arguments.json {
+                    display(&event, true)?;
+                } else if std::io::stdin().is_terminal() {
+                    let mut stdout = tokio::io::stdout();
+                    stdout.write_all(b"task> ").await?;
+                    stdout.flush().await?;
+                }
+            }
+            RuntimeEventKind::Activity { ref activity } if !arguments.json => {
+                use agent_cli::protocol::ModelActivity;
+                match activity {
+                    ModelActivity::Thinking { text } => {
+                        if !thinking {
+                            eprint!("thinking> ");
+                            thinking = true;
+                        }
+                        eprint!("{text}");
+                        std::io::Write::flush(&mut std::io::stderr())?;
+                    }
+                    ModelActivity::ToolStarted { name, .. } => {
+                        if thinking {
+                            eprintln!();
+                            thinking = false;
+                        }
+                        eprintln!("[{name}]");
+                    }
+                    ModelActivity::ToolFinished { .. } => {}
+                }
+            }
+            RuntimeEventKind::Notice { text, .. } if !arguments.json => {
+                if !attached {
+                    eprintln!("{text}");
+                }
+            }
             other => {
+                if thinking {
+                    eprintln!();
+                    thinking = false;
+                }
                 outcome = true;
                 display(&other, arguments.json)?;
             }
@@ -1115,7 +1260,7 @@ async fn request(
         bail!("{failure}");
     }
     ensure!(outcome, "Coordinator completed without a result");
-    Ok(())
+    Ok(history_cursor)
 }
 
 fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
@@ -1137,6 +1282,38 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
             ),
         },
         RuntimeEventKind::Answer { text, .. } => println!("{text}"),
+        RuntimeEventKind::History { messages, .. } => {
+            use agent_cli::protocol::HistoryRole;
+            for message in messages {
+                let role = match message.role {
+                    HistoryRole::User => "user",
+                    HistoryRole::Assistant => "agent",
+                    HistoryRole::Thinking => "thinking",
+                    HistoryRole::Tool => "tool",
+                };
+                if message.continuation {
+                    println!("{}", message.text);
+                } else {
+                    println!("{role}> {}", message.text);
+                }
+            }
+        }
+        RuntimeEventKind::Message { message } => {
+            if message.continuation {
+                println!("{}", message.text);
+            } else {
+                println!(
+                    "{}> {}",
+                    if matches!(message.role, agent_cli::protocol::HistoryRole::User) {
+                        "input"
+                    } else {
+                        "agent"
+                    },
+                    message.text
+                );
+            }
+        }
+        RuntimeEventKind::InputRejected { message, .. } => eprintln!("Input not saved: {message}"),
         RuntimeEventKind::Tasks { tasks } => {
             for task in tasks {
                 println!("{}  {}", task.id, task.title);

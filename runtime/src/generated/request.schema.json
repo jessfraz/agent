@@ -1068,6 +1068,40 @@
                 "null"
               ]
             },
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "task_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TaskId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "read_history"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agent_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "allocation_id": {
               "type": "string"
             },
@@ -1106,6 +1140,12 @@
             "instructions": {
               "type": "string"
             },
+            "interactive": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "model": {
               "$ref": "#/$defs/ModelSelection"
             },
@@ -1125,6 +1165,38 @@
             "instructions",
             "model",
             "cwd"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            },
+            "input_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "worker_input"
+            }
+          },
+          "required": [
+            "type",
+            "input_id",
+            "input"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "detach_worker"
+            }
+          },
+          "required": [
+            "type"
           ]
         },
         {

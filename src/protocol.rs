@@ -179,6 +179,11 @@ pub enum RuntimeCommand {
     ReadTask {
         task_id: TaskId,
     },
+    ReadHistory {
+        task_id: Option<TaskId>,
+        agent_id: Option<String>,
+        cursor: Option<String>,
+    },
     RevokeAllocation {
         task_id: TaskId,
         allocation_id: String,
@@ -196,7 +201,15 @@ pub enum RuntimeCommand {
         instructions: String,
         model: ModelSelection,
         cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        interactive: Option<bool>,
     },
+    WorkerInput {
+        input_id: String,
+        input: String,
+    },
+    DetachWorker,
     HostReply {
         call_id: String,
         result: HostResult,
@@ -530,11 +543,56 @@ pub enum RuntimeEventKind {
         conversation_id: String,
         text: String,
     },
+    History {
+        conversation_id: String,
+        messages: Vec<HistoryMessage>,
+        next_cursor: Option<String>,
+    },
+    TaskReady {
+        conversation_id: String,
+        title: String,
+    },
+    WorkerIdle,
+    InputRejected {
+        input_id: String,
+        message: String,
+    },
+    Activity {
+        activity: ModelActivity,
+    },
+    Message {
+        message: HistoryMessage,
+    },
     Failure {
         code: ErrorCode,
         message: String,
     },
     Done,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct HistoryMessage {
+    pub entry_id: String,
+    pub role: HistoryRole,
+    pub text: String,
+    pub continuation: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryRole {
+    User,
+    Assistant,
+    Thinking,
+    Tool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelActivity {
+    Thinking { text: String },
+    ToolStarted { call_id: String, name: String },
+    ToolFinished { call_id: String, name: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]

@@ -16,6 +16,8 @@ import { TaskError, TaskStore } from "./tasks.js";
 import { createAppTools, Executions, HostRequests } from "./tools.js";
 import { createSourceTools, SourceJournal } from "./sources.js";
 import { createResourceTools, ResourceStore } from "./resources.js";
+import { activity, history } from "./transcript.js";
+import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 
 const VERSION = 1;
 function stateDirectory(): string {
@@ -61,9 +63,13 @@ async function openApplication() {
 let application: ReturnType<typeof openApplication> | undefined;
 function app(): ReturnType<typeof openApplication> { return application ??= openApplication(); }
 let mainQueue = Promise.resolve();
+const workers = new Map<number, { command: Extract<RuntimeCommand, { type: "run_task" }>; controller: AbortController }>();
 
 async function handle(request: RuntimeRequest): Promise<void> {
   const { id, command } = request;
+  if (command.type === "run_task" && command.interactive === true) {
+    workers.set(id, { command, controller: new AbortController() });
+  }
   try {
     switch (command.type) {
       case "configure_coordinator":
@@ -96,6 +102,15 @@ async function handle(request: RuntimeRequest): Promise<void> {
         emit(id, { type: "task", task: await tasks.get(command.task_id), history: await tasks.history(command.task_id) });
         break;
       }
+      case "read_history": {
+        const { harness, tasks } = await app();
+        if (command.task_id === null && command.agent_id !== null) throw new TaskError("Choose a task for agent history");
+        const conversation = command.task_id === null ? await harness.root(BACKGROUND_CONTEXT)
+          : await tasks.conversation(command.agent_id === null ? (await tasks.get(command.task_id)).conversation_id
+            : (await tasks.get(command.task_id)).agents.find((agent) => agent.id === command.agent_id)?.conversation_id ?? "");
+        for (const frame of await history(conversation, command.cursor)) emit(id, frame);
+        break;
+      }
       case "revoke_allocation": {
         const { tasks } = await app();
         const task = await tasks.revokeAllocation(command.task_id, command.allocation_id, command.agent_id);
@@ -123,11 +138,26 @@ async function handle(request: RuntimeRequest): Promise<void> {
       }
       case "run_task": {
         const { tasks, executions, tools, sourceTools, resourceTools } = await app();
+        let stop: (() => Promise<void>) | undefined;
+        try {
+        const worker = workers.get(id);
         const answer = await tasks.run(command, (conversation, host, model) => executions.bind(conversation.id.toString(), {
           model, cwd: command.cwd, hosts: [host], role: "worker", call: (operation) => hostRequests.call(id, operation),
         }), (task, text) => emit(id, { type: "notice", task_id: task.id, text: `${task.title}: ${text}` }),
-        [tools.host, tools.worker, sourceTools, resourceTools], (operation) => hostRequests.call(id, operation), (selected) => inference.preflight(selected));
-        emit(id, { type: "answer", ...answer });
+        [tools.host, tools.worker, sourceTools, resourceTools], (operation) => hostRequests.call(id, operation), (selected) => inference.preflight(selected),
+        worker === undefined ? undefined : {
+          signal: worker.controller.signal,
+          async ready(conversation, title) {
+            emit(id, { type: "task_ready", conversation_id: conversation.id.toString(), title });
+            for (const frame of await history(conversation, null)) emit(id, frame);
+            stop = await activity(tasks.session, conversation, (activity) => emit(id, { type: "activity", activity }),
+              (message) => emit(id, { type: "message", message }));
+          },
+          answer(conversation_id, text) { emit(id, { type: "answer", conversation_id, text }); },
+          idle() { emit(id, { type: "worker_idle" }); },
+        });
+        if (worker === undefined) emit(id, { type: "answer", ...answer });
+        } finally { await stop?.(); }
         break;
       }
       case "chat": {
@@ -143,6 +173,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
             model: selected, cwd: command.cwd, hosts, default_host, call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
             notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
           });
+          const stop = await activity(harness, root, (activity) => emit(id, { type: "activity", activity }));
           try {
             const related = await tasks.search(command.input);
             const relatedContext = related.length === 0 ? "" : "\n\nRelated existing tasks (read and reuse the matching task):\n" +
@@ -159,7 +190,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
             const text = entry?.model?.flatMap((message) => message.role !== "assistant" ? []
               : message.content.flatMap((part) => part.type === "text" ? [part.text] : [])).join("\n") ?? "";
             emit(id, { type: "answer", conversation_id: root.id.toString(), text });
-          } finally { release(); }
+          } finally { await stop(); release(); }
         });
         mainQueue = turn.then(() => {}, () => {});
         await turn;
@@ -172,6 +203,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
     if (error instanceof TaskError || error instanceof ModelError || error instanceof EnvironmentError) failure(id, "invalid_request", error.message);
     else emit(id, errorEvent(error));
   } finally {
+    workers.delete(id);
     hostRequests.finish(id);
     emit(id, { type: "done" });
   }
@@ -198,12 +230,29 @@ try {
       if (activeLoginRequestId === request.id) auth.forwardCallback(request.command.target);
       continue;
     }
+    if (request.command.type === "worker_input" || request.command.type === "detach_worker") {
+      const worker = workers.get(request.id);
+      if (worker === undefined) continue;
+      if (request.command.type === "detach_worker") worker.controller.abort();
+      else {
+        const { input, input_id } = request.command;
+        try {
+          if (worker.controller.signal.aborted) throw new TaskError("This worker is detaching");
+          await (await app()).tasks.input(worker.command, input, input_id);
+        } catch (error) {
+          emit(request.id, { type: "input_rejected", input_id,
+            message: error instanceof TaskError ? error.message : "Input could not be saved; its previous history is retained" });
+        }
+      }
+      continue;
+    }
     if (pending.size >= 64) {
       failure(request.id, "invalid_request", "The coordinator is busy; retry later"); emit(request.id, { type: "done" }); continue;
     }
     const operation = handle(request).finally(() => pending.delete(operation));
     pending.add(operation);
   }
+  for (const worker of workers.values()) worker.controller.abort();
   await Promise.allSettled(pending);
 } finally {
   if (application !== undefined) {

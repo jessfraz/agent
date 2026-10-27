@@ -55,6 +55,10 @@ enum CommandMessage {
         request_id: u32,
         target: String,
     },
+    WorkerControl {
+        request_id: u32,
+        command: Box<RuntimeCommand>,
+    },
     Shutdown,
 }
 
@@ -62,6 +66,7 @@ struct Pending {
     events: Option<mpsc::Sender<RuntimeEventKind>>,
     host_calls: HashSet<String>,
     login: bool,
+    worker: bool,
 }
 
 impl Runtime {
@@ -142,6 +147,8 @@ impl Runtime {
                     | RuntimeCommand::OAuthCallback { .. }
                     | RuntimeCommand::Watch
                     | RuntimeCommand::ConnectWorker { .. }
+                    | RuntimeCommand::WorkerInput { .. }
+                    | RuntimeCommand::DetachWorker
             ),
             "Transport control commands do not create Pi requests"
         );
@@ -174,6 +181,23 @@ impl Runtime {
             .commands
             .send(CommandMessage::Detached(request_id))
             .await;
+    }
+
+    pub async fn worker_control(&self, request_id: u32, command: RuntimeCommand) -> Result<()> {
+        ensure!(
+            matches!(
+                command,
+                RuntimeCommand::WorkerInput { .. } | RuntimeCommand::DetachWorker
+            ),
+            "Invalid worker control"
+        );
+        self.commands
+            .send(CommandMessage::WorkerControl {
+                request_id,
+                command: Box::new(command),
+            })
+            .await
+            .context("Pi runtime is closed")
     }
 
     pub async fn callback(&self, request_id: u32, target: String) -> Result<()> {
@@ -230,6 +254,18 @@ async fn send(stdin: &mut ChildStdin, request: RuntimeRequest) -> Result<()> {
 
 async fn reject_host_calls(stdin: &mut ChildStdin, id: u32, pending: &mut Pending) -> Result<()> {
     pending.events.take();
+    if pending.worker {
+        pending.worker = false;
+        send(
+            stdin,
+            RuntimeRequest {
+                version: PROTOCOL_VERSION,
+                id,
+                command: RuntimeCommand::DetachWorker,
+            },
+        )
+        .await?;
+    }
     for call_id in pending.host_calls.drain() {
         send(
             stdin,
@@ -269,11 +305,12 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                     Some(CommandMessage::Request { command, admitted }) => {
                         let command = *command;
                         let login = matches!(command, RuntimeCommand::Login);
+                        let worker = matches!(command, RuntimeCommand::RunTask { interactive: Some(true), .. });
                         let id = next_id;
                         next_id = id.checked_add(1).context("Runtime request IDs exhausted")?;
                         let (sender, events) = mpsc::channel(64);
                         send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id, command }).await?;
-                        pending.insert(id, Pending { events: Some(sender), host_calls: HashSet::new(), login });
+                        pending.insert(id, Pending { events: Some(sender), host_calls: HashSet::new(), login, worker });
                         if admitted.send(Ok(RuntimeCall { request_id: id, events })).is_err()
                             && let Some(call) = pending.get_mut(&id) {
                             reject_host_calls(&mut stdin, id, call).await?;
@@ -295,6 +332,11 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                         if pending.get(&request_id).is_some_and(|request| request.login) {
                             send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id: request_id,
                                 command: RuntimeCommand::OAuthCallback { target } }).await?;
+                        }
+                    }
+                    Some(CommandMessage::WorkerControl { request_id, command }) => {
+                        if pending.get(&request_id).is_some_and(|request| request.worker && request.events.is_some()) {
+                            send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id: request_id, command: *command }).await?;
                         }
                     }
                     Some(CommandMessage::Shutdown) | None => break Ok(()),

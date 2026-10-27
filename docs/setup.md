@@ -60,6 +60,13 @@ configured coordinator. Caller project information accompanies the request;
 shared context and conversation storage stay on the coordinator. `agent nodes`
 shows registered machines and which are online.
 
+`agent` opens that same saved main conversation. Recent messages appear on
+startup; `/history` reads older pages and `/exit` detaches. Task sessions open
+directly into an interactive `Chat` tab. Reply there or through the main agent;
+both use the same task conversation. Named child tabs return results while
+remaining available for follow-ups. Live activity shows tool names and exposed
+provider thinking text.
+
 A CLI-only client uses the same `agent init --coordinator ...` command and
 skips the service. Phone access is the Rex phone CLI connected to one of these
 machines, running the same `agent chat` command.
@@ -127,9 +134,10 @@ same reader. Their working directory, deadline, diagnostics and output limits
 are preserved. Commands run directly in an unrelated shell still use that
 shell's macOS permission context.
 
-With Messages enabled, `agent serve` installs the small Rex action module once.
-Existing Rex configuration is preserved. An unchanged module causes no reload
-on agent upgrades. Setup can also be run explicitly:
+With Messages enabled, the coordinator installs the small Rex action module at
+startup, and workers check it when connecting using the coordinator's settings.
+Existing Rex configuration is preserved; an unchanged module causes no reload.
+Setup can also be run explicitly:
 
 ```sh
 agent rex install

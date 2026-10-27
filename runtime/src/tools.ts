@@ -209,6 +209,15 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
     record,
   ] });
   const worker = defineExtension({ name: "task-worker", tools: [record,
+    defineTool({ name: "continue_agent", description: "Give an attached agent a follow-up in its existing conversation and terminal. A finished assignment reopens; its previous result stays in history.",
+      parameters: Type.Object({ agent_id: Type.String({ minLength: 1 }), input: Type.String({ minLength: 1, maxLength: 16000 }) }),
+      async execute(args, api, context) {
+        executions.get(api.conversationId.toString());
+        const owner = await tasks.owner(api.conversationId.toString());
+        if (owner.agent !== undefined) throw new TaskError("Only the parent worker may continue task agents");
+        const inputId = await api.memo("agent_input_id", randomUUID(), context);
+        return output(await tasks.continueAgent(owner.task.id, args.agent_id, args.input, inputId));
+      } }),
     defineTool({ name: "spawn_agent", description: "Give a bounded assignment to a named terminal in this task's Rex session. The parent retains the overall outcome.",
       parameters: Type.Object({ title: Type.String({ minLength: 1, maxLength: 80 }),
         outcome: Type.String({ minLength: 1, maxLength: 4000 }), input: Type.String({ minLength: 1, maxLength: 16000 }) }),

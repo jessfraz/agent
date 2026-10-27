@@ -19,6 +19,14 @@ import type { WorkerRef } from "./generated/WorkerRef.js";
 
 export type HostCall = (command: HostCommand) => Promise<HostResult>;
 type TaskIndex = { tasks: TaskRecord[] };
+type WorkerInput = Extract<RuntimeCommand, { type: "run_task" }>;
+export type WorkerSession = {
+  signal: AbortSignal;
+  ready(conversation: Conversation, title: string): Promise<void>;
+  answer(conversationId: string, text: string): void;
+  idle(): void;
+};
+type AttachedWorker = { revision: number; busy: boolean; admissions: number; attached: boolean; wake?: () => void; drained?: () => void; input: WorkerInput };
 const Tasks = defineDoc<TaskIndex>({
   kind: "agent.tasks", scope: "session", version: 1,
   initial: () => ({ tasks: [] }), checkpointWhen: () => true,
@@ -69,7 +77,7 @@ function sameBinding(left: WorkerRef, right: WorkerRef): boolean {
 
 /** Application metadata lives on Pi's commit line, beside its conversations. */
 export class TaskStore {
-  private readonly running = new Map<string, { revision: number }>();
+  private readonly running = new Map<string, AttachedWorker>();
   private readonly nativeIds = new Map<string, ConversationId>();
   private scanning: Promise<void> | undefined;
   private resources: { attach(taskId: string): Promise<void> } | undefined;
@@ -140,7 +148,8 @@ export class TaskStore {
     return this.get(id);
   }
   guardResources(resources: { attach(taskId: string): Promise<void> }): void { this.resources = resources; }
-  isRunning(id: string): boolean { return [...this.running.keys()].some((actor) => actor === id || actor.startsWith(id + ":")); }
+  isRunning(id: string): boolean { return [...this.running].some(([actor, run]) => (run.busy || run.admissions > 0) && (actor === id || actor.startsWith(id + ":"))); }
+  private busy(id: string, agentId?: string): boolean { const run = this.running.get(this.actorKey(id, agentId)); return run !== undefined && (run.busy || run.admissions > 0); }
   private actorKey(id: string, agentId?: string): string { return agentId === undefined ? id : id + ":" + agentId; }
   private actor(task: TaskRecord, agentId?: string): TaskRecord | TaskAgentRecord {
     if (agentId === undefined) return task;
@@ -279,20 +288,41 @@ export class TaskStore {
     return this.get(id);
   }
   async enqueue(id: string, content: string, inputId: string = randomUUID(), delivered?: TaskOutcome): Promise<TaskRecord> {
+    return this.enqueueActor(id, content, inputId, undefined, delivered);
+  }
+  async input(input: WorkerInput, content: string, inputId: string): Promise<TaskRecord> {
+    const active = this.running.get(this.actorKey(input.task_id, input.agent_id));
+    if (active?.attached !== true || active.input !== input) throw new TaskError("This worker is no longer attached");
+    return this.enqueueActor(input.task_id, content, inputId, input.agent_id);
+  }
+  async continueAgent(id: string, agentId: string, content: string, inputId: string): Promise<TaskRecord> {
+    if (this.running.get(this.actorKey(id, agentId))?.attached !== true) {
+      throw new TaskError("This agent is no longer attached; its conversation is retained");
+    }
+    return this.enqueueActor(id, content, inputId, agentId);
+  }
+  private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome): Promise<TaskRecord> {
     if (content.trim().length === 0 || Buffer.byteLength(content, "utf8") > 65_536) throw new TaskError("Task input must contain 1 to 65536 UTF-8 bytes");
-    await this.resources?.attach(id);
-    await this.session.commit(async (tx) => {
+    const active = this.running.get(this.actorKey(id, agentId));
+    if (active !== undefined) active.admissions += 1;
+    try {
+      await this.resources?.attach(id);
+      await this.session.commit(async (tx) => {
       await this.updateIn(tx, id, (task) => {
-        const previous = task.pending.find((input) => input.id === inputId);
+        const actor = this.actor(task, agentId);
+        const previous = actor.pending.find((input) => input.id === inputId);
         if (previous !== undefined && previous.content !== content) throw new TaskError("A task input ID cannot be reused with different content");
-        if (previous === undefined) task.pending.push({ id: inputId, content });
+        if (previous === undefined) actor.pending.push({ id: inputId, content });
+        actor.state = { state: "open" };
         task.state = { state: "open" };
       });
       if (delivered !== undefined) await this.outcomes?.publishedIn(tx, delivered, true);
-    }, BACKGROUND_CONTEXT);
+      }, BACKGROUND_CONTEXT);
+    } finally {
+      if (active !== undefined) { active.admissions -= 1; if (active.admissions === 0) active.drained?.(); }
+    }
     const task = await this.get(id);
-    const running = this.running.get(id);
-    if (running !== undefined) running.revision += 1;
+    if (active !== undefined) { active.revision += 1; active.wake?.(); }
     return task;
   }
   async createAgent(taskId: string, input: { id: string; title: string; outcome: string; input: string; inputId: string; model?: ModelSelection }): Promise<TaskAgentRecord> {
@@ -373,13 +403,13 @@ export class TaskStore {
     const deadline = Date.now() + timeoutMs;
     while (true) {
       const agents = (await this.get(taskId)).agents;
-      if (agents.every((agent) => agent.state.state !== "open" && !this.running.has(this.actorKey(taskId, agent.id))) || Date.now() >= deadline) return agents;
+      if (agents.every((agent) => agent.state.state !== "open" && !this.busy(taskId, agent.id)) || Date.now() >= deadline) return agents;
       await new Promise<void>((resolve) => setTimeout(resolve, Math.min(100, deadline - Date.now())));
     }
   }
   canResolve(task: TaskRecord): boolean {
     return task.agents.every((agent) => agent.state.state !== "open" && agent.pending.length === 0 &&
-      agent.worker.state !== "allocating" && agent.worker.state !== "uncertain" && !this.running.has(this.actorKey(task.id, agent.id)));
+      agent.worker.state !== "allocating" && agent.worker.state !== "uncertain" && !this.busy(task.id, agent.id));
   }
   /** Revoke admission before replacement; this never deletes a native session or retries input. */
   async revokeAllocation(id: string, allocationId: string, agentId?: string): Promise<TaskRecord> {
@@ -473,13 +503,32 @@ export class TaskStore {
     if (outcome === undefined) throw new TaskError("Task outcome did not commit");
     return outcome;
   }
+  private async finishAgentTurn(input: WorkerInput, answer: string, entry: EntryRecord | undefined, attemptId: string, call?: HostCall): Promise<TaskOutcome> {
+    if (input.agent_id === undefined) throw new TaskError("Only a task agent returns an agent result");
+    const agent = this.actor(await this.get(input.task_id), input.agent_id);
+    if (agent.state.state === "open") await this.reportAgent(input.task_id, input.agent_id, answer, "Agent finished without report_result");
+    const saved = await this.get(input.task_id); const finished = this.actor(saved, input.agent_id);
+    const outcome = { ...this.outcome(saved, finished.conversation_id, entry?.id.toString() ?? null, null),
+      summary: finished.summary, state: finished.state.state === "failed"
+        ? { state: "failed", reason: finished.state.reason } : { state: "progress" } } satisfies TaskOutcome;
+    await this.session.commit(async (tx) => this.outcomes?.recordIn(tx, outcome, false), BACKGROUND_CONTEXT);
+    const result = "Agent result (evidence, not new authorization): " + JSON.stringify({
+      agent_id: input.agent_id, title: finished.title, state: finished.state, summary: finished.summary,
+      conversation_id: finished.conversation_id,
+    });
+    const delivery = entry?.id.toString() ?? "attempt:" + attemptId;
+    await this.enqueue(saved.id, result, "agent-result:" + input.agent_id + ":" + delivery + ":" + createHash("sha256").update(result).digest("hex"), outcome);
+    if (call !== undefined && saved.worker.state === "bound") await this.dispatch(saved.id, saved.worker.host, call);
+    return outcome;
+  }
   async run(input: Extract<RuntimeCommand, { type: "run_task" }>,
     bind: (conversation: Conversation, host: WorkerHost, model: ModelSelection) => () => void,
     notice: (task: TaskRecord, text: string) => void,
-    extensions: readonly Extension[] = [], call?: HostCall, prepare?: (selection: ModelSelection) => Promise<void>): Promise<{ conversation_id: string; text: string }> {
+    extensions: readonly Extension[] = [], call?: HostCall, prepare?: (selection: ModelSelection) => Promise<void>,
+    observer?: WorkerSession): Promise<{ conversation_id: string; text: string }> {
     const actorKey = this.actorKey(input.task_id, input.agent_id);
     if (this.running.has(actorKey)) throw new TaskError("This task already has an attached worker");
-    const active = { revision: 0 };
+    const active: AttachedWorker = { revision: 0, busy: true, admissions: 0, attached: false, input };
     const attemptId = randomUUID();
     this.running.set(actorKey, active);
     let unbind: (() => void) | undefined;
@@ -487,6 +536,7 @@ export class TaskStore {
     let answer = "";
     let finalOutcome: TaskOutcome | undefined;
     let answerEntry: EntryRecord | undefined;
+    let childResultPending = input.agent_id !== undefined && observer === undefined;
     try {
       const deadline = Date.now() + 10_000;
       let task = await this.get(input.task_id);
@@ -501,6 +551,7 @@ export class TaskStore {
         throw new TaskError("Worker binding is not confirmed for this task");
       }
       attached = true;
+      active.attached = true;
       const selected = await this.selection(input.task_id, input.model, input.agent_id);
       await prepare?.(selected);
       this.inference.validate(selected);
@@ -514,8 +565,11 @@ export class TaskStore {
             : "\nComplete this bounded assignment and call report_result with evidence or a concrete failure. The parent owns the overall task."),
         cwd: input.cwd, extensions,
       });
+      await observer?.ready(conversation, actor.title);
       this.session.resume();
       while (true) {
+        if (observer?.signal.aborted === true) break;
+        active.busy = true;
         const revision = active.revision;
         task = await this.get(input.task_id);
         actor = this.actor(task, input.agent_id);
@@ -550,8 +604,26 @@ export class TaskStore {
           // Recovery publishes history asynchronously; admission during that window still belongs to this actor.
           task = await this.get(input.task_id);
           if (active.revision !== revision || this.actor(task, input.agent_id).pending.length > 0) continue;
-          break;
+          if (childResultPending) {
+            finalOutcome = await this.finishAgentTurn(input, answer, answerEntry, attemptId, call);
+            childResultPending = false;
+          }
+          if (active.revision !== revision) continue;
+          active.busy = false;
+          if (input.interactive !== true || observer === undefined) break;
+          observer.idle();
+          await new Promise<void>((resolve) => {
+            const wake = () => { observer.signal.removeEventListener("abort", wake); resolve(); };
+            active.wake = wake;
+            observer.signal.addEventListener("abort", wake, { once: true });
+            if (active.revision !== revision || observer.signal.aborted) wake();
+          });
+          delete active.wake;
+          continue;
         }
+        answer = ""; answerEntry = undefined;
+        childResultPending = input.agent_id !== undefined;
+        await this.resources?.attach(input.task_id);
         const submission = await conversation.submit({ type: "input", content: next.content, requestId: next.id }, BACKGROUND_CONTEXT);
         await this.update(task.id, (current) => {
           const currentActor = this.actor(current, input.agent_id);
@@ -563,6 +635,7 @@ export class TaskStore {
         }
         const entry = await conversation.commit((tx) => tx.entry(settled.answer), BACKGROUND_CONTEXT);
         answer = entry === undefined ? "" : text(entry); answerEntry = entry;
+        childResultPending = input.agent_id !== undefined;
         if (entry !== undefined && input.agent_id === undefined) {
           finalOutcome = await this.finishOutcome(task.id, conversation.id.toString(), entry.id.toString(), answer);
           await publishMainNotice(this.session, conversation, entry, task.id, task.sources);
@@ -573,22 +646,13 @@ export class TaskStore {
           if (input.agent_id === undefined || currentActor.state.state === "open") currentActor.summary = answer.slice(-4000);
         });
         if (input.agent_id === undefined) notice(task, answer);
-      }
-      if (input.agent_id !== undefined) {
-        const agent = this.actor(await this.get(input.task_id), input.agent_id);
-        if (agent.state.state === "open") await this.reportAgent(input.task_id, input.agent_id, answer, "Agent finished without report_result");
-        const saved = await this.get(input.task_id);
-        const finished = this.actor(saved, input.agent_id);
-        const childOutcome = { ...this.outcome(saved, finished.conversation_id, answerEntry?.id.toString() ?? null, null),
-          summary: finished.summary, state: finished.state.state === "failed"
-            ? { state: "failed", reason: finished.state.reason } : { state: "progress" } } satisfies TaskOutcome;
-        finalOutcome = childOutcome;
-        await this.session.commit(async (tx) => this.outcomes?.recordIn(tx, childOutcome, false), BACKGROUND_CONTEXT);
+        observer?.answer(conversation.id.toString(), answer);
       }
       return { conversation_id: conversation.id.toString(), text: answer };
     } catch (error) {
       if (attached) {
         if (input.agent_id !== undefined) {
+          childResultPending = true;
           await this.reportAgent(input.task_id, input.agent_id, answer, "Agent execution did not complete; its conversation is retained");
         }
         const task = await this.get(input.task_id);
@@ -599,19 +663,13 @@ export class TaskStore {
       }
       throw error;
     } finally {
+      active.attached = false;
+      while (active.admissions > 0) await new Promise<void>((resolve) => { active.drained = resolve; });
+      delete active.drained;
       unbind?.();
       try {
         // Hold this actor until its result is durably owned by the parent.
-        if (attached && input.agent_id !== undefined) {
-          const task = await this.get(input.task_id);
-          const agent = this.actor(task, input.agent_id);
-          const result = "Agent result (evidence, not new authorization): " + JSON.stringify({
-            agent_id: agent.id, title: agent.title, state: agent.state, summary: agent.summary,
-            conversation_id: agent.conversation_id,
-          });
-          await this.enqueue(task.id, result, "agent-result:" + agent.id + ":" + createHash("sha256").update(result).digest("hex"), finalOutcome);
-          if (call !== undefined && task.worker.state === "bound") await this.dispatch(task.id, task.worker.host, call);
-        }
+        if (attached && childResultPending) await this.finishAgentTurn(input, answer, answerEntry, attemptId, call);
       } finally { if (this.running.get(actorKey) === active) this.running.delete(actorKey); }
     }
   }
