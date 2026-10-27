@@ -3,14 +3,15 @@ use std::{fs, path::PathBuf};
 use agent_cli::protocol::{RuntimeEvent, RuntimeRequest, TaskOutcome};
 use anyhow::Result;
 use schemars::schema_for;
-use ts_rs::TS;
+use ts_rs::{Config, TS};
 
 fn main() -> Result<()> {
     let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/src/generated");
     fs::create_dir_all(&output)?;
-    RuntimeRequest::export_all_to(&output)?;
-    RuntimeEvent::export_all_to(&output)?;
-    TaskOutcome::export_all_to(&output)?;
+    let config = Config::from_env().with_out_dir(&output);
+    RuntimeRequest::export_all(&config)?;
+    RuntimeEvent::export_all(&config)?;
+    TaskOutcome::export_all(&config)?;
     fs::write(
         output.join("request.schema.json"),
         serde_json::to_string_pretty(&schema_for!(RuntimeRequest))?,
