@@ -33,9 +33,9 @@ in {
       description = "Coordinator working directory.";
     };
     tailnetPort = lib.mkOption {
-      type = lib.types.nullOr lib.types.port;
+      type = lib.types.nullOr (lib.types.ints.between 1 65535);
       default = null;
-      description = "Optional port bound exclusively to the Tailscale interface.";
+      description = "Coordinator Tailscale port; null uses the CLI default, 43187.";
     };
     extraPackages = lib.mkOption {
       type = lib.types.listOf lib.types.package;

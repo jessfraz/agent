@@ -96,8 +96,8 @@ Rex server restart recovery remains an open question below.
 ```
 
 Background sources implement a transport-neutral Rust trait in
-`sources/mod.rs`, with sibling CLI adapters for mail, calendars, GitHub and
-Slack. CLIs own authentication and refresh. An API adapter, such as a future
+`sources/mod.rs`, with sibling CLI adapters for mail, calendars, GitHub, Messages
+and Slack. CLIs own authentication and refresh. An API adapter, such as a future
 Home Assistant source, returns the same normalized events, checkpoint and
 coverage. The coordinator rediscovers configured accounts, polls bounded pages
 and preserves separate cursors and
@@ -150,8 +150,7 @@ that source; a separate allowance for this app is unavailable.
 
 ## After the MVP
 
-Messages joins through its read-only Switchboard CLI when available. Home
-Assistant can use its API for repairs, failures and state changes. Later
+Home Assistant can use its API for repairs, failures and state changes. Later
 sources may include MyChart notifications and Ramp activity through their
 existing CLIs. These are optional feeds; domain workflows such as Poshmark
 offers continue through ordinary mail intake. API credentials stay in the

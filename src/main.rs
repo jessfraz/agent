@@ -74,8 +74,10 @@ enum Action {
     },
     /// Run the local coordinator in the foreground.
     Serve {
-        #[arg(long)]
-        tailnet_port: Option<u16>,
+        #[arg(long, default_value_t = agent_cli::tailnet::DEFAULT_PORT, value_parser = clap::value_parser!(u16).range(1..))]
+        tailnet_port: u16,
+        #[arg(long, hide = true, conflicts_with = "tailnet_port")]
+        local_only: bool,
         #[arg(long)]
         no_sources: bool,
     },
@@ -207,6 +209,7 @@ async fn main() -> Result<()> {
     // when this machine's ordinary client profile points elsewhere.
     if let Action::Serve {
         tailnet_port,
+        local_only,
         no_sources,
     } = action
     {
@@ -232,9 +235,10 @@ async fn main() -> Result<()> {
                 let _ = intake::run(state, profile, context).await;
             })))
         };
-        return match tailnet_port {
-            Some(port) => service::serve_tailnet(&script, &directory, port, policy, daemon).await,
-            None => service::serve(&script, &directory).await,
+        return if local_only {
+            service::serve(&script, &directory).await
+        } else {
+            service::serve_tailnet(&script, &directory, tailnet_port, policy, daemon).await
         };
     }
     if matches!(action, Action::Rpc) {
@@ -513,16 +517,8 @@ async fn local_connection(
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(directory.join("coordinator.log"))?;
-    let mut command = Command::new(config::program()?);
-    if let Some(path) = config_path {
-        command.arg("--config").arg(path);
-    }
+    let mut command = local_service_command(&config::program()?, script, directory, config_path);
     command
-        .arg("--state-dir")
-        .arg(directory)
-        .arg("--runtime")
-        .arg(script)
-        .arg("serve")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
@@ -555,6 +551,26 @@ async fn local_connection(
         );
         sleep(Duration::from_millis(25)).await;
     }
+}
+
+fn local_service_command(
+    program: &Path,
+    script: &Path,
+    directory: &Path,
+    config_path: Option<&Path>,
+) -> Command {
+    let mut command = Command::new(program);
+    if let Some(path) = config_path {
+        command.arg("--config").arg(path);
+    }
+    command
+        .arg("--state-dir")
+        .arg(directory)
+        .arg("--runtime")
+        .arg(script)
+        .arg("serve")
+        .arg("--local-only");
+    command
 }
 
 fn quoted(value: &str) -> String {
@@ -812,4 +828,76 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Action, Arguments, local_service_command};
+    use clap::Parser;
+    use std::path::Path;
+
+    #[test]
+    fn serve_defaults_to_the_tailnet_port_and_rejects_invalid_or_conflicting_overrides() {
+        let parsed = Arguments::try_parse_from(["agent", "serve"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Action::Serve {
+                tailnet_port: 43_187,
+                local_only: false,
+                ..
+            })
+        ));
+        let parsed =
+            Arguments::try_parse_from(["agent", "serve", "--tailnet-port", "50000"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Action::Serve {
+                tailnet_port: 50_000,
+                local_only: false,
+                ..
+            })
+        ));
+        let parsed = Arguments::try_parse_from(["agent", "serve", "--local-only"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Action::Serve {
+                local_only: true,
+                ..
+            })
+        ));
+        for arguments in [
+            vec!["agent", "serve", "--tailnet-port", "0"],
+            vec!["agent", "serve", "--tailnet-port", "65536"],
+            vec!["agent", "serve", "--local-only", "--tailnet-port", "43187"],
+        ] {
+            assert!(Arguments::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn implicit_local_startup_preserves_paths_and_selects_only_the_unix_transport() {
+        let program = Path::new("/example/agent");
+        let script = Path::new("/example/runtime with spaces/bridge.js");
+        let state = Path::new("/example/private state");
+        let config = Path::new("/example/private config.json");
+        for selected in [None, Some(config)] {
+            let command = local_service_command(program, script, state, selected);
+            let native = command.as_std();
+            let parsed = Arguments::try_parse_from(
+                std::iter::once(native.get_program()).chain(native.get_args()),
+            )
+            .unwrap();
+            assert_eq!(parsed.runtime.as_deref(), Some(script));
+            assert_eq!(parsed.state_dir.as_deref(), Some(state));
+            assert_eq!(parsed.config.as_deref(), selected);
+            assert!(matches!(
+                parsed.command,
+                Some(Action::Serve {
+                    local_only: true,
+                    no_sources: false,
+                    ..
+                })
+            ));
+        }
+    }
 }

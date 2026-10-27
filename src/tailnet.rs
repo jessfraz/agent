@@ -20,6 +20,8 @@ use tokio::{
     time::timeout,
 };
 
+pub const DEFAULT_PORT: u16 = 43_187;
+
 /// Select one native daemon explicitly when GUI and system daemons coexist.
 #[derive(Clone, Debug, Default)]
 pub struct Daemon {

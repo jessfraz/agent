@@ -41,12 +41,12 @@ async function issuer(directory: string) {
   const control: {
     defect: Defect; deny: boolean; scope: string; expiresIn: number;
     exchangeFails: boolean; refreshError: string; revocationFails: boolean;
-    exchanges: number; refreshes: number; revocations: number;
+    exchanges: number; refreshes: number; revocations: number; calls: number;
   } = {
     defect: "none",
     deny: false, scope: SCOPE, expiresIn: 3600,
     exchangeFails: false, refreshError: "", revocationFails: false,
-    exchanges: 0, refreshes: 0, revocations: 0,
+    exchanges: 0, refreshes: 0, revocations: 0, calls: 0,
   };
   function jwt(nonce: string | null) {
     const now = Math.floor(Date.now() / 1000);
@@ -63,6 +63,7 @@ async function issuer(directory: string) {
       control.defect === "signature" ? badKey.privateKey : key.privateKey).toString("base64url");
   }
   const server = createServer((request, response) => {
+    control.calls += 1;
     const send = (status: number, body: unknown) => {
       response.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
     };
@@ -157,6 +158,20 @@ async function login(auth: ChatGptAuth) {
   const result = auth.login(url => { browser = fetch(url); void browser.catch(() => {}) }, new AbortController().signal);
   try { return await result } finally { await browser }
 }
+
+test("signed-out credentials return the login command before contacting the provider", async () => {
+  const f = await fixture();
+  try {
+    await assert.rejects(f.auth.credential(), (error: unknown) => {
+      assert.ok(error instanceof AuthError); assert.equal(error.code, "needs_sign_in");
+      assert.deepEqual(errorEvent(error), { type: "failure", code: "authentication_required",
+        message: "Not signed in to ChatGPT. Run agent login." });
+      return true;
+    });
+    assert.equal(f.provider.control.calls, 0);
+    assert.deepEqual(await f.auth.status(), { state: "signed_out" });
+  } finally { await f.close() }
+});
 
 test("verified login persists one private registration and exposes only account metadata", async () => {
   const f = await fixture();
@@ -278,7 +293,12 @@ test("transient refresh failure retains tokens; invalid_grant transitions to nee
     assert.equal((await f.auth.status()).state, "connected");
     assert.equal(record(record((await saved(f.directory)).connection).tokens).refresh, "synthetic-refresh-1");
     f.provider.control.refreshError = "invalid_grant";
-    await assert.rejects(f.auth.credential(), authError("needs_sign_in"));
+    await assert.rejects(f.auth.credential(), (error: unknown) => {
+      assert.ok(authError("needs_sign_in")(error));
+      assert.ok(error instanceof AuthError);
+      assert.equal(error.message, "ChatGPT sign-in expired. Run agent login.");
+      return true;
+    });
     assert.equal((await f.auth.status()).state, "needs_sign_in");
     assert.equal(record((await saved(f.directory)).connection).tokens, undefined);
     f.provider.check();
@@ -333,6 +353,8 @@ test("malformed private state is not silently replaced by a new installation", a
   try {
     await writeFile(join(f.directory, "auth.json"), '{"version":99}', { mode: 0o600 });
     await assert.rejects(f.auth.status(), authError("storage"));
+    await assert.rejects(f.auth.credential(), authError("storage"));
     assert.equal(await readFile(join(f.directory, "auth.json"), "utf8"), '{"version":99}');
+    assert.equal(f.provider.control.calls, 0);
   } finally { await f.close() }
 });

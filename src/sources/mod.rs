@@ -4,6 +4,7 @@
 pub mod calendar;
 pub mod github;
 pub mod google;
+pub mod messages;
 pub mod slack;
 
 use std::{
@@ -94,6 +95,9 @@ pub enum SourceConfig {
     GoogleCalendar {
         namespaces: Option<Vec<String>>,
     },
+    Messages {
+        namespaces: Option<Vec<String>>,
+    },
     /// An authenticated Slack API CLI prefix, optionally through a read-only wrapper.
     Slack {
         command: Vec<String>,
@@ -164,6 +168,29 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                                     account,
                                 },
                                 "GitHub account discovery failed; coverage is unknown",
+                            ));
+                        }
+                    }
+                }
+            }
+            SourceConfig::Messages { namespaces } => {
+                match messages::MessagesSource::discover(namespaces.as_deref()).await {
+                    Ok(discovered) => sources.extend(
+                        discovered
+                            .into_iter()
+                            .map(|source| Box::new(source) as Box<dyn Source>),
+                    ),
+                    Err(_) => {
+                        for account in namespaces
+                            .clone()
+                            .unwrap_or_else(|| vec!["discovery".into()])
+                        {
+                            failures.push(SourceBatch::unavailable(
+                                SourceKey {
+                                    provider: "messages".into(),
+                                    account,
+                                },
+                                "Messages account discovery failed; coverage is unknown",
                             ));
                         }
                     }

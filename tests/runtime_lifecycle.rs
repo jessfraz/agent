@@ -60,7 +60,7 @@ fn killing_supervisor_preserves_lock_until_pi_child_exits() {
             .arg(state.path())
             .arg("--runtime")
             .arg(&script)
-            .args(["serve", "--no-sources"])
+            .args(["serve", "--local-only", "--no-sources"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());

@@ -50,7 +50,8 @@
         postInstall = ''
           wrapProgram "$out/bin/agent" \
             --set AGENT_RUNTIME_PATH "${runtime}/lib/agent-runtime/dist/src/bridge.js" \
-            --prefix PATH : "${pkgs.lib.makeBinPath [pkgs.nodejs_22 pkgs.git pkgs.lsof pkgs.openssh]}"
+            --prefix PATH : "${pkgs.lib.makeBinPath [pkgs.nodejs_22 pkgs.git pkgs.lsof pkgs.openssh]}" \
+            --suffix PATH : /run/current-system/sw/bin
         '';
       };
     in {

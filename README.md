@@ -74,6 +74,12 @@ through Switchboard. Remove an entry from `sources` to disable it; an empty list
 disables intake. Failed reads remain visible as coverage gaps. Only the selected
 coordinator polls sources and owns conversation state.
 
+Add `{"provider":"messages","namespaces":null}` to `sources` to enable the
+read-only `messages` CLI on macOS.
+Configured Switchboard Messages namespaces take precedence; otherwise it reads
+the local account. It reconciles locally available history from the last seven
+days and preserves unread state. Older outages need a separate history import.
+
 The CLI reads `$CODEX_HOME/AGENTS.md` or `~/.codex/AGENTS.md`, then scoped
 project instructions, before user turns and worker startup. Credentials,
 configuration and conversation data stay outside this repository. `agent usage`
