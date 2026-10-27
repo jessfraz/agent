@@ -115,6 +115,16 @@ They return results to their parent; the parent returns the outcome to the
 main chat. The same task cannot acquire a second active execution. Recent task
 activity promotes its session in the host's sidebar.
 
+Task terminals remain interactive after a turn. A single attached actor
+serializes replies typed in the terminal and inputs queued by the main agent;
+queued work wakes an idle terminal automatically. An idle attachment retains
+its execution lease without counting as busy work. New input reacquires
+resource guards. Child results return while their tabs remain available for
+replies. Main and task CLIs render stored history with older pages available
+through `/history`; reading it does not submit it back to the model. Live
+activity exposes tool names and provider-supplied thinking text, without tool
+arguments, signatures or encrypted state.
+
 Persist allocation intent before creating a session or terminal. A missing
 creation receipt becomes uncertain and requires reconciliation. History sync
 must never create an execution. Continuing an exited worker reuses its session;
@@ -213,8 +223,8 @@ configured private credential provider.
 
 Cross-Mac recovery needs replicated conversation/event data, one fenced writer
 and explicit host transfer of execution. A synced record remains history until
-ownership is transferred. Codex history import should retain provenance and
-source references without inventing prior Pi tool executions.
+ownership is transferred. The [history proposal](history.md) covers inert Codex
+import, hybrid retrieval and reopening closed Rex sessions.
 
 Learning produces a proposed instruction/code diff and representative evaluation
 evidence. Human approval is required before activating that diff. Keep learning
