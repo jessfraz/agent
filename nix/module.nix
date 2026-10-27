@@ -64,7 +64,9 @@ in {
         RunAtLoad = true;
         KeepAlive = true;
         ThrottleInterval = 10;
-        ProcessType = "Background";
+        # Chats and worker calls need responsive I/O. Unix/TCP activity cannot
+        # drive launchd's XPC-based Adaptive classification.
+        ProcessType = "Interactive";
       };
       environment.PATH = lib.makeBinPath ([cfg.package] ++ cfg.extraPackages)
         + ":/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin";
