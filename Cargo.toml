@@ -16,7 +16,7 @@ path = "src/bin/export_protocol.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-dirs = "6"
+dirs = "7"
 fs2 = "0.4"
 libc = "0.2"
 schemars = "1"
