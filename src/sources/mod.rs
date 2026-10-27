@@ -1,6 +1,8 @@
 //! Read-only provider adapters. Checkpoints are candidates: the caller commits
 //! them only after admitting every returned event into its durable inbox.
 
+pub mod calendar;
+pub mod github;
 pub mod google;
 pub mod slack;
 
@@ -82,8 +84,17 @@ pub trait Source: Debug + Send + Sync {
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceConfig {
     /// Omitted namespaces discovers every configured Google account.
-    Google { namespaces: Option<Vec<String>> },
-    /// A private read-only helper prefix, for example ["slack-read"].
+    Google {
+        namespaces: Option<Vec<String>>,
+    },
+    #[serde(rename = "github")]
+    GitHub {
+        namespaces: Option<Vec<String>>,
+    },
+    GoogleCalendar {
+        namespaces: Option<Vec<String>>,
+    },
+    /// An authenticated Slack API CLI prefix, optionally through a read-only wrapper.
     Slack {
         command: Vec<String>,
         account: String,
@@ -133,6 +144,52 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                         },
                         "Slack source configuration is invalid; coverage is unknown",
                     )),
+                }
+            }
+            SourceConfig::GitHub { namespaces } => {
+                match github::GitHubSource::discover(namespaces.as_deref()).await {
+                    Ok(discovered) => sources.extend(
+                        discovered
+                            .into_iter()
+                            .map(|source| Box::new(source) as Box<dyn Source>),
+                    ),
+                    Err(_) => {
+                        for account in namespaces
+                            .clone()
+                            .unwrap_or_else(|| vec!["discovery".into()])
+                        {
+                            failures.push(SourceBatch::unavailable(
+                                SourceKey {
+                                    provider: "github".into(),
+                                    account,
+                                },
+                                "GitHub account discovery failed; coverage is unknown",
+                            ));
+                        }
+                    }
+                }
+            }
+            SourceConfig::GoogleCalendar { namespaces } => {
+                match calendar::CalendarSource::discover(namespaces.as_deref()).await {
+                    Ok(discovered) => {
+                        for source in discovered {
+                            sources.push(Box::new(source));
+                        }
+                    }
+                    Err(_) => {
+                        for account in namespaces
+                            .clone()
+                            .unwrap_or_else(|| vec!["discovery".into()])
+                        {
+                            failures.push(SourceBatch::unavailable(
+                                SourceKey {
+                                    provider: "google_calendar".into(),
+                                    account,
+                                },
+                                "Calendar account discovery failed; coverage is unknown",
+                            ));
+                        }
+                    }
                 }
             }
         }

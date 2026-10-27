@@ -1,6 +1,7 @@
 {
   "coordinator": null,
   "trusted_nodes": [],
+  "tailscale_socket": null,
   "hosts": [
     {
       "name": "desktop",
@@ -17,6 +18,10 @@
       "agent_program": "agent"
     }
   ],
-  "sources": [{ "provider": "google", "namespaces": null }],
+  "sources": [
+    { "provider": "google", "namespaces": null },
+    { "provider": "google_calendar", "namespaces": null },
+    { "provider": "github", "namespaces": null }
+  ],
   "poll_interval_seconds": 60
 }

@@ -45,8 +45,11 @@ and evidence; native handles and ownership must be checked again before effects.
 ```
 
 One selected coordinator is the only writer and source poller. Clients and
-workers on either machine use that same store. A process lock is inherited by
-the Pi child, so losing its Rust supervisor does not admit a second writer.
+workers on either machine use that same store. Rex owns terminal/session
+lifetime; the coordinator owns application state and routing. Reusing a Rex
+connection could replace transport, but would still require this process.
+A process lock is inherited by the Pi child, so losing its Rust supervisor does
+not admit a second writer.
 Local clients use a private Unix socket. Remote clients use Tailscale with live
 peer identity checks, or an existing SSH connection. Empty `trusted_nodes`
 allows only authorized, untagged peers of the same user. An explicit list pins
@@ -92,9 +95,12 @@ Rex server restart recovery remains an open question below.
                           verified result or next check
 ```
 
-Background sources implement a Rust trait in `sources/mod.rs`, with sibling
-providers such as `google.rs` and `slack.rs`. The coordinator rediscovers
-configured accounts, polls bounded pages and preserves separate cursors and
+Background sources implement a transport-neutral Rust trait in
+`sources/mod.rs`, with sibling CLI adapters for mail, calendars, GitHub and
+Slack. CLIs own authentication and refresh. An API adapter, such as a future
+Home Assistant source, returns the same normalized events, checkpoint and
+coverage. The coordinator rediscovers configured accounts, polls bounded pages
+and preserves separate cursors and
 coverage. Admit events durably before advancing a cursor. Partial reads never
 pretend to be complete, and repeated event versions do not create duplicate
 work. Exact triage input survives interrupted requests.
@@ -109,8 +115,10 @@ the conversation carries forward.
 ## Resources
 
 Worktree allocation, ownership, active consumers and cleanup evidence live in
-the shared task inventory. Native worktree metadata also carries a private
-ownership marker. Allocation becomes ready only after submodules initialize.
+the shared task inventory. One task can own several worktrees in different
+repositories; each retains its own native identity and cleanup result. Native
+worktree metadata also carries a private ownership marker. Allocation becomes
+ready only after submodules initialize.
 
 Before collection, all parent/child consumers must be finished. The owning
 host checks actual Git topology, branch, process activity and merge evidence.
@@ -135,6 +143,13 @@ copied. Account quota reads use the installed Codex app-server and identify
 that source; a separate allowance for this app is unavailable.
 
 ## After the MVP
+
+Messages joins through its read-only Switchboard CLI when available. Home
+Assistant can use its API for repairs, failures and state changes. Later
+sources may include MyChart notifications and Ramp activity through their
+existing CLIs. These are optional feeds; domain workflows such as Poshmark
+offers continue through ordinary mail intake. API credentials stay in the
+configured private credential provider.
 
 Cross-Mac recovery needs replicated conversation/event data, one fenced writer
 and explicit host transfer of execution. A synced record remains history until

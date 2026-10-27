@@ -201,8 +201,6 @@ impl Source for SlackSource {
         let window = self.window(checkpoint, now_seconds()?)?;
         let mut args = self.command.clone();
         args.extend([
-            "--timeout-seconds".into(),
-            "25".into(),
             "search.messages".into(),
             format!(
                 "query=after:{} before:{}",
