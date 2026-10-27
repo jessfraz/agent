@@ -124,6 +124,53 @@ test("new work during cleanup planning retains the consumer and prevents native 
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("one task retains multiple repository worktrees and their independent cleanup outcomes after reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-resource-")); let app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "Update clients", outcome: "Merge both repository changes" });
+    const requests: WorktreeAllocation[] = ["client", "server"].map((name) => ({
+      allocation_id: randomUUID(), host_id: hostId, task_id: task.id, repository: `/workspace/${name}`, branch: "update",
+    }));
+    for (const request of requests) {
+      const record = ready(request);
+      record.state = { state: "ready", identity: { ...identity, primary: request.repository,
+        top: request.repository + "-update", common_dir: request.repository + "/.git",
+        git_dir: request.repository + "/.git/worktrees/update", branch: request.branch } };
+      await app.resources.allocate(request, async () => ({ type: "resource", report: { type: "observed", record } }));
+    }
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    assert.deepEqual((await app.resources.list()).map((record) => record.id), requests.map((request) => request.allocation_id));
+    assert.deepEqual((await app.resources.list()).map((record) => record.task_id), [task.id, task.id]);
+    await app.tasks.update(task.id, (saved) => { saved.state = { state: "resolved", evidence: "Both changes verified" }; });
+    const collected: string[] = [];
+    await app.resources.collect(hostId, async (command) => {
+      if (command.type === "resource_inspect") return { type: "resource", report: { type: "observed", record: command.record } };
+      if (command.type === "resource_plan_cleanup") {
+        if (command.record.state.state !== "ready") throw new Error("Only ready resources are planned");
+        const ownIdentity = command.record.state.identity;
+        if (command.record.repository === "/workspace/server") return { type: "resource", report: { type: "observed",
+          record: { ...command.record, state: { state: "held", identity: ownIdentity, reason: "Uncommitted changes" } } } };
+        const id = randomUUID();
+        return { type: "resource", report: { type: "planned",
+          record: { ...command.record, state: { state: "retiring", identity: ownIdentity, plan_id: id } },
+          plan: { id, resource_id: command.record.id, identity: ownIdentity, path: "/private/plans/client.json", fingerprint: "fixture" } } };
+      }
+      if (command.type !== "resource_collect") throw new Error("Unexpected resource effect");
+      collected.push(command.record.repository);
+      return { type: "resource", report: { type: "collected", record: { ...command.record, state: { state: "removed", identity: command.plan.identity } },
+        receipt: { status: "completed", worktree_removed: true, branch_deleted: command.record.branch,
+          primary_worktree: command.record.repository, retained_submodules: null, summary: "Removed merged client worktree" } } };
+    });
+    assert.deepEqual(collected, ["/workspace/client"]);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const records = await app.resources.list();
+    assert.equal(records.length, 2);
+    assert.equal(records.find((record) => record.repository === "/workspace/client")?.state.state, "removed");
+    assert.equal(records.find((record) => record.repository === "/workspace/server")?.state.state, "held");
+    assert.ok(records.every((record) => record.task_id === task.id));
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("the real model tool allocates only for its owning bound task", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-resource-")); const app = await open(directory);
   try {

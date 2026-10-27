@@ -6,6 +6,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::NonZeroU64,
     os::fd::AsRawFd,
+    path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
@@ -18,6 +19,35 @@ use tokio::{
     process::Command,
     time::timeout,
 };
+
+/// Select one native daemon explicitly when GUI and system daemons coexist.
+#[derive(Clone, Debug, Default)]
+pub struct Daemon {
+    socket: Option<PathBuf>,
+}
+
+impl Daemon {
+    pub fn new(socket: Option<&Path>) -> Result<Self> {
+        if let Some(path) = socket {
+            ensure!(
+                path.is_absolute(),
+                "Tailscale socket must be an absolute path"
+            );
+        }
+        Ok(Self {
+            socket: socket.map(Path::to_owned),
+        })
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new("tailscale");
+        if let Some(path) = &self.socket {
+            command.arg("--socket").arg(path);
+        }
+        command.args(args);
+        command
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -176,16 +206,16 @@ fn authorize(status: &Status, peer: SocketAddr, whois: &Whois, policy: &PeerPoli
     Ok(())
 }
 
-pub async fn self_address(port: u16) -> Result<SocketAddr> {
-    let status: Status = invoke(&["status", "--json"]).await?;
+pub async fn self_address(port: u16, daemon: &Daemon) -> Result<SocketAddr> {
+    let status: Status = invoke(daemon, &["status", "--json"]).await?;
     Ok(SocketAddr::new(current_address(&status)?.into(), port))
 }
 
 /// Validate the actual connected IP, never a forwarded header or caller label.
-pub async fn validate_peer(peer: SocketAddr, policy: &PeerPolicy) -> Result<()> {
+pub async fn validate_peer(peer: SocketAddr, policy: &PeerPolicy, daemon: &Daemon) -> Result<()> {
     tailnet_v4(peer.ip())?;
-    let status: Status = invoke(&["status", "--json"]).await?;
-    let whois: Whois = invoke(&["whois", "--json", &peer.to_string()]).await?;
+    let status: Status = invoke(daemon, &["status", "--json"]).await?;
+    let whois: Whois = invoke(daemon, &["whois", "--json", &peer.to_string()]).await?;
     authorize(&status, peer, &whois, policy)
 }
 
@@ -193,22 +223,23 @@ pub(crate) async fn validate_connection(
     local: SocketAddr,
     peer: SocketAddr,
     policy: &PeerPolicy,
+    daemon: &Daemon,
 ) -> Result<()> {
     tailnet_v4(peer.ip())?;
-    let status: Status = invoke(&["status", "--json"]).await?;
+    let status: Status = invoke(daemon, &["status", "--json"]).await?;
     ensure!(
         local.ip() == IpAddr::V4(current_address(&status)?),
         "Coordinator listener is no longer the active Tailscale address"
     );
-    let whois: Whois = invoke(&["whois", "--json", &peer.to_string()]).await?;
+    let whois: Whois = invoke(daemon, &["whois", "--json", &peer.to_string()]).await?;
     authorize(&status, peer, &whois, policy)
 }
 
-pub async fn connect(peer: SocketAddr, policy: &PeerPolicy) -> Result<TcpStream> {
+pub async fn connect(peer: SocketAddr, policy: &PeerPolicy, daemon: &Daemon) -> Result<TcpStream> {
     tailnet_v4(peer.ip())?;
-    let status: Status = invoke(&["status", "--json"]).await?;
+    let status: Status = invoke(daemon, &["status", "--json"]).await?;
     let address = current_address(&status)?;
-    let whois: Whois = invoke(&["whois", "--json", &peer.to_string()]).await?;
+    let whois: Whois = invoke(daemon, &["whois", "--json", &peer.to_string()]).await?;
     authorize(&status, peer, &whois, policy)?;
     let socket = scoped_socket(address)?;
     socket.bind(SocketAddr::new(address.into(), 0))?;
@@ -218,8 +249,8 @@ pub async fn connect(peer: SocketAddr, policy: &PeerPolicy) -> Result<TcpStream>
         .context("Could not connect to Tailscale coordinator")
 }
 
-pub(crate) async fn listen(port: u16) -> Result<TcpListener> {
-    let address = self_address(port).await?;
+pub(crate) async fn listen(port: u16, daemon: &Daemon) -> Result<TcpListener> {
+    let address = self_address(port, daemon).await?;
     let socket = scoped_socket(tailnet_v4(address.ip())?)?;
     socket
         .bind(address)
@@ -329,10 +360,10 @@ fn bind_interface(_socket: &TcpSocket, _interface: &Interface) -> Result<()> {
     anyhow::bail!("Tailscale interface binding is unsupported on this platform")
 }
 
-async fn invoke<T: DeserializeOwned>(args: &[&str]) -> Result<T> {
+async fn invoke<T: DeserializeOwned>(daemon: &Daemon, args: &[&str]) -> Result<T> {
     const MAX_BYTES: u64 = 1024 * 1024;
-    let mut child = Command::new("tailscale")
-        .args(args)
+    let mut child = daemon
+        .command(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -614,7 +645,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires this machine's running Tailscale daemon"]
     async fn live_tailscale_self_connection_checks_native_identity() {
-        use crate::tailnet::{connect, listen, validate_connection};
+        use crate::tailnet::{Daemon, connect, listen, validate_connection};
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
             time::{Duration, timeout},
@@ -623,15 +654,16 @@ mod tests {
         // longer than one CLI read while the local daemon is cold.
         timeout(Duration::from_secs(60), async {
             let policy = PeerPolicy::new(&[]).unwrap();
+            let daemon = Daemon::default();
             eprintln!("native smoke: binding");
-            let listener = listen(0).await.unwrap();
+            let listener = listen(0, &daemon).await.unwrap();
             let address = listener.local_addr().unwrap();
             eprintln!("native smoke: connecting");
-            let mut client = connect(address, &policy).await.unwrap();
+            let mut client = connect(address, &policy, &daemon).await.unwrap();
             eprintln!("native smoke: accepting");
             let (mut accepted, peer) = listener.accept().await.unwrap();
             eprintln!("native smoke: validating");
-            validate_connection(accepted.local_addr().unwrap(), peer, &policy)
+            validate_connection(accepted.local_addr().unwrap(), peer, &policy, &daemon)
                 .await
                 .unwrap();
             eprintln!("native smoke: exchanging");

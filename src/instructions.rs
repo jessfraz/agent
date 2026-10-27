@@ -44,6 +44,7 @@ pub fn load(global: &Path, working_directory: &Path) -> Result<String> {
     sections.push(
         "Find relevant existing task conversations before creating a new one. \
          Continue through them and report the result in the main conversation. \
+         Use allocate_worktree for new task worktrees so ownership and cleanup are recorded. \
          Keep updates brief and actionable."
             .into(),
     );

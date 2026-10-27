@@ -59,8 +59,9 @@ pub async fn serve_tailnet(
     state: &Path,
     port: u16,
     policy: crate::tailnet::PeerPolicy,
+    daemon: crate::tailnet::Daemon,
 ) -> Result<()> {
-    serve_with_transport(script, state, Some(port), policy, shutdown_signal()).await
+    serve_with_transport(script, state, Some(port), policy, daemon, shutdown_signal()).await
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -82,6 +83,7 @@ async fn serve_until(
         state,
         None,
         crate::tailnet::PeerPolicy::new(&[])?,
+        crate::tailnet::Daemon::default(),
         shutdown,
     )
     .await
@@ -92,6 +94,7 @@ async fn serve_with_transport(
     state: &Path,
     port: Option<u16>,
     policy: crate::tailnet::PeerPolicy,
+    daemon: crate::tailnet::Daemon,
     shutdown: impl Future<Output = Result<()>>,
 ) -> Result<()> {
     // Claim the writer before deciding an old socket is stale.
@@ -105,7 +108,7 @@ async fn serve_with_transport(
     };
     let owner = Arc::new(owner);
     let tailnet = match port {
-        Some(port) => match crate::tailnet::listen(port).await {
+        Some(port) => match crate::tailnet::listen(port, &daemon).await {
             Ok(listener) => Some(listener),
             Err(error) => {
                 drop(listener);
@@ -143,8 +146,9 @@ async fn serve_with_transport(
                     };
                     let runtime = owner.clone();
                     let policy = policy.clone();
+                    let daemon = daemon.clone();
                     clients.spawn(async move {
-                        authenticated(stream, runtime, crate::tailnet::validate_connection(local, peer, &policy)).await
+                        authenticated(stream, runtime, crate::tailnet::validate_connection(local, peer, &policy, &daemon)).await
                     });
                 }
                 Err(error) => break Err(error.into()),

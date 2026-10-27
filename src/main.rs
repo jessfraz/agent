@@ -212,6 +212,7 @@ async fn main() -> Result<()> {
     {
         let mut profile = config::load(arguments.config.as_deref())?;
         let policy = agent_cli::tailnet::PeerPolicy::new(&profile.trusted_nodes)?;
+        let daemon = agent_cli::tailnet::Daemon::new(profile.tailscale_socket.as_deref())?;
         let _sources = if no_sources {
             None
         } else {
@@ -232,7 +233,7 @@ async fn main() -> Result<()> {
             })))
         };
         return match tailnet_port {
-            Some(port) => service::serve_tailnet(&script, &directory, port, policy).await,
+            Some(port) => service::serve_tailnet(&script, &directory, port, policy, daemon).await,
             None => service::serve(&script, &directory).await,
         };
     }
@@ -575,7 +576,8 @@ async fn connection(
     if let Some(address) = coordinator.strip_prefix("tailscale://") {
         let address = address.parse()?;
         let policy = agent_cli::tailnet::PeerPolicy::new(&config.trusted_nodes)?;
-        let stream = agent_cli::tailnet::connect(address, &policy).await?;
+        let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
+        let stream = agent_cli::tailnet::connect(address, &policy, &daemon).await?;
         let (reader, writer) = stream.into_split();
         return Ok(Wire {
             reader: Box::new(reader),
@@ -644,7 +646,8 @@ async fn request(
     ) {
         (true, Some(address)) => {
             let address: std::net::SocketAddr = address.parse()?;
-            address.ip() != agent_cli::tailnet::self_address(0).await?.ip()
+            let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
+            address.ip() != agent_cli::tailnet::self_address(0, &daemon).await?.ip()
         }
         _ => false,
     };
@@ -748,7 +751,20 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
             }
         }
         RuntimeEventKind::Resources { resources } => {
-            for resource in resources {
+            let mut previous_task = None;
+            let mut ordered: Vec<_> = resources.iter().collect();
+            ordered.sort_by_key(|resource| {
+                (
+                    resource.task_id.to_string(),
+                    resource.repository.clone(),
+                    resource.branch.clone(),
+                )
+            });
+            for resource in ordered {
+                if previous_task.as_ref() != Some(&resource.task_id) {
+                    println!("Task {}", resource.task_id);
+                    previous_task = Some(resource.task_id.clone());
+                }
                 let (status, reason) = match &resource.state {
                     agent_cli::resources::ResourceState::Allocating => ("allocating", None),
                     agent_cli::resources::ResourceState::Ready { .. } => ("ready", None),
@@ -761,14 +777,19 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
                         ("partial", Some(reason))
                     }
                 };
+                let path = resource
+                    .state
+                    .identity()
+                    .map(|identity| identity.top.as_str())
+                    .unwrap_or(&resource.repository);
                 println!(
-                    "{}  {}  {}  {status}{}",
-                    resource.id,
-                    resource.host_id,
+                    "  {} ({})  {status}{}  @{}",
+                    path,
                     resource.branch,
                     reason
                         .map(|reason| format!(": {reason}"))
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    resource.host_id,
                 );
             }
         }

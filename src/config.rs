@@ -19,6 +19,7 @@ pub struct ClientConfig {
     pub launch: Option<WorkerLaunch>,
     pub coordinator: Option<String>,
     pub coordinator_program: Option<String>,
+    pub tailscale_socket: Option<PathBuf>,
     #[serde(default)]
     pub trusted_nodes: Vec<String>,
     #[serde(default)]
@@ -36,6 +37,7 @@ impl Default for ClientConfig {
             launch: None,
             coordinator: None,
             coordinator_program: None,
+            tailscale_socket: None,
             trusted_nodes: Vec::new(),
             hosts: Vec::new(),
             sources: Vec::new(),
@@ -72,6 +74,7 @@ pub fn load(explicit: Option<&Path>) -> Result<ClientConfig> {
     }
     let mut names = HashSet::new();
     crate::tailnet::PeerPolicy::new(&config.trusted_nodes)?;
+    crate::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
     ensure!(
         (10..=3600).contains(&config.poll_interval_seconds),
         "Source polling interval must be between 10 and 3600 seconds"
