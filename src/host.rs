@@ -572,8 +572,9 @@ const descendant = spawn(process.execPath, ['--eval', `
   server.listen(0, '127.0.0.1', () => process.stdout.write(String(server.address().port)));
 `], {stdio:['ignore','pipe','ignore']});
 descendant.stdout.once('data', (data) => {
-  writeFileSync(process.argv[1], JSON.stringify({pid:process.pid,port:Number(data.toString())}));
-  process.stdout.write('ready');
+  process.stdout.write('ready', () => {
+    writeFileSync(process.argv[1], JSON.stringify({pid:process.pid,port:Number(data.toString())}));
+  });
 });
 setInterval(() => {}, 1000);
 "#;
