@@ -318,8 +318,11 @@ try {
       failure(request.id, "invalid_request", "Unsupported protocol version"); emit(request.id, { type: "done" }); continue;
     }
     if (request.command.type === "interrupt") {
-      if (!activeCommands.has(request.id)) { failure(request.id, "invalid_request", "Interrupt requires its active chat connection"); continue; }
-      void interrupt(request.id).catch(() => failure(request.id, "internal", "Interruption could not be confirmed; inspect current work"));
+      // Done may already be buffered while Rust still owns the request and sends its last control.
+      if (!activeCommands.has(request.id)) continue;
+      void interrupt(request.id).catch(() => {
+        if (activeCommands.has(request.id)) failure(request.id, "internal", "Interruption could not be confirmed; inspect current work");
+      });
       continue;
     }
     if (request.command.type === "host_reply") {

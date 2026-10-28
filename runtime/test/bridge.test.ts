@@ -94,3 +94,33 @@ test("real bridge reads canonical settings and node history before a default-mod
     ]);
   } finally { lines.close(); child.stdin.end(); child.kill(); await closed; await rm(directory, { recursive: true, force: true }); }
 });
+
+test("real bridge ignores a delayed interrupt after Done and still interrupts active chat", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-late-interrupt-")); await chmod(directory, 0o700);
+  const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("../src/bridge.js", import.meta.url)), directory],
+    { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, OPENAI_API_KEY: "" } });
+  const closed = new Promise<number | null>((resolve, reject) => { child.once("close", resolve); child.once("error", reject); });
+  const lines = createInterface({ input: child.stdout });
+  const frames: RuntimeEvent[] = [];
+  const completed = new Map<number, () => void>();
+  let errors = ""; child.stderr.setEncoding("utf8").on("data", (chunk: string) => { errors += chunk; });
+  lines.on("line", (line) => {
+    const event: unknown = JSON.parse(line); assert.ok(validEvent(event)); frames.push(event);
+    if (event.event.type === "done") completed.get(event.id)?.();
+  });
+  const send = (id: number, command: RuntimeCommand) => child.stdin.write(JSON.stringify({ version: 1, id, command }) + "\n");
+  const done = (id: number) => new Promise<void>((resolve) => { completed.set(id, resolve); });
+  const chat: RuntimeCommand = { type: "chat", input: "Synthetic fixture", instructions: "", model: DEFAULT_MODEL,
+    origin_host_id: null, cwd: "/tmp", hosts: [] };
+  try {
+    const first = done(1); send(1, chat); await first;
+    // Rust can still have this request pending while Done waits unread in its pipe.
+    send(1, { type: "interrupt" });
+    const barrier = done(2); send(2, { type: "status" }); await barrier;
+    const active = done(3); send(3, chat); send(3, { type: "interrupt" }); await active;
+    child.stdin.end(); assert.equal(await closed, 0, errors);
+    assert.deepEqual(frames.filter((frame) => frame.id === 1).map((frame) => frame.event.type), ["failure", "done"],
+      "A stale control must not emit another frame after the request's Done");
+    assert.deepEqual(frames.filter((frame) => frame.id === 3).map((frame) => frame.event.type), ["interrupted", "done"]);
+  } finally { lines.close(); child.kill(); await closed; await rm(directory, { recursive: true, force: true }); }
+});

@@ -351,7 +351,21 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                     let frame: RuntimeEvent = serde_json::from_slice(&bytes)
                         .context("Pi runtime returned an invalid event")?;
                     ensure!(frame.version == PROTOCOL_VERSION, "Pi runtime protocol mismatch");
-                    let call = pending.get_mut(&frame.id).context("Pi returned an unknown request ID")?;
+                    let call = pending.get_mut(&frame.id).with_context(|| {
+                        let event = match &frame.event {
+                            RuntimeEventKind::Failure { code, .. } => format!("failure {code:?}"),
+                            RuntimeEventKind::Notice { .. } => "notice".into(),
+                            RuntimeEventKind::HostCall { .. } => "host call".into(),
+                            RuntimeEventKind::HostCancel { .. } => "host cancellation".into(),
+                            RuntimeEventKind::InputRejected { .. } => "rejected input".into(),
+                            RuntimeEventKind::Interrupted => "interruption".into(),
+                            RuntimeEventKind::ImportProgress { .. } => "import progress".into(),
+                            RuntimeEventKind::Activity { .. } => "activity".into(),
+                            RuntimeEventKind::Done => "completion".into(),
+                            _ => "event".into(),
+                        };
+                        format!("Pi returned {event} for unknown request ID {}", frame.id)
+                    })?;
                     if matches!(frame.event, RuntimeEventKind::Notice { .. }) {
                         let _ = notices.send(RuntimeNotice { request_id: frame.id, event: frame.event.clone() });
                     }
