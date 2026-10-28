@@ -103,7 +103,9 @@ impl LlamaProvider {
         std::fs::set_permissions(&self.directory, std::fs::Permissions::from_mode(0o700))?;
         let directory = self.directory.join(Uuid::new_v4().simple().to_string());
         std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
-        let socket = directory.join("runner.sock");
+        // macOS limits Unix socket paths to 104 bytes; the normal application
+        // support directory already consumes most of that budget.
+        let socket = directory.join("s.sock");
         if socket.as_os_str().len() >= 104 {
             std::fs::remove_dir(&directory)?;
             bail!("Embedding state path is too long for a private Unix socket");
@@ -274,7 +276,8 @@ mod tests {
     #[ignore = "requires the pinned local embedding runtime and model from nix develop"]
     async fn native_runner_is_private_warm_and_returns_retrieval_vectors() {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
-        let provider = LlamaProvider::from_environment(directory.path()).unwrap();
+        let state = directory.path().join("a".repeat(36));
+        let provider = LlamaProvider::from_environment(&state).unwrap();
         let documents = provider
             .embed(
                 &[

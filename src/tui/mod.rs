@@ -439,8 +439,14 @@ impl State {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let control = key.modifiers.contains(KeyModifiers::CONTROL);
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('c') if key.code == KeyCode::Esc || control => {
-                        if self.working && (!control || !self.interrupting) {
+                    KeyCode::Esc => {
+                        if self.working {
+                            self.interrupting = true;
+                            return Some(TuiInput::Interrupt);
+                        }
+                    }
+                    KeyCode::Char('c') if control => {
+                        if self.working && !self.interrupting {
                             self.interrupting = true;
                             return Some(TuiInput::Interrupt);
                         }
@@ -799,6 +805,14 @@ mod tests {
         assert!(after.contains("gpt-6.1-sol · high"));
         assert!(after.contains("/workspace/example · Ready"));
         assert!(after.contains("let ready = true;"));
+    }
+    #[test]
+    fn escape_keeps_an_idle_chat_and_its_draft_open() {
+        let mut state = state();
+        state.input(Event::Paste("An unfinished correction".into()));
+        assert_eq!(state.input(key(KeyCode::Esc, KeyModifiers::NONE)), None);
+        assert!(!state.exiting);
+        assert_eq!(state.editor.lines().join("\n"), "An unfinished correction");
     }
     #[test]
     fn multiline_editing_interrupt_and_queue_preserve_the_draft() {
