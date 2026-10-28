@@ -279,6 +279,87 @@
         "instruction_version"
       ]
     },
+    "FeedbackContext": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "binding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "conversation_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "draft": {
+          "type": "string"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin_host_id": {
+          "type": "string"
+        },
+        "queued_inputs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "truncated": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "origin_host_id",
+        "cwd",
+        "draft",
+        "queued_inputs",
+        "client_errors"
+      ]
+    },
     "GuidanceSnapshot": {
       "type": "object",
       "properties": {
@@ -875,6 +956,13 @@
             "message"
           ]
         }
+      ]
+    },
+    "InputMode": {
+      "type": "string",
+      "enum": [
+        "steer",
+        "follow_up"
       ]
     },
     "ModelProvider": {
@@ -1601,6 +1689,44 @@
         {
           "type": "object",
           "properties": {
+            "context": {
+              "$ref": "#/$defs/FeedbackContext"
+            },
+            "description": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "feedback"
+            }
+          },
+          "required": [
+            "type",
+            "description",
+            "context"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "read_feedback"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "hosts": {
               "type": "array",
               "items": {
@@ -1791,6 +1917,30 @@
             "type",
             "input_id",
             "input"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            },
+            "input_id": {
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/InputMode"
+            },
+            "type": {
+              "type": "string",
+              "const": "submit_input"
+            }
+          },
+          "required": [
+            "type",
+            "input_id",
+            "input",
+            "mode"
           ]
         },
         {

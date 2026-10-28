@@ -68,11 +68,19 @@ remaining available for follow-ups. Live activity shows tool names and exposed
 provider thinking text.
 
 TTY sessions use a Markdown TUI with model, reasoning, directory and activity
-status. Esc interrupts current work. A correction entered while the main agent
-is busy is shown as queued and unsent until its next turn; Esc stops the current
-turn first. `/history` or Ctrl+R loads older messages. Alt+Enter inserts a
-newline; `/exit` detaches. Use `agent --no-tui chat` for plain output or
-`agent --json chat` for protocol events.
+status. Enter steers active work; Tab queues a separate follow-up turn. Queued
+messages run in order. Esc stops, and Shift+Enter or Alt+Enter inserts a newline.
+Select transcript text with the terminal's normal copy/paste controls;
+PgUp/PgDn scroll the transcript. `/history` or Ctrl+R loads older messages, and
+`/exit` detaches. Use `agent --no-tui chat` for plain output or `agent --json chat`
+for protocol events.
+
+`/feedback <description>` saves private diagnostics and starts a background
+repair worker on the originating machine. A repair started inside Rex uses a
+named terminal in that folder; later reports reuse the repair task. From a raw
+CLI, the first report creates its repair session. Results appear in the saved
+main chat. `agent feedback latest` and `agent feedback show <id>` read captures;
+they are never uploaded automatically.
 
 Import existing local Codex conversations after both services are connected:
 

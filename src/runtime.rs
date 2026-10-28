@@ -149,6 +149,7 @@ impl Runtime {
                     | RuntimeCommand::Watch
                     | RuntimeCommand::ConnectWorker { .. }
                     | RuntimeCommand::WorkerInput { .. }
+                    | RuntimeCommand::SubmitInput { .. }
                     | RuntimeCommand::DetachWorker
             ),
             "Transport control commands do not create Pi requests"
@@ -189,6 +190,7 @@ impl Runtime {
             matches!(
                 command,
                 RuntimeCommand::WorkerInput { .. }
+                    | RuntimeCommand::SubmitInput { .. }
                     | RuntimeCommand::DetachWorker
                     | RuntimeCommand::Interrupt
             ),
@@ -340,7 +342,8 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                     }
                     Some(CommandMessage::WorkerControl { request_id, command }) => {
                         if pending.get(&request_id).is_some_and(|request| request.events.is_some() &&
-                            (request.worker || (request.interruptible && matches!(*command, RuntimeCommand::Interrupt)))) {
+                            (request.worker || (request.interruptible && matches!(*command,
+                                RuntimeCommand::Interrupt | RuntimeCommand::SubmitInput { .. })))) {
                             send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id: request_id, command: *command }).await?;
                         }
                     }

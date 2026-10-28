@@ -2,6 +2,7 @@ pub mod config;
 pub mod context;
 pub mod discovery;
 pub mod embeddings;
+pub mod feedback;
 pub mod history;
 pub mod host;
 pub mod models;

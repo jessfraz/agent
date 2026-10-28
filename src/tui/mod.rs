@@ -9,8 +9,8 @@ use anyhow::{Context, Result, anyhow, ensure};
 use crossterm::{
     cursor::{MoveTo, Show},
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
+        KeyEventKind, KeyModifiers,
     },
     execute,
     terminal::{
@@ -46,6 +46,8 @@ pub struct TuiInfo {
 #[derive(Debug, PartialEq, Eq)]
 pub enum TuiInput {
     Submit(String),
+    Queue(String),
+    Feedback(String),
     History,
     Interrupt,
     Exit,
@@ -58,6 +60,9 @@ enum Update {
     Status(TuiInfo),
     Working(bool),
     Draft(tokio::sync::oneshot::Sender<String>),
+    Info(tokio::sync::oneshot::Sender<TuiInfo>),
+    Notice(String),
+    RestoreInput(String),
     Stop,
 }
 
@@ -90,6 +95,17 @@ impl TuiHandle {
         let (sender, draft) = tokio::sync::oneshot::channel();
         self.send(Update::Draft(sender))?;
         draft.await.context("The terminal draft could not be read")
+    }
+    pub async fn info(&self) -> Result<TuiInfo> {
+        let (sender, info) = tokio::sync::oneshot::channel();
+        self.send(Update::Info(sender))?;
+        info.await.context("The terminal context could not be read")
+    }
+    pub fn notice(&self, text: String) -> Result<()> {
+        self.send(Update::Notice(text))
+    }
+    pub fn restore_input(&self, text: String) -> Result<()> {
+        self.send(Update::RestoreInput(text))
     }
 }
 
@@ -185,7 +201,8 @@ impl Screen {
             Clear(ClearType::All),
             MoveTo(0, 0),
             EnableBracketedPaste,
-            EnableMouseCapture
+            // Leave drag selection to Rex and other native terminals.
+            DisableMouseCapture
         )?;
         let terminal = Terminal::new(CrosstermBackend::new(output))?;
         Ok(Self {
@@ -478,8 +495,12 @@ impl State {
                     KeyCode::Char('j') if control => {
                         self.editor.insert_newline();
                     }
-                    KeyCode::Enter => {
+                    KeyCode::Enter | KeyCode::Tab => {
                         let value = self.editor.lines().join("\n");
+                        if let Some(description) = crate::feedback::command(&value) {
+                            self.editor = editor();
+                            return Some(TuiInput::Feedback(description.to_owned()));
+                        }
                         if value.trim() == "/history" {
                             self.editor = editor();
                             self.history_offset = Some(0);
@@ -493,6 +514,9 @@ impl State {
                         if !value.trim().is_empty() {
                             self.editor = editor();
                             self.scroll = 0;
+                            if key.code == KeyCode::Tab {
+                                return Some(TuiInput::Queue(value));
+                            }
                             self.working = true;
                             return Some(TuiInput::Submit(value));
                         }
@@ -506,11 +530,6 @@ impl State {
             Event::Paste(text) if !self.exiting => {
                 self.editor.insert_str(markdown::plain(&text));
             }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_add(3),
-                MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_sub(3),
-                _ => {}
-            },
             _ => {}
         }
         None
@@ -647,7 +666,7 @@ impl State {
         );
         frame.render_widget(
             Paragraph::new(
-                "Enter send · Alt+Enter newline · Esc stop · ^R older · PgUp scroll · ^C exit",
+                "Enter steer · Tab queue · Shift+Enter newline · Esc stop · PgUp/PgDn scroll · ^R older",
             )
             .style(Style::default().fg(Color::DarkGray)),
             areas[4],
@@ -721,6 +740,17 @@ fn run(
                 }
                 Ok(Update::Draft(sender)) => {
                     let _ = sender.send(state.editor.lines().join("\n"));
+                }
+                Ok(Update::Info(sender)) => {
+                    let _ = sender.send(state.info.clone());
+                }
+                Ok(Update::Notice(text)) => state.push(Role::Notice, text),
+                Ok(Update::RestoreInput(text)) => {
+                    if state.editor.lines().iter().any(|line| !line.is_empty()) {
+                        state.editor.insert_newline();
+                    }
+                    state.editor.insert_str(text);
+                    state.push(Role::Notice, "Unsent input returned to the draft.".into());
                 }
             }
         }
@@ -835,6 +865,40 @@ mod tests {
             state.input(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(TuiInput::Exit)
         );
+    }
+    #[test]
+    fn enter_steers_tab_queues_and_feedback_is_a_control_without_stopping_work() {
+        let mut state = state();
+        state.working(true);
+        state.input(Event::Paste("Correct the active work".into()));
+        assert_eq!(
+            state.input(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(TuiInput::Submit("Correct the active work".into()))
+        );
+        state.input(Event::Paste("Do this after the current answer".into()));
+        assert_eq!(
+            state.input(key(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(TuiInput::Queue("Do this after the current answer".into()))
+        );
+        assert!(state.working);
+        state.input(Event::Paste("First line".into()));
+        state.input(key(KeyCode::Enter, KeyModifiers::SHIFT));
+        state.input(Event::Paste("Second line".into()));
+        assert_eq!(state.editor.lines().join("\n"), "First line\nSecond line");
+        assert_eq!(
+            state.input(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(TuiInput::Submit("First line\nSecond line".into()))
+        );
+        state.input(Event::Paste("/feedback the wrong task was opened".into()));
+        assert_eq!(
+            state.input(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(TuiInput::Feedback("the wrong task was opened".into()))
+        );
+        assert!(state.working);
+        assert!(!state.interrupting);
+        assert!(!state.exiting);
+        assert!(state.editor.lines().iter().all(String::is_empty));
+        assert!(rendered(&mut state, 120, 20).contains("Tab queue"));
     }
     #[test]
     fn history_prepends_in_frame_order_and_scroll_has_an_explicit_follow_mode() {

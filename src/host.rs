@@ -273,7 +273,8 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             task_id,
             allocation_id,
             title,
-        } => spawn_worker(&host, &task_id, &allocation_id, &title).await,
+            parent,
+        } => spawn_worker(&host, &task_id, &allocation_id, &title, parent.as_ref()).await,
         HostCommand::SpawnSubagent {
             host,
             parent,
@@ -446,6 +447,7 @@ async fn spawn_worker(
     task_id: &TaskId,
     allocation_id: &str,
     title: &str,
+    parent: Option<&WorkerRef>,
 ) -> Result<HostResult> {
     let client = RexClient::new(None);
     let identity = client.whoami().await?;
@@ -455,15 +457,36 @@ async fn spawn_worker(
             .is_none_or(|id| id == &identity.host_id.to_string()),
         "Worker host differs from this node's native Rex identity"
     );
-    match client
-        .create_session(
-            title,
-            &host.agent_program,
-            &worker_args(host, task_id, allocation_id),
-            Path::new(&host.cwd),
-        )
-        .await
-    {
+    let result = if let Some(parent) = parent {
+        ensure!(
+            identity.host_id == HostId::parse(&parent.host_id)?,
+            "The feedback terminal must use its originating host"
+        );
+        let native = native_binding(parent)?;
+        client
+            .inspect_session(&native.session_id)
+            .await?
+            .verify_binding(&native, &identity.host_id)?;
+        client
+            .create_worker_window(
+                &native.session_id,
+                title,
+                &host.agent_program,
+                &worker_args(host, task_id, allocation_id),
+                Path::new(&host.cwd),
+            )
+            .await
+    } else {
+        client
+            .create_session(
+                title,
+                &host.agent_program,
+                &worker_args(host, task_id, allocation_id),
+                Path::new(&host.cwd),
+            )
+            .await
+    };
+    match result {
         Ok(binding) => {
             if !confirmed_binding(&client, &binding, &identity.host_id).await {
                 return Ok(HostResult::CreationUncertain {

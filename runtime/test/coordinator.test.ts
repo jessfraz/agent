@@ -14,7 +14,7 @@ test("real CLI, coordinator and worker retain main history across an offline lap
   const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../target/debug/agent", import.meta.url));
   const runtime = fileURLToPath(new URL("./fixtures/coordinator-runtime.js", import.meta.url));
   const coordinator = "11111111-1111-4111-8111-111111111111", laptop = "22222222-2222-4222-8222-222222222222";
-  const bin = join(directory, "bin"), queue = join(directory, "responses.json");
+  const bin = join(directory, "bin"), queue = join(directory, "responses.json"), feedbackGate = join(directory, "feedback-gate");
   const homes = [join(directory, "desktop"), join(directory, "laptop")];
   const socket = join(homes[0]!, "state", "agent.sock");
   const children: { child: ChildProcessWithoutNullStreams; exited: Promise<number | null>; output: () => string; errors: () => string }[] = [];
@@ -30,7 +30,7 @@ test("real CLI, coordinator and worker retain main history across an offline lap
       PATH: bin + delimiter + process.env.PATH, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local"),
       TMPDIR: directory, AGENT_SQLITE_VEC: process.env.AGENT_SQLITE_VEC, OPENAI_API_KEY: "sk-synthetic-fixture",
       AGENT_TEST_NODE_ID: host === 0 ? coordinator : laptop, AGENT_TEST_REX_STATE: join(home, "rex.json"),
-      AGENT_TEST_MODEL_QUEUE: queue, AGENT_TEST_COORDINATOR_SOCKET: socket, ...extra,
+      AGENT_TEST_MODEL_QUEUE: queue, AGENT_TEST_COORDINATOR_SOCKET: socket, AGENT_TEST_FEEDBACK_GATE: feedbackGate, ...extra,
     } });
     let stdout = "", stderr = "";
     child.stdout.setEncoding("utf8").on("data", (text: string) => { stdout += text; });
@@ -43,9 +43,9 @@ test("real CLI, coordinator and worker retain main history across an offline lap
   async function cli(host: number, args: string[], input = "") {
     const process = start(host, args, input); assert.equal(await process.exited, 0, process.errors()); return events(process.output());
   }
-  async function until(check: () => Promise<boolean>): Promise<void> {
+  async function until(check: () => Promise<boolean>, message = ""): Promise<void> {
     const deadline = Date.now() + 10_000;
-    while (!await check()) { assert.ok(Date.now() < deadline, children.map((process) => process.errors()).join("\n")); await new Promise((resolve) => setTimeout(resolve, 20)); }
+    while (!await check()) { assert.ok(Date.now() < deadline, message + "\n" + children.map((process) => process.errors()).join("\n")); await new Promise((resolve) => setTimeout(resolve, 20)); }
   }
   async function online(ids: string[]): Promise<void> {
     await until(async () => {
@@ -62,6 +62,7 @@ test("real CLI, coordinator and worker retain main history across an offline lap
   const effect = ["-e", "const value={host:process.env.AGENT_TEST_NODE_ID,cwd:process.cwd()};require('node:fs').appendFileSync(process.env.HOME+'/effects',JSON.stringify(value)+'\\n');process.stdout.write(JSON.stringify(value))"];
   const exec: ModelStep = { tool: "exec", args: { program: process.execPath, args: effect } };
   const delegate = (title: string, host?: string): ModelStep => ({ tool: "delegate_task", args: { title, outcome: title, input: title, new_task: true,
+    new_task_reason: `${title} is a separate synthetic audit.`,
     ...(host === undefined ? {} : { host }) } });
   try {
     await mkdir(bin); await writeFile(queue, "{}");
@@ -128,6 +129,56 @@ test("real CLI, coordinator and worker retain main history across an offline lap
       }
     }
     assert.ok(readEvidence, "The real read_task result must deliver offline worker evidence back to the model");
+    await writeFile(feedbackGate, "hold the independent feedback admission");
+    actor.child.stdin.write("/feedback fixture-feedback-first: preserve the existing task folder.\n");
+    const reports = () => events(actor.output()).filter((event) => event.type === "feedback_ready");
+    await until(async () => stat(feedbackGate + ".entered").then(() => true, () => false));
+    assert.equal(reports().length, 0, "The fixture must hold the actual native feedback admission");
+    await script("fixture-original-during-feedback", [{ text: "The original task accepted input while feedback admission was held." }]);
+    actor.child.stdin.write("fixture-original-during-feedback\n");
+    await until(async () => events(actor.output()).some((event) => event.type === "answer" &&
+      event.conversation_id === old.conversation_id && event.text === "The original task accepted input while feedback admission was held."),
+    "The original worker must keep processing input while feedback admission waits");
+    assert.equal(reports().length, 0, "Processing the original task must not depend on receiving the feedback receipt");
+    await rm(feedbackGate);
+    await until(async () => reports().length === 1);
+    const firstReport = reports()[0]; assert.ok(firstReport);
+    const captured = (await cli(0, ["feedback", "show", firstReport.receipt.id])).find((event) => event.type === "feedback");
+    assert.ok(captured?.type === "feedback");
+    assert.equal(captured.bundle.context.origin_host_id, laptop); assert.equal(captured.bundle.context.task_id, old.id);
+    assert.equal(captured.bundle.context.conversation_id, old.conversation_id); assert.deepEqual(captured.bundle.context.binding, original.binding);
+    assert.equal((await stat(firstReport.receipt.path)).mode & 0o077, 0, "The coordinator must retain feedback privately");
+    const repair = (await tasks()).find((task) => task.id === firstReport.receipt.task_id); assert.ok(repair?.worker.state === "bound");
+    const repairBinding = repair.worker.binding;
+    assert.notEqual(repair.id, old.id); assert.equal(repair.worker.binding.host_id, laptop);
+    assert.equal(repair.worker.binding.session_id, original.binding.session_id); assert.notEqual(repair.worker.binding.window_id, original.binding.window_id);
+    const repairLaunch = sessions(join(homes[1]!, "rex.json")).find((window) => window.block_id === repairBinding.block_id); assert.ok(repairLaunch);
+    assert.equal(repairLaunch.label, "Agent feedback");
+    await script("fixture-feedback-first", [{ text: "The feedback repair is verified and remains in the existing folder." }]);
+    const repairActor = start(1, repairLaunch.command.slice(1), undefined,
+      { REX_SESSION: repairLaunch.session_id, REX_BLOCK: repairLaunch.block_id }, true);
+    await until(async () => events(repairActor.output()).some((event) => event.type === "worker_idle"));
+    await until(async () => (await cli(0, [], "/exit\n")).some((event) => event.type === "history" &&
+      event.conversation_id === first.conversation_id && event.messages.some((message) => message.text === "The feedback repair is verified and remains in the existing folder.")));
+    await script("fixture-feedback-again", [{ text: "The additional feedback was checked in the same repair conversation." }]);
+    actor.child.stdin.write("/feedback fixture-feedback-again: keep the queued correction too.\n");
+    await until(async () => reports().length === 2);
+    const secondReport = reports()[1]; assert.ok(secondReport);
+    assert.notEqual(secondReport.receipt.id, firstReport.receipt.id); assert.equal(secondReport.receipt.task_id, repair.id);
+    await until(async () => events(repairActor.output()).some((event) => event.type === "answer" &&
+      event.conversation_id === repair.conversation_id && event.text === "The additional feedback was checked in the same repair conversation."));
+    const repaired = (await tasks()).find((task) => task.id === repair.id); assert.ok(repaired?.worker.state === "bound");
+    assert.deepEqual(repaired.worker.binding, repairBinding);
+    const windows = sessions(join(homes[1]!, "rex.json"));
+    assert.equal(new Set(windows.map((window) => window.session_id)).size, 2, "Feedback must not create a top-level Rex folder");
+    assert.equal(windows.filter((window) => window.session_id === original.binding.session_id).length, 2, "Repeated feedback must reuse its repair terminal");
+    await script("fixture-original-after-feedback", [{ text: "The original task remains usable after both feedback reports." }]);
+    actor.child.stdin.write("fixture-original-after-feedback\n");
+    await until(async () => events(actor.output()).some((event) => event.type === "answer" &&
+      event.conversation_id === old.conversation_id && event.text === "The original task remains usable after both feedback reports."));
+    const originalAfterFeedback = (await tasks()).find((task) => task.id === old.id); assert.ok(originalAfterFeedback?.worker.state === "bound");
+    assert.deepEqual(originalAfterFeedback.worker.binding, original.binding);
+    repairActor.child.stdin.end("/exit\n"); assert.equal(await repairActor.exited, 0, repairActor.errors());
     actor.child.stdin.end("/exit\n"); assert.equal(await actor.exited, 0, actor.errors());
     worker.child.kill("SIGINT"); await worker.exited; server.child.kill("SIGTERM"); assert.equal(await server.exited, 0, server.errors());
   } finally {

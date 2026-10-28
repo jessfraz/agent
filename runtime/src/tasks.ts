@@ -22,6 +22,7 @@ import type { SavedMatch } from "./generated/SavedMatch.js";
 import type { ImportedConversation } from "./generated/ImportedConversation.js";
 import type { SearchRecord, SearchResult } from "./search.js";
 import type { SearchMode } from "./generated/SearchMode.js";
+import type { InputMode } from "./generated/InputMode.js";
 
 export type HostCall = (command: HostCommand) => Promise<HostResult>;
 export type SearchQuery = (query: string, sourceRefs: string[], limit: number, mode?: SearchMode) => Promise<SearchResult>;
@@ -35,8 +36,9 @@ export type WorkerSession = {
   idle(): void;
   fence?(): Promise<void>;
   beforeTurn?(): Promise<void>;
+  rejected?(inputId: string, message: string): void;
 };
-type AttachedWorker = { revision: number; busy: boolean; admissions: number; attached: boolean; fenced: boolean; observer?: WorkerSession;
+type AttachedWorker = { revision: number; busy: boolean; admissions: number; attached: boolean; fenced: boolean; nativeActive: boolean; observer?: WorkerSession;
   conversation?: Conversation; finished: Promise<void>; finish(): void; wake?: () => void; drained?: () => void; input: WorkerInput };
 const Tasks = defineDoc<TaskIndex>({
   kind: "agent.tasks", scope: "session", version: 1,
@@ -391,10 +393,10 @@ export class TaskStore {
   async enqueue(id: string, content: string, inputId: string = randomUUID(), delivered?: TaskOutcome): Promise<TaskRecord> {
     return this.enqueueActor(id, content, inputId, undefined, delivered);
   }
-  async input(input: WorkerInput, content: string, inputId: string): Promise<TaskRecord> {
+  async input(input: WorkerInput, content: string, inputId: string, mode?: InputMode): Promise<TaskRecord> {
     const active = this.running.get(this.actorKey(input.task_id, input.agent_id));
     if (active?.attached !== true || active.input !== input) throw new TaskError("This worker is no longer attached");
-    return this.enqueueActor(input.task_id, content, inputId, input.agent_id);
+    return this.enqueueActor(input.task_id, content, inputId, input.agent_id, undefined, mode);
   }
   async continueAgent(id: string, agentId: string, content: string, inputId: string, call?: HostCall): Promise<TaskRecord> {
     if (this.running.get(this.actorKey(id, agentId))?.attached !== true) {
@@ -407,7 +409,7 @@ export class TaskStore {
     }
     return this.enqueueActor(id, content, inputId, agentId);
   }
-  private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome): Promise<TaskRecord> {
+  private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome, mode?: InputMode): Promise<TaskRecord> {
     if (content.trim().length === 0 || Buffer.byteLength(content, "utf8") > 65_536) throw new TaskError("Task input must contain 1 to 65536 UTF-8 bytes");
     const active = this.running.get(this.actorKey(id, agentId));
     if (active !== undefined) active.admissions += 1;
@@ -418,13 +420,25 @@ export class TaskStore {
         if (delivered !== undefined) this.assertSource(delivered.conversation_id);
         const actor = this.actor(task, agentId);
         const previous = actor.pending.find((input) => input.id === inputId);
-        if (previous !== undefined && previous.content !== content) throw new TaskError("A task input ID cannot be reused with different content");
-        if (previous === undefined) actor.pending.push({ id: inputId, content });
+        if (previous !== undefined && (previous.content !== content || (previous.mode ?? "follow_up") !== (mode ?? "follow_up"))) {
+          throw new TaskError("A task input ID cannot be reused with different content or mode");
+        }
+        if (previous === undefined) actor.pending.push({ id: inputId, content, ...(mode === undefined ? {} : { mode }) });
         actor.state = { state: "open" };
         task.state = { state: "open" };
       });
       if (delivered !== undefined) await this.outcomes?.publishedIn(tx, delivered, true);
       }, BACKGROUND_CONTEXT);
+      if (mode !== undefined && active?.nativeActive && active.attached && !active.fenced &&
+          active.observer?.signal.aborted !== true && active.conversation !== undefined) {
+        // The outbox is committed first. A crash between these commits retries
+        // the same native request ID instead of injecting the input twice.
+        try {
+          const queued = this.actor(await this.get(id), agentId).pending;
+          for (const input of queued) await active.conversation.submit({ type: "input", content: input.content, requestId: input.id,
+            whenBusy: input.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
+        } catch { /* The durable outbox still owns admission through this actor. */ }
+      }
     } finally {
       if (active !== undefined) { active.admissions -= 1; if (active.admissions === 0) active.drained?.(); }
     }
@@ -684,7 +698,7 @@ export class TaskStore {
     if (this.running.has(actorKey)) throw new TaskError("This task already has an attached worker");
     let finish = () => {};
     const finished = new Promise<void>((resolve) => { finish = resolve; });
-    const active: AttachedWorker = { revision: 0, busy: true, admissions: 0, attached: false, fenced: false, input, finished, finish,
+    const active: AttachedWorker = { revision: 0, busy: true, admissions: 0, attached: false, fenced: false, nativeActive: false, input, finished, finish,
       ...(observer === undefined ? {} : { observer }) };
     const attemptId = randomUUID();
     this.running.set(actorKey, active);
@@ -695,6 +709,7 @@ export class TaskStore {
     let answerEntry: EntryRecord | undefined;
     let childResultPending = input.agent_id !== undefined && observer === undefined;
     let recoverPrevious = true;
+    const published = new Set<string>();
     try {
       const deadline = Date.now() + 10_000;
       let task = await this.get(input.task_id);
@@ -735,7 +750,16 @@ export class TaskStore {
         const revision = active.revision;
         task = await this.get(input.task_id);
         actor = this.actor(task, input.agent_id);
-        const next = actor.pending[0];
+        // Pi can place a steer before an older follow-up. Preserve that native
+        // order on recovery so an older shared answer cannot replace a newer one.
+        const next = await this.session.commit(async (tx) => {
+          let selected = actor.pending[0], placed = Number.POSITIVE_INFINITY;
+          for (const candidate of actor.pending) {
+            const native = await tx.submissionByRequest(conversation.id, candidate.id);
+            if (native?.entry !== undefined && native.entry < placed) { selected = candidate; placed = native.entry; }
+          }
+          return selected;
+        }, BACKGROUND_CONTEXT);
         if (next === undefined) {
           await conversation.waitForIdle(BACKGROUND_CONTEXT);
           if (active.revision !== revision) continue;
@@ -786,20 +810,24 @@ export class TaskStore {
           delete active.wake;
           continue;
         }
+        const previousAnswer = answer, previousEntry = answerEntry;
         answer = ""; answerEntry = undefined;
         recoverPrevious = false;
         childResultPending = input.agent_id !== undefined;
         await this.resources?.attach(input.task_id);
         await observer?.beforeTurn?.();
         if (active.fenced || observer?.signal.aborted) break;
-        const submission = await conversation.submit({ type: "input", content: next.content, requestId: next.id }, BACKGROUND_CONTEXT);
+        const submission = await conversation.submit({ type: "input", content: next.content, requestId: next.id,
+          whenBusy: next.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
+        active.nativeActive = true;
         await this.update(task.id, (current) => {
           const currentActor = this.actor(current, input.agent_id);
           currentActor.pending = currentActor.pending.filter((item) => item.id !== next.id);
         });
-        const settled = await submission.wait(BACKGROUND_CONTEXT);
+        const settled = await submission.wait(BACKGROUND_CONTEXT).finally(() => { active.nativeActive = false; });
         if (active.fenced) { await conversation.waitForIdle(BACKGROUND_CONTEXT); break; }
         if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted" && input.interactive === true && observer !== undefined) {
+          if (next.mode !== undefined) observer.rejected?.(next.id, "The stopped turn withdrew this input; submit it again to continue.");
           await conversation.waitForIdle(BACKGROUND_CONTEXT);
           childResultPending = false;
           continue;
@@ -810,6 +838,10 @@ export class TaskStore {
         const entry = await conversation.commit((tx) => tx.entry(settled.answer), BACKGROUND_CONTEXT);
         if (active.fenced) break;
         answer = entry === undefined ? "" : text(entry); answerEntry = entry;
+        if (published.has(settled.answer.toString())) {
+          answer = previousAnswer; answerEntry = previousEntry; childResultPending = false; continue;
+        }
+        published.add(settled.answer.toString());
         childResultPending = input.agent_id !== undefined;
         if (entry !== undefined && input.agent_id === undefined) {
           finalOutcome = await this.finishOutcome(task.id, conversation.id.toString(), entry.id.toString(), answer);
@@ -827,6 +859,9 @@ export class TaskStore {
       return { conversation_id: conversation.id.toString(), text: answer };
     } catch (error) {
       if (active.fenced) return { conversation_id: this.actor(await this.get(input.task_id), input.agent_id).conversation_id, text: "" };
+      // Native failures retain queued inbox inputs. Withdraw them explicitly
+      // rather than leaving an admitted follow-up waiting without an executor.
+      await active.conversation?.abort(BACKGROUND_CONTEXT);
       if (attached) {
         if (input.agent_id !== undefined) {
           childResultPending = true;
@@ -843,6 +878,7 @@ export class TaskStore {
       active.attached = false;
       while (active.admissions > 0) await new Promise<void>((resolve) => { active.drained = resolve; });
       delete active.drained;
+      await active.conversation?.waitForIdle(BACKGROUND_CONTEXT);
       unbind?.();
       try {
         // Hold this actor until its result is durably owned by the parent.

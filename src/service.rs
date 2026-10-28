@@ -277,6 +277,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         !matches!(
             command,
             RuntimeCommand::Interrupt
+                | RuntimeCommand::SubmitInput { .. }
                 | RuntimeCommand::WorkerInput { .. }
                 | RuntimeCommand::DetachWorker
                 | RuntimeCommand::HostReply { .. }
@@ -395,6 +396,9 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                         RuntimeCommand::Interrupt if interruptible => {
                             runtime.worker_control(call.request_id, RuntimeCommand::Interrupt).await?;
                         }
+                        command @ RuntimeCommand::SubmitInput { .. } if interactive || (!attached && interruptible) => {
+                            runtime.worker_control(call.request_id, command).await?;
+                        }
                         RuntimeCommand::OAuthCallback { target } if login => {
                             runtime.callback(call.request_id, target).await?;
                         }
@@ -476,7 +480,7 @@ mod reset_tests;
 
 #[cfg(test)]
 mod tests {
-    use crate::protocol::{AuthStatus, HostResult, RuntimeCommand, RuntimeEventKind};
+    use crate::protocol::{AuthStatus, HostResult, InputMode, RuntimeCommand, RuntimeEventKind};
     use crate::runtime::{FrameReader, Runtime};
     use crate::service::{
         SOCKET_NAME, SocketOwner, authenticated, connect, serve_until, write_frame,
@@ -511,6 +515,13 @@ mod tests {
         } else if(command.type==='run_task'&&command.interactive) {
           emit(id,{type:'task_ready',conversation_id:'persisted-task',title:'Interactive fixture'});
           emit(id,{type:'worker_idle'});
+        } else if(command.type==='chat') {
+          emit(id,{type:'notice',task_id:null,text:'Chat ready'});
+        } else if(command.type==='submit_input') {
+          writeFileSync(join(process.argv[2],'input-'+command.input_id+'.json'),JSON.stringify({id,input:command.input,mode:command.mode}));
+          emit(id,{type:'input_accepted',input_id:command.input_id});
+        } else if(command.type==='interrupt') {
+          finish(id);
         } else if(command.type==='worker_input') {
           writeFileSync(join(process.argv[2],'worker-input.json'),JSON.stringify({id,input:command.input}));
           emit(id,{type:'answer',conversation_id:'persisted-task',text:command.input}); emit(id,{type:'worker_idle'});
@@ -542,6 +553,98 @@ mod tests {
             cwd: "/".into(),
             interactive: None,
         }
+    }
+
+    #[tokio::test]
+    async fn submitted_inputs_stay_on_their_active_chat_or_worker_connection() {
+        #[derive(serde::Deserialize)]
+        struct Submitted {
+            id: u32,
+            input: String,
+            mode: InputMode,
+        }
+        let service = Running::start().await;
+        let mut unscoped = service.client().await;
+        write_frame(
+            &mut unscoped,
+            &RuntimeCommand::SubmitInput {
+                input_id: "unscoped".into(),
+                input: "Rejected".into(),
+                mode: InputMode::Steer,
+            },
+        )
+        .await
+        .unwrap();
+        let mut bytes = Vec::new();
+        unscoped.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        assert!(
+            !service
+                .directory
+                .path()
+                .join("input-unscoped.json")
+                .exists()
+        );
+
+        let mut chat = service.client().await;
+        write_frame(
+            &mut chat,
+            &RuntimeCommand::Chat {
+                input: "Start chat".into(),
+                instructions: String::new(),
+                model: None,
+                origin_host_id: None,
+                cwd: "/".into(),
+                hosts: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let (read, mut write) = chat.into_split();
+        let mut chat = FrameReader::new(BufReader::new(read));
+        chat.next_frame().await.unwrap().unwrap();
+        for (input_id, mode) in [("steer", InputMode::Steer), ("queue", InputMode::FollowUp)] {
+            write_frame(
+                &mut write,
+                &RuntimeCommand::SubmitInput {
+                    input_id: input_id.into(),
+                    input: input_id.into(),
+                    mode,
+                },
+            )
+            .await
+            .unwrap();
+            let event: RuntimeEventKind =
+                serde_json::from_slice(&chat.next_frame().await.unwrap().unwrap()).unwrap();
+            assert!(
+                matches!(event, RuntimeEventKind::InputAccepted { input_id: accepted } if accepted == input_id)
+            );
+        }
+        let read = |name: &str| -> Submitted {
+            serde_json::from_slice(
+                &fs::read(service.directory.path().join(format!("input-{name}.json"))).unwrap(),
+            )
+            .unwrap()
+        };
+        let steer = read("steer");
+        let queue = read("queue");
+        assert_eq!(steer.id, queue.id);
+        assert_eq!(steer.input, "steer");
+        assert_eq!(steer.mode, InputMode::Steer);
+        assert_eq!(queue.mode, InputMode::FollowUp);
+        status(service.client().await).await;
+        write_frame(&mut write, &RuntimeCommand::Interrupt)
+            .await
+            .unwrap();
+        loop {
+            let event: RuntimeEventKind =
+                serde_json::from_slice(&chat.next_frame().await.unwrap().unwrap()).unwrap();
+            if matches!(event, RuntimeEventKind::Done) {
+                break;
+            }
+        }
+        drop((chat, write));
+        service.stop().await;
     }
 
     struct Running {

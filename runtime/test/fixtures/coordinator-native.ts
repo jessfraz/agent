@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
+import { setTimeout } from "node:timers/promises";
 
 export type NativeSession = { session_id: string; window_id: string; block_id: string; label: string; command: string[]; cwd: string };
 function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
@@ -30,20 +31,36 @@ if (process.env.AGENT_TEST_NATIVE === "ssh") {
   const saved = sessions(path); let result: unknown;
   if (method === "whoami") result = { host_id: host, instance_id: "33333333-3333-4333-8333-333333333333", rex_version: "synthetic" };
   else if (method === "hosts") result = { hosts: [] };
-  else if (method === "session.create") {
-    assert.ok(Array.isArray(input.initial_windows)); const window: unknown = input.initial_windows[0];
+  else if (method === "session.create" || method === "session.new_window") {
+    const creating = method === "session.create";
+    const gate = process.env.AGENT_TEST_FEEDBACK_GATE;
+    if (!creating && input.window_label === "Agent feedback" && gate !== undefined && existsSync(gate)) {
+      writeFileSync(gate + ".entered", "waiting");
+      while (existsSync(gate)) await setTimeout(10);
+    }
+    if (creating) assert.ok(Array.isArray(input.initial_windows));
+    const window: unknown = creating && Array.isArray(input.initial_windows) ? input.initial_windows[0] : input;
     assert.ok(object(window) && object(window.layout) && object(window.layout.block) && object(window.layout.block.options));
     const options = window.layout.block.options; assert.ok(Array.isArray(options.command) && options.command.every((arg: unknown) => typeof arg === "string"));
-    const session: NativeSession = { session_id: `session:${randomUUID()}`, window_id: `window:${randomUUID()}`, block_id: `block:${randomUUID()}`,
-      label: field(input, "label"), cwd: field(options, "cwd"), command: options.command.map(String) };
-    saved.unshift(session); writeFileSync(path, JSON.stringify(saved));
-    result = { session_id: session.session_id, initial_windows: [{ window_id: session.window_id, block_ids: [session.block_id], revision: 1 }] };
-  } else if (method === "session.list") result = { sessions: saved.map((session) => ({ session_id: session.session_id, label: session.label })) };
-  else if (method === "session.view") {
+    const session_id = creating ? `session:${randomUUID()}` : field(input, "session_id");
+    if (!creating) assert.ok(saved.some((session) => session.session_id === session_id));
+    const session: NativeSession = { session_id, window_id: `window:${randomUUID()}`, block_id: `block:${randomUUID()}`,
+      label: field(input, creating ? "label" : "window_label"), cwd: field(options, "cwd"), command: options.command.map(String) };
+    if (creating) saved.unshift(session); else saved.push(session);
+    writeFileSync(path, JSON.stringify(saved));
+    const created = { window_id: session.window_id, block_ids: [session.block_id], revision: 1 };
+    result = creating ? { session_id: session.session_id, initial_windows: [created] } : created;
+  } else if (method === "session.list") {
+    const seen = new Set<string>();
+    result = { sessions: saved.filter((session) => {
+      if (seen.has(session.session_id)) return false; seen.add(session.session_id); return true;
+    }).map((session) => ({ session_id: session.session_id, label: session.label })) };
+  } else if (method === "session.view") {
     const session = saved.find((session) => session.session_id === input.session_id); assert.ok(session);
-    result = { session_id: session.session_id, revision: 1, label: session.label, windows: [{ window_id: session.window_id, layers: [{ blocks: [
-      { block_id: session.block_id, host_id: host, flavor: "com.superlogical.terminal.shell" },
-    ] }] }] };
+    result = { session_id: session.session_id, revision: 1, label: session.label,
+      windows: saved.filter((window) => window.session_id === session.session_id).map((window) => ({ window_id: window.window_id, layers: [{ blocks: [
+        { block_id: window.block_id, host_id: host, flavor: "com.superlogical.terminal.shell" },
+      ] }] })) };
   } else if (method === "session.move") result = {};
   else if (method === "com.superlogical.terminal.process") result = { child: { pid: process.pid }, foreground: null, last_exit: null };
   else throw new Error(`Unexpected synthetic Rex operation: ${method}`);

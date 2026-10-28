@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
-import { AssistantEntry, createRegistry, Harness } from "@earendil-works/pi-durable";
+import { AssistantEntry, createRegistry, Harness, type Conversation, type Submission } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
@@ -16,6 +16,8 @@ import { TaskError, TaskStore, type HostCall } from "./tasks.js";
 import { HistoryStore } from "./history.js";
 import { CodexImporter } from "./importer.js";
 import { Retrieval } from "./retrieval.js";
+import { FeedbackStore } from "./feedback.js";
+import { FeedbackDispatcher } from "./feedback-dispatch.js";
 import { createGuidance } from "./guidance.js";
 import { createAppTools, Executions, HostRequests } from "./tools.js";
 import { createSourceTools, SourceJournal } from "./sources.js";
@@ -49,13 +51,16 @@ async function openApplication() {
   await database.exec("PRAGMA synchronous = FULL");
   const storage = await SqliteStorage.open(database);
   const registry = createRegistry();
-  const harness = await Harness.open(storage, { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  const harness = await Harness.open(storage, { models, registry, identity: { attribution: null },
+    settings: { steeringMode: "all", followUpMode: "one-at-a-time" } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(harness, inference);
   const environment = new CoordinatorEnvironment(harness); environment.useLiveGuidance(); tasks.useEnvironment(environment);
   const assets = join(state, "history", "assets");
   const histories = new HistoryStore(harness, assets); tasks.useHistory(histories);
   const importer = new CodexImporter(harness, histories, assets);
   const retrieval = new Retrieval(harness, histories, tasks, join(state, "search.sqlite"));
+  const feedback = new FeedbackStore(state, tasks);
+  const repairs = new FeedbackDispatcher(feedback, tasks, environment);
   const executions = new Executions();
   const sources = new SourceJournal(harness, tasks, executions);
   const tools = createAppTools(tasks, executions);
@@ -69,7 +74,7 @@ async function openApplication() {
   registry.install(tools.worker);
   registry.install(sourceTools);
   registry.install(resourceTools);
-  return { harness, tasks, environment, executions, tools, sources, sourceTools, resources, resourceTools, histories, importer, retrieval, guidance };
+  return { harness, tasks, environment, executions, tools, sources, sourceTools, resources, resourceTools, histories, importer, retrieval, guidance, feedback, repairs };
 }
 let application: ReturnType<typeof openApplication> | undefined;
 function app(): ReturnType<typeof openApplication> { return application ??= openApplication(); }
@@ -79,6 +84,16 @@ const activeCommands = new Set<number>();
 const interrupted = new Set<number>();
 const interrupts = new Map<number, Promise<void>>();
 const workers = new Map<number, { command: Extract<RuntimeCommand, { type: "run_task" }>; controller: AbortController }>();
+type MainTurn = { conversation?: Conversation; accepting: boolean; admissions: number; wake?: () => void;
+  ready: Promise<boolean>; start(ready: boolean): void; inputs: { input_id?: string; submission: Submission }[] };
+function mainTurn(): MainTurn {
+  let start = (_ready: boolean) => {};
+  const ready = new Promise<boolean>((resolve) => { start = resolve; });
+  return { ready, start, accepting: true, admissions: 0, inputs: [] };
+}
+const mainTurns = new Map<number, MainTurn>();
+const inputControls = new Map<number, Set<Promise<void>>>();
+const ending = new Set<number>();
 
 function searchFor(application: Awaited<ReturnType<typeof openApplication>>, id: number) {
   return (query: string, refs: string[], limit: number, mode: SearchMode = "semantic") => application.retrieval.search(query, refs, limit,
@@ -93,9 +108,45 @@ async function interrupt(id: number): Promise<void> {
   const operation = (async () => { await conversation.abort(BACKGROUND_CONTEXT); emit(id, { type: "interrupted" }); })();
   interrupts.set(id, operation); await operation;
 }
+function submitInput(id: number, command: Extract<RuntimeCommand, { type: "submit_input" }>): void {
+  if (!activeCommands.has(id) || ending.has(id)) return;
+  const worker = workers.get(id), main = mainTurns.get(id);
+  if (main !== undefined) main.admissions += 1;
+  const operations = inputControls.get(id) ?? new Set<Promise<void>>(); inputControls.set(id, operations);
+  const operation = (async () => {
+    if (command.input.trim().length === 0 || Buffer.byteLength(command.input, "utf8") > 65_536) throw new TaskError("Input must contain 1 to 65536 UTF-8 bytes");
+    if (main !== undefined && !await main.ready) throw new TaskError("The turn could not start; this input was not accepted");
+    const stopping = interrupts.get(id); await stopping;
+    if (worker !== undefined) {
+      if (worker.controller.signal.aborted) throw new TaskError("This worker is detaching");
+      await (await app()).tasks.input(worker.command, command.input, command.input_id, command.mode);
+    } else {
+      if (main === undefined || !main.accepting || main.conversation === undefined) throw new TaskError("The turn has finished; this input was not accepted");
+      if (interrupts.get(id) === stopping) {
+        interrupts.delete(id); interrupted.delete(id); hostRequests.resumeRequest(id);
+      }
+      const submission = await main.conversation.submit({ type: "input", content: command.input, requestId: command.input_id,
+        whenBusy: command.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
+      if (!main.accepting) {
+        await main.conversation.abort(BACKGROUND_CONTEXT);
+        throw new TaskError("The turn ended while this input was being saved; its original is retained");
+      }
+      main.inputs.push({ input_id: command.input_id, submission });
+    }
+    emit(id, { type: "input_accepted", input_id: command.input_id });
+  })().catch((error: unknown) => {
+    emit(id, { type: "input_rejected", input_id: command.input_id,
+      message: error instanceof TaskError ? error.message : "Input could not be saved; its draft is retained" });
+  }).finally(() => {
+    if (main !== undefined) { main.admissions -= 1; main.wake?.(); }
+    operations.delete(operation);
+  });
+  operations.add(operation);
+}
 async function handle(request: RuntimeRequest): Promise<void> {
   const { id, command } = request;
   if (command.type === "chat" || command.type === "run_task") activeCommands.add(id);
+  if (command.type === "chat") mainTurns.set(id, mainTurn());
   if (command.type === "run_task" && command.interactive === true) {
     workers.set(id, { command, controller: new AbortController() });
   }
@@ -122,6 +173,16 @@ async function handle(request: RuntimeRequest): Promise<void> {
         await auth.logout();
         emit(id, { type: "auth_status", status: await auth.status() });
         break;
+      case "feedback": {
+        const application = await app();
+        const root = await application.harness.root(BACKGROUND_CONTEXT);
+        const context = { ...command.context, model: command.context.model ?? application.executions.model(root.id.toString()) ??
+          await application.environment.model(null) };
+        const bundle = await application.feedback.capture(command.description, context);
+        const receipt = await application.repairs.dispatch(bundle, (operation) => hostRequests.call(id, operation));
+        emit(id, { type: "feedback_ready", receipt }); break;
+      }
+      case "read_feedback": emit(id, { type: "feedback", bundle: await (await app()).feedback.read(command.id) }); break;
       case "import_codex": {
         const application = await app(); const available = await application.environment.environment();
         await application.importer.run(available.nodes, available.online_host_ids, command.hosts,
@@ -232,6 +293,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
           },
           answer(conversation_id, text) { emit(id, { type: "answer", conversation_id, text }); },
           idle() { emit(id, { type: "worker_idle" }); },
+          rejected(input_id, message) { emit(id, { type: "input_rejected", input_id, message }); },
         });
         if (worker === undefined) emit(id, { type: "answer", ...answer });
         } finally { await stop?.(); }
@@ -258,7 +320,9 @@ async function handle(request: RuntimeRequest): Promise<void> {
               : { type: "on_node", host_id: command.origin_host_id, command: { type: "project_guidance", cwd: command.cwd } }), call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
             notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
           });
-          const stop = await activity(harness, root, (activity) => emit(id, { type: "activity", activity }));
+          const stop = await activity(harness, root, (activity) => emit(id, { type: "activity", activity }),
+            (message) => emit(id, { type: "message", message }));
+          const turn = mainTurns.get(id);
           try {
             const related = await tasks.find(command.input, [], 8, searchFor(application, id));
             if (interrupted.has(id)) { await interrupts.get(id); return; }
@@ -271,14 +335,43 @@ async function handle(request: RuntimeRequest): Promise<void> {
               instructions: (await environment.instructions(command.instructions)) + relatedContext + hostsContext, cwd: command.cwd, extensions: [guidance, tools.host, tools.main, sourceTools, resourceTools] });
             if (interrupted.has(id)) { await interrupts.get(id); return; }
             const submission = await root.submit({ type: "input", content: command.input }, BACKGROUND_CONTEXT);
-            const settled = await submission.wait(BACKGROUND_CONTEXT);
-            if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted") { await interrupts.get(id); return; }
-            if (settled.type !== "input" || settled.status !== "done") throw new TaskError("The model turn did not complete; its state is retained");
-            const entry = await root.commit((tx) => tx.entry(AssistantEntry, settled.answer), BACKGROUND_CONTEXT);
-            const text = entry?.model?.flatMap((message) => message.role !== "assistant" ? []
-              : message.content.flatMap((part) => part.type === "text" ? [part.text] : [])).join("\n") ?? "";
-            emit(id, { type: "answer", conversation_id: root.id.toString(), text });
-          } finally { await stop(); release(); }
+            if (turn === undefined) throw new TaskError("The main execution owner is unavailable");
+            turn.conversation = root; turn.inputs.push({ submission }); turn.start(true);
+            const answers = new Set<string>(); let next = 0;
+            for (;;) {
+              const input = turn.inputs[next];
+              if (input === undefined) {
+                if (turn.admissions === 0) { turn.accepting = false; break; }
+                const active = turn;
+                await new Promise<void>((resolve) => { active.wake = resolve; }); delete turn.wake; continue;
+              }
+              next += 1;
+              const settled = await input.submission.wait(BACKGROUND_CONTEXT);
+              if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted") {
+                if (input.input_id !== undefined) emit(id, { type: "input_rejected", input_id: input.input_id, message: "The stopped turn withdrew this input; submit it again to continue." });
+                continue;
+              }
+              if (settled.type !== "input" || settled.status !== "done") throw new TaskError("The model turn did not complete; its state is retained");
+              if (answers.has(settled.answer.toString())) continue;
+              answers.add(settled.answer.toString());
+              const entry = await root.commit((tx) => tx.entry(AssistantEntry, settled.answer), BACKGROUND_CONTEXT);
+              const text = entry?.model?.flatMap((message) => message.role !== "assistant" ? []
+                : message.content.flatMap((part) => part.type === "text" ? [part.text] : [])).join("\n") ?? "";
+              emit(id, { type: "answer", conversation_id: root.id.toString(), text });
+            }
+          } catch (error) {
+            if (turn !== undefined) {
+              turn.accepting = false; await root.abort(BACKGROUND_CONTEXT);
+              for (const input of turn.inputs) if (input.input_id !== undefined && (await input.submission.status(BACKGROUND_CONTEXT)).status === "unanswered") {
+                emit(id, { type: "input_rejected", input_id: input.input_id, message: "The turn failed before this input completed; its original is retained." });
+              }
+            }
+            throw error;
+          } finally {
+            if (turn !== undefined) { turn.accepting = false; turn.start(false); }
+            await Promise.allSettled([...(inputControls.get(id) ?? [])]);
+            await stop(); release();
+          }
         });
         mainQueue = turn.then(() => {}, () => {});
         await turn;
@@ -296,11 +389,16 @@ async function handle(request: RuntimeRequest): Promise<void> {
     else if (error instanceof TaskError || error instanceof ModelError || error instanceof EnvironmentError) failure(id, "invalid_request", error.message);
     else emit(id, errorEvent(error));
   } finally {
+    ending.add(id);
+    const turn = mainTurns.get(id); if (turn !== undefined) { turn.accepting = false; turn.start(false); }
+    await Promise.allSettled([...(inputControls.get(id) ?? [])]); inputControls.delete(id);
+    mainTurns.delete(id);
     await interrupts.get(id)?.catch(() => {});
     activeCommands.delete(id); activeConversations.delete(id); interrupted.delete(id); interrupts.delete(id);
     workers.delete(id);
     hostRequests.finish(id);
     emit(id, { type: "done" });
+    ending.delete(id);
   }
 }
 
@@ -330,6 +428,7 @@ try {
       });
       continue;
     }
+    if (request.command.type === "submit_input") { submitInput(request.id, request.command); continue; }
     if (request.command.type === "host_reply") {
       hostRequests.reply(request.id, request.command.call_id, request.command.result);
       continue;

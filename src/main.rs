@@ -17,11 +17,13 @@ use std::{
 use agent_cli::{
     config::{self, ClientConfig},
     context::ContextStore,
-    discovery, host, instructions, intake,
+    discovery,
+    feedback::FeedbackContext,
+    host, instructions, intake,
     models::{ModelProvider, ModelSelection, Reasoning},
     protocol::{
-        AuthStatus, CoordinatorBootstrap, CoordinatorSettings, ImportPhase, RuntimeCommand,
-        RuntimeEventKind, SearchMode, TaskId, WorkerLaunch, WorkerRef,
+        AuthStatus, CoordinatorBootstrap, CoordinatorSettings, ImportPhase, InputMode,
+        RuntimeCommand, RuntimeEventKind, SearchMode, TaskId, WorkerLaunch, WorkerRef,
     },
     rex::{BlockId, RexClient, SessionId},
     runtime::FrameReader,
@@ -106,6 +108,11 @@ enum Action {
     History {
         #[command(subcommand)]
         command: HistoryAction,
+    },
+    /// Read a private debugging snapshot captured by /feedback.
+    Feedback {
+        #[command(subcommand)]
+        command: FeedbackAction,
     },
     /// Run this machine's coordinator or registered worker service.
     Serve {
@@ -243,6 +250,12 @@ enum HistoryAction {
         #[arg(long)]
         host: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum FeedbackAction {
+    Latest,
+    Show { id: String },
 }
 
 #[derive(Subcommand)]
@@ -516,6 +529,12 @@ async fn main() -> Result<()> {
         Action::Logout => RuntimeCommand::Logout,
         Action::Sources => RuntimeCommand::SourceStates,
         Action::Nodes => RuntimeCommand::Environment,
+        Action::Feedback { command } => RuntimeCommand::ReadFeedback {
+            id: match command {
+                FeedbackAction::Latest => None,
+                FeedbackAction::Show { id } => Some(id),
+            },
+        },
         Action::Resources { command } => match command {
             ResourcesAction::List => RuntimeCommand::ListResources,
             ResourcesAction::Collect => RuntimeCommand::CollectResources {
@@ -669,53 +688,97 @@ async fn main() -> Result<()> {
             )
             .await?;
             let mut input = BufReader::new(tokio::io::stdin()).lines();
-            loop {
-                if !arguments.json && std::io::stdin().is_terminal() {
-                    let mut stdout = tokio::io::stdout();
-                    stdout.write_all(b"agent> ").await?;
-                    stdout.flush().await?;
-                }
-                let Some(line) = input.next_line().await? else {
-                    return Ok(());
-                };
-                if line.trim() == "/exit" {
-                    return Ok(());
-                }
-                if line.trim() == "/history" {
-                    if history_cursor.is_none() {
-                        if !arguments.json {
-                            println!("No older history.");
+            let mut feedback = tokio::task::JoinSet::new();
+            let result = async {
+                loop {
+                    if !arguments.json && std::io::stdin().is_terminal() {
+                        let mut stdout = tokio::io::stdout();
+                        stdout.write_all(b"agent> ").await?;
+                        stdout.flush().await?;
+                    }
+                    let Some(line) = input.next_line().await? else {
+                        return Ok(());
+                    };
+                    if line.trim() == "/exit" {
+                        return Ok(());
+                    }
+                    if let Some(description) = agent_cli::feedback::command(&line) {
+                        let config = config.clone();
+                        let coordinator = coordinator.clone();
+                        let script = script.clone();
+                        let directory = directory.clone();
+                        let cwd = cwd.to_string_lossy().into_owned();
+                        let model = model.clone();
+                        let description = description.to_owned();
+                        let json = arguments.json;
+                        while feedback.try_join_next().is_some() {}
+                        feedback.spawn(async move {
+                            let captured = async {
+                                let context = feedback_context(cwd, model, None).await?;
+                                exchange(
+                                    &config,
+                                    coordinator.as_deref(),
+                                    &script,
+                                    &directory,
+                                    context.command(description),
+                                )
+                                .await
+                            }
+                            .await;
+                            match captured {
+                                Ok(events) => {
+                                    for event in events {
+                                        if let Err(error) = display(&event, json) {
+                                            eprintln!(
+                                                "Feedback receipt could not be displayed: {error}"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(error) => eprintln!("Feedback could not start: {error}"),
+                            }
+                        });
+                        continue;
+                    }
+                    if line.trim() == "/history" {
+                        if history_cursor.is_none() {
+                            if !arguments.json {
+                                println!("No older history.");
+                            }
+                        } else {
+                            history_cursor = request(
+                                &arguments,
+                                &config,
+                                coordinator.as_deref(),
+                                &script,
+                                &directory,
+                                RuntimeCommand::ReadHistory {
+                                    task_id: None,
+                                    agent_id: None,
+                                    cursor: history_cursor,
+                                },
+                            )
+                            .await?;
                         }
-                    } else {
-                        history_cursor = request(
+                        continue;
+                    }
+                    if !line.trim().is_empty() {
+                        let command = chat_command(line, model.clone(), &cwd).await?;
+                        request(
                             &arguments,
                             &config,
                             coordinator.as_deref(),
                             &script,
                             &directory,
-                            RuntimeCommand::ReadHistory {
-                                task_id: None,
-                                agent_id: None,
-                                cursor: history_cursor,
-                            },
+                            command,
                         )
                         .await?;
                     }
-                    continue;
-                }
-                if !line.trim().is_empty() {
-                    let command = chat_command(line, model.clone(), &cwd).await?;
-                    request(
-                        &arguments,
-                        &config,
-                        coordinator.as_deref(),
-                        &script,
-                        &directory,
-                        command,
-                    )
-                    .await?;
                 }
             }
+            .await;
+            finish_feedback(&mut feedback).await;
+            return result;
         }
         _ => bail!("Unsupported client command"),
     };
@@ -756,6 +819,7 @@ async fn main() -> Result<()> {
         } else {
             None
         };
+        finish_feedback(&mut ui.feedback).await;
         let stopped = guard.stop().await;
         match recovery {
             Some(Ok(Some(path))) => eprintln!(
@@ -849,7 +913,7 @@ async fn preserve_ui_recovery(
     ui: &UiSession,
 ) -> Result<Option<PathBuf>> {
     let draft = ui.handle.draft().await?;
-    if draft.is_empty() && ui.queued.is_empty() {
+    if draft.is_empty() && ui.queued.is_empty() && ui.submitted.is_empty() {
         return Ok(None);
     }
     write_ui_recovery(
@@ -857,7 +921,12 @@ async fn preserve_ui_recovery(
         &UiRecovery {
             owner,
             draft,
-            queued_inputs: ui.queued.iter().cloned().collect(),
+            queued_inputs: ui
+                .queued
+                .iter()
+                .chain(ui.submitted.iter().map(|(_, text, _)| text))
+                .cloned()
+                .collect(),
         },
     )
     .map(Some)
@@ -895,6 +964,11 @@ struct UiSession {
     history_cursor: Option<String>,
     exiting: bool,
     failure_shown: bool,
+    conversation_id: Option<String>,
+    submitted: VecDeque<(String, String, InputMode)>,
+    observed_user: Option<(String, String)>,
+    errors: VecDeque<String>,
+    feedback: tokio::task::JoinSet<()>,
 }
 impl UiSession {
     fn new(handle: TuiHandle, inputs: tokio::sync::mpsc::UnboundedReceiver<TuiInput>) -> Self {
@@ -905,12 +979,141 @@ impl UiSession {
             history_cursor: None,
             exiting: false,
             failure_shown: false,
+            conversation_id: None,
+            submitted: VecDeque::new(),
+            observed_user: None,
+            errors: VecDeque::new(),
+            feedback: tokio::task::JoinSet::new(),
         }
     }
     fn enqueue(&mut self, input: String) -> Result<()> {
         self.handle.queued_user(input.clone())?;
         self.queued.push_back(input);
         Ok(())
+    }
+    fn committed_input(&mut self, message: &agent_cli::protocol::HistoryMessage) {
+        if message.continuation {
+            if let Some((id, text)) = &mut self.observed_user
+                && id == &message.entry_id
+            {
+                text.push_str(&message.text);
+            }
+        } else {
+            self.observed_user = Some((message.entry_id.clone(), message.text.clone()));
+        }
+        if let Some((_, text)) = &self.observed_user {
+            if let Some(index) = self
+                .submitted
+                .iter()
+                .position(|(_, input, _)| input == text)
+            {
+                self.submitted.remove(index);
+                self.observed_user = None;
+            } else if !self
+                .submitted
+                .iter()
+                .any(|(_, input, _)| input.starts_with(text))
+            {
+                self.observed_user = None;
+            }
+        }
+    }
+}
+
+async fn feedback_context(
+    cwd: String,
+    model: Option<ModelSelection>,
+    target: Option<(TaskId, Option<String>)>,
+) -> Result<FeedbackContext> {
+    let origin_host_id = RexClient::new(None).whoami().await?.host_id.to_string();
+    let binding = if env::var_os("REX_SESSION").is_some() && env::var_os("REX_BLOCK").is_some() {
+        Some(local_worker_binding().await?)
+    } else {
+        None
+    };
+    let (task_id, agent_id) = target.map_or((None, None), |(task, agent)| (Some(task), agent));
+    Ok(FeedbackContext {
+        origin_host_id,
+        cwd,
+        conversation_id: None,
+        task_id,
+        agent_id,
+        model,
+        binding,
+        draft: String::new(),
+        queued_inputs: Vec::new(),
+        client_errors: Vec::new(),
+        truncated: None,
+    })
+}
+
+fn feedback_from_ui(
+    config: &ClientConfig,
+    coordinator: Option<&str>,
+    script: &Path,
+    directory: &Path,
+    ui: &mut UiSession,
+    target: Option<(TaskId, Option<String>)>,
+    description: String,
+) {
+    let config = config.clone();
+    let coordinator = coordinator.map(str::to_owned);
+    let script = script.to_owned();
+    let directory = directory.to_owned();
+    let handle = ui.handle.clone();
+    let conversation_id = ui.conversation_id.clone();
+    let queued_inputs = ui
+        .queued
+        .iter()
+        .chain(ui.submitted.iter().map(|(_, text, _)| text))
+        .cloned()
+        .collect();
+    let client_errors = ui.errors.iter().cloned().collect();
+    while ui.feedback.try_join_next().is_some() {}
+    ui.feedback.spawn(async move {
+        let result = async {
+            let info = handle.info().await?;
+            let draft = handle.draft().await?;
+            let mut context = feedback_context(info.cwd, Some(info.model), target).await?;
+            context.conversation_id = conversation_id;
+            context.draft = draft;
+            context.queued_inputs = queued_inputs;
+            context.client_errors = client_errors;
+            exchange(
+                &config,
+                coordinator.as_deref(),
+                &script,
+                &directory,
+                context.command(description),
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(events) => {
+                for event in events {
+                    if let RuntimeEventKind::FeedbackReady { receipt } = event {
+                        let _ = handle.notice(format!(
+                            "Feedback {}: debugging in the background; results will return here.",
+                            receipt.id
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = handle.notice(format!("Feedback could not start: {error}"));
+            }
+        }
+    });
+}
+
+async fn finish_feedback(admissions: &mut tokio::task::JoinSet<()>) {
+    // Admission ends once the coordinator owns the private bundle and repair
+    // task. Detaching never waits for the repair itself, or drops an unsent report.
+    while let Some(result) = admissions.join_next().await {
+        if let Err(error) = result {
+            eprintln!("Feedback admission stopped unexpectedly: {error}");
+        }
     }
 }
 struct Presentation<'a> {
@@ -951,7 +1154,11 @@ async fn chat_tui(
         while !ui.exiting {
             if paused || ui.queued.is_empty() {
                 match ui.inputs.recv().await.unwrap_or(TuiInput::Exit) {
-                    TuiInput::Submit(input) => { ui.enqueue(input)?; paused = false; }
+                    TuiInput::Submit(input) | TuiInput::Queue(input) => { ui.enqueue(input)?; paused = false; }
+                    TuiInput::Feedback(description) => {
+                        feedback_from_ui(config, coordinator, script, directory, &mut ui, None, description);
+                        continue;
+                    }
                     TuiInput::History => {
                         if let Some(cursor) = ui.history_cursor.take() {
                             ui.history_cursor = request_presented(arguments, config, coordinator, script, directory,
@@ -994,6 +1201,7 @@ async fn chat_tui(
         }
         Ok(())
     }.await;
+    finish_feedback(&mut ui.feedback).await;
     let stopped = guard.stop().await;
     if !ui.queued.is_empty() {
         eprintln!("{} queued messages were not sent.", ui.queued.len());
@@ -1206,6 +1414,13 @@ async fn chat_command(
     model: Option<ModelSelection>,
     cwd: &Path,
 ) -> Result<RuntimeCommand> {
+    if let Some(description) = agent_cli::feedback::command(&input) {
+        return Ok(
+            feedback_context(cwd.to_string_lossy().into_owned(), model, None)
+                .await?
+                .command(description.to_owned()),
+        );
+    }
     Ok(RuntimeCommand::Chat {
         input,
         instructions: instructions::project(cwd)?,
@@ -1503,10 +1718,16 @@ async fn request_presented(
         } => Some((task_id.clone(), agent_id.clone())),
         _ => None,
     };
+    let feedback_settings = match &command {
+        RuntimeCommand::RunTask { model, cwd, .. } => Some((Some(model.clone()), cwd.clone())),
+        RuntimeCommand::Chat { model, cwd, .. } => Some((model.clone(), cwd.clone())),
+        _ => None,
+    };
     let mut ready = false;
     let mut history_cursor = None;
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut operations = tokio::task::JoinSet::new();
+    let mut feedback = tokio::task::JoinSet::new();
     let mut cancellations: HashMap<String, tokio::sync::watch::Sender<bool>> = HashMap::new();
     let executor = Arc::new(host::Executor::new(directory));
     let mut thinking = false;
@@ -1527,6 +1748,7 @@ async fn request_presented(
     } else {
         None
     };
+    let result = async {
     write_command(&mut *wire.writer, &command).await?;
     let mut reader = FrameReader::new(BufReader::new(wire.reader));
     let mut failure = None;
@@ -1551,14 +1773,21 @@ async fn request_presented(
                 }
             }, if ui_controls => {
                 let action = action.unwrap_or(TuiInput::Exit);
+                let mode = if matches!(action, TuiInput::Queue(_)) { InputMode::FollowUp } else { InputMode::Steer };
                 match action {
-                    TuiInput::Submit(text) => {
+                    TuiInput::Submit(text) | TuiInput::Queue(text) => {
                         let ui = presentation.as_mut().and_then(|view| view.session.as_deref_mut()).context("Missing terminal input owner")?;
-                        if attached && ready {
+                        if chat || (attached && ready) {
                             active_turn = true;
-                            ui.handle.say_user(text.clone())?;
-                            write_command(&mut *wire.writer, &RuntimeCommand::WorkerInput { input_id: uuid::Uuid::new_v4().to_string(), input: text }).await?;
+                            let input_id = uuid::Uuid::new_v4().to_string();
+                            ui.submitted.push_back((input_id.clone(), text.clone(), mode));
+                            write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: text, mode }).await?;
                         } else { ui.enqueue(text)?; }
+                    }
+                    TuiInput::Feedback(description) => {
+                        if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
+                            feedback_from_ui(config, coordinator, script, directory, ui, history_target.clone(), description);
+                        }
                     }
                     TuiInput::Interrupt => {
                         if active_turn { write_command(&mut *wire.writer, &RuntimeCommand::Interrupt).await?; }
@@ -1599,9 +1828,27 @@ async fn request_presented(
                                     RuntimeCommand::ReadHistory { task_id: Some(task_id.clone()), agent_id: agent_id.clone(), cursor: history_cursor })).await?;
                             }
                         }
+                    } else if let Some(description) = agent_cli::feedback::command(&line) {
+                        if let Some((model, cwd)) = &feedback_settings {
+                            let config = config.clone(); let coordinator = coordinator.map(str::to_owned);
+                            let script = script.to_owned(); let directory = directory.to_owned();
+                            let cwd = cwd.clone(); let model = model.clone(); let target = history_target.clone();
+                            let description = description.to_owned(); let json = arguments.json;
+                            while feedback.try_join_next().is_some() {}
+                            feedback.spawn(async move {
+                            let captured = async {
+                                let context = feedback_context(cwd, model, target).await?;
+                                exchange(&config, coordinator.as_deref(), &script, &directory, context.command(description)).await
+                            }.await;
+                            match captured {
+                                Ok(events) => for event in events { if let Err(error) = display(&event, json) { eprintln!("Feedback receipt could not be displayed: {error}"); } },
+                                Err(error) => eprintln!("Feedback could not start: {error}"),
+                            }
+                            });
+                        }
                     } else if !line.trim().is_empty() {
-                        write_command(&mut *wire.writer, &RuntimeCommand::WorkerInput {
-                            input_id: uuid::Uuid::new_v4().to_string(), input: line,
+                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput {
+                            input_id: uuid::Uuid::new_v4().to_string(), input: line, mode: InputMode::Steer,
                         }).await?;
                     }
                 }
@@ -1624,6 +1871,52 @@ async fn request_presented(
         };
         let event: RuntimeEventKind =
             serde_json::from_slice(&frame).context("Coordinator returned an invalid event")?;
+        if let Some(ui) = presentation
+            .as_mut()
+            .and_then(|view| view.session.as_deref_mut())
+        {
+            match &event {
+                RuntimeEventKind::InputRejected { input_id, .. } => {
+                    if let Some(index) = ui.submitted.iter().position(|(id, _, _)| id == input_id)
+                        && let Some((_, text, _)) = ui.submitted.remove(index)
+                    {
+                        ui.handle.restore_input(text)?;
+                    }
+                }
+                RuntimeEventKind::InputAccepted { input_id } => {
+                    if let Some((_, _, mode)) =
+                        ui.submitted.iter().find(|(id, _, _)| id == input_id)
+                    {
+                        ui.handle.notice(
+                            if *mode == InputMode::Steer {
+                                "Steering accepted."
+                            } else {
+                                "Queued for the next turn."
+                            }
+                            .into(),
+                        )?;
+                    }
+                }
+                RuntimeEventKind::Message { message }
+                    if matches!(message.role, agent_cli::protocol::HistoryRole::User) =>
+                {
+                    ui.committed_input(message);
+                }
+                RuntimeEventKind::Failure { message, .. } => {
+                    if ui.errors.len() == 8 {
+                        ui.errors.pop_front();
+                    }
+                    ui.errors.push_back(message.clone());
+                }
+                RuntimeEventKind::TaskReady {
+                    conversation_id, ..
+                }
+                | RuntimeEventKind::Answer {
+                    conversation_id, ..
+                } => ui.conversation_id = Some(conversation_id.clone()),
+                _ => {}
+            }
+        }
         match &event {
             RuntimeEventKind::Activity { .. }
             | RuntimeEventKind::Message {
@@ -1721,8 +2014,16 @@ async fn request_presented(
                 }
             }
             RuntimeEventKind::History {
-                ref next_cursor, ..
+                ref next_cursor,
+                ref conversation_id,
+                ..
             } => {
+                if let Some(ui) = presentation
+                    .as_mut()
+                    .and_then(|view| view.session.as_deref_mut())
+                {
+                    ui.conversation_id = Some(conversation_id.clone());
+                }
                 history_cursor = next_cursor.clone();
                 outcome = true;
                 if presentation.is_none() {
@@ -1820,6 +2121,9 @@ async fn request_presented(
     }
     ensure!(outcome, "Coordinator completed without a result");
     Ok(history_cursor)
+    }.await;
+    finish_feedback(&mut feedback).await;
+    result
 }
 
 fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
@@ -1828,6 +2132,13 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
         return Ok(());
     }
     match event {
+        RuntimeEventKind::FeedbackReady { receipt } => println!(
+            "Feedback {}: debugging in the background; results will return to the main chat.",
+            receipt.id
+        ),
+        RuntimeEventKind::Feedback { bundle } => {
+            println!("{}", serde_json::to_string_pretty(bundle)?)
+        }
         RuntimeEventKind::Interrupted => println!("Interrupted."),
         RuntimeEventKind::ImportProgress { progress } => {
             println!(
@@ -2029,6 +2340,25 @@ mod tests {
     use agent_cli::protocol::SearchMode;
     use clap::Parser;
     use std::path::Path;
+
+    #[test]
+    fn feedback_cli_reads_a_typed_private_bundle_without_starting_chat() {
+        use crate::FeedbackAction;
+        let parsed = Arguments::try_parse_from(["agent", "--json", "feedback", "latest"]).unwrap();
+        assert!(parsed.json);
+        assert!(matches!(
+            parsed.command,
+            Some(Action::Feedback {
+                command: FeedbackAction::Latest
+            })
+        ));
+        let parsed =
+            Arguments::try_parse_from(["agent", "feedback", "show", "example-id"]).unwrap();
+        assert!(
+            matches!(parsed.command, Some(Action::Feedback { command: FeedbackAction::Show { id } }) if id == "example-id")
+        );
+        assert!(Arguments::try_parse_from(["agent", "feedback", "upload"]).is_err());
+    }
 
     #[test]
     fn history_import_and_terminal_flags_parse_into_typed_commands() {

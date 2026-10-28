@@ -43,8 +43,11 @@ Rex task tabs open directly into chat and accept replies after a turn finishes.
 `agent` reopens the main conversation. Both show recent saved history;
 `/history` reads older pages and `/exit` detaches without deleting history.
 The terminal UI renders Markdown and shows the model, reasoning setting,
-directory and live activity. Esc interrupts a running turn; type a correction
-to steer it. Use `--no-tui` for the plain interface.
+directory and live activity. Enter steers active work, Tab queues a later turn,
+Shift+Enter inserts a newline, and Esc stops. Use `--no-tui` for plain output.
+
+`/feedback <description>` starts a background repair on the same machine with
+private diagnostic context. Its result returns to the main chat.
 
 For example, JLCPCB emails about a missing fabrication file. The agent finds
 the existing hardware task, attaches the email and continues its Rex session.

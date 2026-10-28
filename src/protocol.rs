@@ -1,4 +1,5 @@
 use crate::embeddings::{EmbeddingBatch, EmbeddingPurpose};
+use crate::feedback::{FeedbackBundle, FeedbackContext, FeedbackReceipt};
 use crate::history::{HistoryGap, HistoryItem, HistoryRequest, HistoryResponse, HistoryThread};
 use crate::instructions::{GuidanceSnapshot, GuidanceSource};
 use crate::models::ModelSelection;
@@ -187,6 +188,13 @@ pub enum RuntimeCommand {
         agent_id: Option<String>,
         cursor: Option<String>,
     },
+    Feedback {
+        description: String,
+        context: FeedbackContext,
+    },
+    ReadFeedback {
+        id: Option<String>,
+    },
     ImportCodex {
         hosts: Vec<String>,
     },
@@ -230,6 +238,11 @@ pub enum RuntimeCommand {
         input_id: String,
         input: String,
     },
+    SubmitInput {
+        input_id: String,
+        input: String,
+        mode: InputMode,
+    },
     DetachWorker,
     Interrupt,
     HostReply {
@@ -267,6 +280,42 @@ pub struct SourceRef {
     pub provider: String,
     pub account: String,
     pub thread_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct DelegationCandidate {
+    pub conversation_id: String,
+    pub task_id: Option<TaskId>,
+    pub score: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DelegationSelection {
+    Considered,
+    Reuse {
+        task_id: TaskId,
+        conversation_id: String,
+    },
+    Adopt {
+        task_id: TaskId,
+        conversation_id: String,
+    },
+    Create {
+        task_id: TaskId,
+        conversation_id: String,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct DelegationDecision {
+    pub actor_conversation_id: String,
+    pub tool_call_id: String,
+    pub query: Option<String>,
+    pub candidates: Vec<DelegationCandidate>,
+    pub gaps: Vec<String>,
+    pub selection: DelegationSelection,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -356,6 +405,9 @@ pub enum TaskAgentState {
 pub struct TaskInput {
     pub id: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mode: Option<InputMode>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -462,6 +514,9 @@ pub enum HostCommand {
     },
     SpawnWorker {
         host: WorkerHost,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        parent: Option<WorkerRef>,
         task_id: TaskId,
         allocation_id: String,
         title: String,
@@ -549,6 +604,12 @@ pub struct RuntimeEvent {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEventKind {
+    FeedbackReady {
+        receipt: FeedbackReceipt,
+    },
+    Feedback {
+        bundle: Box<FeedbackBundle>,
+    },
     ImportProgress {
         progress: ImportProgress,
     },
@@ -618,6 +679,9 @@ pub enum RuntimeEventKind {
         input_id: String,
         message: String,
     },
+    InputAccepted {
+        input_id: String,
+    },
     Activity {
         activity: ModelActivity,
     },
@@ -650,6 +714,13 @@ pub enum HistoryRole {
     Assistant,
     Thinking,
     Tool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InputMode {
+    Steer,
+    FollowUp,
 }
 
 #[derive(

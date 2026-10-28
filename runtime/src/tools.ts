@@ -2,11 +2,13 @@ import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import { defineExtension, defineTool, ROOT_CONVERSATION_ID, type Extension, type ToolExecutionResult } from "@earendil-works/pi-durable";
 import { DEFAULT_MODEL } from "./models.js";
+import { recordDelegation } from "./delegation.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { HostCommand } from "./generated/HostCommand.js";
 import type { HostResult } from "./generated/HostResult.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { SearchMode } from "./generated/SearchMode.js";
+import type { DelegationDecision } from "./generated/DelegationDecision.js";
 import { TaskError, TaskStore, type HostCall, type SearchQuery } from "./tasks.js";
 
 export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; default_host?: WorkerHost | null; call: HostCall; role?: "worker" | "triage";
@@ -27,6 +29,7 @@ export class Executions {
     return execution;
   }
   search(id: string): SearchQuery | undefined { return this.attached.get(id)?.search; }
+  model(id: string): ModelSelection | undefined { return this.attached.get(id)?.model; }
 }
 
 function output(value: unknown, isError = false): ToolExecutionResult {
@@ -197,12 +200,22 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
     defineTool({ name: "revoke_allocation", description: "Revoke one exact unresolved worker allocation after inspecting it. Preserves pending input and history; does not retry work or delete Rex sessions.",
       parameters: Type.Object({ task_id: Type.String(), allocation_id: Type.String(), agent_id: Type.Optional(Type.String()) }),
       async execute(args) { return output(await tasks.revokeAllocation(args.task_id, args.allocation_id, args.agent_id)); } }),
-    defineTool({ name: "delegate_task", description: "Continue existing work in its Rex worker, or create a separate task when no existing task fits. Queues the instruction durably.",
+    defineTool({ name: "delegate_task", description: "Continue work by task_id or conversation_id. A separate top-level outcome needs new_task:true and new_task_reason when related work exists. Queues the instruction durably.",
       parameters: Type.Object({ task_id: Type.Optional(Type.String()), conversation_id: Type.Optional(Type.String()), input: Type.String({ minLength: 1, maxLength: 65536 }),
         title: Type.Optional(Type.String()), outcome: Type.Optional(Type.String()), host: Type.Optional(Type.String()),
-        cwd: Type.Optional(Type.String({ minLength: 1 })), new_task: Type.Optional(Type.Boolean()), sources: Type.Optional(Type.Array(source)) }),
+        cwd: Type.Optional(Type.String({ minLength: 1 })), new_task: Type.Optional(Type.Boolean()),
+        new_task_reason: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })), sources: Type.Optional(Type.Array(source)) }),
       async execute(args, api, context) {
         const execution = executions.get(api.conversationId.toString());
+        let query: string | null = null;
+        let related: Awaited<ReturnType<TaskStore["find"]>> = { matches: [], gaps: [] };
+        let action: "reuse" | "create" | "adopt" = "reuse";
+        const reason = args.new_task_reason?.trim() || null;
+        const record = (selection: DelegationDecision["selection"]) => api.commit((tx) => recordDelegation(tx, api.conversationId, {
+          actor_conversation_id: api.conversationId.toString(), tool_call_id: api.callId, query,
+          candidates: related.matches.map((match) => ({ conversation_id: match.conversation_id, task_id: match.task_id, score: match.score })),
+          gaps: related.gaps, selection,
+        }), context);
         let task;
         if (args.task_id !== undefined && args.conversation_id !== undefined) throw new TaskError("Choose a task_id or conversation_id");
         if (args.conversation_id !== undefined) {
@@ -216,15 +229,18 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
             const model = configured.launch?.model ?? execution.model ?? DEFAULT_MODEL;
             await tasks.inference.preflight(model);
             const id = await api.memo("task_id", randomUUID(), context);
-            const related = await tasks.find(args.input, args.sources ?? [], 8, execution.search);
+            query = args.input; related = await tasks.find(query, args.sources ?? [], 8, execution.search);
             const evidence = related.matches.find((match) => match.conversation_id === args.conversation_id)?.excerpt ?? await tasks.readConversation(args.conversation_id, 24_000);
             task = await tasks.adopt(args.conversation_id, { id, ...(args.title === undefined ? {} : { title: args.title }),
               outcome: args.outcome ?? args.input, evidence, model, ...(args.sources === undefined ? {} : { sources: args.sources }) });
+            action = "adopt";
           }
         } else if (args.task_id === undefined) {
-          const related = await tasks.find(args.input + " " + (args.title ?? ""), args.sources ?? [], 8, execution.search);
-          if (related.matches.length > 0 && args.new_task !== true) {
-            return output({ related_conversations: related.matches, gaps: related.gaps, instruction: "Read and continue a matching task or imported conversation, or set new_task for a separate outcome." });
+          query = args.input + " " + (args.title ?? ""); related = await tasks.find(query, args.sources ?? [], 8, execution.search);
+          if (related.matches.length > 0 && (args.new_task !== true || reason === null)) {
+            await record({ kind: "considered" });
+            return output({ related_conversations: related.matches, gaps: related.gaps,
+              instruction: "Read and continue matching work. For a separate outcome, retry with new_task:true and a concise new_task_reason." });
           }
           if (args.title === undefined || args.outcome === undefined) throw new TaskError("A new task needs a concise title and outcome");
           const configured = args.host === undefined ? execution.default_host === undefined ? execution.hosts[0] : execution.default_host
@@ -234,6 +250,7 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
           await tasks.inference.preflight(model);
           const id = await api.memo("task_id", randomUUID(), context);
           task = await tasks.create({ id, title: args.title, outcome: args.outcome, sources: args.sources ?? [], model });
+          action = "create";
         } else task = await tasks.get(args.task_id);
         if (task.model === null) { await tasks.selection(task.id, execution.model ?? DEFAULT_MODEL); task = await tasks.get(task.id); }
         if (task.worker.state === "bound" && args.cwd !== undefined && args.cwd !== task.worker.host.cwd) {
@@ -249,6 +266,8 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         }
         const host = task.worker.state === "bound" ? await tasks.workerHost(task.id)
           : args.cwd === undefined ? configured : { ...configured, cwd: args.cwd };
+        await record(action === "create" ? { kind: "create", task_id: task.id, conversation_id: task.conversation_id, reason }
+          : { kind: action, task_id: task.id, conversation_id: task.conversation_id });
         const inputId = await api.memo("input_id", randomUUID(), context);
         await tasks.enqueue(task.id, args.input, inputId);
         return output(await tasks.dispatch(task.id, host, execution.call));

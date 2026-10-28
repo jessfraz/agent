@@ -167,7 +167,7 @@ test("main chat keeps its Pi history and coordinator default while a laptop disc
       assert.equal(settled.status, "done"); assert.equal(app.faux.getPendingResponseCount(), 0);
     } finally { release(); }
   }
-  const newDefault = (title: string) => tool("delegate_task", { title, outcome: title, input: title, new_task: true });
+  const newDefault = (title: string) => tool("delegate_task", { title, outcome: title, input: title, new_task: true, new_task_reason: `${title} is a separate synthetic audit.` });
   try {
     await app.environment.configure({ settings, node: coordinator }); await app.environment.register(laptop);
     app.environment.setConnected([coordinator.host_id, laptop.host_id]);
@@ -213,7 +213,8 @@ test("main chat keeps its Pi history and coordinator default while a laptop disc
         return tool("exec", { program: "inspect", args: [] });
       },
       newDefault("Offline coordinator audit"),
-      tool("delegate_task", { title: "Unavailable laptop task", outcome: "Wait for laptop", input: "Work on the laptop.", host: laptop.host_id, new_task: true }),
+      tool("delegate_task", { title: "Unavailable laptop task", outcome: "Wait for laptop", input: "Work on the laptop.", host: laptop.host_id, new_task: true,
+        new_task_reason: "This is a separate synthetic offline-host validation." }),
       (context) => { assert.equal(latest(context).isError, true); return tool("delegate_task", { task_id: old.id, input: "Do not move this task while offline." }); },
       (context) => { assert.equal(latest(context).isError, true); return fauxAssistantMessage("Coordinator work started; the laptop task is retained."); },
     ]);
@@ -225,7 +226,8 @@ test("main chat keeps its Pi history and coordinator default while a laptop disc
     await app.environment.register(currentLaptop); app.environment.setConnected([coordinator.host_id, laptop.host_id]);
     await turn("The laptop is back; continue its task and start the requested new work.", coordinator, coordinator.home_directory, [
       tool("exec", { program: "inspect", args: [] }), newDefault("Reconnected coordinator audit"),
-      tool("delegate_task", { title: "Reconnected laptop audit", outcome: "Inspect the laptop", input: "Inspect the restored laptop.", host: laptop.host_id, new_task: true }),
+      tool("delegate_task", { title: "Reconnected laptop audit", outcome: "Inspect the laptop", input: "Inspect the restored laptop.", host: laptop.host_id, new_task: true,
+        new_task_reason: "This is a separate synthetic laptop audit." }),
       tool("delegate_task", { task_id: old.id, input: "Continue the sapphire connector review." }),
       (context) => { assert.equal(latest(context).isError, false); return fauxAssistantMessage("The existing laptop session received the follow-up."); },
     ]);

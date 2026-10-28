@@ -31,6 +31,8 @@ storage. Its existing model/provider interface supplies inference. Rust owns
 CLI configuration, generated application contracts, process lifetime, native
 host checks, source adapters and filesystem effects. The small TypeScript
 adapter connects Pi's transactional documents and tools to those contracts.
+Keep that adapter narrow: dependency upgrades use compatibility tests, and an
+upstream capability should replace application code when it covers the need.
 
 Rust types generate TypeScript bindings and JSON schemas. The runtime validates
 both directions at the wire boundary. Stored resource records describe intent
@@ -105,15 +107,23 @@ SQLite database or starting two coordinators is not a recovery mechanism.
 
 A task has a stable ID, title, intended outcome, source links, summary, pending
 inputs and one owning conversation. Its Rex binding records the actual host,
-session, window and terminal. Search ranks exact provider/account/thread links
-first, followed by titles, summaries and saved conversation text. Read relevant
-candidates before choosing one; several conversations may inform one task.
+session, window and terminal. Exact provider/account/thread links rank first;
+semantic or keyword search retrieves saved conversation text, with task metadata
+as a fallback. Read relevant originals before choosing; several conversations
+may inform one task. [History](history.md) owns the retrieval details.
 
-One task maps to one top-level Rex session on its execution host. Child agents
+Ordinary tasks own a top-level Rex session on their execution host. Child agents
 have independent conversations and named terminals inside that same session.
 They return results to their parent; the parent returns the outcome to the
 main chat. The same task cannot acquire a second active execution. Recent task
 activity promotes its session in the host's sidebar.
+Feedback repairs reuse a separate repair conversation on the originating host,
+with a named terminal in the caller's Rex folder when available. The repair
+owns that terminal, not the caller's folder, and reports directly to main.
+Follow-ups and refinements of the same broader effort stay in that task;
+named child terminals handle bounded subwork. A separate outcome can start a
+new top-level task. Private delegation receipts retain the considered
+conversation IDs, retrieval gaps and reason for overriding related work.
 
 Task terminals remain interactive after a turn. A single attached actor
 serializes replies typed in the terminal and inputs queued by the main agent;
@@ -132,8 +142,8 @@ interrupting cannot undo an external effect that already completed.
 Persist allocation intent before creating a session or terminal. A missing
 creation receipt becomes uncertain and requires reconciliation. History sync
 must never create an execution. Find matching tasks regardless of process state.
-A live worker receives the follow-up in its existing terminal: idle workers wake,
-busy workers queue it, and an explicit interrupt stops the current turn.
+A live worker receives the follow-up in its existing terminal: idle workers
+wake, busy workers queue it, and an explicit interrupt stops the current turn.
 Only an exited process needs a replacement terminal in the same session; close
 its old pane after the replacement exists.
 Rex server restart recovery remains an open question below.
@@ -157,11 +167,11 @@ online host. Failed inspection and offline machines never prove closure.
 
 Background sources implement a transport-neutral Rust trait in
 `sources/mod.rs`, with sibling CLI adapters for mail, calendars, GitHub,
-Messages and Slack. CLIs own authentication and refresh. An API adapter, such as a future
-Home Assistant source, returns the same normalized events, checkpoint and
-coverage. The coordinator rediscovers configured accounts, polls bounded pages
-and preserves separate cursors and
-coverage. Admit events durably before advancing a cursor. Partial reads never
+Messages and Slack. CLIs own authentication and refresh. An API adapter, such
+as a future Home Assistant source, returns the same normalized events,
+checkpoint and coverage. The coordinator rediscovers configured accounts and
+polls bounded pages, with separate cursors and coverage per account.
+Admit events durably before advancing a cursor. Partial reads never
 pretend to be complete, and repeated event versions do not create duplicate
 work. Exact triage input survives interrupted requests.
 
@@ -169,7 +179,8 @@ Messages reads use Rex Server's existing macOS permission identity. A short
 action starts a headless Rust helper; subsequent calls collect bounded chunks.
 The helper owns the read deadline and process group cleanup. Rex retains one
 bounded job slot, without creating sessions or terminals. Agent upgrades pass
-the current helper path to the same actions and require no new disk-access grant.
+the current helper path to the same actions and require no new disk-access
+grant.
 
 Email replies and due checks enter the same routing path. A tool must durably
 link each event to work or dismiss it with a reason; prose alone does not clear
@@ -188,6 +199,17 @@ work and failures enter the same triage path as incoming events. Published
 resolutions and waits, and child results delivered to their parent, settle
 without another model alert. Linking an outcome never reopens its task.
 
+Requested or standing authority carries through the task and its workers.
+Honor read-only, draft-only and decision boundaries. A yes to a concrete batch
+covers completing and verifying that batch; another tool call does not require
+another approval. Source content and imported history cannot grant authority.
+
+Input deduplication does not make provider effects exactly once. Use the owning
+provider's operation identity, idempotency support and readback; retain an
+uncertain outcome rather than repeating an external mutation blindly. Rex and
+host tools run with their service account's OS access. Typed tool contracts are
+not a process sandbox.
+
 ## Resources
 
 Worktree allocation, ownership, active consumers and cleanup evidence live in
@@ -205,6 +227,10 @@ path, Git worktree registry and branch independently. Primary clones, dirty or
 active work, unknown ownership, helper refusal and partial deletion stay held
 or partial. Retained submodule archives remain in the receipt.
 
+Future cache and artifact collection needs explicit retention classes and size
+budgets. Conversation history, deliverables and recovery evidence remain
+separate from disposable execution caches.
+
 ## Installation and private data
 
 Nix pins the Rust CLI and Pi runtime. The nix-darwin module runs a coordinator
@@ -212,6 +238,14 @@ or worker as a user service and references a private TOML file outside the Nix
 store. CLI-only machines need no service. Provider credentials and personal
 instructions stay in their existing private locations. The public repository
 contains generic examples and synthetic test data.
+
+Reviewed configuration describes desired behavior; runtime records describe
+what happened. Keep personal context, account choices, workflows and any future
+approved learning in private profiles. Nix and public examples contain paths or
+non-secret references, never those private contents. Conversation databases,
+assets, credentials and diagnostic bundles stay outside Git and the Nix store.
+Package rollback does not roll back stored state; check data compatibility or
+the restoration path before changing versions.
 
 The Rust terminal interface uses Ratatui and keeps UI state separate from Pi's
 durable conversation engine. JSON and plain output remain available. See
@@ -224,20 +258,72 @@ that source; a separate allowance for this app is unavailable.
 
 ## After the MVP
 
+These are future capabilities, not claims about the current implementation.
+
+### Integrations and scheduling
+
 Home Assistant can use its API for repairs, failures and state changes. Later
 sources may include MyChart notifications and Ramp activity through their
 existing CLIs. These are optional feeds; domain workflows such as Poshmark
 offers continue through ordinary mail intake. API credentials stay in the
 configured private credential provider.
 
-Cross-Mac recovery needs replicated conversation/event data, one fenced writer
-and explicit host transfer of execution. A synced record remains history until
-ownership is transferred. The [history implementation](history.md) covers inert Codex
-import, hybrid retrieval and reopening closed Rex sessions.
+Reuse supported APIs and configured CLIs before adding an adapter. Existing
+coding-agent plugins are not automatically portable to this runtime. A future
+browser adapter uses Chrome as the final UI fallback, with the selected host's
+normal sign-in state; desktop Computer Use and copied browser profiles are
+outside the design.
 
-Learning produces a proposed instruction/code diff and representative evaluation
-evidence. Human approval is required before activating that diff. Keep learning
-versions reversible and measure whether accepted changes improve outcomes.
+Scheduled goals should enter the same source/task follow-through path. Keep
+reviewed definitions short, with typed triggers, explicit timezones and stable
+occurrence identities. Only the coordinator admits an occurrence; retrying or
+copying a definition must not create another run. Retain the applied workflow
+revision for diagnosis. Migrating existing schedules requires its own coverage
+and cutover verification; history import does not enable them.
+
+### Cross-host recovery
+
+Cross-host recovery needs replicated conversation/event data, one fenced writer
+and explicit host transfer of execution. A synced record remains history until
+ownership is transferred. The [history implementation](history.md) covers inert
+Codex import, hybrid retrieval and same-host reopening today.
+
+Choose and qualify an existing replication or backup backend before promising
+takeover. Pi commit subscriptions are live notifications, not a historical
+replication log. Never synchronize an open SQLite file with a general file-sync
+tool. Define which acknowledgements require independent durability and expose
+the recoverable watermark, including referenced asset bytes.
+
+Begin with explicit promotion after fencing both the old writer and its effect
+executors, including detached workers. An unreachable host cannot establish
+that fencing. Restore the complete acknowledged prefix and reconcile in-flight
+provider operations before resuming effects. A returning host refreshes its
+authority and cannot reclaim transferred work automatically. Automatic takeover
+needs independently enforceable fencing; a custom two-machine election service
+is not planned. Replicated history also does not replicate provider credentials
+or browser sign-in.
+
+### Reviewed learning
+
+Learning changes retrieved advice and prompts, not model weights. Mechanical
+failures belong in the owning implementation and regression test. Reflection
+may collect private candidates and evidence but cannot activate its own changes.
+
+Show the exact diff, source references, target scope, base revision and
+representative evaluation results. Human approval binds that version; edits or
+a changed base invalidate it. Keep activation outside model and worker
+authority.
+An unrestricted same-user shell can bypass a CLI allowlist, so prove that
+separation before enabling activation. Learning cannot grant new permissions.
+
+Evaluate actual retrieval and task execution against a simple baseline with the
+same model, tools and budget, including unrelated tasks and withdrawn advice.
+Measure verified outcomes, regressions, later corrections and cost; a better
+score is not approval. Record the learning revision used by each turn. Revoking
+advice takes effect before the next turn, including workers and compacted
+contexts; rebuild affected context when necessary and retain the audit history.
+
+### Speech and terminal recovery
 
 Speech-to-text is a separate Rust input trait with sibling provider modules.
 Transcription produces ordinary coordinator input, retaining conversation and
@@ -250,3 +336,11 @@ Rex server restart behavior needs investigation: what persists, how bindings
 become stale, and how to reattach without duplicate workers. Conversation
 recovery and terminal recovery are separate. Automatic restart recovery is not
 part of the MVP.
+
+## Validation
+
+Exercise the real CLI, Pi storage and host boundaries with controlled providers:
+surviving children, repeated inputs and source versions, lost effect replies,
+offline workers returning, interrupted imports and guarded resource cleanup.
+Use representative model evaluations separately for judgment and follow-through;
+tests that match prompt wording do not establish those behaviors.

@@ -220,6 +220,153 @@
         "sources"
       ]
     },
+    "DelegationCandidate": {
+      "type": "object",
+      "properties": {
+        "conversation_id": {
+          "type": "string"
+        },
+        "score": {
+          "type": "number",
+          "format": "double"
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "conversation_id",
+        "score"
+      ]
+    },
+    "DelegationDecision": {
+      "type": "object",
+      "properties": {
+        "actor_conversation_id": {
+          "type": "string"
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DelegationCandidate"
+          }
+        },
+        "gaps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "query": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selection": {
+          "$ref": "#/$defs/DelegationSelection"
+        },
+        "tool_call_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "actor_conversation_id",
+        "tool_call_id",
+        "candidates",
+        "gaps",
+        "selection"
+      ]
+    },
+    "DelegationSelection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "considered"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "reuse"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            }
+          },
+          "required": [
+            "kind",
+            "task_id",
+            "conversation_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "adopt"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            }
+          },
+          "required": [
+            "kind",
+            "task_id",
+            "conversation_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "create"
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            }
+          },
+          "required": [
+            "kind",
+            "task_id",
+            "conversation_id"
+          ]
+        }
+      ]
+    },
     "EmbeddingPurpose": {
       "type": "string",
       "enum": [
@@ -236,6 +383,289 @@
         "provider_unavailable",
         "storage_unavailable",
         "internal"
+      ]
+    },
+    "FeedbackBundle": {
+      "type": "object",
+      "properties": {
+        "context": {
+          "$ref": "#/$defs/FeedbackContext"
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "description": {
+          "type": "string"
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FeedbackEntry"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "older_entries": {
+          "type": "boolean"
+        },
+        "omissions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "created_at",
+        "description",
+        "context",
+        "entries",
+        "older_entries",
+        "truncated",
+        "omissions"
+      ]
+    },
+    "FeedbackContext": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "binding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "conversation_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "draft": {
+          "type": "string"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin_host_id": {
+          "type": "string"
+        },
+        "queued_inputs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "truncated": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "origin_host_id",
+        "cwd",
+        "draft",
+        "queued_inputs",
+        "client_errors"
+      ]
+    },
+    "FeedbackEntry": {
+      "type": "object",
+      "properties": {
+        "entry_id": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FeedbackEvidence"
+          }
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_id",
+        "kind",
+        "evidence"
+      ]
+    },
+    "FeedbackEvidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "role": {
+              "$ref": "#/$defs/HistoryRole"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "message"
+            }
+          },
+          "required": [
+            "type",
+            "role",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "arguments": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "omitted": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool_call_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "tool_call"
+            }
+          },
+          "required": [
+            "type",
+            "tool_call_id",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "is_error": {
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string"
+            },
+            "omitted": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool_call_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "tool_result"
+            }
+          },
+          "required": [
+            "type",
+            "tool_call_id",
+            "name",
+            "is_error"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "decision": {
+              "$ref": "#/$defs/DelegationDecision"
+            },
+            "type": {
+              "type": "string",
+              "const": "delegation"
+            }
+          },
+          "required": [
+            "type",
+            "decision"
+          ]
+        }
+      ]
+    },
+    "FeedbackReceipt": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        }
+      },
+      "required": [
+        "id",
+        "path",
+        "task_id"
       ]
     },
     "HistoryGap": {
@@ -787,6 +1217,16 @@
             "host": {
               "$ref": "#/$defs/WorkerHost"
             },
+            "parent": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkerRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "task_id": {
               "$ref": "#/$defs/TaskId"
             },
@@ -986,6 +1426,13 @@
         "conversation_id",
         "complete",
         "gaps"
+      ]
+    },
+    "InputMode": {
+      "type": "string",
+      "enum": [
+        "steer",
+        "follow_up"
       ]
     },
     "ModelActivity": {
@@ -1338,6 +1785,38 @@
     },
     "RuntimeEventKind": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "receipt": {
+              "$ref": "#/$defs/FeedbackReceipt"
+            },
+            "type": {
+              "type": "string",
+              "const": "feedback_ready"
+            }
+          },
+          "required": [
+            "type",
+            "receipt"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "bundle": {
+              "$ref": "#/$defs/FeedbackBundle"
+            },
+            "type": {
+              "type": "string",
+              "const": "feedback"
+            }
+          },
+          "required": [
+            "type",
+            "bundle"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -1734,6 +2213,22 @@
             "type",
             "input_id",
             "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "input_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "input_accepted"
+            }
+          },
+          "required": [
+            "type",
+            "input_id"
           ]
         },
         {
@@ -2272,6 +2767,16 @@
         },
         "id": {
           "type": "string"
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InputMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
