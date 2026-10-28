@@ -7,34 +7,42 @@ ChatGPT plan sign-in, persistent conversations and workers in
 [Rex](https://www.superlogical.com/rex). One main conversation finds existing
 work before starting another task.
 
+## Why
+
+Find the old conversation. Continue the existing task. Close the loop.
+Incoming email, Slack, GitHub and Messages should produce useful action or a
+concrete decision. Otherwise, stay quiet.
+
+Authorization carries forward; an approved action should not trigger another
+approval loop. Pi owns the provider interface and durable conversations. Rex
+owns the hosts, sessions and terminals. Reuse them.
+
 ```text
-  phone CLI via Rex    laptop CLI    desktop CLI
-           \              |             /
-            +-------------+------------+
+  phone CLI in Rex       CLI / Rex terminal on any host
+             \                       /
+              +----- agent chat ----+
                           |
-                   desktop coordinator
-                   Pi Durable + SQLite
-                   settings + context
-                   mail / Slack / feeds
+               desktop coordinator (macOS)
+               main conversation / Pi Durable / SQLite
+               settings / context / incoming events
                           |
                find and reuse the right task
                           |
-           +--------------+---------------+
-           |                              |
-      desktop agent                  laptop agent
-      local Rex                      local Rex
-      |                              |
-      + Fix login                    + Update dependencies
-      | + Implementation             | + Implementation
-      | + Review                     | + Checks
-      |                              |
-      + Track shipment               + Investigate slow build
-        + Follow-up                    + Investigation
-                                       + Review
+          +---------------+----------------+
+          |               |                |
+   desktop (macOS)  laptop (macOS)    server (Linux)
+   Rex sessions     Rex sessions     Rex sessions
+   + Fix login      + Update deps    + Fix CI
+   | + Chat         | + Chat         | + Chat
+   | + Review       | + Checks       | + Review
+   + Track order    + Investigate    + Tune build
+     + Chat           + Chat           + Chat
+     + Follow-up      + Review         + Profile
 ```
 
 Every chat uses the coordinator. Each task gets one named Rex session on its
 execution machine; its subagents get named terminals inside that session.
+Hosts can run macOS or Linux; the three hosts above are one example.
 Results return to the main chat, so visiting task sessions is optional. Worker
 connections share metadata, not duplicate executions. Offline workers retain
 their tasks; automatic transfer to another machine comes later.

@@ -8,12 +8,10 @@ history and report concise, actionable results back to it.
                        |
                find related work
               /                 \
-       matching task          new task
+       existing task       separate outcome
+       reuse conversation  create task record
+       and Rex binding     choose online host
               \                 /
-               durable task record
-                       |
-            choose execution host
-                       |
             named Rex task session
             + Implementation
             + Review
@@ -39,30 +37,35 @@ both directions at the wire boundary. Stored resource records describe intent
 and evidence; native handles and ownership must be checked again before effects.
 
 ```text
-  phone CLI in Rex    laptop CLI     desktop CLI
-          \               |              /
-           +--------------+-------------+
+  phone CLI in Rex       CLI / Rex terminal on any host
+             \                       /
+              +----- agent chat ----+
                           |
-                 desktop coordinator
-                 + main conversation
-                 + Pi Durable / SQLite
-                 + shared settings / context repos
-                 + source polling / task routing
+                desktop coordinator (macOS)
+                + main conversation
+                + Pi Durable / SQLite
+                + settings / context repositories
+                + source polling / task routing
                           |
-                 broker of host effects
-                   /              \
-          local execution     reverse worker connection
-                 |                 |
-            desktop Rex       laptop agent -> local Rex
-            + Task A          + Task C
-            | + Build         | + Investigation
-            | + Review        | + Checks
-            + Task B          + Task D
-              + Follow-up       + Implementation
+                reuse task owner and Rex binding
+                choose host only for new work
+                          |
+          +---------------+----------------+
+          | local         | reverse        | reverse
+          | effects       | worker link    | worker link
+          |               |                |
+   desktop (macOS)  laptop (macOS)    server (Linux)
+   local Rex        agent -> Rex     agent -> Rex
+   + Task A         + Task C         + Task E
+   | + Chat         | + Chat         | + Chat
+   | + Review       | + Checks       | + Review
+   + Task B         + Task D         + Task F
+     + Chat           + Chat           + Chat
+     + Follow-up      + Investigation  + Profile
 ```
 
 One selected coordinator is the only writer and source poller. Clients and
-workers on either machine use that same store. Rex owns terminal/session
+workers on any host use that same store. Rex owns terminal/session
 lifetime; the coordinator owns application state and routing. Reusing a Rex
 connection could replace transport, but would still require this process.
 A process lock is inherited by the Pi child, so losing its Rust supervisor does
@@ -99,7 +102,7 @@ shared tagged-device identity. Check the connected /32 against native WhoIs
 metadata in both cases; names, tags and user-supplied claims do not grant
 access.
 
-The MVP does not replicate the store or recover onto another Mac. If the
+The MVP does not replicate the store or recover onto another host. If the
 coordinator is down, the client reports that it is unavailable. Copying a live
 SQLite database or starting two coordinators is not a recovery mechanism.
 
