@@ -675,6 +675,30 @@ test("resuming a task keeps its session and conversation while replacing an exit
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("an unconfirmed terminal startup keeps its session binding and queued correction through reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-task-")); let app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "Unsubscribe mailing lists", outcome: "Finish the existing unsubscribe work" });
+    const saved = await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    await app.tasks.enqueue(task.id, "Continue the same work.", "one-correction");
+    const pending = await app.tasks.dispatch(task.id, host, async (command) => {
+      assert.equal(command.type, "resume_worker", "Startup must not allocate another session");
+      return { type: "worker_presence", presence: { state: "pending" } };
+    });
+    assert.deepEqual(pending.worker, saved.worker);
+    assert.equal(pending.conversation_id, task.conversation_id);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const retained = await app.tasks.get(task.id);
+    assert.deepEqual(retained.worker, saved.worker);
+    assert.equal(retained.pending.length, 1);
+    assert.equal(retained.pending[0]?.id, "one-correction");
+    const resumed = await app.tasks.dispatch(task.id, host, async (command) => {
+      assert.equal(command.type, "resume_worker"); return { type: "written" };
+    });
+    assert.deepEqual(resumed.worker, saved.worker);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("host replies are correlated to their request and release resources when a request ends", async () => {
   const emitted: { request: number; call: string; command: HostCommand }[] = [];
   const requests = new HostRequests((request, call, command) => emitted.push({ request, call, command }));

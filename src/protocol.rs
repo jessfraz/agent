@@ -723,6 +723,7 @@ pub struct SavedMatch {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum WorkerPresence {
+    Pending,
     Present { running: bool },
     MissingSession,
     MissingTerminal,

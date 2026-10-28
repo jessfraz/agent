@@ -260,9 +260,9 @@ async function handle(request: RuntimeRequest): Promise<void> {
           });
           const stop = await activity(harness, root, (activity) => emit(id, { type: "activity", activity }));
           try {
-            const related = (await tasks.find(command.input, [], 8, searchFor(application, id))).matches;
+            const related = await tasks.find(command.input, [], 8, searchFor(application, id));
             if (interrupted.has(id)) { await interrupts.get(id); return; }
-            const relatedContext = related.length === 0 ? "" : "\n\nRelated existing tasks (read and reuse the matching task):\n" +
+            const relatedContext = related.matches.length === 0 && related.gaps.length === 0 ? "" : "\n\nRelated saved conversations and retrieval coverage (read and reuse matching work):\n" +
               JSON.stringify(related);
             const hostsContext = "\n\nConnected worker hosts: " +
               JSON.stringify({ default_host_id: default_host?.host_id ?? null, origin_host_id: command.origin_host_id, project_cwd: command.cwd,

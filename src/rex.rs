@@ -119,6 +119,7 @@ pub struct WorkerBinding {
 
 pub enum WorkerResume {
     Running,
+    Pending,
     Started(WorkerBinding),
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -215,8 +216,10 @@ impl RexClient {
                 .await
                 .map_err(read_failure)?,
         )?;
-        Ok(WorkerPresence::Present {
-            running: process.child.is_some(),
+        Ok(match process.state() {
+            TerminalState::Running => WorkerPresence::Present { running: true },
+            TerminalState::Exited => WorkerPresence::Present { running: false },
+            TerminalState::Pending => WorkerPresence::Pending,
         })
     }
 
@@ -364,11 +367,11 @@ impl RexClient {
                     .await
                     .map_err(read_failure)?,
             )?;
-            if process.child.is_none() {
-                break;
-            }
-            if attempt == 19 {
-                return Ok(WorkerResume::Running);
+            match process.state() {
+                TerminalState::Exited => break,
+                TerminalState::Running if attempt == 19 => return Ok(WorkerResume::Running),
+                TerminalState::Pending if attempt == 19 => return Ok(WorkerResume::Pending),
+                _ => {}
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -426,7 +429,7 @@ impl RexClient {
                     .await
                     .map_err(read_failure)?,
             )?;
-            if process.child.is_none() {
+            if process.state() == TerminalState::Exited {
                 self.api(
                     "block.close",
                     &BlockRequest {
@@ -570,6 +573,32 @@ struct ProcessRequest {
 #[derive(Deserialize)]
 struct TerminalProcess {
     child: Option<TerminalChild>,
+    foreground: Option<TerminalChild>,
+    last_exit: Option<TerminalExit>,
+}
+#[derive(Debug, PartialEq, Eq)]
+enum TerminalState {
+    Running,
+    Exited,
+    Pending,
+}
+impl TerminalProcess {
+    fn state(&self) -> TerminalState {
+        if self.child.is_some() || self.foreground.is_some() {
+            TerminalState::Running
+        } else if self.last_exit.is_some() {
+            TerminalState::Exited
+        } else {
+            // A direct terminal can be published before its process starts.
+            // Missing process information alone never authorizes replacement.
+            TerminalState::Pending
+        }
+    }
+}
+#[derive(Deserialize)]
+struct TerminalExit {
+    #[serde(rename = "exit_code")]
+    _exit_code: i32,
 }
 #[derive(Deserialize)]
 struct TerminalChild {
@@ -859,6 +888,145 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn native_process_completion_evidence_prevents_duplicate_chat_windows() {
+        const TEST: &str =
+            "rex::tests::native_process_completion_evidence_prevents_duplicate_chat_windows";
+        if let Ok(directory) = std::env::var("AGENT_TEST_REX_PROCESS_FIXTURE") {
+            let client = RexClient::new(None);
+            let binding = WorkerBinding {
+                session_id: SessionId::parse(SESSION).unwrap(),
+                window_id: WindowId::parse(WINDOW).unwrap(),
+                block_id: BlockId::parse(BLOCK).unwrap(),
+                revision: 1,
+            };
+            let case = std::env::var("AGENT_TEST_REX_PROCESS_CASE").unwrap();
+            let presence = client
+                .worker_presence(&binding, &HostId::parse(HOST).unwrap())
+                .await;
+            if case == "invalid-exit" {
+                assert_eq!(presence.unwrap_err(), RexError::InvalidResponse);
+                assert!(matches!(
+                    client
+                        .resume_worker(&binding, "/example/agent", &[], Path::new("/tmp"))
+                        .await,
+                    Err(RexError::InvalidResponse)
+                ));
+            } else {
+                let presence = presence.unwrap();
+                if case == "starting" {
+                    assert!(
+                        !matches!(
+                            presence,
+                            crate::protocol::WorkerPresence::Present { .. }
+                                | crate::protocol::WorkerPresence::MissingSession
+                                | crate::protocol::WorkerPresence::MissingTerminal
+                        ),
+                        "No process and no completion is pending, never proof that the worker exited"
+                    );
+                } else {
+                    assert!(
+                        matches!(presence, crate::protocol::WorkerPresence::Present { running } if running == (case != "exited"))
+                    );
+                }
+                let resumed = client
+                    .resume_worker(&binding, "/example/agent", &[], Path::new("/tmp"))
+                    .await
+                    .unwrap();
+                if case == "exited" {
+                    assert!(
+                        matches!(resumed, WorkerResume::Started(ref next) if next.session_id == binding.session_id && next.block_id != binding.block_id)
+                    );
+                } else {
+                    assert!(
+                        !matches!(resumed, WorkerResume::Started(_)),
+                        "An unconfirmed exit cannot create another Chat"
+                    );
+                }
+            }
+            let calls = std::fs::read_to_string(Path::new(&directory).join("calls")).unwrap();
+            assert_eq!(
+                calls
+                    .lines()
+                    .filter(|method| *method == "session.new_window")
+                    .count(),
+                usize::from(case == "exited")
+            );
+            assert_eq!(
+                calls
+                    .lines()
+                    .filter(|method| *method == "block.close")
+                    .count(),
+                usize::from(case == "exited")
+            );
+            return;
+        }
+        let node = std::process::Command::new("node")
+            .args(["-p", "process.execPath"])
+            .output()
+            .unwrap();
+        assert!(node.status.success());
+        let node = String::from_utf8(node.stdout).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("rex");
+        let fixture = r#"
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+const root = process.env.AGENT_TEST_REX_PROCESS_FIXTURE;
+const mode = process.env.AGENT_TEST_REX_PROCESS_CASE;
+const method = process.argv.includes('whoami') ? 'whoami' : process.argv[process.argv.indexOf('call') + 1];
+appendFileSync(join(root, 'calls'), method + '\n');
+const session = 'session:11111111-1111-4111-8111-111111111111';
+const window = 'window:22222222-2222-4222-8222-222222222222';
+const block = 'block:33333333-3333-4333-8333-333333333333';
+const host = '44444444-4444-4444-8444-444444444444';
+const replacement = 'block:55555555-5555-4555-8555-555555555555';
+let value;
+if (method === 'session.list') value = { sessions: [{ session_id: session, label: 'Synthetic work' }] };
+else if (method === 'session.view') {
+  const blocks = existsSync(join(root, 'closed')) ? [] : [block];
+  if (existsSync(join(root, 'created'))) blocks.push(replacement);
+  value = { session_id: session, revision: 2, windows: [{ window_id: window, layers: [{ blocks: blocks.map(id => ({ block_id: id, host_id: host, flavor: 'com.superlogical.terminal.shell' })) }] }] };
+} else if (method === 'com.superlogical.terminal.process') {
+  const live = { pid: 123, user_id: 501, name: 'agent' };
+  value = { child: mode === 'child' ? live : null, foreground: mode === 'foreground' ? live : null,
+    last_exit: mode === 'invalid-exit' ? {} : mode === 'starting' || mode === 'child' ? null : { exit_code: 0 } };
+} else if (method === 'session.new_window') {
+  writeFileSync(join(root, 'created'), ''); value = { window_id: window, block_ids: [replacement], revision: 2 };
+} else if (method === 'whoami') value = { host_id: host, instance_id: '66666666-6666-4666-8666-666666666666', rex_version: 'fixture' };
+else if (method === 'block.close') { writeFileSync(join(root, 'closed'), ''); value = {}; }
+else throw new Error('Unexpected native method ' + method);
+process.stdout.write(JSON.stringify(value));
+"#;
+        std::fs::write(&program, format!("#!{}\n{fixture}", node.trim())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = std::env::join_paths(
+            std::iter::once(directory.path().to_path_buf())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        for case in ["starting", "foreground", "child", "exited", "invalid-exit"] {
+            std::fs::write(directory.path().join("calls"), "").unwrap();
+            for marker in ["created", "closed"] {
+                let _ = std::fs::remove_file(directory.path().join(marker));
+            }
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env("PATH", &paths)
+                .env("AGENT_TEST_REX_PROCESS_FIXTURE", directory.path())
+                .env("AGENT_TEST_REX_PROCESS_CASE", case)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "Native fixture {case}:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+
     #[derive(Deserialize)]
     struct NativeWindows {
         windows: Vec<NamedWindow>,
@@ -868,16 +1036,6 @@ mod tests {
         window_id: WindowId,
         label: String,
     }
-    #[derive(Deserialize)]
-    struct NativeProcess {
-        child: Option<TerminalChild>,
-        last_exit: Option<NativeExit>,
-    }
-    #[derive(Deserialize)]
-    struct NativeExit {
-        exit_code: i32,
-    }
-
     async fn assert_native_output(
         client: &RexClient,
         binding: &WorkerBinding,
@@ -885,7 +1043,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let process: NativeProcess = decode(
+            let process: TerminalProcess = decode(
                 &client
                     .api(
                         "com.superlogical.terminal.process",
@@ -898,11 +1056,11 @@ mod tests {
                     .await
                     .map_err(read_failure)?,
             )?;
-            if process.child.is_none()
+            if process.state() == TerminalState::Exited
                 && let Some(exit) = process.last_exit
             {
                 anyhow::ensure!(
-                    exit.exit_code == 0,
+                    exit._exit_code == 0,
                     "Native marker process did not exit successfully"
                 );
                 break;
@@ -1035,7 +1193,7 @@ mod tests {
                 labels
                     .windows
                     .iter()
-                    .any(|window| window.window_id == binding.window_id && window.label == "Worker")
+                    .any(|window| window.window_id == binding.window_id && window.label == "Chat")
                     && labels
                         .windows
                         .iter()
@@ -1059,8 +1217,8 @@ mod tests {
                 .await?
             {
                 WorkerResume::Started(resumed) => resumed,
-                WorkerResume::Running => {
-                    anyhow::bail!("An exited parent was incorrectly reported as running")
+                WorkerResume::Running | WorkerResume::Pending => {
+                    anyhow::bail!("An exited parent was not confirmed as exited")
                 }
             };
             anyhow::ensure!(

@@ -576,7 +576,7 @@ export class TaskStore {
         if (result.type === "spawned" && result.binding.session_id === previous.binding.session_id &&
             result.binding.host_id === previous.binding.host_id) {
           task.worker = { ...previous, binding: result.binding };
-        } else if (result.type === "written") task.worker = previous;
+        } else if (result.type === "written" || (result.type === "worker_presence" && result.presence.state === "pending")) task.worker = previous;
         else task.worker = { state: "uncertain", allocation_id: previous.allocation_id,
           host: previous.host, session_id: previous.binding.session_id };
       });

@@ -2236,6 +2236,18 @@
         {
           "type": "object",
           "properties": {
+            "state": {
+              "type": "string",
+              "const": "pending"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "running": {
               "type": "boolean"
             },

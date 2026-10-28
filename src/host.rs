@@ -518,6 +518,9 @@ async fn resume_worker(
         .await
     {
         Ok(WorkerResume::Running) => Ok(HostResult::Written),
+        Ok(WorkerResume::Pending) => Ok(HostResult::WorkerPresence {
+            presence: crate::protocol::WorkerPresence::Pending,
+        }),
         Ok(WorkerResume::Started(replacement)) => Ok(HostResult::Spawned {
             binding: WorkerRef {
                 host_id: binding.host_id.clone(),

@@ -78,7 +78,7 @@ Never import authentication state, system/developer prompts or permission
 grants.
 
 Retain available tool arguments/results, structured payloads and referenced
-assets privately on the coordinator, including compressed cold material. A
+assets privately on the coordinator, including large cold payloads. A
 path on an unavailable source machine is insufficient. Materialize and verify
 assets before committing references; record missing payloads. Historical tool
 calls are evidence, never replayed. Render these data entries alongside Pi
