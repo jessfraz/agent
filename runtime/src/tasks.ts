@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { AssistantEntry, defineDoc, type Conversation, type ConversationId, type Cursor, type EntryRecord, type Extension, type Harness, type Tx } from "@earendil-works/pi-durable";
+import { AssistantEntry, defineDoc, ROOT_CONVERSATION_ID, type Conversation, type ConversationId, type Cursor, type EntryRecord, type Extension, type Harness, type Tx } from "@earendil-works/pi-durable";
 import type { CoordinatorEnvironment } from "./environment.js";
 import { ConversationModels, DEFAULT_MODEL, ModelError, savedHost, savedModel } from "./models.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
@@ -340,9 +340,10 @@ export class TaskStore {
     return this.get(id);
   }
   async *records(conversationId: string): AsyncIterable<SearchRecord> {
-    const conversation = await this.conversation(conversationId);
     const task = (await this.list()).find((task) => task.conversation_id === conversationId || task.agents.some((agent) => agent.conversation_id === conversationId));
     const imported = await this.histories?.byConversation(conversationId);
+    if (conversationId !== ROOT_CONVERSATION_ID.toString() && task === undefined && imported === undefined) return;
+    const conversation = await this.conversation(conversationId);
     const refs = (task?.sources ?? []).map(sourceReference);
     if (imported !== undefined) refs.push(sourceReference({ provider: "codex", account: "local", thread_id: imported.thread.id }));
     let cursor: Cursor | undefined;

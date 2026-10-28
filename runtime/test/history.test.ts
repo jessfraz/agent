@@ -13,6 +13,8 @@ import { HistoryStore, ImportedItemEntry, ImportedThreadEntry, importedText } fr
 import { ConversationModels } from "../src/models.js";
 import { TaskStore } from "../src/tasks.js";
 import { createAppTools, Executions } from "../src/tools.js";
+import { createSourceTools, SourceJournal } from "../src/sources.js";
+import { SearchIndex, type Embed } from "../src/search.js";
 import { history } from "../src/transcript.js";
 import { fixtureModel } from "./model.js";
 import type { HistoryImportBatch } from "../src/generated/HistoryImportBatch.js";
@@ -39,7 +41,7 @@ async function open(directory: string) {
   const imported = new HistoryStore(session, join(directory, "assets")); const tasks = new TaskStore(session, new ConversationModels(models)); tasks.useHistory(imported);
   const executions = new Executions(); const tools = createAppTools(tasks, executions);
   registry.install(tools.main); registry.install(tools.worker); registry.install(tools.host);
-  return { session, storage, imported, tasks, faux, executions, tools };
+  return { session, storage, imported, tasks, faux, executions, tools, registry };
 }
 
 test("legacy oversized previews stay intact as evidence and become bounded titles on reads and adoption", async () => {
@@ -266,4 +268,56 @@ test("live indexing includes full visible text while excluding system instructio
     assert.equal(records[0]?.text.includes("Instructions must never"), false); assert.equal(records[0]?.text.includes("Provider thinking"), false);
     assert.equal(app.faux.state.callCount, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("native source-triage and unknown conversations stay out of search while human histories remain searchable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-human-history-index-")); const app = await open(directory);
+  const index = new SearchIndex(":memory:");
+  try {
+    const sources = new SourceJournal(app.session, app.tasks, app.executions);
+    const sourceTools = createSourceTools(sources, app.executions); app.registry.install(sourceTools);
+    await sources.admit({ source: { provider: "mail", account: "synthetic" }, checkpoint: { value: "one" }, coverage: { status: "complete" },
+      events: [{ id: "routine", version: "one", source: { provider: "mail", account: "synthetic", thread_id: "routine" },
+        title: "Internal feed signal", text: "noisequantum internal-only source payload. ".repeat(500) }] }, null);
+    const keys = (await sources.events({ pending: true })).map((event) => event.key);
+    app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("dismiss_source_events", { keys, reason: "No action is needed" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Internal triage finished without a user notice."),
+    ]);
+    let internal = "";
+    await sources.triage({ type: "triage_sources", instructions: "Keep internal processing quiet", model: fixtureModel, cwd: host.cwd, hosts: [] },
+      (conversation) => {
+        internal = conversation.id.toString();
+        return app.executions.bind(internal, { role: "triage", cwd: host.cwd, hosts: [], call: async () => { throw new Error("No host effect expected"); } });
+      }, [sourceTools]);
+    assert.notEqual(internal, "");
+    const internalRecords = []; for await (const record of app.tasks.records(internal)) internalRecords.push(record);
+    assert.equal(internalRecords.length, 0, "Automatic source work is not a human conversation or continuation target");
+    const unknown = await app.session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT);
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    const task = await app.tasks.create({ title: "Human task", outcome: "Retain human work", model: fixtureModel });
+    const child = await app.tasks.createAgent(task.id, { id: "review", title: "Human review", outcome: "Review the human task", input: "Review", inputId: "review", model: fixtureModel });
+    for (const [conversation, text] of [[root, "lapisroot visible human request"],
+      [await app.tasks.conversation(task.conversation_id), "topaztask visible task request"],
+      [await app.tasks.conversation(child.conversation_id), "sapphirereview visible agent evidence"],
+      [unknown, "noiseunknown internal processing"]] satisfies Array<[import("@earendil-works/pi-durable").Conversation, string]>) {
+      await conversation.commit((tx) => tx.appendEntry(conversation.id, { kind: "fixture.visible", model: [{ role: "user", content: text, timestamp: 1 }] }), BACKGROUND_CONTEXT);
+    }
+    const full = "Retained historical context. ".repeat(1000) + "zirconiumhistory late detail";
+    const original = item("item1", full.slice(0, 16_000)); original.data = { type: "userMessage", text: full };
+    const imported = await app.imported.import(batch([original])); const embedded: string[] = [];
+    const embed: Embed = async (texts, purpose) => {
+      if (purpose === "document") embedded.push(...texts);
+      return { space: { id: "synthetic", model_revision: "one", model_digest: "synthetic", dimensions: 3,
+        pooling: "last", normalization: "l2", instruction_version: 1 }, vectors: texts.map(() => [1, 0, 0]) };
+    };
+    await index.reconcile(app.imported.inventory(), (id) => app.tasks.records(id), embed);
+    assert.equal(embedded.some((text) => text.includes("noisequantum") || text.includes("noiseunknown")), false);
+    for (const [query, id] of [["lapisroot", root.id.toString()], ["topaztask", task.conversation_id],
+      ["sapphirereview", child.conversation_id], ["zirconiumhistory", imported.conversation.conversation_id]] satisfies Array<[string, string]>) {
+      const result = await index.search(query, embed, [], 8);
+      assert.ok(result.candidates.some((candidate) => candidate.conversation_id === id && candidate.matches.some((match) => match.text.includes(query))));
+      assert.equal(result.candidates.some((candidate) => candidate.conversation_id === internal || candidate.conversation_id === unknown.id.toString()), false);
+    }
+  } finally { index.close(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

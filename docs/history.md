@@ -86,13 +86,15 @@ model messages.
 
 ## One derived search index
 
-Use one SQLite file for live/imported conversation chunks, source references,
+Use one SQLite file for main, task, worker and imported conversation chunks,
+source references,
 FTS5 and `sqlite-vec` vectors. Pi remains authoritative. Commit Pi first, then
 atomically update derived rows and their indexing checkpoint. Per-conversation
 watermarks and dirty index rows support catch-up and rebuilding. Pi commit
 subscriptions only enqueue work; they must not await or re-enter a Session.
 Startup reconciliation compares conversation tails with saved watermarks, so
-missed notifications cannot permanently hide a conversation.
+missed notifications cannot permanently hide a conversation. Internal feed
+judgment transcripts are retained in Pi but are not retrieval candidates.
 
 Keep useful user/assistant text and bounded meaningful tool content searchable.
 Respect message boundaries and retain entry/asset provenance for every chunk.
