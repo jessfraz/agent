@@ -45,7 +45,7 @@ function space(value: unknown): EmbeddingSpace {
 function* chunks(record: SearchRecord): Generator<Chunk> {
   if (record.entry_id.length === 0 || !Number.isSafeInteger(record.ordinal) || record.ordinal < 0) throw new Error("Invalid search record identity");
   const source_refs = [...new Set(record.source_refs)].sort();
-  if (source_refs.some((ref) => ref.length === 0 || ref.length > 2048) || source_refs.length > 64) throw new Error("Invalid search source references");
+  if (source_refs.some((ref) => ref.length === 0 || ref.length > 2048)) throw new Error("Invalid search source references");
   const bytes = Buffer.from(record.text); let part = 0;
   for (let start = 0; start < bytes.length;) {
     let end = Math.min(start + 2048, bytes.length);
