@@ -91,6 +91,7 @@ export class HistoryStore {
   async indexText(entry: EntryRecord): Promise<string | undefined> {
     if (!ImportedItemEntry.is(entry)) return importedText(entry);
     const item = entry.data.item;
+    if (item.kind === "imageGeneration") return "";
     if (item.role !== "user" && item.role !== "assistant") return item.text.slice(0, 32_000);
     const data = await this.original(entry);
     return body(data) || item.text;

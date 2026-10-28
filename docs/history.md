@@ -99,7 +99,8 @@ judgment transcripts are retained in Pi but are not retrieval candidates.
 Keep useful user/assistant text and bounded meaningful tool content searchable.
 Respect message boundaries and retain entry/asset provenance for every chunk.
 Debug logs, repeated boilerplate and arbitrary tool dumps are not useful index
-content. A conversation may need many chunks; conversation count is not vector
+content. Generated image bytes stay in retained evidence, outside search text.
+A conversation may need many chunks; conversation count is not vector
 count. Avoid indexing only generated summaries, which can omit the needed fact.
 
 Independently retrieve exact source links, FTS matches and dense neighbors.

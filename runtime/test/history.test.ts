@@ -175,6 +175,30 @@ test("retained cold originals remain readable offline and full user text is avai
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("generated images retain their original evidence without indexing binary previews", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-import-image-")); let app = await open(directory);
+  try {
+    const assets = join(directory, "assets"); await mkdir(assets);
+    const bytes = Buffer.from("png"); const digest = createHash("sha256").update(bytes).digest("hex");
+    const path = join(assets, digest); await writeFile(path, bytes);
+    const image: HistoryItem = { ...item("image1", "cG5n", "tool"), kind: "imageGeneration",
+      data: { type: "imageGeneration", id: "image1", status: "completed", revisedPrompt: "A violet connector", result: "cG5n" },
+      assets: [{ path, item_id: "image1", version: "v1", kind: "inline_media", media_type: "image/png", sha256: digest, size: bytes.length }] };
+    const saved = await app.imported.import(batch([item("request1", "Draw a violet connector."), image]));
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    assert.equal((await app.imported.import(batch([image]))).added_items, 0);
+    const records = []; for await (const record of app.tasks.records(saved.conversation.conversation_id)) records.push(record);
+    assert.ok(records.some((record) => record.text === "Draw a violet connector."));
+    assert.ok(records.every((record) => record.text !== "cG5n"), "Image bytes are evidence, not search text");
+    const conversation = await app.imported.conversation(saved.conversation.conversation_id); assert.ok(conversation);
+    const page = await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT);
+    const original = page.items.find((entry) => ImportedItemEntry.is(entry) && entry.data.item.id === image.id); assert.ok(original);
+    assert.deepEqual(await app.imported.original(original), image.data);
+    assert.deepEqual(await readFile(path), bytes);
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("adoption reuses the historical Pi conversation and activates only the new instruction under current rules", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-adopt-")); const app = await open(directory);
   try {
