@@ -800,17 +800,7 @@ impl NativeThread {
         } else {
             title.trim_end().to_owned()
         };
-        let fingerprint = self
-            .path
-            .as_ref()
-            .and_then(|path| std::fs::metadata(path).ok())
-            .and_then(|metadata| {
-                metadata
-                    .modified()
-                    .ok()
-                    .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|modified| (metadata.len(), modified.as_secs(), modified.subsec_nanos()))
-            });
+        let fingerprint = self.path.as_deref().and_then(locator_fingerprint);
         let version = digest(&serde_json::to_vec(&(
             &self.id,
             native_title,
@@ -819,7 +809,7 @@ impl NativeThread {
             &self.forked_from_id,
             &self.parent_thread_id,
             &self.path,
-            fingerprint,
+            &fingerprint,
         ))?);
         Ok(HistoryThread {
             id: self.id.clone(),
@@ -835,6 +825,37 @@ impl NativeThread {
         })
     }
 }
+
+/// Codex may expose the canonical plain locator while storing its compressed
+/// sibling. Match its regular-file precedence without reading either format.
+fn locator_fingerprint(path: &Path) -> Option<(PathBuf, u64, u64, u32)> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let plain = if path.extension().is_some_and(|extension| extension == "zst") {
+        path.with_extension("")
+    } else {
+        path.to_path_buf()
+    };
+    let (physical, metadata) = [plain.clone(), plain.with_added_extension("zst")]
+        .into_iter()
+        .find_map(|candidate| {
+            let metadata = std::fs::metadata(&candidate).ok()?;
+            metadata.is_file().then_some((candidate, metadata))
+        })?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?;
+    Some((
+        physical,
+        metadata.len(),
+        modified.as_secs(),
+        modified.subsec_nanos(),
+    ))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeList {
@@ -2146,6 +2167,124 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         assert_eq!(
             threads[0].version, unavailable_hint,
             "Unavailable fingerprints remain deterministic, with reliability explicit"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_compressed_locator_is_reliable_and_tracks_changes_without_timestamp_updates() {
+        #[derive(serde::Serialize)]
+        struct Message {
+            id: &'static str,
+            #[serde(rename = "type")]
+            kind: &'static str,
+            text: &'static str,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let plain = directory.path().join("rollout-synthetic.jsonl");
+        let compressed = plain.with_added_extension("zst");
+        // The adapter reads only metadata. Canonical contents still come from
+        // the native API, so this file deliberately is not a zstd stream.
+        std::fs::write(&compressed, b"first compressed representation").unwrap();
+        let message = Message {
+            id: "message-one",
+            kind: "agentMessage",
+            text: "Canonical native evidence",
+        };
+        let mut native = provider_fixture(vec![serde_json::to_value(message).unwrap()]);
+        native.get_mut("threads").unwrap().as_array_mut().unwrap()[0]
+            .as_object_mut()
+            .unwrap()
+            .insert("path".into(), Value::String(plain.to_str().unwrap().into()));
+        let source = fixture(directory.path(), &native);
+        let HistoryResponse::List { threads, .. } = source.list(false, None).await.unwrap() else {
+            panic!("Expected inventory")
+        };
+        assert!(
+            threads[0].version_reliable,
+            "The native compressed representation must provide a reliable source hint"
+        );
+        let first = threads[0].version.clone();
+        let HistoryResponse::Read {
+            items,
+            gaps,
+            complete,
+            ..
+        } = source.read("thread-a".into(), None).await.unwrap()
+        else {
+            panic!("Expected native history")
+        };
+        assert!(complete);
+        assert!(gaps.is_empty());
+        assert_eq!(items[0].text, "Canonical native evidence");
+        std::fs::write(
+            &compressed,
+            b"changed compressed representation with a new length",
+        )
+        .unwrap();
+        let HistoryResponse::List { threads, .. } = source.list(false, None).await.unwrap() else {
+            panic!("Expected inventory")
+        };
+        assert!(threads[0].version_reliable);
+        assert_eq!(threads[0].updated_at, 2);
+        assert_ne!(threads[0].version, first);
+    }
+
+    #[test]
+    fn native_locator_uses_plain_regular_file_priority_and_representation_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let plain = directory.path().join("rollout-synthetic.jsonl");
+        let compressed = plain.with_added_extension("zst");
+        let mut native: NativeThread = serde_json::from_str(THREAD).unwrap();
+        native.path = Some(compressed.clone());
+        std::fs::write(&compressed, b"same bytes").unwrap();
+        let archived = native.metadata(false).unwrap();
+        assert!(archived.version_reliable);
+        std::fs::write(&plain, b"same bytes").unwrap();
+        let modified = std::fs::metadata(&compressed).unwrap().modified().unwrap();
+        std::fs::File::open(&plain)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let plain_metadata = std::fs::metadata(&plain).unwrap();
+        let compressed_metadata = std::fs::metadata(&compressed).unwrap();
+        assert_eq!(plain_metadata.len(), compressed_metadata.len());
+        assert_eq!(
+            plain_metadata.modified().unwrap(),
+            compressed_metadata.modified().unwrap()
+        );
+        let materialized = native.metadata(false).unwrap();
+        assert!(materialized.version_reliable);
+        assert_ne!(
+            materialized.version, archived.version,
+            "The chosen physical representation must participate in the version even when its size and mtime match"
+        );
+        std::fs::write(
+            &compressed,
+            b"changed compressed sibling must not win over the plain file",
+        )
+        .unwrap();
+        assert_eq!(
+            native.metadata(false).unwrap().version,
+            materialized.version
+        );
+        std::fs::remove_file(&plain).unwrap();
+        std::fs::create_dir(&plain).unwrap();
+        let fallback = native.metadata(false).unwrap();
+        assert!(fallback.version_reliable);
+        assert_ne!(
+            fallback.version, materialized.version,
+            "A directory is not the canonical plain file"
+        );
+        std::fs::remove_file(&compressed).unwrap();
+        assert!(!native.metadata(false).unwrap().version_reliable);
+        std::fs::remove_dir(&plain).unwrap();
+        assert!(!native.metadata(false).unwrap().version_reliable);
+        native.path = None;
+        assert!(!native.metadata(false).unwrap().version_reliable);
+        native.path = Some("Cargo.toml".into());
+        assert!(
+            !native.metadata(false).unwrap().version_reliable,
+            "A relative locator cannot identify a native file independently of the agent cwd"
         );
     }
 
