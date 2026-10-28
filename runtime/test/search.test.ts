@@ -49,6 +49,32 @@ test("an exact source conversation precedes an unrelated lexical and dense agree
   } finally { index.close(); }
 });
 
+test("published text vectors are reused across conversations without merging ownership or surviving every owner", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-published-vector-reuse-")); const path = join(directory, "search.sqlite");
+  let index = new SearchIndex(path); let documents = 0;
+  const embedding: Embed = async (texts, purpose) => { if (purpose === "document") documents += texts.length; return embed(texts, purpose); };
+  const text = "Identical automobile maintenance evidence";
+  try {
+    await index.upsert("first", "one", records([record("first-entry", text, 0, ["mail:synthetic:first"])]), embedding);
+    index.close(); index = new SearchIndex(path);
+    await index.upsert("second", "one", records([record("second-entry", text, 0, ["mail:synthetic:second"])]), embedding);
+    assert.equal(documents, 1, "Identical published text must not invoke document embedding again for another conversation");
+    const found = await index.search("automobile", embedding);
+    assert.deepEqual(found.candidates.map((candidate) => [candidate.conversation_id, candidate.matches.map((match) => [match.entry_id, match.source_refs])]), [
+      ["first", [["first-entry", ["mail:synthetic:first"]]]], ["second", [["second-entry", ["mail:synthetic:second"]]]],
+    ]);
+    await index.delete("first");
+    const remaining = await index.search("automobile", embedding);
+    assert.deepEqual(remaining.candidates.map((candidate) => candidate.conversation_id), ["second"]);
+    assert.equal(remaining.candidates[0]?.matches[0]?.entry_id, "second-entry");
+    await index.upsert("third", "one", records([record("third-entry", text)]), embedding);
+    assert.equal(documents, 1, "Any remaining published owner can supply the cached vector");
+    await index.delete("second"); await index.delete("third");
+    await index.upsert("fourth", "one", records([record("fourth-entry", text)]), embedding);
+    assert.equal(documents, 2, "Removing every published owner must remove the reusable vector too");
+  } finally { index.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("streamed indexing reuses vectors and preserves the old checkpoint on interruption", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-search-")); const path = join(directory, "search.sqlite");
   const batches: number[] = []; let fail = false;
@@ -121,7 +147,7 @@ test("partial vector caches are conversation scoped and deleted or rebuilt with 
   try {
     await assert.rejects(index.upsert("partial", "one", interrupted(), embedding), /Synthetic source stopped/);
     requested = 0; await index.upsert("other", "one", records(data), embedding); assert.equal(requested, 16);
-    await index.delete("partial"); requested = 0;
+    await index.delete("other"); await index.delete("partial"); requested = 0;
     await index.upsert("partial", "two", records(data), embedding); assert.equal(requested, 16, "Deleted ownership must remove unpublished cached vectors too");
     await assert.rejects(index.upsert("rebuilt", "one", interrupted(), embedding), /Synthetic source stopped/);
     requested = 0; current = { ...space, id: "rebuilt-space", instruction_version: 2 };
@@ -253,12 +279,26 @@ test("bounded Unicode chunks retain entry provenance and representative queries 
     }
     await index.upsert("representative", "1000", records(Array.from({ length: 1000 }, (_, ordinal) =>
       record(`entry-${ordinal}`, `Automobile maintenance sample ${ordinal}`, ordinal, [`mail:synthetic:${ordinal}`]))), embed);
+    await index.upsert("published-clone", "1000", records(Array.from({ length: 1000 }, (_, ordinal) =>
+      record(`clone-${ordinal}`, `Automobile maintenance sample ${ordinal}`, ordinal, [`mail:synthetic:clone-${ordinal}`]))), embed);
     const partial = Array.from({ length: 1024 }, (_, ordinal) => record(`partial-${ordinal}`, `Partial automobile evidence ${ordinal}`, ordinal));
     async function* interrupted() { yield* partial; throw new Error("Synthetic source stopped"); }
     for (const id of ["partial-plan", "other-partial-plan"]) await assert.rejects(index.upsert(id, "1024", interrupted(), embed), /Synthetic source stopped/);
     const db = new DatabaseSync(path, { allowExtension: true });
     try {
       assert.ok(process.env.AGENT_SQLITE_VEC); db.loadExtension(process.env.AGENT_SQLITE_VEC);
+      const publishedHashes = db.prepare("SELECT hash FROM chunks WHERE conversation_id=? ORDER BY ordinal LIMIT 16").all("representative").map((row) => {
+        assert.ok(typeof row.hash === "string"); return row.hash;
+      });
+      const publishedSlots = publishedHashes.map(() => "?").join(",");
+      const oldPublishedCache = `SELECT c.hash,v.embedding FROM chunks c JOIN chunk_vectors v ON v.rowid=c.id WHERE c.conversation_id=? AND c.hash IN (${publishedSlots})`;
+      const publishedCache = `SELECT c.hash,v.embedding FROM (SELECT hash,min(id) AS id FROM chunks WHERE hash IN (${publishedSlots}) GROUP BY hash) c JOIN chunk_vectors v ON v.rowid=c.id`;
+      db.exec("DROP INDEX chunks_text_hash; CREATE INDEX chunks_hash ON chunks(conversation_id,hash)");
+      const publishedBefore = db.prepare("EXPLAIN QUERY PLAN " + oldPublishedCache).all("representative", ...publishedHashes);
+      assert.equal(db.prepare(oldPublishedCache).all("representative", ...publishedHashes).length, 16);
+      const globalBefore = db.prepare("EXPLAIN QUERY PLAN " + publishedCache).all(...publishedHashes);
+      db.exec("CREATE INDEX chunks_text_hash ON chunks(hash); DROP INDEX chunks_hash");
+      assert.equal(db.prepare(publishedCache).all(...publishedHashes).length, 16, "Each text hash must select one vector despite multiple published owners");
       const hashes = db.prepare("SELECT hash FROM staging WHERE conversation_id=? ORDER BY ordinal LIMIT 16").all("partial-plan").map((row) => {
         assert.ok(typeof row.hash === "string"); return row.hash;
       });
@@ -274,7 +314,10 @@ test("bounded Unicode chunks retain entry provenance and representative queries 
         exact: db.prepare("EXPLAIN QUERY PLAN SELECT DISTINCT chunk_id FROM source_refs WHERE ref IN (?) LIMIT ?").all("mail:synthetic:10", 20),
         fts: db.prepare("EXPLAIN QUERY PLAN SELECT rowid AS id,rank AS value FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?").all('"maintenance"', 20),
         dense: db.prepare("EXPLAIN QUERY PLAN SELECT rowid AS id,distance AS value FROM chunk_vectors WHERE embedding MATCH ? AND k=? ORDER BY distance").all(new Uint8Array(new Float32Array([1, 0, 0]).buffer), 20),
-        cache: db.prepare("EXPLAIN QUERY PLAN SELECT c.hash,v.embedding FROM chunks c JOIN chunk_vectors v ON v.rowid=c.id WHERE c.conversation_id=? AND c.hash IN (?)").all("representative", "synthetic"),
+        publishedCacheBefore: publishedBefore,
+        globalCacheBeforeHashIndex: globalBefore,
+        publishedCache: db.prepare("EXPLAIN QUERY PLAN " + publishedCache).all(...publishedHashes),
+        publishedDelete: db.prepare("EXPLAIN QUERY PLAN DELETE FROM chunks WHERE conversation_id=?").all("representative"),
         stagingBeforeHashIndex: before,
         stagingCache: db.prepare("EXPLAIN QUERY PLAN " + stagedCache).all("partial-plan", ...hashes),
         stagingPublish: db.prepare(`EXPLAIN QUERY PLAN INSERT INTO chunks(conversation_id,entry_id,ordinal,part,hash,text,source_refs)

@@ -85,7 +85,8 @@ export class SearchIndex {
       CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         entry_id TEXT NOT NULL, ordinal INTEGER NOT NULL, part INTEGER NOT NULL, hash TEXT NOT NULL, text TEXT NOT NULL, source_refs TEXT NOT NULL,
         UNIQUE(conversation_id,entry_id,part));
-      CREATE INDEX IF NOT EXISTS chunks_hash ON chunks(conversation_id,hash);
+      CREATE INDEX IF NOT EXISTS chunks_text_hash ON chunks(hash);
+      DROP INDEX IF EXISTS chunks_hash;
       CREATE TABLE IF NOT EXISTS source_refs(ref TEXT NOT NULL, chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE, PRIMARY KEY(ref,chunk_id));
       CREATE INDEX IF NOT EXISTS refs_chunk ON source_refs(chunk_id);
       CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(text,content='chunks',content_rowid='id');
@@ -142,8 +143,10 @@ export class SearchIndex {
         const batch = pending; pending = [];
         const cached = new Map<string, Uint8Array>();
         if (this.space !== undefined) {
-          for (const row of this.db.prepare(`SELECT c.hash,v.embedding FROM chunks c JOIN chunk_vectors v ON v.rowid=c.id
-            WHERE c.conversation_id=? AND c.hash IN (${batch.map(() => "?").join(",")})`).all(conversation_id, ...batch.map((chunk) => chunk.hash))) {
+          // Published owners share vector bytes, while each new chunk keeps its own provenance.
+          for (const row of this.db.prepare(`SELECT c.hash,v.embedding FROM
+            (SELECT hash,min(id) AS id FROM chunks WHERE hash IN (${batch.map(() => "?").join(",")}) GROUP BY hash) c
+            JOIN chunk_vectors v ON v.rowid=c.id`).all(...batch.map((chunk) => chunk.hash))) {
             if (!(row.embedding instanceof Uint8Array)) throw new Error("Invalid cached embedding");
             cached.set(string(row, "hash"), row.embedding);
           }

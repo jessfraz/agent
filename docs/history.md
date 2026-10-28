@@ -14,7 +14,9 @@ agent history open CONVERSATION_ID
 ```
 
 Run import again to catch up. Completed reliable source versions are skipped;
-partial reads resume their committed cursor. The same native thread and item
+partial reads resume their committed cursor. Interrupted indexing resumes from
+the retained corpus before the next fresh import. Explicit `--host` selection
+starts a fresh walk of those hosts. The same native thread and item
 versions are retained once across hosts. Neither importing nor searching opens
 Rex sessions. Opening a historical conversation adopts it into one task using
 current settings, then opens its named interactive session.
@@ -95,6 +97,8 @@ watermarks and dirty index rows support catch-up and rebuilding. Pi commit
 subscriptions only enqueue work; they must not await or re-enter a Session.
 Completed embedding batches survive interruptions privately. Only a complete
 conversation generation replaces the published index; retries reuse its vectors.
+Identical text reuses published vectors across conversations while retaining
+each entry's identity and provenance.
 Startup reconciliation compares conversation tails with saved watermarks, so
 missed notifications cannot permanently hide a conversation. Internal feed
 judgment transcripts are retained in Pi but are not retrieval candidates.

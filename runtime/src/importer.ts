@@ -46,13 +46,18 @@ export class CodexImporter {
     this.listeners.add(notify);
     try {
       if (this.active !== undefined) { notify(await this.status()); return await this.active; }
-      const selected = requested.length === 0 ? nodes : requested.map((value) => {
-        const node = nodes.find((node) => node.host_id === value || node.name.toLocaleLowerCase() === value.toLocaleLowerCase());
-        if (node === undefined) throw new Error("Choose a registered history host"); return node;
-      });
-      const hosts = [...new Map(selected.map((node) => [node.host_id, node])).values()];
-      if (hosts.length === 0) throw new Error("No registered hosts are available for Codex import");
-      this.active = this.walk(hosts, online, call, index);
+      // Claim the job before awaiting its checkpoint so concurrent callers attach.
+      this.active = (async () => {
+        const saved = (await this.session.snapshot(Progress, BACKGROUND_CONTEXT))?.progress;
+        if (requested.length === 0 && saved?.phase === "indexing") return this.finish(structuredClone(saved), index);
+        const selected = requested.length === 0 ? nodes : requested.map((value) => {
+          const node = nodes.find((node) => node.host_id === value || node.name.toLocaleLowerCase() === value.toLocaleLowerCase());
+          if (node === undefined) throw new Error("Choose a registered history host"); return node;
+        });
+        const hosts = [...new Map(selected.map((node) => [node.host_id, node])).values()];
+        if (hosts.length === 0) throw new Error("No registered hosts are available for Codex import");
+        return this.walk(hosts, online, call, index);
+      })();
       return await this.active;
     } finally { this.listeners.delete(notify); if (this.listeners.size === 0) this.active = undefined; }
   }
@@ -90,6 +95,9 @@ export class CodexImporter {
         } catch (error) { addGap(progress, `${node.name}: ${archived ? "archived" : "active"} inventory: ${message(error)}`); }
       }
     }
+    return this.finish(progress, index);
+  }
+  private async finish(progress: ImportProgress, index: () => Promise<void>): Promise<ImportProgress> {
     progress.phase = "indexing"; progress.host_id = null; await this.publish(progress);
     try { await index(); } catch (error) { addGap(progress, `Search indexing: ${message(error)}`); }
     progress.phase = progress.gaps.length === 0 ? "complete" : "partial";

@@ -60,6 +60,21 @@ async function originals(app: Awaited<ReturnType<typeof open>>, id: string) {
   const entries = await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT);
   return { conversation, entries: entries.items.filter(ImportedItemEntry.is) };
 }
+async function stoppedDuringIndexing(directory: string, producer: Producer) {
+  const previous = await open(directory);
+  let release = () => {}, entered = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const began = new Promise<void>((resolve) => { entered = resolve; });
+  const pending = previous.importer.run([coordinator], [coordinator.host_id], [], native(producer), () => {}, async () => {
+    entered(); await gate; throw new Error("Previous indexing owner stopped");
+  });
+  void pending.catch(() => {});
+  await began;
+  const progress = await previous.importer.status(); assert.equal(progress.phase, "indexing");
+  assert.equal(previous.faux.state.callCount, 0);
+  await previous.session.close(BACKGROUND_CONTEXT);
+  return { app: await open(directory), progress, settle: async () => { release(); await pending.catch(() => {}); } };
+}
 
 test("the orchestrator imports active and archived history from both hosts without Rex sessions, model calls or duplicate entries", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-importer-native-")); const app = await open(directory);
@@ -199,6 +214,72 @@ test("status reports a stopped import after reopening Pi and preserves its resum
     assert.equal(resumed.phase, "complete"); assert.equal(resumed.items_added, 1);
     assert.equal((await originals(app, source.id)).entries.length, 2);
   } finally { release(); await abandoned.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("interrupted indexing resumes retained counts and gaps without rereading sources regardless of host availability", async (t) => {
+  for (const available of [
+    { name: "online", nodes: [coordinator], online: [coordinator.host_id] },
+    { name: "unregistered", nodes: [], online: [] },
+    { name: "offline", nodes: [coordinator], online: [] },
+  ]) await t.test(available.name, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-importer-index-resume-"));
+    const source = thread("retained-media"), failed = thread("failed-read"), tail = thread("new-tail"); let catchup = false;
+    const producer: Producer = (_host, request) => {
+      if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source, failed, ...(catchup ? [tail] : [])], next_cursor: null };
+      if (request.type !== "read") throw new Error("No transferable assets are present");
+      if (request.thread_id === failed.id && !catchup) throw new Error("Synthetic native read unavailable");
+      if (request.thread_id === source.id) return { ...page(source, [item("retained")]), complete: false,
+        gaps: [{ code: "missing", item_id: "retained", message: "A referenced media asset is unavailable" }] };
+      return page(request.thread_id === failed.id ? failed : tail, [item(request.thread_id)]);
+    };
+    const stopped = await stoppedDuringIndexing(directory, producer); const { app, progress } = stopped;
+    let release = () => {}, entered = () => {}, sourceCalls = 0, indexCalls = 0;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const began = new Promise<void>((resolve) => { entered = resolve; });
+    const forbidden: HostCall = async () => { sourceCalls += 1; throw new Error("Resuming indexing must not read native sources"); };
+    const index = async () => { indexCalls += 1; entered(); await gate; };
+    try {
+      const status = await app.importer.status(); assert.equal(status.phase, "partial");
+      assert.equal(status.gap_count, progress.gap_count + 1);
+      const first = app.importer.run(available.nodes, available.online, [], forbidden, () => {}, index);
+      const second = app.importer.run(available.nodes, available.online, [], forbidden, () => {}, index);
+      void first.catch(() => {}); void second.catch(() => {});
+      try {
+        await Promise.race([began, first.then(() => { throw new Error("Index recovery did not reach its callback"); })]);
+        assert.equal(sourceCalls, 0, "The resumed phase must not walk native inventory again"); assert.equal(indexCalls, 1);
+        assert.deepEqual(await app.importer.status(), progress);
+        release();
+        const results = await Promise.all([first, second]);
+        assert.deepEqual(results, [{ ...progress, phase: "partial" }, { ...progress, phase: "partial" }]);
+      } finally { release(); await Promise.allSettled([first, second]); }
+      assert.equal(app.importer.isRunning(), false); assert.equal(app.faux.state.callCount, 0);
+      assert.deepEqual((await originals(app, source.id)).entries.map((entry) => entry.data.item.id), ["retained"]);
+      catchup = true;
+      const fresh = await app.run(producer);
+      assert.equal(fresh.threads_seen, 3); assert.equal(fresh.items_added, 2); assert.equal(fresh.items_unchanged, 1);
+      assert.equal(fresh.gap_count, 1); assert.equal((await originals(app, tail.id)).entries.length, 1);
+    } finally { release(); await stopped.settle(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+});
+
+test("explicit host selection starts a new native walk instead of claiming an interrupted index", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-importer-index-selection-")); const source = thread("retained");
+  const producer: Producer = (_host, request) => {
+    if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+    if (request.type !== "read") throw new Error("No assets are present");
+    return page(source, [item("retained")]);
+  };
+  const stopped = await stoppedDuringIndexing(directory, producer); const { app } = stopped;
+  const hosts: string[] = []; let indexes = 0;
+  const call = native((host, request) => { hosts.push(host); return producer(host, request); });
+  try {
+    await assert.rejects(app.importer.run([coordinator, laptop], [coordinator.host_id, laptop.host_id], ["unknown"], call, () => {}, async () => { indexes += 1; }), /registered history host/);
+    assert.equal(indexes, 0); assert.deepEqual(hosts, []);
+    const result = await app.importer.run([coordinator, laptop], [coordinator.host_id, laptop.host_id], [laptop.name], call, () => {}, async () => { indexes += 1; });
+    assert.equal(result.phase, "complete"); assert.equal(result.items_added, 0); assert.equal(result.items_unchanged, 1);
+    assert.deepEqual(hosts, [laptop.host_id, laptop.host_id, laptop.host_id]); assert.equal(indexes, 1);
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { await stopped.settle(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("a failed chunked asset transfer leaves a gap and retries the same item version into private coordinator storage", async () => {
