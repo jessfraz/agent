@@ -1,7 +1,13 @@
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
+import { builtinModels } from "@earendil-works/pi-ai/providers/all";
+import { createRegistry, Harness } from "@earendil-works/pi-durable";
+import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { HistoryStore } from "../src/history.js";
 import { DEFAULT_MODEL } from "../src/models.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, readdir, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -225,4 +231,72 @@ test("real bridge preserves literal Unicode separators through LF-framed request
     assert.ok(frames.some((value) => value.id === 3 && value.event.type === "done"), "EOF retains the final unterminated frame");
     assert.equal(buffered.length, 0);
   } finally { child.kill(); await closed; await rm(directory, { recursive: true, force: true }); }
+});
+
+
+test("real bridge admits input before imported corpus catchup and interrupts a held semantic lookup", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-index-admission-")); await chmod(directory, 0o700);
+  const harness = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models: builtinModels(), registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  try {
+    const history = new HistoryStore(harness);
+    await history.import({ host_id: "fixture-source", thread: { id: "retained-thread", title: "Connector context", cwd: "/example/project",
+      created_at: 1, updated_at: 2, version: "one", version_reliable: true, archived: true, forked_from_id: null, parent_thread_id: null },
+      items: [{ id: "old-user", turn_id: "one", kind: "userMessage", role: "user", text: "Connector decision from retained history.", version: "one",
+        order: 0, timestamp_ms: 1, data: { type: "userMessage", text: "Connector decision from retained history." }, assets: [] }],
+      next_cursor: null, gaps: [], complete: true });
+  } finally { await harness.close(BACKGROUND_CONTEXT); }
+  const queue = join(directory, "responses.json");
+  await writeFile(queue, JSON.stringify({
+    "fixture-before-index": [{ text: "The main chat is responsive before indexing." }],
+    "fixture-held-search": [{ tool: "search_tasks", args: { query: "Connector retained history" } }],
+    "fixture-after-index-stop": [{ text: "A new turn works after the lookup was interrupted." }],
+  }));
+  const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("./fixtures/coordinator-runtime.js", import.meta.url)), directory],
+    { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, OPENAI_API_KEY: "sk-synthetic-fixture", AGENT_TEST_MODEL_QUEUE: queue } });
+  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+  const lines = createInterface({ input: child.stdout }); const frames: RuntimeEvent[] = [];
+  const listeners = new Set<() => void>(); let errors = "";
+  child.stderr.setEncoding("utf8").on("data", (chunk: string) => { errors += chunk; });
+  lines.on("line", (line) => {
+    const frame: unknown = JSON.parse(line); assert.ok(validEvent(frame)); frames.push(frame);
+    if (frame.event.type === "host_call") {
+      const command = frame.event.command;
+      if (command.type === "reload_guidance") send(frame.id, { type: "host_reply", call_id: frame.event.call_id,
+        result: { type: "shared_guidance", global: { text: "Brief fixture instructions.", sources: [] }, workflow_policy: "", context_repositories: [], context_sources: [] } });
+      else if (command.type === "project_guidance") send(frame.id, { type: "host_reply", call_id: frame.event.call_id,
+        result: { type: "project_guidance", snapshot: { text: "", sources: [] } } });
+    }
+    for (const notify of listeners) notify();
+  });
+  const send = (id: number, command: RuntimeCommand) => child.stdin.write(JSON.stringify({ version: 1, id, command }) + "\n");
+  const wait = (id: number, predicate: (event: RuntimeEventKind) => boolean): Promise<RuntimeEventKind> => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { listeners.delete(check); reject(new Error("Bridge did not finish request " + id + ": " + JSON.stringify(frames.map((frame) => ({ id: frame.id, event: frame.event }))) + errors)); }, 3000);
+    const check = () => {
+      const frame = frames.find((frame) => frame.id === id && predicate(frame.event));
+      if (frame === undefined) return; clearTimeout(timer); listeners.delete(check); resolve(frame.event);
+    };
+    listeners.add(check); check();
+  });
+  const chat = (input: string, input_id: string): RuntimeCommand => ({ type: "chat", input, input_id, model: DEFAULT_MODEL, instructions: "Brief answers.",
+    cwd: "/example/project", origin_host_id: null, hosts: [] });
+  try {
+    send(1, chat("fixture-before-index", "first-input"));
+    const admission = await wait(1, (event) => ["input_placed", "host_call", "failure"].includes(event.type));
+    assert.equal(admission.type, "input_placed", "Initial input must be saved before any embedding or corpus reconciliation host effect");
+    await wait(1, (event) => event.type === "done");
+    assert.ok(frames.some((frame) => frame.id === 1 && frame.event.type === "answer" && frame.event.text === "The main chat is responsive before indexing."));
+    assert.equal(frames.some((frame) => frame.id === 1 && frame.event.type === "host_call" && frame.event.command.type === "embed"), false);
+    send(2, chat("fixture-held-search", "lookup-input"));
+    const held = await wait(2, (event) => (event.type === "host_call" && event.command.type === "embed") || event.type === "failure");
+    assert.ok(held.type === "host_call" && held.command.type === "embed", "Explicit semantic search must still use the native embedding path");
+    send(2, { type: "interrupt" });
+    await wait(2, (event) => event.type === "done");
+    assert.ok(frames.some((frame) => frame.id === 2 && frame.event.type === "host_cancel" && frame.event.call_id === held.call_id));
+    assert.ok(frames.some((frame) => frame.id === 2 && frame.event.type === "interrupted"));
+    send(3, chat("fixture-after-index-stop", "next-input"));
+    await wait(3, (event) => event.type === "done");
+    assert.ok(frames.some((frame) => frame.id === 3 && frame.event.type === "answer" && frame.event.text === "A new turn works after the lookup was interrupted."));
+    assert.equal(frames.some((frame) => frame.event.type === "failure"), false, errors);
+  } finally { lines.close(); child.stdin.end(); child.kill(); await closed; await rm(directory, { recursive: true, force: true }); }
 });

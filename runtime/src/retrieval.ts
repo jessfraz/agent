@@ -51,6 +51,16 @@ export class Retrieval {
     });
     this.syncing = operation.catch(() => {}); return operation;
   }
+  /** Automatic context must not hold user admission behind corpus catchup. */
+  async snapshot(query: string, sources: string[], limit: number): Promise<SearchResult> {
+    const coverage = "Automatic context includes published keyword matches and current task metadata only. Use search_tasks for semantic lookup before starting separate work when this context is insufficient.";
+    try {
+      const result = await this.open().search(query, undefined, sources, limit, "keyword");
+      return { candidates: result.candidates, gaps: [coverage, ...result.gaps] };
+    } catch (error) {
+      return { candidates: [], gaps: [coverage, error instanceof Error ? error.message : "History search is unavailable"] };
+    }
+  }
   async search(query: string, sources: string[], limit: number, call: HostCall, importing = false, mode: SearchMode = "semantic"): Promise<SearchResult> {
     const gaps: string[] = [];
     if (!importing) {

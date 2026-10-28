@@ -403,7 +403,8 @@ async function handle(request: RuntimeRequest): Promise<void> {
             (message) => emit(id, { type: "message", message }));
           const turn = mainTurns.get(id);
           try {
-            const related = await tasks.find(command.input, [], 8, searchFor(application, id));
+            const related = await tasks.find(command.input, [], 8,
+              (query, refs, limit) => application.retrieval.snapshot(query, refs, limit));
             if (interrupted.has(id)) { await interrupts.get(id); return; }
             const relatedContext = related.matches.length === 0 && related.gaps.length === 0 ? "" : "\n\nRelated saved conversations and retrieval coverage (read and reuse matching work):\n" +
               JSON.stringify(related);

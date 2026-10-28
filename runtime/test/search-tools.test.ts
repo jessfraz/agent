@@ -196,3 +196,34 @@ test("main and worker search retain fresh matching tasks while an import fills t
     assert.equal((await tasks.list()).length, 2); assert.equal(importer.isRunning(), true);
   } finally { release(); await importing; retrieval.close(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
+
+
+test("automatic context reads published keyword matches while a native corpus update is held", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-search-snapshot-"));
+  const models = createModels();
+  const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  const history = new HistoryStore(session), tasks = new TaskStore(session, new ConversationModels(models)); tasks.useHistory(history);
+  const retrieval = new Retrieval(session, history, tasks, join(directory, "search.sqlite"));
+  let release = () => {}, start = () => {}; let held = false;
+  const gate = new Promise<void>((resolve) => { release = resolve; }), started = new Promise<void>((resolve) => { start = resolve; });
+  const call: HostCall = async (command) => {
+    assert.ok(command.type === "embed");
+    if (held && command.purpose === "document") { start(); await gate; }
+    return { type: "embeddings", batch: { space, vectors: command.texts.map(() => [1, 0, 0]) } };
+  };
+  let syncing: Promise<void> | undefined;
+  try {
+    const old = await history.import(batch("published-connector", 1, [item("old", "Connector published decision", 1)]));
+    await retrieval.sync(call);
+    await history.import(batch("pending-connector", 2, [item("new", "Connector new unpublished decision", 1)]));
+    held = true; syncing = retrieval.sync(call); await started;
+    const snapshot = await retrieval.snapshot("Connector", [], 8);
+    assert.deepEqual(snapshot.candidates.map((candidate) => candidate.conversation_id), [old.conversation.conversation_id]);
+    assert.ok(snapshot.gaps.some((gap) => gap.includes("published keyword") && gap.includes("semantic lookup")));
+    assert.ok(snapshot.gaps.some((gap) => gap.includes("await indexing")));
+    release(); await syncing;
+    const complete = await retrieval.search("Connector", [], 8, call, true);
+    assert.equal(complete.candidates.length, 2, "Full semantic search retains newly published corpus results");
+  } finally { release(); await syncing; retrieval.close(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});

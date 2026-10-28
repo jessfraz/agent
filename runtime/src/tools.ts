@@ -57,7 +57,7 @@ export class HostRequests {
   private readonly cancelled = new Set<number>();
   private readonly pending = new Map<string, {
     request: number; resolve: (value: HostResult) => void; reject: (error: Error) => void;
-    timer: ReturnType<typeof setTimeout>; cancelled: boolean;
+    timer: ReturnType<typeof setTimeout>; cancelled: boolean; cancellable: boolean;
   }>();
   constructor(private readonly emit: (request: number, call: string, command: HostCommand) => void,
     private readonly cancel: (request: number, call: string) => void = () => {}) {}
@@ -75,7 +75,7 @@ export class HostRequests {
         this.pending.delete(call);
         reject(new TaskError("The execution client did not confirm the operation; inspect its state before retrying"));
       }, timeout);
-      this.pending.set(call, { request, resolve, reject, timer, cancelled: false });
+      this.pending.set(call, { request, resolve, reject, timer, cancelled: false, cancellable: operation.type === "embed" });
       try { this.emit(request, call, command); }
       catch {
         clearTimeout(timer);
@@ -98,6 +98,12 @@ export class HostRequests {
       if (pending.request !== request || pending.cancelled) continue;
       pending.cancelled = true;
       this.cancel(request, call);
+      // Embedding is a read-only computation, so its caller need not wait for
+      // an external write receipt before releasing an interrupted turn.
+      if (pending.cancellable) {
+        clearTimeout(pending.timer); this.pending.delete(call);
+        pending.reject(new TaskError("History embedding was interrupted"));
+      }
     }
   }
   resumeRequest(request: number): void { this.cancelled.delete(request); }

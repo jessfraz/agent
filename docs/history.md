@@ -128,6 +128,11 @@ Several conversations can inform one task; similarity does not authorize
 merging them or changing state.
 An unavailable embedding runner is a retrieval gap, not "no related work."
 
+Automatic chat context reads published keyword matches and current task
+metadata without waiting for corpus indexing. The agent can use semantic search
+for deeper matching. Esc cancels a pending embedding lookup; completed import
+batches remain saved.
+
 `sqlite-vec` runs inside SQLite, with no external vector service. Pin its stable
 release through Nix. The existing Node runtime supports FTS5 and extension
 loading without another SQLite driver. A separate derived file isolates index

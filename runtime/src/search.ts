@@ -210,7 +210,7 @@ export class SearchIndex {
     }));
     await this.reconcile(inventory, records, embed);
   }
-  async search(query: string, embed: Embed, source_refs: string[] = [], limit = 8, mode: SearchMode = "semantic"): Promise<SearchResult> {
+  async search(query: string, embed: Embed | undefined, source_refs: string[] = [], limit = 8, mode: SearchMode = "semantic"): Promise<SearchResult> {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new Error("Search limit must be 1 to 50");
     let dense: RankedChunk[] = []; let lexical: RankedChunk[] = [];
     const gaps: string[] = []; const take = Math.min(200, limit * 10);
@@ -218,7 +218,7 @@ export class SearchIndex {
     const dirty = this.db.prepare("SELECT count(*) AS count FROM conversations WHERE dirty<>0").get();
     if (dirty !== undefined && number(dirty, "count") > 0) gaps.push(`${number(dirty, "count")} conversations await indexing`);
     try {
-      if (query.trim().length > 0) {
+      if (query.trim().length > 0 && embed !== undefined) {
         const batch = await embed([query], "query"); validate(batch, 1); this.setSpace(batch.space);
         dense = this.db.prepare("SELECT rowid AS id,distance AS value FROM chunk_vectors WHERE embedding MATCH ? AND k=? ORDER BY distance")
           .all(new Uint8Array(new Float32Array(batch.vectors[0]!).buffer), take).map((row) => ({ id: number(row, "id"), value: number(row, "value") }));

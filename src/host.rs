@@ -78,6 +78,22 @@ impl Executor {
         command: HostCommand,
         mut cancelled: tokio::sync::watch::Receiver<bool>,
     ) -> HostResult {
+        if matches!(&command, HostCommand::Embed { .. }) {
+            // Embeddings have no external write to reconcile. Dropping this
+            // future releases its place behind background corpus work.
+            return tokio::select! {
+                biased;
+                () = async {
+                    loop {
+                        if *cancelled.borrow_and_update() { return; }
+                        if cancelled.changed().await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                } => HostResult::Failed { message: "History embedding was interrupted".into() },
+                result = self.execute(command) => result,
+            };
+        }
         if let HostCommand::Exec {
             program,
             args,
@@ -727,6 +743,38 @@ mod tests {
         host::{execute, run_process, run_process_until},
         protocol::{HostCommand, HostResult},
     };
+
+    #[tokio::test]
+    async fn interrupt_releases_embedding_waiting_behind_the_owned_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let executor = std::sync::Arc::new(crate::host::Executor::new(directory.path()));
+        let held = executor.embeddings.lock().await;
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let running = std::sync::Arc::clone(&executor);
+        let operation = tokio::spawn(async move {
+            running
+                .execute_cancelled(
+                    HostCommand::Embed {
+                        texts: vec!["Retained context".into()],
+                        purpose: crate::embeddings::EmbeddingPurpose::Query,
+                    },
+                    cancelled,
+                )
+                .await
+        });
+        cancel.send(true).unwrap();
+        let result = timeout(Duration::from_secs(2), operation)
+            .await
+            .expect("Cancellation must not wait for the held embedding provider")
+            .unwrap();
+        assert!(
+            matches!(result, HostResult::Failed { message } if message == "History embedding was interrupted")
+        );
+        assert!(
+            held.is_none(),
+            "Cancellation must not initialize another embedding provider"
+        );
+    }
 
     #[tokio::test]
     async fn source_capture_preserves_literal_arguments_and_nonzero_status() {
