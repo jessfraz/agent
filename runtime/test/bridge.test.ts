@@ -10,6 +10,8 @@ import { fileURLToPath } from "node:url";
 import { validEvent } from "../src/protocol.js";
 import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
+import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
+import type { EmbeddingSpace } from "../src/generated/EmbeddingSpace.js";
 
 test("real Pi bridge gives signed-out chat the login command before starting Pi and rejects invalid commands", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-bridge-"));
@@ -123,4 +125,91 @@ test("real bridge ignores a delayed interrupt after Done and still interrupts ac
       "A stale control must not emit another frame after the request's Done");
     assert.deepEqual(frames.filter((frame) => frame.id === 3).map((frame) => frame.event.type), ["interrupted", "done"]);
   } finally { lines.close(); child.kill(); await closed; await rm(directory, { recursive: true, force: true }); }
+});
+
+test("real bridge confines malformed host replies to their matching operation", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-invalid-reply-")); await chmod(directory, 0o700);
+  const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("../src/bridge.js", import.meta.url)), directory],
+    { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, OPENAI_API_KEY: "" } });
+  const closed = new Promise<number | null>((resolve, reject) => { child.once("close", resolve); child.once("error", reject); });
+  const lines = createInterface({ input: child.stdout }); const frames: RuntimeEvent[] = [];
+  const waiting = new Map<string, (event: RuntimeEventKind) => void>();
+  let errors = ""; child.stderr.setEncoding("utf8").on("data", (chunk: string) => { errors += chunk; });
+  lines.on("line", (line) => {
+    const event: unknown = JSON.parse(line); assert.ok(validEvent(event)); frames.push(event);
+    waiting.get(`${event.id}:${event.event.type}`)?.(event.event);
+  });
+  const event = (id: number, type: RuntimeEventKind["type"]): Promise<RuntimeEventKind> => {
+    const saved = frames.find((frame) => frame.id === id && frame.event.type === type);
+    return saved === undefined ? new Promise((resolve) => { waiting.set(`${id}:${type}`, resolve); }) : Promise.resolve(saved.event);
+  };
+  const write = (frame: unknown) => child.stdin.write(JSON.stringify(frame) + "\n");
+  const send = (id: number, command: RuntimeCommand) => write({ version: 1, id, command });
+  const space: EmbeddingSpace = { id: "synthetic", model_revision: "fixture", model_digest: "fixture", dimensions: 3,
+    pooling: "last", normalization: "l2", instruction_version: 1 };
+  const invalid = { type: "embeddings", batch: { space, vectors: [["private payload must not enter diagnostics"]] } };
+  const malformed = (id: number, call_id: string) => write({ version: 1, id, command: { type: "host_reply", call_id, result: invalid } });
+  try {
+    send(1, { type: "search_history", query: "synthetic first", limit: 8 });
+    send(2, { type: "search_history", query: "synthetic second", limit: 8 });
+    const [first, second] = await Promise.all([event(1, "host_call"), event(2, "host_call")]);
+    assert.ok(first.type === "host_call" && second.type === "host_call");
+    assert.equal(first.command.type, "embed"); assert.equal(second.command.type, "embed");
+    malformed(2, first.call_id); malformed(1, "unknown-call");
+    send(3, { type: "status" }); await event(3, "done");
+    assert.equal(frames.some((frame) => frame.id === 0), false, "A malformed host reply must not create an unowned request-zero frame");
+    assert.equal(frames.some((frame) => frame.id <= 2 && frame.event.type === "done"), false,
+      "Neither another request ID nor an unknown call ID may settle a pending operation");
+    malformed(1, first.call_id); await event(1, "done");
+    const failed = await event(1, "saved_matches"); assert.ok(failed.type === "saved_matches");
+    assert.ok(failed.gaps.some((gap) => /invalid host reply/iu.test(gap)));
+    assert.ok(failed.gaps.some((gap) => /schema/iu.test(gap)), "Failure should retain bounded validation metadata");
+    assert.equal(frames.some((frame) => frame.id === 2 && frame.event.type === "done"), false);
+    send(2, { type: "host_reply", call_id: second.call_id, result: { type: "embeddings", batch: { space, vectors: [[1, 0, 0]] } } });
+    await event(2, "done"); const healthy = await event(2, "saved_matches"); assert.ok(healthy.type === "saved_matches");
+    assert.deepEqual(healthy.gaps, []);
+    assert.equal(JSON.stringify(frames).includes("private payload must not enter diagnostics"), false);
+    child.stdin.end(); assert.equal(await closed, 0, errors);
+    assert.equal(errors.includes("private payload must not enter diagnostics"), false);
+  } finally { lines.close(); child.kill(); await closed; await rm(directory, { recursive: true, force: true }); }
+});
+
+test("real bridge preserves literal Unicode separators through LF-framed requests and responses", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-unicode-frames-")); await chmod(directory, 0o700);
+  const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("../src/bridge.js", import.meta.url)), directory],
+    { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, OPENAI_API_KEY: "" } });
+  const closed = new Promise<number | null>((resolve, reject) => { child.once("close", resolve); child.once("error", reject); });
+  const frames: RuntimeEvent[] = []; let buffered = Buffer.alloc(0); let errors = "";
+  const completed = new Map<number, () => void>();
+  child.stderr.setEncoding("utf8").on("data", (chunk: string) => { errors += chunk; });
+  // Read the actual wire delimiter, independently of both readline and the production decoder.
+  child.stdout.on("data", (chunk: Buffer) => {
+    buffered = Buffer.concat([buffered, chunk]);
+    for (let end = buffered.indexOf(0x0a); end >= 0; end = buffered.indexOf(0x0a)) {
+      const value: unknown = JSON.parse(buffered.subarray(0, end).toString("utf8")); buffered = buffered.subarray(end + 1);
+      assert.ok(validEvent(value)); frames.push(value);
+      if (value.event.type === "done") {
+        if (value.id === 0) for (const resolve of completed.values()) resolve();
+        else completed.get(value.id)?.();
+      }
+    }
+  });
+  const done = (id: number) => new Promise<void>((resolve) => { completed.set(id, resolve); });
+  const text = "First\u2028second\u2029third: 🐙 日本語 café";
+  const frame = (id: number, command: RuntimeCommand) => Buffer.from(JSON.stringify({ version: 1, id, command }));
+  try {
+    const configured = done(1);
+    const bytes = frame(1, { type: "configure_coordinator", bootstrap: { node: null,
+      settings: { model: DEFAULT_MODEL, instructions: text, context_repositories: [], sources: [] } } });
+    for (const byte of bytes) child.stdin.write(Buffer.from([byte]));
+    child.stdin.write("\r"); child.stdin.write("\n"); await configured;
+    assert.equal(frames.some((value) => value.id === 0), false, "Literal Unicode separators must not split a JSON protocol frame");
+    const snapshot = done(2); child.stdin.write(frame(2, { type: "environment" })); child.stdin.write("\n"); await snapshot;
+    const environment = frames.find((value) => value.id === 2 && value.event.type === "environment")?.event;
+    assert.ok(environment?.type === "environment"); assert.equal(environment.settings.instructions, text);
+    child.stdin.end(frame(3, { type: "status" })); assert.equal(await closed, 0, errors);
+    assert.equal(frames.some((value) => value.id === 0), false);
+    assert.ok(frames.some((value) => value.id === 3 && value.event.type === "done"), "EOF retains the final unterminated frame");
+    assert.equal(buffered.length, 0);
+  } finally { child.kill(); await closed; await rm(directory, { recursive: true, force: true }); }
 });

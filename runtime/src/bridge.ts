@@ -1,6 +1,5 @@
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { createInterface } from "node:readline";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { AssistantEntry, createRegistry, Harness } from "@earendil-works/pi-durable";
@@ -12,7 +11,7 @@ import type { ErrorCode } from "./generated/ErrorCode.js";
 import { CoordinatorEnvironment, EnvironmentError } from "./environment.js";
 import { ConversationModels, ModelError } from "./models.js";
 import { ChatGptAuth } from "./auth.js";
-import { validRequest, validEvent, errorEvent } from "./protocol.js";
+import { validRequest, validEvent, errorEvent, invalidHostReply, protocolLines } from "./protocol.js";
 import { TaskError, TaskStore, type HostCall } from "./tasks.js";
 import { HistoryStore } from "./history.js";
 import { CodexImporter } from "./importer.js";
@@ -306,12 +305,17 @@ async function handle(request: RuntimeRequest): Promise<void> {
 
 const pending = new Set<Promise<void>>();
 try {
-  for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
+  for await (const line of protocolLines(process.stdin)) {
     let request: unknown;
     try { request = JSON.parse(line); } catch {
       failure(0, "invalid_request", "Invalid protocol frame"); emit(0, { type: "done" }); continue;
     }
     if (!validRequest(request)) {
+      const reply = invalidHostReply(request, VERSION);
+      if (reply !== undefined) {
+        hostRequests.reply(reply.id, reply.command.call_id, reply.command.result);
+        continue;
+      }
       failure(0, "invalid_request", "Invalid protocol frame"); emit(0, { type: "done" }); continue;
     }
     if (request.version !== VERSION) {
