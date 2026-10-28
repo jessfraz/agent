@@ -176,6 +176,50 @@ pub struct RexClient {
     server: Option<String>,
 }
 impl RexClient {
+    /// Absence is established by successful native reads, never a failed RPC.
+    pub async fn worker_presence(
+        &self,
+        binding: &WorkerBinding,
+        host: &HostId,
+    ) -> Result<crate::protocol::WorkerPresence, RexError> {
+        use crate::protocol::WorkerPresence;
+        if !self
+            .list_sessions()
+            .await?
+            .iter()
+            .any(|session| session.session_id == binding.session_id)
+        {
+            return Ok(WorkerPresence::MissingSession);
+        }
+        let view = self.inspect_session(&binding.session_id).await?;
+        let found = view
+            .windows
+            .iter()
+            .flat_map(|window| &window.layers)
+            .flat_map(|layer| &layer.blocks)
+            .any(|block| block.block_id.as_ref() == Some(&binding.block_id));
+        if !found {
+            return Ok(WorkerPresence::MissingTerminal);
+        }
+        view.verify_binding(binding, host)?;
+        let process: TerminalProcess = decode(
+            &self
+                .api(
+                    "com.superlogical.terminal.process",
+                    &ProcessRequest {
+                        session_id: binding.session_id.clone(),
+                        block_id: binding.block_id.clone(),
+                        args: Empty {},
+                    },
+                )
+                .await
+                .map_err(read_failure)?,
+        )?;
+        Ok(WorkerPresence::Present {
+            running: process.child.is_some(),
+        })
+    }
+
     pub fn new(server: Option<String>) -> Self {
         Self { server }
     }

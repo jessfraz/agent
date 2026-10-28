@@ -6,9 +6,11 @@ import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { HostCommand } from "./generated/HostCommand.js";
 import type { HostResult } from "./generated/HostResult.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
-import { TaskError, TaskStore, type HostCall } from "./tasks.js";
+import { TaskError, TaskStore, type HostCall, type SearchQuery } from "./tasks.js";
 
 export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; default_host?: WorkerHost | null; call: HostCall; role?: "worker" | "triage";
+  search?: SearchQuery;
+  project?: () => Promise<HostResult>;
   notify?: (task: string | null, text: string) => void };
 /** A conversation can execute only through its currently attached CLI client. */
 export class Executions {
@@ -23,6 +25,7 @@ export class Executions {
     if (execution === undefined) throw new TaskError("The execution client is disconnected; attach the task to continue");
     return execution;
   }
+  search(id: string): SearchQuery | undefined { return this.attached.get(id)?.search; }
 }
 
 function output(value: unknown, isError = false): ToolExecutionResult {
@@ -41,24 +44,28 @@ const taskState = Type.Union([
 ]);
 
 export class HostRequests {
+  private readonly cancelled = new Set<number>();
   private readonly pending = new Map<string, {
     request: number; resolve: (value: HostResult) => void; reject: (error: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
+    timer: ReturnType<typeof setTimeout>; cancelled: boolean;
   }>();
-  constructor(private readonly emit: (request: number, call: string, command: HostCommand) => void) {}
+  constructor(private readonly emit: (request: number, call: string, command: HostCommand) => void,
+    private readonly cancel: (request: number, call: string) => void = () => {}) {}
   call(request: number, command: HostCommand): Promise<HostResult> {
+    if (this.cancelled.has(request)) return Promise.reject(new TaskError("This turn was interrupted before the host operation started"));
     if (this.pending.size >= 128) return Promise.reject(new TaskError("Too many pending host operations"));
     const call = randomUUID();
     return new Promise<HostResult>((resolve, reject) => {
       let operation = command;
       while (operation.type === "on_node") operation = operation.command;
       const timeout = operation.type === "exec" ? operation.timeout_seconds * 1000 + 10_000
+        : operation.type === "history" ? 930_000 : operation.type === "embed" ? 330_000
         : operation.type.startsWith("resource_") ? 310_000 : 30_000;
       const timer = setTimeout(() => {
         this.pending.delete(call);
         reject(new TaskError("The execution client did not confirm the operation; inspect its state before retrying"));
       }, timeout);
-      this.pending.set(call, { request, resolve, reject, timer });
+      this.pending.set(call, { request, resolve, reject, timer, cancelled: false });
       try { this.emit(request, call, command); }
       catch {
         clearTimeout(timer);
@@ -75,7 +82,17 @@ export class HostRequests {
     pending.resolve(result);
     return true;
   }
+  cancelRequest(request: number): void {
+    this.cancelled.add(request);
+    for (const [call, pending] of this.pending) {
+      if (pending.request !== request || pending.cancelled) continue;
+      pending.cancelled = true;
+      this.cancel(request, call);
+    }
+  }
+  resumeRequest(request: number): void { this.cancelled.delete(request); }
   finish(request: number): void {
+    this.cancelled.delete(request);
     for (const [call, pending] of this.pending) {
       if (pending.request !== request) continue;
       clearTimeout(pending.timer);
@@ -157,27 +174,55 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
       return output(await tasks.record(task.id, args, { conversation_id: api.conversationId.toString(),
         call_id: api.callId, settled: api.conversationId === ROOT_CONVERSATION_ID || execution.role === "triage" }));
     } });
-  const main = defineExtension({ name: "task-main", tools: [
-    defineTool({ name: "search_tasks", description: "Find related existing work before creating a task. Source references are account-specific.",
+  const searchTask = defineTool({ name: "search_tasks", description: "Find related tasks and imported conversations before starting new work. Read matching originals before continuing them.",
       replay: "safe", parameters: Type.Object({ query: Type.String(), sources: Type.Optional(Type.Array(source)) }),
-      async execute(args) { return output(await tasks.search(args.query, args.sources ?? [])); } }),
-    defineTool({ name: "read_task", description: "Read a task's current state and original conversation before continuing it.",
-      replay: "safe", parameters: Type.Object({ task_id: Type.String(), agent_id: Type.Optional(Type.String()) }),
-      async execute(args) { return output({ task: await tasks.get(args.task_id), history: await tasks.history(args.task_id, 120_000, args.agent_id) }); } }),
+      async execute(args, api) { return output(await tasks.find(args.query, args.sources ?? [], 8, executions.search(api.conversationId.toString()))); } });
+  const readTask = defineTool({ name: "read_task", description: "Read task state or an imported conversation's original evidence before continuing it.",
+      replay: "safe", parameters: Type.Object({ task_id: Type.Optional(Type.String()), conversation_id: Type.Optional(Type.String()), agent_id: Type.Optional(Type.String()),
+        entry_ids: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 16 })), offset: Type.Optional(Type.Integer({ minimum: 0 })) }),
+      async execute(args) {
+        if ((args.task_id === undefined) === (args.conversation_id === undefined)) throw new TaskError("Choose a task_id or conversation_id");
+        if (args.conversation_id !== undefined) {
+          if (args.agent_id !== undefined) throw new TaskError("A conversation already identifies its exact history");
+          return output({ conversation_id: args.conversation_id, imported: await tasks.saved(args.conversation_id) ?? null,
+            history: args.entry_ids === undefined ? await tasks.readConversation(args.conversation_id) : undefined,
+            originals: args.entry_ids === undefined ? undefined : await tasks.originals(args.conversation_id, args.entry_ids, args.offset) });
+        }
+        if (args.task_id === undefined) throw new TaskError("Choose a task");
+        return output({ task: await tasks.get(args.task_id), history: await tasks.history(args.task_id, 120_000, args.agent_id) });
+      } });
+  const main = defineExtension({ name: "task-main", tools: [searchTask, readTask,
     defineTool({ name: "revoke_allocation", description: "Revoke one exact unresolved worker allocation after inspecting it. Preserves pending input and history; does not retry work or delete Rex sessions.",
       parameters: Type.Object({ task_id: Type.String(), allocation_id: Type.String(), agent_id: Type.Optional(Type.String()) }),
       async execute(args) { return output(await tasks.revokeAllocation(args.task_id, args.allocation_id, args.agent_id)); } }),
     defineTool({ name: "delegate_task", description: "Continue existing work in its Rex worker, or create a separate task when no existing task fits. Queues the instruction durably.",
-      parameters: Type.Object({ task_id: Type.Optional(Type.String()), input: Type.String({ minLength: 1, maxLength: 65536 }),
+      parameters: Type.Object({ task_id: Type.Optional(Type.String()), conversation_id: Type.Optional(Type.String()), input: Type.String({ minLength: 1, maxLength: 65536 }),
         title: Type.Optional(Type.String()), outcome: Type.Optional(Type.String()), host: Type.Optional(Type.String()),
         cwd: Type.Optional(Type.String({ minLength: 1 })), new_task: Type.Optional(Type.Boolean()), sources: Type.Optional(Type.Array(source)) }),
       async execute(args, api, context) {
         const execution = executions.get(api.conversationId.toString());
         let task;
-        if (args.task_id === undefined) {
-          const related = await tasks.search(args.input + " " + (args.title ?? ""), args.sources ?? []);
-          if (related.length > 0 && args.new_task !== true) {
-            return output({ related_tasks: related, instruction: "Read and continue a matching task, or set new_task for a separate outcome." });
+        if (args.task_id !== undefined && args.conversation_id !== undefined) throw new TaskError("Choose a task_id or conversation_id");
+        if (args.conversation_id !== undefined) {
+          const saved = await tasks.saved(args.conversation_id);
+          if (saved === undefined) throw new TaskError("Choose an imported conversation or existing task");
+          if (saved.adopted_task_id !== null) task = await tasks.get(saved.adopted_task_id);
+          else {
+            const configured = args.host === undefined ? execution.default_host === undefined ? execution.hosts[0] : execution.default_host
+              : execution.hosts.find((host) => host.name === args.host || host.host_id === args.host);
+            if (configured === undefined || configured === null) throw new TaskError("Choose a connected worker host");
+            const model = configured.launch?.model ?? execution.model ?? DEFAULT_MODEL;
+            await tasks.inference.preflight(model);
+            const id = await api.memo("task_id", randomUUID(), context);
+            const related = await tasks.find(args.input, args.sources ?? [], 8, execution.search);
+            const evidence = related.matches.find((match) => match.conversation_id === args.conversation_id)?.excerpt ?? await tasks.readConversation(args.conversation_id, 24_000);
+            task = await tasks.adopt(args.conversation_id, { id, ...(args.title === undefined ? {} : { title: args.title }),
+              outcome: args.outcome ?? args.input, evidence, model, ...(args.sources === undefined ? {} : { sources: args.sources }) });
+          }
+        } else if (args.task_id === undefined) {
+          const related = await tasks.find(args.input + " " + (args.title ?? ""), args.sources ?? [], 8, execution.search);
+          if (related.matches.length > 0 && args.new_task !== true) {
+            return output({ related_conversations: related.matches, gaps: related.gaps, instruction: "Read and continue a matching task or imported conversation, or set new_task for a separate outcome." });
           }
           if (args.title === undefined || args.outcome === undefined) throw new TaskError("A new task needs a concise title and outcome");
           const configured = args.host === undefined ? execution.default_host === undefined ? execution.hosts[0] : execution.default_host
@@ -208,15 +253,15 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
       } }),
     record,
   ] });
-  const worker = defineExtension({ name: "task-worker", tools: [record,
-    defineTool({ name: "continue_agent", description: "Give an attached agent a follow-up in its existing conversation and terminal. A finished assignment reopens; its previous result stays in history.",
+  const worker = defineExtension({ name: "task-worker", tools: [record, searchTask, readTask,
+    defineTool({ name: "continue_agent", description: "Give an agent a follow-up in its existing conversation. After a closed task session is reopened, an unassigned agent gets a new named terminal in that session.",
       parameters: Type.Object({ agent_id: Type.String({ minLength: 1 }), input: Type.String({ minLength: 1, maxLength: 16000 }) }),
       async execute(args, api, context) {
-        executions.get(api.conversationId.toString());
+        const execution = executions.get(api.conversationId.toString());
         const owner = await tasks.owner(api.conversationId.toString());
         if (owner.agent !== undefined) throw new TaskError("Only the parent worker may continue task agents");
         const inputId = await api.memo("agent_input_id", randomUUID(), context);
-        return output(await tasks.continueAgent(owner.task.id, args.agent_id, args.input, inputId));
+        return output(await tasks.continueAgent(owner.task.id, args.agent_id, args.input, inputId, execution.call));
       } }),
     defineTool({ name: "spawn_agent", description: "Give a bounded assignment to a named terminal in this task's Rex session. The parent retains the overall outcome.",
       parameters: Type.Object({ title: Type.String({ minLength: 1, maxLength: 80 }),

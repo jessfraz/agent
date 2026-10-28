@@ -67,6 +67,28 @@ both use the same task conversation. Named child tabs return results while
 remaining available for follow-ups. Live activity shows tool names and exposed
 provider thinking text.
 
+TTY sessions use a Markdown TUI with model, reasoning, directory and activity
+status. Esc interrupts current work. A correction entered while the main agent
+is busy is shown as queued and unsent until its next turn; Esc stops the current
+turn first. `/history` or Ctrl+R loads older messages. Alt+Enter inserts a
+newline; `/exit` detaches. Use `agent --no-tui chat` for plain output or
+`agent --json chat` for protocol events.
+
+Import existing local Codex conversations after both services are connected:
+
+```sh
+agent import codex
+agent import status
+agent history search "supplier fabrication question"
+agent history read CONVERSATION_ID
+agent history open CONVERSATION_ID
+```
+
+The import creates no Rex sessions. Rerun the same command to resume partial
+reads and catch up changed conversations. `--host NAME` limits an import to a
+registered host. An unavailable source is reported as partial coverage, not
+silently skipped. [History](history.md) describes storage and retrieval.
+
 A CLI-only client uses the same `agent init --coordinator ...` command and
 skips the service. Phone access is the Rex phone CLI connected to one of these
 machines, running the same `agent chat` command.

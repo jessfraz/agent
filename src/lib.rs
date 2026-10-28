@@ -1,6 +1,8 @@
 pub mod config;
 pub mod context;
 pub mod discovery;
+pub mod embeddings;
+pub mod history;
 pub mod host;
 pub mod models;
 pub mod protocol;
@@ -15,3 +17,4 @@ pub mod instructions;
 pub mod intake;
 pub mod sources;
 pub mod tailnet;
+pub mod tui;

@@ -124,12 +124,19 @@ replies. Main and task CLIs render stored history with older pages available
 through `/history`; reading it does not submit it back to the model. Live
 activity exposes tool names and provider-supplied thinking text, without tool
 arguments, signatures or encrypted state.
+The Rust TUI renders Markdown with model, reasoning and directory status. A
+request-scoped interrupt cancels the current Pi turn and drains owned host
+operations before admitting the correction. Tool results remain recorded;
+interrupting cannot undo an external effect that already completed.
 
 Persist allocation intent before creating a session or terminal. A missing
 creation receipt becomes uncertain and requires reconciliation. History sync
 must never create an execution. Continuing an exited worker reuses its session;
 it creates a replacement terminal and closes only the recorded exited pane.
 Rex server restart recovery remains an open question below.
+Closing a whole session is different: positive native absence fences its old
+actor before a replacement session is bound to the same task on the same
+online host. Failed inspection and offline machines never prove closure.
 
 ## Sources and follow-through
 
@@ -203,9 +210,8 @@ store. CLI-only machines need no service. Provider credentials and personal
 instructions stay in their existing private locations. The public repository
 contains generic examples and synthetic test data.
 
-The initial terminal interface is a small Rust interactive CLI. Pi Durable
-provides the headless conversation engine; a richer TUI can replace the client
-later without changing ownership of conversations or tasks. See
+The Rust terminal interface uses Ratatui and keeps UI state separate from Pi's
+durable conversation engine. JSON and plain output remain available. See
 [setup](setup.md) for the commands and service configuration.
 
 App-owned ChatGPT OAuth credentials are validated, stored privately and
@@ -223,7 +229,7 @@ configured private credential provider.
 
 Cross-Mac recovery needs replicated conversation/event data, one fenced writer
 and explicit host transfer of execution. A synced record remains history until
-ownership is transferred. The [history proposal](history.md) covers inert Codex
+ownership is transferred. The [history implementation](history.md) covers inert Codex
 import, hybrid retrieval and reopening closed Rex sessions.
 
 Learning produces a proposed instruction/code diff and representative evaluation

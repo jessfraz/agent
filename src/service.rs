@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     future::{Future, pending},
     io,
@@ -133,7 +133,7 @@ async fn serve_with_transport(
 ) -> Result<()> {
     // Claim the writer before deciding an old socket is stale.
     let owner = Runtime::start(script, state)?;
-    let broker = match Broker::new(bootstrap.as_ref()) {
+    let broker = match Broker::new(bootstrap.as_ref(), state) {
         Ok(broker) => Arc::new(broker),
         Err(error) => {
             owner.close().await?;
@@ -276,6 +276,17 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     ensure!(
         !matches!(
             command,
+            RuntimeCommand::Interrupt
+                | RuntimeCommand::WorkerInput { .. }
+                | RuntimeCommand::DetachWorker
+                | RuntimeCommand::HostReply { .. }
+                | RuntimeCommand::OAuthCallback { .. }
+        ),
+        "Control commands require their active chat or login connection"
+    );
+    ensure!(
+        !matches!(
+            command,
             RuntimeCommand::ConfigureCoordinator { .. }
                 | RuntimeCommand::RegisterNode { .. }
                 | RuntimeCommand::SetConnectedNodes { .. }
@@ -302,6 +313,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     let attached = matches!(command, RuntimeCommand::RunTask { .. });
+    let interruptible = attached || matches!(command, RuntimeCommand::Chat { .. });
     let interactive = matches!(
         command,
         RuntimeCommand::RunTask {
@@ -313,15 +325,24 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     let mut input_closed = false;
     let mut output_closed = false;
     let mut host_calls = HashSet::new();
+    let mut effects = JoinSet::new();
+    let mut cancellations: HashMap<String, tokio::sync::watch::Sender<bool>> = HashMap::new();
     let result: Result<()> = async {
         loop {
             tokio::select! {
+                completed = effects.join_next(), if !effects.is_empty() => {
+                    let (call_id, result) = completed.context("Owned effect queue closed")??;
+                    cancellations.remove(&call_id);
+                    runtime.reply(call.request_id, call_id, result).await?;
+                }
                 event = call.events.recv() => {
                     let event = event.context("Coordinator closed before completing the request")?;
                     if let RuntimeEventKind::HostCall { call_id, command } = &event {
-                        if !attached || matches!(**command, HostCommand::ReadContext { .. } | HostCommand::SearchContext { .. }) {
-                            let result = broker.execute((**command).clone()).await;
-                            runtime.reply(call.request_id, call_id.clone(), result).await?;
+                        if !attached || matches!(**command, HostCommand::ReadContext { .. } | HostCommand::SearchContext { .. } | HostCommand::ReloadGuidance | HostCommand::Embed { .. }) {
+                            let (cancel, cancelled) = tokio::sync::watch::channel(false);
+                            cancellations.insert(call_id.clone(), cancel);
+                            let broker = broker.clone(); let command = (**command).clone(); let call_id = call_id.clone();
+                            effects.spawn(async move { (call_id, broker.execute_cancelled(command, cancelled).await) });
                             continue;
                         }
                         if input_closed {
@@ -329,6 +350,11 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                             continue;
                         }
                         host_calls.insert(call_id.clone());
+                    }
+                    if let RuntimeEventKind::HostCancel { call_id } = &event
+                        && let Some(cancel) = cancellations.get(call_id) {
+                        let _ = cancel.send(true);
+                        continue;
                     }
                     let done = matches!(event, RuntimeEventKind::Done);
                     if !output_closed && let Err(error) = write_frame(&mut writer, &event).await {
@@ -339,7 +365,19 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                     if done { return Ok(()); }
                 }
                 frame = reader.next_frame(), if !input_closed => {
-                    let Some(bytes) = frame? else {
+                    let bytes = match frame {
+                        Ok(bytes) => bytes,
+                        Err(_) if !attached => {
+                            // A dropped CLI does not revoke work it already
+                            // admitted. Keep the effect owner alive through its
+                            // real result, as with EOF or a failed output write.
+                            input_closed = true;
+                            output_closed = true;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let Some(bytes) = bytes else {
                         input_closed = true;
                         if interactive { runtime.worker_control(call.request_id, RuntimeCommand::DetachWorker).await?; }
                         for call_id in host_calls.drain() {
@@ -354,6 +392,9 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                             ensure!(host_calls.remove(&call_id), "Client replied to an unknown host call");
                             runtime.reply(call.request_id, call_id, result).await?;
                         }
+                        RuntimeCommand::Interrupt if interruptible => {
+                            runtime.worker_control(call.request_id, RuntimeCommand::Interrupt).await?;
+                        }
                         RuntimeCommand::OAuthCallback { target } if login => {
                             runtime.callback(call.request_id, target).await?;
                         }
@@ -366,6 +407,14 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }.await;
+    for cancel in cancellations.values() {
+        let _ = cancel.send(true);
+    }
+    while let Some(completed) = effects.join_next().await {
+        if let Ok((call_id, response)) = completed {
+            let _ = runtime.reply(call.request_id, call_id, response).await;
+        }
+    }
     runtime.detach(call.request_id).await;
     result
 }
@@ -420,6 +469,10 @@ impl Drop for SocketOwner {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "service/reset_tests.rs"]
+mod reset_tests;
 
 #[cfg(test)]
 mod tests {
@@ -842,7 +895,7 @@ mod tests {
             authenticated(
                 server,
                 rejected_runtime,
-                Arc::new(crate::broker::Broker::new(None).unwrap()),
+                Arc::new(crate::broker::Broker::new(None, std::path::Path::new("/tmp")).unwrap()),
                 async {
                     anyhow::bail!("Rejected synthetic peer");
                 },
@@ -865,7 +918,7 @@ mod tests {
             authenticated(
                 server,
                 allowed_runtime,
-                Arc::new(crate::broker::Broker::new(None).unwrap()),
+                Arc::new(crate::broker::Broker::new(None, std::path::Path::new("/tmp")).unwrap()),
                 async { Ok(()) },
             )
             .await

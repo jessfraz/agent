@@ -1,6 +1,8 @@
 use std::{fs, path::PathBuf};
 
-use agent_cli::protocol::{RuntimeEvent, RuntimeRequest, TaskOutcome};
+use agent_cli::protocol::{
+    HistoryImportBatch, HistoryImportReceipt, RuntimeEvent, RuntimeRequest, TaskOutcome,
+};
 use anyhow::Result;
 use schemars::schema_for;
 use ts_rs::{Config, TS};
@@ -12,6 +14,8 @@ fn main() -> Result<()> {
     RuntimeRequest::export_all(&config)?;
     RuntimeEvent::export_all(&config)?;
     TaskOutcome::export_all(&config)?;
+    HistoryImportBatch::export_all(&config)?;
+    HistoryImportReceipt::export_all(&config)?;
     fs::write(
         output.join("request.schema.json"),
         serde_json::to_string_pretty(&schema_for!(RuntimeRequest))?,

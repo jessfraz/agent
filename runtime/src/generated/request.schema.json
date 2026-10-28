@@ -218,8 +218,513 @@
         "sources"
       ]
     },
+    "EmbeddingBatch": {
+      "type": "object",
+      "properties": {
+        "space": {
+          "$ref": "#/$defs/EmbeddingSpace"
+        },
+        "vectors": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            }
+          }
+        }
+      },
+      "required": [
+        "space",
+        "vectors"
+      ]
+    },
+    "EmbeddingSpace": {
+      "type": "object",
+      "properties": {
+        "dimensions": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string"
+        },
+        "instruction_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "model_digest": {
+          "type": "string"
+        },
+        "model_revision": {
+          "type": "string"
+        },
+        "normalization": {
+          "type": "string"
+        },
+        "pooling": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "model_revision",
+        "model_digest",
+        "dimensions",
+        "pooling",
+        "normalization",
+        "instruction_version"
+      ]
+    },
+    "GuidanceSnapshot": {
+      "type": "object",
+      "properties": {
+        "sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GuidanceSource"
+          }
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "sources"
+      ]
+    },
+    "GuidanceSource": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ]
+    },
+    "HistoryAssetKind": {
+      "type": "string",
+      "enum": [
+        "local_media",
+        "inline_media",
+        "cold_evidence"
+      ]
+    },
+    "HistoryAssetRef": {
+      "type": "object",
+      "properties": {
+        "item_id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/HistoryAssetKind"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "item_id",
+        "version",
+        "kind",
+        "media_type"
+      ]
+    },
+    "HistoryGap": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/HistoryGapCode"
+        },
+        "item_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ]
+    },
+    "HistoryGapCode": {
+      "type": "string",
+      "enum": [
+        "missing",
+        "unsupported",
+        "oversized",
+        "unavailable",
+        "changed",
+        "invalid"
+      ]
+    },
+    "HistoryItem": {
+      "type": "object",
+      "properties": {
+        "assets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HistoryAssetRef"
+          }
+        },
+        "data": true,
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "order": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "role": {
+          "$ref": "#/$defs/HistoryRole"
+        },
+        "text": {
+          "type": "string"
+        },
+        "timestamp_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "turn_id",
+        "kind",
+        "role",
+        "text",
+        "version",
+        "order",
+        "data",
+        "assets"
+      ]
+    },
+    "HistoryResponse": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "threads": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/HistoryThread"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "list"
+            }
+          },
+          "required": [
+            "type",
+            "threads"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "complete": {
+              "type": "boolean"
+            },
+            "gaps": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/HistoryGap"
+              }
+            },
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/HistoryItem"
+              }
+            },
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "thread_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "read"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "thread_id",
+            "version",
+            "items",
+            "gaps",
+            "complete"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "data_base64": {
+              "type": "string"
+            },
+            "next_offset": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "offset": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "path": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string"
+            },
+            "total_bytes": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "asset"
+            }
+          },
+          "required": [
+            "type",
+            "path",
+            "offset",
+            "data_base64",
+            "total_bytes",
+            "sha256"
+          ]
+        }
+      ]
+    },
+    "HistoryRole": {
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "thinking",
+        "tool"
+      ]
+    },
+    "HistoryThread": {
+      "type": "object",
+      "properties": {
+        "archived": {
+          "type": "boolean"
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "forked_from_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "parent_thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "version": {
+          "type": "string"
+        },
+        "version_reliable": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "cwd",
+        "created_at",
+        "updated_at",
+        "version",
+        "archived"
+      ]
+    },
     "HostResult": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "context_repositories": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ContextRepository"
+              }
+            },
+            "context_sources": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/GuidanceSource"
+              }
+            },
+            "global": {
+              "$ref": "#/$defs/GuidanceSnapshot"
+            },
+            "type": {
+              "type": "string",
+              "const": "shared_guidance"
+            },
+            "workflow_policy": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "global",
+            "workflow_policy",
+            "context_repositories",
+            "context_sources"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "snapshot": {
+              "$ref": "#/$defs/GuidanceSnapshot"
+            },
+            "type": {
+              "type": "string",
+              "const": "project_guidance"
+            }
+          },
+          "required": [
+            "type",
+            "snapshot"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "response": {
+              "$ref": "#/$defs/HistoryResponse"
+            },
+            "type": {
+              "type": "string",
+              "const": "history"
+            }
+          },
+          "required": [
+            "type",
+            "response"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "batch": {
+              "$ref": "#/$defs/EmbeddingBatch"
+            },
+            "type": {
+              "type": "string",
+              "const": "embeddings"
+            }
+          },
+          "required": [
+            "type",
+            "batch"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "presence": {
+              "$ref": "#/$defs/WorkerPresence"
+            },
+            "type": {
+              "type": "string",
+              "const": "worker_presence"
+            }
+          },
+          "required": [
+            "type",
+            "presence"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -1096,6 +1601,103 @@
         {
           "type": "object",
           "properties": {
+            "hosts": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "import_codex"
+            }
+          },
+          "required": [
+            "type",
+            "hosts"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "import_status"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "limit": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "query": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "search_history"
+            }
+          },
+          "required": [
+            "type",
+            "query",
+            "limit"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "read_conversation"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "host": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "open_conversation"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "agent_id": {
               "type": [
                 "string",
@@ -1193,6 +1795,18 @@
             "type": {
               "type": "string",
               "const": "detach_worker"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "interrupt"
             }
           },
           "required": [
@@ -1616,6 +2230,50 @@
           ]
         }
       }
+    },
+    "WorkerPresence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "running": {
+              "type": "boolean"
+            },
+            "state": {
+              "type": "string",
+              "const": "present"
+            }
+          },
+          "required": [
+            "state",
+            "running"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "missing_session"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "missing_terminal"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        }
+      ]
     },
     "WorkerRef": {
       "type": "object",

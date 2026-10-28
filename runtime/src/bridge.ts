@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
@@ -12,7 +13,11 @@ import { CoordinatorEnvironment, EnvironmentError } from "./environment.js";
 import { ConversationModels, ModelError } from "./models.js";
 import { ChatGptAuth } from "./auth.js";
 import { validRequest, validEvent, errorEvent } from "./protocol.js";
-import { TaskError, TaskStore } from "./tasks.js";
+import { TaskError, TaskStore, type HostCall } from "./tasks.js";
+import { HistoryStore } from "./history.js";
+import { CodexImporter } from "./importer.js";
+import { Retrieval } from "./retrieval.js";
+import { createGuidance } from "./guidance.js";
 import { createAppTools, Executions, HostRequests } from "./tools.js";
 import { createSourceTools, SourceJournal } from "./sources.js";
 import { createResourceTools, ResourceStore } from "./resources.js";
@@ -34,7 +39,8 @@ function emit(id: number, event: RuntimeEventKind): void {
   process.stdout.write(`${JSON.stringify(frame)}\n`);
 }
 function failure(id: number, code: ErrorCode, message: string): void { emit(id, { type: "failure", code, message }); }
-const hostRequests = new HostRequests((id, call_id, command) => emit(id, { type: "host_call", call_id, command }));
+const hostRequests = new HostRequests((id, call_id, command) => emit(id, { type: "host_call", call_id, command }),
+  (id, call_id) => emit(id, { type: "host_cancel", call_id }));
 const inference = new ConversationModels(undefined, auth);
 const models = inference.models;
 
@@ -45,10 +51,15 @@ async function openApplication() {
   const registry = createRegistry();
   const harness = await Harness.open(storage, { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(harness, inference);
-  const environment = new CoordinatorEnvironment(harness); tasks.useEnvironment(environment);
+  const environment = new CoordinatorEnvironment(harness); environment.useLiveGuidance(); tasks.useEnvironment(environment);
+  const assets = join(state, "history", "assets");
+  const histories = new HistoryStore(harness, assets); tasks.useHistory(histories);
+  const importer = new CodexImporter(harness, histories, assets);
+  const retrieval = new Retrieval(harness, histories, tasks, join(state, "search.sqlite"));
   const executions = new Executions();
-  const sources = new SourceJournal(harness, tasks);
+  const sources = new SourceJournal(harness, tasks, executions);
   const tools = createAppTools(tasks, executions);
+  const guidance = createGuidance(executions); registry.install(guidance);
   const sourceTools = createSourceTools(sources, executions);
   const resources = new ResourceStore(harness, tasks);
   tasks.guardResources(resources);
@@ -58,15 +69,33 @@ async function openApplication() {
   registry.install(tools.worker);
   registry.install(sourceTools);
   registry.install(resourceTools);
-  return { harness, tasks, environment, executions, tools, sources, sourceTools, resources, resourceTools };
+  return { harness, tasks, environment, executions, tools, sources, sourceTools, resources, resourceTools, histories, importer, retrieval, guidance };
 }
 let application: ReturnType<typeof openApplication> | undefined;
 function app(): ReturnType<typeof openApplication> { return application ??= openApplication(); }
 let mainQueue = Promise.resolve();
+const activeConversations = new Map<number, import("@earendil-works/pi-durable").Conversation>();
+const activeCommands = new Set<number>();
+const interrupted = new Set<number>();
+const interrupts = new Map<number, Promise<void>>();
 const workers = new Map<number, { command: Extract<RuntimeCommand, { type: "run_task" }>; controller: AbortController }>();
 
+function searchFor(application: Awaited<ReturnType<typeof openApplication>>, id: number) {
+  return (query: string, refs: string[], limit: number) => application.retrieval.search(query, refs, limit,
+    (command) => hostRequests.call(id, command), application.importer.isRunning());
+}
+async function interrupt(id: number): Promise<void> {
+  interrupted.add(id);
+  if (interrupts.has(id)) return interrupts.get(id);
+  hostRequests.cancelRequest(id);
+  const conversation = activeConversations.get(id);
+  if (conversation === undefined) return;
+  const operation = (async () => { await conversation.abort(BACKGROUND_CONTEXT); emit(id, { type: "interrupted" }); })();
+  interrupts.set(id, operation); await operation;
+}
 async function handle(request: RuntimeRequest): Promise<void> {
   const { id, command } = request;
+  if (command.type === "chat" || command.type === "run_task") activeCommands.add(id);
   if (command.type === "run_task" && command.interactive === true) {
     workers.set(id, { command, controller: new AbortController() });
   }
@@ -93,6 +122,40 @@ async function handle(request: RuntimeRequest): Promise<void> {
         await auth.logout();
         emit(id, { type: "auth_status", status: await auth.status() });
         break;
+      case "import_codex": {
+        const application = await app(); const available = await application.environment.environment();
+        await application.importer.run(available.nodes, available.online_host_ids, command.hosts,
+          (operation) => hostRequests.call(id, operation), (progress) => emit(id, { type: "import_progress", progress }),
+          () => application.retrieval.sync((operation) => hostRequests.call(id, operation), true));
+        break;
+      }
+      case "import_status": emit(id, { type: "import_progress", progress: await (await app()).importer.status() }); break;
+      case "search_history": {
+        const application = await app();
+        const result = await application.tasks.find(command.query, [], command.limit, searchFor(application, id));
+        emit(id, { type: "saved_matches", ...result }); break;
+      }
+      case "read_conversation": {
+        for (const frame of await history(await (await app()).tasks.conversation(command.conversation_id), command.cursor)) emit(id, frame);
+        break;
+      }
+      case "open_conversation": {
+        const application = await app(); const { tasks, environment } = application;
+        const imported = await tasks.saved(command.conversation_id);
+        let task = (await tasks.list()).find((task) => task.conversation_id === command.conversation_id);
+        if (task === undefined && imported !== undefined) task = await tasks.adopt(command.conversation_id, {
+          id: randomUUID(), outcome: "Continue this historical conversation", evidence: await tasks.readConversation(command.conversation_id, 24_000), model: await environment.model(null),
+        });
+        if (task === undefined) throw new TaskError("This conversation has no task; run agent chat for the main conversation");
+        const hosts = await environment.hosts("/", null, []);
+        const host = task.worker.state === "bound" ? await tasks.workerHost(task.id)
+          : command.host === null ? await environment.defaultHost(hosts)
+          : hosts.find((host) => host.name === command.host || host.host_id === command.host);
+        if (host === null || host === undefined) throw new TaskError("Choose an online execution host");
+        const opened = await tasks.dispatch(task.id, host, (operation) => hostRequests.call(id, operation));
+        if (opened.worker.state !== "bound") throw new TaskError("Rex session allocation is unconfirmed; saved history is retained");
+        emit(id, { type: "notice", task_id: task.id, text: `Opened ${task.title}` }); break;
+      }
       case "list_tasks": emit(id, { type: "tasks", tasks: await (await app()).tasks.list() }); break;
       case "list_resources": emit(id, { type: "resources", resources: await (await app()).resources.list() }); break;
       case "collect_resources": emit(id, { type: "resources", resources: await (await app()).resources.collect(command.host_id, (operation) => hostRequests.call(id, operation)) }); break;
@@ -124,30 +187,44 @@ async function handle(request: RuntimeRequest): Promise<void> {
         break;
       }
       case "triage_sources": {
-        const { sources, environment, executions, tools, sourceTools, resourceTools } = await app();
+        const application = await app();
+        const { sources, environment, executions, tools, sourceTools, resourceTools, guidance } = application;
         if (await sources.hasWork()) {
           const hosts = await environment.hosts(command.cwd, null, command.hosts);
           const default_host = await environment.defaultHost(hosts);
           await sources.triage({ ...command, hosts }, (conversation, model) => executions.bind(conversation.id.toString(), {
-            model, cwd: command.cwd, hosts, default_host, role: "triage", call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
+            model, cwd: command.cwd, hosts, default_host, role: "triage", search: searchFor(application, id), call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
             notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
-          }), [tools.host, tools.main, sourceTools, resourceTools]);
+          }), [guidance, tools.host, tools.main, sourceTools, resourceTools]);
         }
         emit(id, { type: "sources", sources: await sources.states() });
         break;
       }
       case "run_task": {
-        const { tasks, executions, tools, sourceTools, resourceTools } = await app();
+        const application = await app();
+        const { tasks, executions, tools, sourceTools, resourceTools, guidance } = application;
         let stop: (() => Promise<void>) | undefined;
         try {
         const worker = workers.get(id);
         const answer = await tasks.run(command, (conversation, host, model) => executions.bind(conversation.id.toString(), {
-          model, cwd: command.cwd, hosts: [host], role: "worker", call: (operation) => hostRequests.call(id, operation),
+          model, cwd: command.cwd, hosts: [host], role: "worker", search: searchFor(application, id), call: (operation) => hostRequests.call(id, operation),
         }), (task, text) => emit(id, { type: "notice", task_id: task.id, text: `${task.title}: ${text}` }),
-        [tools.host, tools.worker, sourceTools, resourceTools], (operation) => hostRequests.call(id, operation), (selected) => inference.preflight(selected),
+        [guidance, tools.host, tools.worker, sourceTools, resourceTools], (operation) => hostRequests.call(id, operation), (selected) => inference.preflight(selected),
         worker === undefined ? undefined : {
           signal: worker.controller.signal,
+          async fence() { await interrupt(id); },
+          async beforeTurn() {
+            for (;;) {
+              const stopping = interrupts.get(id);
+              if (stopping === undefined) return;
+              await stopping;
+              if (interrupts.get(id) !== stopping) continue;
+              interrupts.delete(id); interrupted.delete(id); hostRequests.resumeRequest(id);
+            }
+          },
           async ready(conversation, title) {
+            activeConversations.set(id, conversation);
+            if (interrupted.has(id)) await interrupt(id);
             emit(id, { type: "task_ready", conversation_id: conversation.id.toString(), title });
             for (const frame of await history(conversation, null)) emit(id, frame);
             stop = await activity(tasks.session, conversation, (activity) => emit(id, { type: "activity", activity }),
@@ -162,29 +239,40 @@ async function handle(request: RuntimeRequest): Promise<void> {
       }
       case "chat": {
         const turn = mainQueue.then(async () => {
+          if (interrupted.has(id)) { emit(id, { type: "interrupted" }); return; }
           const selected = command.model ?? await (await app()).environment.model(null);
           await inference.preflight(selected);
-          const { harness, tasks, environment, executions, tools, sourceTools, resourceTools } = await app();
+          const application = await app();
+          const { harness, tasks, environment, executions, tools, sourceTools, resourceTools, guidance } = application;
           const hosts = await environment.hosts(command.cwd, command.origin_host_id, command.hosts);
           const default_host = await environment.defaultHost(hosts);
           const root = await harness.root(BACKGROUND_CONTEXT);
+          activeConversations.set(id, root);
+          if (interrupted.has(id)) { emit(id, { type: "interrupted" }); return; }
           await root.waitForIdle(BACKGROUND_CONTEXT);
+          if (interrupted.has(id)) { await interrupts.get(id); return; }
           const release = executions.bind(root.id.toString(), {
-            model: selected, cwd: command.cwd, hosts, default_host, call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
+            model: selected, cwd: command.cwd, hosts, default_host, search: searchFor(application, id),
+            project: () => hostRequests.call(id, command.origin_host_id === null
+              ? { type: "project_guidance", cwd: command.cwd }
+              : { type: "on_node", host_id: command.origin_host_id, command: { type: "project_guidance", cwd: command.cwd } }), call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
             notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
           });
           const stop = await activity(harness, root, (activity) => emit(id, { type: "activity", activity }));
           try {
-            const related = await tasks.search(command.input);
+            const related = (await tasks.find(command.input, [], 8, searchFor(application, id))).matches;
+            if (interrupted.has(id)) { await interrupts.get(id); return; }
             const relatedContext = related.length === 0 ? "" : "\n\nRelated existing tasks (read and reuse the matching task):\n" +
-              JSON.stringify(related.map((task) => ({ id: task.id, title: task.title, outcome: task.outcome, state: task.state, summary: task.summary })));
+              JSON.stringify(related);
             const hostsContext = "\n\nConnected worker hosts: " +
               JSON.stringify({ default_host_id: default_host?.host_id ?? null, origin_host_id: command.origin_host_id, project_cwd: command.cwd,
                 hosts: hosts.map((host) => ({ host_id: host.host_id, name: host.name, cwd: host.cwd })) });
             await inference.configure(root, selected, {
-              instructions: (await environment.instructions(command.instructions)) + relatedContext + hostsContext, cwd: command.cwd, extensions: [tools.host, tools.main, sourceTools, resourceTools] });
+              instructions: (await environment.instructions(command.instructions)) + relatedContext + hostsContext, cwd: command.cwd, extensions: [guidance, tools.host, tools.main, sourceTools, resourceTools] });
+            if (interrupted.has(id)) { await interrupts.get(id); return; }
             const submission = await root.submit({ type: "input", content: command.input }, BACKGROUND_CONTEXT);
             const settled = await submission.wait(BACKGROUND_CONTEXT);
+            if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted") { await interrupts.get(id); return; }
             if (settled.type !== "input" || settled.status !== "done") throw new TaskError("The model turn did not complete; its state is retained");
             const entry = await root.commit((tx) => tx.entry(AssistantEntry, settled.answer), BACKGROUND_CONTEXT);
             const text = entry?.model?.flatMap((message) => message.role !== "assistant" ? []
@@ -200,9 +288,16 @@ async function handle(request: RuntimeRequest): Promise<void> {
       default: throw new TaskError("This request is handled by the coordinator");
     }
   } catch (error) {
-    if (error instanceof TaskError || error instanceof ModelError || error instanceof EnvironmentError) failure(id, "invalid_request", error.message);
+    if (interrupted.has(id)) {
+      const stopping = interrupts.get(id);
+      if (stopping === undefined) emit(id, { type: "interrupted" });
+      else await stopping.catch(() => failure(id, "internal", "Interruption could not be confirmed; inspect current work"));
+    }
+    else if (error instanceof TaskError || error instanceof ModelError || error instanceof EnvironmentError) failure(id, "invalid_request", error.message);
     else emit(id, errorEvent(error));
   } finally {
+    await interrupts.get(id)?.catch(() => {});
+    activeCommands.delete(id); activeConversations.delete(id); interrupted.delete(id); interrupts.delete(id);
     workers.delete(id);
     hostRequests.finish(id);
     emit(id, { type: "done" });
@@ -221,6 +316,11 @@ try {
     }
     if (request.version !== VERSION) {
       failure(request.id, "invalid_request", "Unsupported protocol version"); emit(request.id, { type: "done" }); continue;
+    }
+    if (request.command.type === "interrupt") {
+      if (!activeCommands.has(request.id)) { failure(request.id, "invalid_request", "Interrupt requires its active chat connection"); continue; }
+      void interrupt(request.id).catch(() => failure(request.id, "internal", "Interruption could not be confirmed; inspect current work"));
+      continue;
     }
     if (request.command.type === "host_reply") {
       hostRequests.reply(request.id, request.command.call_id, request.command.result);
@@ -257,6 +357,6 @@ try {
 } finally {
   if (application !== undefined) {
     const opened = await application.catch(() => undefined);
-    if (opened !== undefined) await opened.harness.close(BACKGROUND_CONTEXT);
+    if (opened !== undefined) { opened.retrieval.close(); await opened.harness.close(BACKGROUND_CONTEXT); }
   }
 }

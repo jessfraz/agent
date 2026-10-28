@@ -3,7 +3,25 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use ts_rs::TS;
+
+pub const WORKFLOW_POLICY: &str = "Find relevant existing task conversations before creating a new one. Continue through them and report the result in the main conversation. Use allocate_worktree for new task worktrees so ownership and cleanup are recorded. Keep updates brief and actionable.";
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct GuidanceSource {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct GuidanceSnapshot {
+    pub text: String,
+    pub sources: Vec<GuidanceSource>,
+}
 
 pub fn default_path() -> Result<PathBuf> {
     let directory = match env::var_os("CODEX_HOME") {
@@ -19,12 +37,33 @@ pub fn default_path() -> Result<PathBuf> {
 /// guidance separately, without reading private context on the caller's Mac.
 pub fn global(path: &Path) -> Result<String> {
     Ok(format!(
-        "{}\n\nFind relevant existing task conversations before creating a new one. Continue through them and report the result in the main conversation. Use allocate_worktree for new task worktrees so ownership and cleanup are recorded. Keep updates brief and actionable.",
-        read_optional(path)?.unwrap_or_default()
+        "{}\n\n{WORKFLOW_POLICY}",
+        global_snapshot(path)?.text
     ))
 }
 
+/// File guidance stays separate from the application's stable workflow policy.
+pub fn global_snapshot(path: &Path) -> Result<GuidanceSnapshot> {
+    let mut snapshot = GuidanceSnapshot {
+        text: String::new(),
+        sources: Vec::new(),
+    };
+    if let Some(contents) = read_optional(path)? {
+        snapshot.sources.push(source(path, &contents)?);
+        snapshot.text = contents;
+    }
+    Ok(snapshot)
+}
+
 pub fn project(working_directory: &Path) -> Result<String> {
+    Ok(project_snapshot(working_directory)?.text)
+}
+
+pub fn project_snapshot(working_directory: &Path) -> Result<GuidanceSnapshot> {
+    ensure!(
+        working_directory.is_absolute(),
+        "Project guidance needs an absolute working directory"
+    );
     let mut directories: Vec<_> = working_directory.ancestors().collect();
     match directories
         .iter()
@@ -34,12 +73,28 @@ pub fn project(working_directory: &Path) -> Result<String> {
         None => directories.truncate(1),
     }
     let mut sections = Vec::new();
+    let mut sources = Vec::new();
     for directory in directories.into_iter().rev() {
-        if let Some(contents) = read_optional(&directory.join("AGENTS.md"))? {
+        let path = directory.join("AGENTS.md");
+        if let Some(contents) = read_optional(&path)? {
+            sources.push(source(&path, &contents)?);
             sections.push(format!("# Project instructions\n\n{contents}"));
         }
     }
-    Ok(sections.join("\n\n"))
+    Ok(GuidanceSnapshot {
+        text: sections.join("\n\n"),
+        sources,
+    })
+}
+
+fn source(path: &Path, contents: &str) -> Result<GuidanceSource> {
+    Ok(GuidanceSource {
+        path: std::path::absolute(path)?
+            .to_str()
+            .context("Guidance path is not UTF-8")?
+            .to_owned(),
+        sha256: format!("{:x}", Sha256::digest(contents.as_bytes())),
+    })
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>> {
@@ -52,7 +107,7 @@ fn read_optional(path: &Path) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::instructions::{global, project};
+    use crate::instructions::{global, global_snapshot, project, project_snapshot};
     use std::fs;
 
     #[test]
@@ -87,5 +142,48 @@ mod tests {
         assert!(updated.contains("Second version."));
         assert!(!updated.contains("First version."));
         assert!(project(&workspace).unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshots_refresh_hashes_and_remove_deleted_guidance() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        fs::create_dir(repository.join(".git")).unwrap();
+        let global = root.path().join("global.md");
+        let local = repository.join("AGENTS.md");
+        fs::write(&global, "Current global instructions.").unwrap();
+        fs::write(&local, "Current project instructions.").unwrap();
+        let first = global_snapshot(&global).unwrap();
+        let project_first = project_snapshot(&repository).unwrap();
+        assert_eq!(first.sources.len(), 1);
+        assert_eq!(first.sources[0].path, global.to_str().unwrap());
+        assert_eq!(project_first.sources[0].path, local.to_str().unwrap());
+        fs::write(&global, "Updated global instructions.").unwrap();
+        fs::write(&local, "Updated project instructions.").unwrap();
+        let second = global_snapshot(&global).unwrap();
+        let project_second = project_snapshot(&repository).unwrap();
+        assert_ne!(first.sources[0].sha256, second.sources[0].sha256);
+        assert_ne!(
+            project_first.sources[0].sha256,
+            project_second.sources[0].sha256
+        );
+        assert_eq!(second.text, "Updated global instructions.");
+        assert!(
+            project_second
+                .text
+                .contains("Updated project instructions.")
+        );
+        fs::remove_file(global).unwrap();
+        fs::remove_file(local).unwrap();
+        assert!(
+            global_snapshot(&root.path().join("global.md"))
+                .unwrap()
+                .text
+                .is_empty()
+        );
+        let removed = project_snapshot(&repository).unwrap();
+        assert!(removed.text.is_empty());
+        assert!(removed.sources.is_empty());
     }
 }

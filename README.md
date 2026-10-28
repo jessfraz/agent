@@ -42,6 +42,9 @@ their tasks; automatic transfer to another machine comes later.
 Rex task tabs open directly into chat and accept replies after a turn finishes.
 `agent` reopens the main conversation. Both show recent saved history;
 `/history` reads older pages and `/exit` detaches without deleting history.
+The terminal UI renders Markdown and shows the model, reasoning setting,
+directory and live activity. Esc interrupts a running turn; type a correction
+to steer it. Use `--no-tui` for the plain interface.
 
 For example, JLCPCB emails about a missing fabrication file. The agent finds
 the existing hardware task, attaches the email and continues its Rex session.
@@ -74,6 +77,8 @@ agent nodes
 agent tasks list
 agent sources
 agent usage
+agent import codex
+agent history search "fabrication files"
 ```
 
 [Setup](docs/setup.md) covers services, trust and provider CLIs. Commented TOML
@@ -83,8 +88,9 @@ model defaults, background sources and optional context repositories. Context
 is available without changing the directory where chat started. Hosts announce
 their own identity and launch paths, using Rex's host inventory when available.
 
-The CLI loads `$CODEX_HOME/AGENTS.md` or `~/.codex/AGENTS.md` and project
-instructions. Pi supplies inference and conversation machinery. ChatGPT is the
+The agent refreshes `$CODEX_HOME/AGENTS.md` or `~/.codex/AGENTS.md`, shared context
+and project instructions before each model round, including after compaction.
+Pi supplies inference and conversation machinery. ChatGPT is the
 default; other providers use Pi's environment or ambient credentials. New tasks
 inherit the coordinator's typed model, reasoning and fast-mode settings;
 resumed tasks retain their saved selection. `agent usage` reads the installed
@@ -101,8 +107,13 @@ Only merged, clean, inactive work is eligible. Missing helpers, uncertain
 ownership and partial results stay visible. Services check local resources
 every five minutes.
 
-The [architecture](docs/architecture.md) describes ownership and later recovery,
-history import, speech input and reviewed learning. Private settings,
+Codex imports are incremental. Saved conversations remain searchable after
+closing Rex; reopening relevant work reuses the same conversation. Local
+keyword and semantic search use a rebuildable SQLite index. See
+[history](docs/history.md) for import, coverage and reopening commands.
+
+The [architecture](docs/architecture.md) describes ownership, later recovery,
+speech input and reviewed learning. Private settings,
 credentials and conversations stay outside this repository.
 
 For development:

@@ -40,7 +40,7 @@ function sameEvent(left: SourceEvent, right: SourceEvent): boolean {
 /** Admission and checkpoints share Pi's atomic commit boundary. */
 export class SourceJournal {
   private triaging = false;
-  constructor(readonly session: Harness, readonly tasks: TaskStore) { tasks.trackOutcomes(this); }
+  constructor(readonly session: Harness, readonly tasks: TaskStore, private readonly executions?: Executions) { tasks.trackOutcomes(this); }
   /** Called inside the task mutation's transaction, never from a polling CLI. */
   async recordIn(tx: Tx, outcome: TaskOutcome, settled: boolean, attemptId?: string): Promise<void> {
     const journal = await tx.doc(Sources);
@@ -230,11 +230,12 @@ export class SourceJournal {
       if (content === null) {
         const records = await this.events({ keys: claimed.work.events, limit: 100, pending: true });
         const due = await Promise.all(claimed.work.due.map((task) => this.tasks.get(task.id)));
-        const related = records.length === 0 ? [] : await this.tasks.search(
-          records.map((record) => record.event.title).join(" "), records.map((record) => record.event.source));
+        const related = records.length === 0 ? { matches: [], gaps: [] } : await this.tasks.find(
+          records.map((record) => record.event.title).join(" "), records.map((record) => record.event.source), 8,
+          this.executions?.search(conversation.id.toString()));
         const prepared = "Continue this admitted source work; do not repeat completed actions.\n" + JSON.stringify({
           observed_at: new Date().toISOString(), events: records.map((record) => ({ key: record.key, event: record.event })),
-          due_followups: due, related_tasks: related,
+          due_followups: due, related_tasks: related.matches, retrieval_gaps: related.gaps,
         });
         await this.session.commit(async (tx) => {
           const journal = await tx.doc(Sources);

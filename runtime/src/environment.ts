@@ -35,7 +35,9 @@ function upsert(registry: Registry, node: AgentNode): void {
 /** Persist metadata; only the owning Rust broker declares a connection online. */
 export class CoordinatorEnvironment {
   private connected = new Set<string>();
+  private liveGuidance = false;
   constructor(readonly session: Harness) {}
+  useLiveGuidance(): void { this.liveGuidance = true; }
   async configure(bootstrap: CoordinatorBootstrap): Promise<void> {
     await this.session.commit(async (tx) => {
       const registry = await tx.doc(State);
@@ -58,6 +60,7 @@ export class CoordinatorEnvironment {
     return override ?? (await this.environment()).settings.model;
   }
   async instructions(project: string): Promise<string> {
+    if (this.liveGuidance) return "";
     const settings = (await this.session.snapshot(State, BACKGROUND_CONTEXT))?.settings;
     if (settings === null || settings === undefined) return project;
     return [settings.instructions, ...settings.context_repositories.map((repository) =>

@@ -3,12 +3,14 @@ mod state;
 mod usage;
 
 use std::{
+    collections::{HashMap, VecDeque},
     env,
     fs::OpenOptions,
     io::{ErrorKind, IsTerminal},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 
@@ -18,12 +20,13 @@ use agent_cli::{
     discovery, host, instructions, intake,
     models::{ModelProvider, ModelSelection, Reasoning},
     protocol::{
-        AuthStatus, CoordinatorBootstrap, CoordinatorSettings, RuntimeCommand, RuntimeEventKind,
-        TaskId, WorkerLaunch, WorkerRef,
+        AuthStatus, CoordinatorBootstrap, CoordinatorSettings, ImportPhase, RuntimeCommand,
+        RuntimeEventKind, TaskId, WorkerLaunch, WorkerRef,
     },
     rex::{BlockId, RexClient, SessionId},
     runtime::FrameReader,
     service,
+    tui::{Tui, TuiHandle, TuiInfo, TuiInput},
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
@@ -50,6 +53,9 @@ struct Arguments {
     coordinator: Option<String>,
     #[arg(long, global = true)]
     json: bool,
+    /// Use the plain line interface in an interactive terminal.
+    #[arg(long, global = true)]
+    no_tui: bool,
     #[command(subcommand)]
     command: Option<Action>,
 }
@@ -90,6 +96,16 @@ enum Action {
     Tasks {
         #[command(subcommand)]
         command: TasksAction,
+    },
+    /// Import local Codex history without creating tasks or Rex sessions.
+    Import {
+        #[command(subcommand)]
+        command: ImportAction,
+    },
+    /// Find, read or continue saved conversations.
+    History {
+        #[command(subcommand)]
+        command: HistoryAction,
     },
     /// Run this machine's coordinator or registered worker service.
     Serve {
@@ -195,6 +211,35 @@ enum TasksAction {
         allocation_id: String,
         #[arg(long)]
         agent_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportAction {
+    Codex {
+        /// Restrict import to these registered host IDs or names.
+        #[arg(long = "host")]
+        hosts: Vec<String>,
+    },
+    Status,
+}
+
+#[derive(Subcommand)]
+enum HistoryAction {
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=50))]
+        limit: u32,
+    },
+    Read {
+        conversation_id: String,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    Open {
+        conversation_id: String,
+        #[arg(long)]
+        host: Option<String>,
     },
 }
 
@@ -489,6 +534,29 @@ async fn main() -> Result<()> {
                 agent_id,
             },
         },
+        Action::Import { command } => match command {
+            ImportAction::Codex { hosts } => RuntimeCommand::ImportCodex { hosts },
+            ImportAction::Status => RuntimeCommand::ImportStatus,
+        },
+        Action::History { command } => match command {
+            HistoryAction::Search { query, limit } => {
+                RuntimeCommand::SearchHistory { query, limit }
+            }
+            HistoryAction::Read {
+                conversation_id,
+                cursor,
+            } => RuntimeCommand::ReadConversation {
+                conversation_id,
+                cursor,
+            },
+            HistoryAction::Open {
+                conversation_id,
+                host,
+            } => RuntimeCommand::OpenConversation {
+                conversation_id,
+                host,
+            },
+        },
         Action::RunTask {
             task_id,
             agent_id,
@@ -512,6 +580,29 @@ async fn main() -> Result<()> {
             prompt: Some(input),
             selection,
         } => {
+            if use_tui(&arguments) {
+                let model = selected_model(
+                    selection,
+                    &config,
+                    coordinator.as_deref(),
+                    &script,
+                    &directory,
+                )
+                .await?;
+                return chat_tui(
+                    &arguments,
+                    &config,
+                    coordinator.as_deref(),
+                    &script,
+                    &directory,
+                    &cwd,
+                    ChatStart {
+                        model,
+                        prompt: Some(input),
+                    },
+                )
+                .await;
+            }
             chat_command(
                 input,
                 selected_model(
@@ -538,12 +629,28 @@ async fn main() -> Result<()> {
                 &directory,
             )
             .await?;
+            if use_tui(&arguments) {
+                return chat_tui(
+                    &arguments,
+                    &config,
+                    coordinator.as_deref(),
+                    &script,
+                    &directory,
+                    &cwd,
+                    ChatStart {
+                        model,
+                        prompt: None,
+                    },
+                )
+                .await;
+            }
             let _watch = watch(
                 &config,
                 coordinator.as_deref(),
                 &script,
                 &directory,
                 arguments.json,
+                None,
             )
             .await?;
             let mut history_cursor = request(
@@ -610,6 +717,54 @@ async fn main() -> Result<()> {
         }
         _ => bail!("Unsupported client command"),
     };
+    if use_tui(&arguments)
+        && let RuntimeCommand::RunTask {
+            model,
+            cwd,
+            task_id,
+            agent_id,
+            allocation_id,
+            ..
+        } = &command
+    {
+        let owner = UiRecoveryOwner {
+            task_id: task_id.clone(),
+            agent_id: agent_id.clone(),
+            allocation_id: allocation_id.clone(),
+        };
+        let (handle, inputs, guard) = Tui::start(TuiInfo {
+            title: "Connecting to task".into(),
+            model: model.clone(),
+            cwd: cwd.clone(),
+        })?;
+        let mut ui = UiSession::new(handle, inputs);
+        let result = request_with_ui(
+            &arguments,
+            &config,
+            coordinator.as_deref(),
+            &script,
+            &directory,
+            command,
+            &mut ui,
+        )
+        .await
+        .map(|_| ());
+        let recovery = if result.is_err() {
+            Some(preserve_ui_recovery(&directory, owner, &ui).await)
+        } else {
+            None
+        };
+        let stopped = guard.stop().await;
+        match recovery {
+            Some(Ok(Some(path))) => eprintln!(
+                "Unsent input saved privately to {}. It will not be replayed automatically.",
+                path.display()
+            ),
+            Some(Err(error)) => eprintln!("Could not preserve unsent terminal input: {error}"),
+            _ => {}
+        }
+        return result.and(stopped);
+    }
     request(
         &arguments,
         &config,
@@ -628,6 +783,7 @@ async fn watch(
     script: &Path,
     directory: &Path,
     json: bool,
+    tui: Option<TuiHandle>,
 ) -> Result<WatchGuard> {
     let mut wire = connection(config, coordinator, script, directory, false).await?;
     write_command(&mut *wire.writer, &RuntimeCommand::Watch).await?;
@@ -639,12 +795,208 @@ async fn watch(
             let Ok(event) = serde_json::from_slice::<RuntimeEventKind>(&frame) else {
                 break;
             };
-            if matches!(event, RuntimeEventKind::Notice { .. }) && display(&event, json).is_err() {
-                break;
+            if matches!(event, RuntimeEventKind::Notice { .. }) {
+                if let Some(tui) = &tui {
+                    if tui.event(event).is_err() {
+                        break;
+                    }
+                } else if display(&event, json).is_err() {
+                    break;
+                }
             }
         }
-        eprintln!("Live updates disconnected; saved work is retained.");
+        if let Some(tui) = tui {
+            let _ = tui.event(RuntimeEventKind::Notice {
+                task_id: None,
+                text: "Live updates disconnected; saved work is retained.".into(),
+            });
+        } else {
+            eprintln!("Live updates disconnected; saved work is retained.");
+        }
     })))
+}
+
+fn use_tui(arguments: &Arguments) -> bool {
+    !arguments.json
+        && !arguments.no_tui
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+}
+
+struct ChatStart {
+    model: Option<ModelSelection>,
+    prompt: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UiRecoveryOwner {
+    task_id: TaskId,
+    agent_id: Option<String>,
+    allocation_id: String,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UiRecovery {
+    owner: UiRecoveryOwner,
+    draft: String,
+    queued_inputs: Vec<String>,
+}
+
+async fn preserve_ui_recovery(
+    directory: &Path,
+    owner: UiRecoveryOwner,
+    ui: &UiSession,
+) -> Result<Option<PathBuf>> {
+    let draft = ui.handle.draft().await?;
+    if draft.is_empty() && ui.queued.is_empty() {
+        return Ok(None);
+    }
+    write_ui_recovery(
+        directory,
+        &UiRecovery {
+            owner,
+            draft,
+            queued_inputs: ui.queued.iter().cloned().collect(),
+        },
+    )
+    .map(Some)
+}
+
+fn write_ui_recovery(directory: &Path, recovery: &UiRecovery) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = directory.join("recovery");
+    std::fs::create_dir_all(&directory)?;
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    let id = uuid::Uuid::new_v4();
+    let temporary = directory.join(format!(".tui-draft-{id}.tmp"));
+    let path = directory.join(format!("tui-draft-{id}.json"));
+    let saved = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        serde_json::to_writer(&mut file, recovery)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)?;
+        Ok(())
+    })();
+    if saved.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    saved?;
+    Ok(path)
+}
+struct UiSession {
+    handle: TuiHandle,
+    inputs: tokio::sync::mpsc::UnboundedReceiver<TuiInput>,
+    queued: VecDeque<String>,
+    history_cursor: Option<String>,
+    exiting: bool,
+    failure_shown: bool,
+}
+impl UiSession {
+    fn new(handle: TuiHandle, inputs: tokio::sync::mpsc::UnboundedReceiver<TuiInput>) -> Self {
+        Self {
+            handle,
+            inputs,
+            queued: VecDeque::new(),
+            history_cursor: None,
+            exiting: false,
+            failure_shown: false,
+        }
+    }
+    fn enqueue(&mut self, input: String) -> Result<()> {
+        self.handle.queued_user(input.clone())?;
+        self.queued.push_back(input);
+        Ok(())
+    }
+}
+struct Presentation<'a> {
+    handle: TuiHandle,
+    session: Option<&'a mut UiSession>,
+}
+
+async fn chat_tui(
+    arguments: &Arguments,
+    config: &ClientConfig,
+    coordinator: Option<&str>,
+    script: &Path,
+    directory: &Path,
+    cwd: &Path,
+    start: ChatStart,
+) -> Result<()> {
+    let effective = match &start.model {
+        Some(model) => model.clone(),
+        None => {
+            environment(config, coordinator, script, directory)
+                .await?
+                .model
+        }
+    };
+    let (handle, inputs, guard) = Tui::start(TuiInfo {
+        title: "Main agent".into(),
+        model: effective,
+        cwd: cwd.to_string_lossy().into_owned(),
+    })?;
+    let mut ui = UiSession::new(handle, inputs);
+    let result = async {
+        let _watch = watch(config, coordinator, script, directory, false, Some(ui.handle.clone())).await?;
+        ui.history_cursor = request_presented(arguments, config, coordinator, script, directory,
+            RuntimeCommand::ReadHistory { task_id: None, agent_id: None, cursor: None },
+            Some(Presentation { handle: ui.handle.clone(), session: None })).await?;
+        if let Some(prompt) = start.prompt { ui.enqueue(prompt)?; }
+        let mut paused = false;
+        while !ui.exiting {
+            if paused || ui.queued.is_empty() {
+                match ui.inputs.recv().await.unwrap_or(TuiInput::Exit) {
+                    TuiInput::Submit(input) => { ui.enqueue(input)?; paused = false; }
+                    TuiInput::History => {
+                        if let Some(cursor) = ui.history_cursor.take() {
+                            ui.history_cursor = request_presented(arguments, config, coordinator, script, directory,
+                                RuntimeCommand::ReadHistory { task_id: None, agent_id: None, cursor: Some(cursor) },
+                                Some(Presentation { handle: ui.handle.clone(), session: None })).await?;
+                        } else { ui.handle.event(RuntimeEventKind::Notice { task_id: None, text: "No older history.".into() })?; }
+                        continue;
+                    }
+                    TuiInput::Interrupt => { ui.handle.working(false)?; continue; }
+                    TuiInput::Exit => break,
+                }
+            }
+            let Some(input) = ui.queued.front().cloned() else { continue; };
+            let prepared = async {
+                let model = match &start.model {
+                    Some(model) => model.clone(),
+                    None => environment(config, coordinator, script, directory).await?.model,
+                };
+                ui.handle.set_status(TuiInfo { title: "Main agent".into(), model, cwd: cwd.to_string_lossy().into_owned() })?;
+                chat_command(input.clone(), start.model.clone(), cwd).await
+            }.await;
+            let command = match prepared {
+                Ok(command) => command,
+                Err(error) => {
+                    ui.handle.working(false)?;
+                    ui.handle.event(RuntimeEventKind::Failure { code: agent_cli::protocol::ErrorCode::Internal, message: error.to_string() })?;
+                    paused = true;
+                    continue;
+                }
+            };
+            ui.queued.pop_front();
+            ui.handle.say_user(input)?;
+            ui.handle.working(true)?;
+            if let Err(error) = request_with_ui(arguments, config, coordinator, script, directory, command, &mut ui).await {
+                ui.handle.working(false)?;
+                if !ui.failure_shown { ui.handle.event(RuntimeEventKind::Failure { code: agent_cli::protocol::ErrorCode::Internal, message: error.to_string() })?; }
+                if !ui.queued.is_empty() { ui.handle.event(RuntimeEventKind::Notice { task_id: None, text: format!("{} messages remain queued, unsent. The next submission resumes the queue.", ui.queued.len()) })?; }
+                paused = true;
+            }
+        }
+        Ok(())
+    }.await;
+    let stopped = guard.stop().await;
+    if !ui.queued.is_empty() {
+        eprintln!("{} queued messages were not sent.", ui.queued.len());
+    }
+    result.and(stopped)
 }
 
 async fn exchange(
@@ -739,6 +1091,7 @@ async fn worker_service(
         coordinator.is_some(),
         "A worker needs a selected coordinator"
     );
+    let executor = Arc::new(host::Executor::new(directory));
     let mut delay = 1;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -803,17 +1156,31 @@ async fn worker_service(
                 }
             }));
             let mut effects = tokio::task::JoinSet::new();
+            let mut cancellations: HashMap<String, tokio::sync::watch::Sender<bool>> =
+                HashMap::new();
             loop {
                 tokio::select! {
                     completed = effects.join_next(), if !effects.is_empty() => {
                         let (call_id,result) = completed.context("Worker effect queue closed")??;
+                        cancellations.remove(&call_id);
                         write_command(&mut *wire.writer, &RuntimeCommand::HostReply {call_id,result}).await?;
                     }
-                    frame = reader.next_frame(), if effects.len() < 32 => {
+                    frame = reader.next_frame() => {
                         let frame = frame?.context("Coordinator closed the worker connection")?;
                         let event: RuntimeEventKind = serde_json::from_slice(&frame)?;
+                        if let RuntimeEventKind::HostCancel { call_id } = &event {
+                            if let Some(cancel) = cancellations.get(call_id) { let _ = cancel.send(true); }
+                            continue;
+                        }
                         let RuntimeEventKind::HostCall {call_id,command} = event else { bail!("Unexpected event on the registered worker connection"); };
-                        effects.spawn(async move { (call_id,host::execute(*command).await) });
+                        if effects.len() >= 32 {
+                            write_command(&mut *wire.writer, &RuntimeCommand::HostReply { call_id, result: agent_cli::protocol::HostResult::Failed { message: "The worker is busy; no command was started".into() } }).await?;
+                            continue;
+                        }
+                        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+                        ensure!(cancellations.insert(call_id.clone(), cancel).is_none(), "A host call ID is already running");
+                        let executor = executor.clone();
+                        effects.spawn(async move { (call_id,executor.execute_cancelled(*command, cancelled).await) });
                     }
                 }
             }
@@ -1067,8 +1434,60 @@ async fn request(
     directory: &Path,
     command: RuntimeCommand,
 ) -> Result<Option<String>> {
+    request_presented(
+        arguments,
+        config,
+        coordinator,
+        script,
+        directory,
+        command,
+        None,
+    )
+    .await
+}
+
+async fn request_with_ui(
+    arguments: &Arguments,
+    config: &ClientConfig,
+    coordinator: Option<&str>,
+    script: &Path,
+    directory: &Path,
+    command: RuntimeCommand,
+    ui: &mut UiSession,
+) -> Result<Option<String>> {
+    ui.failure_shown = false;
+    request_presented(
+        arguments,
+        config,
+        coordinator,
+        script,
+        directory,
+        command,
+        Some(Presentation {
+            handle: ui.handle.clone(),
+            session: Some(ui),
+        }),
+    )
+    .await
+}
+
+async fn request_presented(
+    arguments: &Arguments,
+    config: &ClientConfig,
+    coordinator: Option<&str>,
+    script: &Path,
+    directory: &Path,
+    command: RuntimeCommand,
+    mut presentation: Option<Presentation<'_>>,
+) -> Result<Option<String>> {
     let login = matches!(command, RuntimeCommand::Login);
     let attached = matches!(command, RuntimeCommand::RunTask { .. });
+    let chat = matches!(command, RuntimeCommand::Chat { .. });
+    let mut active_turn = chat || attached;
+    let importing = matches!(command, RuntimeCommand::ImportCodex { .. });
+    let mut ui_controls = presentation
+        .as_ref()
+        .is_some_and(|view| view.session.is_some());
     let mut interactive = matches!(
         command,
         RuntimeCommand::RunTask {
@@ -1086,6 +1505,8 @@ async fn request(
     let mut history_cursor = None;
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut operations = tokio::task::JoinSet::new();
+    let mut cancellations: HashMap<String, tokio::sync::watch::Sender<bool>> = HashMap::new();
+    let executor = Arc::new(host::Executor::new(directory));
     let mut thinking = false;
     let mut wire = connection(config, coordinator, script, directory, login).await?;
     let relay_needed = match (
@@ -1108,6 +1529,7 @@ async fn request(
     let mut reader = FrameReader::new(BufReader::new(wire.reader));
     let mut failure = None;
     let mut outcome = false;
+    let mut progress_key = None;
     loop {
         let frame = tokio::select! {
             frame = reader.next_frame() => frame?.context("Coordinator disconnected; saved work is retained")?,
@@ -1120,7 +1542,47 @@ async fn request(
                 write_command(&mut *wire.writer, &RuntimeCommand::OAuthCallback { target: target? }).await?;
                 continue;
             }
-            line = input.next_line(), if interactive && ready => {
+            action = async {
+                match presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
+                    Some(ui) => ui.inputs.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if ui_controls => {
+                let action = action.unwrap_or(TuiInput::Exit);
+                match action {
+                    TuiInput::Submit(text) => {
+                        let ui = presentation.as_mut().and_then(|view| view.session.as_deref_mut()).context("Missing terminal input owner")?;
+                        if attached && ready {
+                            active_turn = true;
+                            ui.handle.say_user(text.clone())?;
+                            write_command(&mut *wire.writer, &RuntimeCommand::WorkerInput { input_id: uuid::Uuid::new_v4().to_string(), input: text }).await?;
+                        } else { ui.enqueue(text)?; }
+                    }
+                    TuiInput::Interrupt => {
+                        if active_turn { write_command(&mut *wire.writer, &RuntimeCommand::Interrupt).await?; }
+                        else if let Some(view) = &presentation { view.handle.working(false)?; }
+                    }
+                    TuiInput::History => {
+                        let view = presentation.as_mut().context("Missing terminal presentation")?;
+                        let cursor = if attached { history_cursor.take() } else { view.session.as_mut().and_then(|ui| ui.history_cursor.take()) };
+                        if let Some(cursor) = cursor {
+                            let (task_id, agent_id) = history_target.clone().map_or((None, None), |(task, agent)| (Some(task), agent));
+                            let next = Box::pin(request_presented(arguments, config, coordinator, script, directory,
+                                RuntimeCommand::ReadHistory { task_id, agent_id, cursor: Some(cursor) },
+                                Some(Presentation { handle: view.handle.clone(), session: None }))).await?;
+                            if attached { history_cursor = next; } else if let Some(ui) = view.session.as_mut() { ui.history_cursor = next; }
+                        } else { view.handle.event(RuntimeEventKind::Notice { task_id: None, text: "No older history.".into() })?; }
+                    }
+                    TuiInput::Exit => {
+                        if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) { ui.exiting = true; }
+                        if active_turn { write_command(&mut *wire.writer, &RuntimeCommand::Interrupt).await?; }
+                        if attached { write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?; }
+                        ui_controls = false;
+                    }
+                }
+                continue;
+            }
+            line = input.next_line(), if interactive && ready && presentation.is_none() => {
                 let line = line?;
                 if line.as_deref().is_none_or(|line| line.trim() == "/exit") {
                     write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?;
@@ -1143,7 +1605,7 @@ async fn request(
                 }
                 continue;
             }
-            signal = tokio::signal::ctrl_c(), if interactive => {
+            signal = tokio::signal::ctrl_c(), if interactive && presentation.is_none() => {
                 signal?;
                 write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?;
                 interactive = false;
@@ -1152,6 +1614,7 @@ async fn request(
             completed = operations.join_next(), if !operations.is_empty() => {
                 if let Some(completed) = completed {
                     let (call_id, result) = completed.context("Host execution task stopped")?;
+                    cancellations.remove(&call_id);
                     write_command(&mut *wire.writer, &RuntimeCommand::HostReply { call_id, result }).await?;
                 }
                 continue;
@@ -1159,13 +1622,55 @@ async fn request(
         };
         let event: RuntimeEventKind =
             serde_json::from_slice(&frame).context("Coordinator returned an invalid event")?;
+        match &event {
+            RuntimeEventKind::Activity { .. }
+            | RuntimeEventKind::Message {
+                message:
+                    agent_cli::protocol::HistoryMessage {
+                        role: agent_cli::protocol::HistoryRole::User,
+                        ..
+                    },
+            } => active_turn = true,
+            RuntimeEventKind::Answer { .. }
+            | RuntimeEventKind::Interrupted
+            | RuntimeEventKind::WorkerIdle => active_turn = false,
+            _ => {}
+        }
+        // The chief's Watch connection already carries notices; workers show their direct answers.
+        if let Some(view) = &presentation
+            && !matches!(event, RuntimeEventKind::Notice { .. })
+        {
+            view.handle.event(event.clone())?;
+        }
         match event {
             RuntimeEventKind::HostCall { call_id, command } => {
                 ensure!(
                     attached,
                     "Only an attached task worker may execute coordinator host calls"
                 );
-                operations.spawn(async move { (call_id, host::execute(*command).await) });
+                let executor = executor.clone();
+                let (cancel, cancelled) = tokio::sync::watch::channel(false);
+                ensure!(
+                    cancellations.insert(call_id.clone(), cancel).is_none(),
+                    "A host call ID is already running"
+                );
+                operations.spawn(async move {
+                    (
+                        call_id,
+                        executor.execute_cancelled(*command, cancelled).await,
+                    )
+                });
+            }
+            RuntimeEventKind::HostCancel { call_id } => {
+                if let Some(cancel) = cancellations.get(&call_id) {
+                    let _ = cancel.send(true);
+                }
+            }
+            RuntimeEventKind::Interrupted => {
+                outcome = true;
+                if presentation.is_none() {
+                    display(&RuntimeEventKind::Interrupted, arguments.json)?;
+                }
             }
             RuntimeEventKind::AuthorizationUrl { url } => {
                 ensure!(
@@ -1180,13 +1685,34 @@ async fn request(
                 eprintln!("Finish ChatGPT sign-in in Chrome.");
             }
             RuntimeEventKind::Failure { message, .. } => {
+                if let Some(ui) = presentation
+                    .as_mut()
+                    .and_then(|view| view.session.as_deref_mut())
+                {
+                    ui.failure_shown = true;
+                }
                 failure = Some(message);
             }
             RuntimeEventKind::Done => break,
             RuntimeEventKind::TaskReady { ref title, .. } => {
                 ready = true;
                 outcome = true;
-                if arguments.json {
+                if let Some(ui) = presentation
+                    .as_mut()
+                    .and_then(|view| view.session.as_deref_mut())
+                {
+                    while let Some(text) = ui.queued.pop_front() {
+                        ui.handle.say_user(text.clone())?;
+                        write_command(
+                            &mut *wire.writer,
+                            &RuntimeCommand::WorkerInput {
+                                input_id: uuid::Uuid::new_v4().to_string(),
+                                input: text,
+                            },
+                        )
+                        .await?;
+                    }
+                } else if arguments.json {
                     display(&event, true)?;
                 } else {
                     println!("{title}\n");
@@ -1197,9 +1723,14 @@ async fn request(
             } => {
                 history_cursor = next_cursor.clone();
                 outcome = true;
-                display(&event, arguments.json)?;
+                if presentation.is_none() {
+                    display(&event, arguments.json)?;
+                }
             }
             RuntimeEventKind::WorkerIdle => {
+                if presentation.is_some() {
+                    continue;
+                }
                 if arguments.json {
                     display(&event, true)?;
                 } else if std::io::stdin().is_terminal() {
@@ -1208,7 +1739,9 @@ async fn request(
                     stdout.flush().await?;
                 }
             }
-            RuntimeEventKind::Activity { ref activity } if !arguments.json => {
+            RuntimeEventKind::Activity { ref activity }
+                if !arguments.json && presentation.is_none() =>
+            {
                 use agent_cli::protocol::ModelActivity;
                 match activity {
                     ModelActivity::Thinking { text } => {
@@ -1229,9 +1762,31 @@ async fn request(
                     ModelActivity::ToolFinished { .. } => {}
                 }
             }
-            RuntimeEventKind::Notice { text, .. } if !arguments.json => {
+            RuntimeEventKind::Notice { text, .. } if !arguments.json && presentation.is_none() => {
                 if !attached {
                     eprintln!("{text}");
+                }
+            }
+            RuntimeEventKind::ImportProgress { ref progress } => {
+                outcome = true;
+                let key = (
+                    import_phase(&progress.phase),
+                    progress.threads_seen / 100,
+                    progress
+                        .threads_imported
+                        .saturating_add(progress.threads_unchanged)
+                        / 100,
+                    progress.items_added / 1000,
+                );
+                if arguments.json || progress_key.as_ref() != Some(&key) {
+                    display(&event, arguments.json)?;
+                    progress_key = Some(key);
+                }
+                if importing && matches!(progress.phase, ImportPhase::Partial) {
+                    failure = Some(format!(
+                        "History import is partial ({} gaps); committed history and checkpoints are retained",
+                        progress.gap_count
+                    ));
                 }
             }
             other => {
@@ -1240,7 +1795,9 @@ async fn request(
                     thinking = false;
                 }
                 outcome = true;
-                display(&other, arguments.json)?;
+                if presentation.is_none() {
+                    display(&other, arguments.json)?;
+                }
             }
         }
     }
@@ -1269,6 +1826,49 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
         return Ok(());
     }
     match event {
+        RuntimeEventKind::Interrupted => println!("Interrupted."),
+        RuntimeEventKind::ImportProgress { progress } => {
+            println!(
+                "{}: {} imported, {} unchanged, {} seen; {} items added, {} assets, {} gaps",
+                import_phase_name(&progress.phase),
+                progress.threads_imported,
+                progress.threads_unchanged,
+                progress.threads_seen,
+                progress.items_added,
+                progress.assets_saved,
+                progress.gap_count
+            );
+            if matches!(progress.phase, ImportPhase::Complete | ImportPhase::Partial) {
+                for gap in progress.gaps.iter().take(3) {
+                    eprintln!("  {gap}");
+                }
+                if progress.gaps.len() > 3 {
+                    eprintln!(
+                        "  {} more gaps; use --json for details.",
+                        progress.gaps.len() - 3
+                    );
+                }
+            }
+        }
+        RuntimeEventKind::SavedMatches { matches, gaps } => {
+            for found in matches {
+                println!(
+                    "{}  {}\n{}\n",
+                    found.conversation_id,
+                    found.title,
+                    found.excerpt.chars().take(240).collect::<String>()
+                );
+            }
+            for gap in gaps.iter().take(3) {
+                eprintln!("Search coverage: {gap}");
+            }
+            if gaps.len() > 3 {
+                eprintln!(
+                    "{} more retrieval gaps; use --json for details.",
+                    gaps.len() - 3
+                );
+            }
+        }
         RuntimeEventKind::AuthStatus { status } => match status {
             AuthStatus::SignedOut => println!("Not signed in. Run agent login."),
             AuthStatus::NeedsSignIn { .. } => println!("ChatGPT needs sign-in. Run agent login."),
@@ -1401,12 +2001,124 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn import_phase(phase: &ImportPhase) -> u8 {
+    match phase {
+        ImportPhase::Discovering => 0,
+        ImportPhase::Importing => 1,
+        ImportPhase::Indexing => 2,
+        ImportPhase::Complete => 3,
+        ImportPhase::Partial => 4,
+    }
+}
+fn import_phase_name(phase: &ImportPhase) -> &'static str {
+    match phase {
+        ImportPhase::Discovering => "Discovering",
+        ImportPhase::Importing => "Importing",
+        ImportPhase::Indexing => "Indexing",
+        ImportPhase::Complete => "Complete",
+        ImportPhase::Partial => "Partial",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{Action, Arguments, ModelArgs, local_service_command};
     use agent_cli::models::{ModelProvider, ModelSelection, Reasoning};
     use clap::Parser;
     use std::path::Path;
+
+    #[test]
+    fn history_import_and_terminal_flags_parse_into_typed_commands() {
+        let parsed = Arguments::try_parse_from([
+            "agent", "--no-tui", "import", "codex", "--host", "desktop", "--host", "laptop",
+        ])
+        .unwrap();
+        assert!(parsed.no_tui);
+        assert!(
+            matches!(parsed.command, Some(Action::Import { command: crate::ImportAction::Codex { hosts } }) if hosts == ["desktop", "laptop"])
+        );
+        let parsed = Arguments::try_parse_from([
+            "agent",
+            "history",
+            "search",
+            "a different phrase",
+            "--limit",
+            "5",
+        ])
+        .unwrap();
+        assert!(
+            matches!(parsed.command, Some(Action::History { command: crate::HistoryAction::Search { query, limit: 5 } }) if query == "a different phrase")
+        );
+        assert!(
+            Arguments::try_parse_from(["agent", "history", "search", "query", "--limit", "0"])
+                .is_err()
+        );
+        let parsed = Arguments::try_parse_from([
+            "agent",
+            "history",
+            "read",
+            "stored-conversation",
+            "--cursor",
+            "opaque-cursor",
+        ])
+        .unwrap();
+        assert!(
+            matches!(parsed.command, Some(Action::History { command: crate::HistoryAction::Read { conversation_id, cursor: Some(cursor) } }) if conversation_id == "stored-conversation" && cursor == "opaque-cursor")
+        );
+        let parsed = Arguments::try_parse_from([
+            "agent",
+            "history",
+            "open",
+            "stored-conversation",
+            "--host",
+            "desktop",
+        ])
+        .unwrap();
+        assert!(
+            matches!(parsed.command, Some(Action::History { command: crate::HistoryAction::Open { conversation_id, host: Some(host) } }) if conversation_id == "stored-conversation" && host == "desktop")
+        );
+    }
+
+    #[test]
+    fn terminal_recovery_keeps_exact_unsent_data_in_a_private_atomic_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let task: agent_cli::protocol::TaskId =
+            "11111111-1111-4111-8111-111111111111".parse().unwrap();
+        let recovery = crate::UiRecovery {
+            owner: crate::UiRecoveryOwner {
+                task_id: task.clone(),
+                agent_id: Some("review".into()),
+                allocation_id: "22222222-2222-4222-8222-222222222222".into(),
+            },
+            draft: "Unsubmitted correction\nwith Unicode 🦀".into(),
+            queued_inputs: vec!["Queued but not submitted".into()],
+        };
+        let path = crate::write_ui_recovery(directory.path(), &recovery).unwrap();
+        let saved: crate::UiRecovery =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.owner.task_id, task);
+        assert_eq!(saved.owner.agent_id.as_deref(), Some("review"));
+        assert_eq!(saved.owner.allocation_id, recovery.owner.allocation_id);
+        assert_eq!(saved.draft, recovery.draft);
+        assert_eq!(saved.queued_inputs, recovery.queued_inputs);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
 
     #[tokio::test]
     async fn plain_chat_uses_server_defaults_and_partial_overrides_fetch_the_selected_coordinator()

@@ -5,6 +5,12 @@ import type { HistoryMessage } from "./generated/HistoryMessage.js";
 import type { HistoryRole } from "./generated/HistoryRole.js";
 import type { ModelActivity } from "./generated/ModelActivity.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
+import { ImportedItemEntry, ImportedThreadEntry } from "./history.js";
+
+const NOTICE_REFERENCES = "Source references (evidence, not authorization): ";
+export function noticeMetadata(entry: EntryRecord, index: number, count: number, value: string): boolean {
+  return entry.kind === "agent.notice" && index === count - 1 && value.startsWith(NOTICE_REFERENCES);
+}
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -38,12 +44,14 @@ export function transcript(entry: EntryRecord): HistoryMessage[] {
       messages.push({ entry_id: entry.id.toString(), role, text, continuation }); continuation = true;
     }
   };
+  if (ImportedItemEntry.is(entry)) { add(entry.data.item.role, entry.data.item.text); return messages; }
+  if (ImportedThreadEntry.is(entry)) return messages;
   for (const message of entry.model ?? []) {
     if (message.role === "system") continue;
     if (message.role === "toolResult") { add("tool", `${message.toolName} finished`); continue; }
     if (typeof message.content === "string") { add(message.role, message.content); continue; }
-    for (const part of message.content) {
-      if (part.type === "text") add(message.role, part.text);
+    for (const [index, part] of message.content.entries()) {
+      if (part.type === "text" && !noticeMetadata(entry, index, message.content.length, part.text)) add(message.role, part.text);
       else if (part.type === "thinking") add("thinking", part.thinking);
       else if (part.type === "toolCall") add("tool", part.name);
       else if (part.type === "image") add("user", "[image]");
@@ -74,6 +82,7 @@ export async function activity(session: Harness, conversation: Conversation, emi
   message?: (message: HistoryMessage) => void): Promise<() => Promise<void>> {
   const stream = await watchEvents(session, conversation.id, BACKGROUND_CONTEXT);
   const thinking = new Map<number, string>();
+  let assistantOpen = false;
   const update = (index: number, text: string) => {
     const previous = thinking.get(index) ?? "";
     const append = text.startsWith(previous) ? text.slice(previous.length) : "\n" + text;
@@ -83,13 +92,15 @@ export async function activity(session: Harness, conversation: Conversation, emi
   stream.start(async (events) => {
     for (const event of events) {
       if (event.type === "message_start") {
-        thinking.clear();
-        if (event.message.role === "assistant") event.message.content.forEach((part, index) => {
-          if (part.type === "thinking") update(index, part.thinking);
-        });
+        if (event.message.role === "assistant") {
+          if (!assistantOpen) thinking.clear();
+          assistantOpen = true;
+          event.message.content.forEach((part, index) => { if (part.type === "thinking") update(index, part.thinking); });
+        }
       } else if (event.type === "message_update") {
+        const whole = new Set(event.changes.flatMap((change) => (change.type === "thinking_start" || change.type === "block") && change.block.type === "thinking" ? [change.contentIndex] : []));
         for (const change of event.changes) {
-          if (change.type === "thinking_delta") update(change.contentIndex, (thinking.get(change.contentIndex) ?? "") + change.delta);
+          if (change.type === "thinking_delta" && !whole.has(change.contentIndex)) update(change.contentIndex, (thinking.get(change.contentIndex) ?? "") + change.delta);
           else if ((change.type === "thinking_start" || change.type === "block") && change.block.type === "thinking") update(change.contentIndex, change.block.thinking);
           else if (change.type === "message") change.message.content.forEach((part, index) => {
             if (part.type === "thinking") update(index, part.thinking);
@@ -101,6 +112,7 @@ export async function activity(session: Harness, conversation: Conversation, emi
         for (const message of event.entry.model ?? []) if (message.role === "assistant") message.content.forEach((part, index) => {
           if (part.type === "thinking") update(index, part.thinking);
         });
+        if (event.entry.model?.some((message) => message.role === "assistant")) assistantOpen = false;
       } else if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
         emit({ type: event.type === "tool_execution_start" ? "tool_started" : "tool_finished",
           call_id: event.toolCallId, name: event.toolName });

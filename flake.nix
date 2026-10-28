@@ -10,6 +10,10 @@
     darwinModules.default = import ./nix/module.nix {inherit self;};
     packages = eachSystem (system: let
       pkgs = import nixpkgs {inherit system;};
+      embeddingModel = pkgs.fetchurl {
+        url = "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/370f27d7550e0def9b39c1f16d3fbaa13aa67728/Qwen3-Embedding-0.6B-Q8_0.gguf";
+        hash = "sha256-BlB8e0JohGnE5ymLCh4W3v8GyvKRzwpbJ4wwgknD5Dk=";
+      };
       runtime = pkgs.buildNpmPackage {
         pname = "agent-runtime";
         version = "0.1.0";
@@ -50,13 +54,18 @@
         postInstall = ''
           wrapProgram "$out/bin/agent" \
             --set AGENT_RUNTIME_PATH "${runtime}/lib/agent-runtime/dist/src/bridge.js" \
+            --set AGENT_LLAMA_SERVER "${pkgs.llama-cpp}/bin/llama-server" \
+            --set AGENT_EMBEDDING_MODEL "${embeddingModel}" \
+            --set AGENT_SQLITE_VEC "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}" \
             --prefix PATH : "${pkgs.lib.makeBinPath [pkgs.nodejs_26 pkgs.git pkgs.lsof pkgs.openssh]}" \
             --suffix PATH : /run/current-system/sw/bin
         '';
       };
     in {
       default = cli;
-      inherit runtime;
+      inherit runtime embeddingModel;
+      embeddingRuntime = pkgs.llama-cpp;
+      sqliteVec = pkgs.sqlite-vec;
     });
     apps = eachSystem (system: {
       default = {
@@ -70,6 +79,9 @@
     in {
       default = pkgs.mkShell {
         packages = with pkgs; [cargo rustc rustfmt clippy nodejs_26 pkg-config git lsof actionlint];
+        AGENT_LLAMA_SERVER = "${pkgs.llama-cpp}/bin/llama-server";
+        AGENT_EMBEDDING_MODEL = self.packages.${system}.embeddingModel;
+        AGENT_SQLITE_VEC = "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
       };
     });
   };

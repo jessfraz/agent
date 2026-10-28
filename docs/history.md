@@ -1,8 +1,22 @@
 # History import and retrieval
 
-Proposal, not implemented. Durable conversations should survive closed Rex
-sessions, and relevant history should be found even when its wording differs
-from a new message. Import must not create work or revive old instructions.
+Conversations survive closed Rex sessions. Keyword and local semantic search
+find related history; import does not create work or revive old instructions.
+
+```sh
+agent import codex                  # all registered online hosts
+agent import codex --host desktop   # one announced host name
+agent import status
+agent history search "fabrication files"
+agent history read CONVERSATION_ID
+agent history open CONVERSATION_ID
+```
+
+Run import again to catch up. Completed reliable source versions are skipped;
+partial reads resume their committed cursor. The same native thread and item
+versions are retained once across hosts. Neither importing nor searching opens
+Rex sessions. Opening a historical conversation adopts it into one task using
+current settings, then opens its named interactive session.
 
 ```text
   registered online hosts
@@ -12,7 +26,7 @@ from a new message. Import must not create work or revive old instructions.
             |
     Pi conversations + private assets       authoritative
             |
-    queued incremental indexing
+    incremental indexing
             |
     search.sqlite: text + FTS5 + vectors    rebuildable
             |
@@ -27,15 +41,14 @@ from a new message. Import must not create work or revive old instructions.
 
 ## Import boundary
 
-The proposed `agent import codex` command gathers history from registered,
+The `agent import codex` command gathers history from registered,
 online hosts through their existing worker connections. It reports checkpointed
 progress and unavailable hosts; no copied host inventory or model run is needed.
 Use the installed Codex app-server's read-only APIs. Page `thread/list` for
 active and archived threads with every native `sourceKinds` value explicitly
 selected; omission includes only interactive sources. Read metadata with
 `thread/read`, then use full turn/item pagination where supported, or the
-installed full-history read. Native fallback reads fill verified gaps using
-Codex metadata. Thread IDs establish identity; filenames and directories are
+installed full-history read. Thread IDs establish identity; filenames and directories are
 locators, not thread IDs or assumptions about which threads are roots.
 
 Rust owns a small `HistorySource` trait for enumeration, transcript reads and
@@ -76,7 +89,7 @@ model messages.
 Use one SQLite file for live/imported conversation chunks, source references,
 FTS5 and `sqlite-vec` vectors. Pi remains authoritative. Commit Pi first, then
 atomically update derived rows and their indexing checkpoint. Per-conversation
-watermarks and a durable dirty ledger support catch-up and rebuilding. Pi commit
+watermarks and dirty index rows support catch-up and rebuilding. Pi commit
 subscriptions only enqueue work; they must not await or re-enter a Session.
 Startup reconciliation compares conversation tails with saved watermarks, so
 missed notifications cannot permanently hide a conversation.
@@ -108,12 +121,12 @@ carries an embedding-space identity: model revision/digest, dimensions, pooling,
 normalization and instruction version. Reject invalid vectors or mixed spaces.
 Changing that identity or the chunker version creates a new index generation.
 
-Evaluate Qwen3-Embedding-0.6B GGUF through llama.cpp. Keep the model warm in an
-app-owned child under the existing supervisor, reachable only inside the local
-application boundary. Do not reload it per query or require a separate
-user-managed daemon. Pin the runtime and model digest through installation.
-Follow the model's query instructions, last-token pooling and normalization;
-choose output dimensions from measured retrieval quality and resource use.
+The Nix installation pins Qwen3-Embedding-0.6B Q8_0, llama.cpp and sqlite-vec.
+A service-owned llama.cpp child stays warm and listens on a private Unix socket.
+There is no separate daemon to configure or external embedding request. The
+1024-dimensional vectors use last-token pooling, normalization and the model's
+query instruction. The model download is about 610 MiB; initial indexing also
+needs CPU/GPU time and private disk space proportional to the retained corpus.
 
 An optional OpenAI API implementation can use the same trait later. ChatGPT plan
 sign-in does not supply documented embeddings API access; API credentials and
@@ -130,17 +143,16 @@ When related work later continues, open a clearly named replacement session on
 the same online execution host and bind it to the existing task. Retain history,
 pending inputs and saved task settings; do not create a duplicate conversation.
 Imported history gets its first task/session only on adoption. Cross-host
-transfer remains separate. The MVP holds a missing whole-session binding as
-uncertain; automatic reopening requires this explicit lifecycle work.
+transfer remains separate. Failed inspection retains uncertain ownership;
+positive closure permits same-host reopening after the previous actor drains.
 
 ## Validation and scope
 
-Measure the normalized corpus and actual chunk count before sizing vectors.
-Benchmark FTS versus hybrid recall, vocabulary mismatch, exact identifiers and
-multiple relevant conversations. Measure warm/cold latency, embedding speed,
-memory and disk on supported machines, and inspect actual query plans with
-representative data. `sqlite-vec` uses exact scans; add no ANN stack until those
-measurements justify one. No latency promise follows from a small thread count.
+The index uses independent exact-reference, FTS and dense retrieval. Exact
+references rank first; fused results are grouped by conversation. An embedding
+failure still permits lexical results and reports the semantic coverage gap.
+`sqlite-vec` uses exact scans. Larger-corpus latency and recall need measurement
+before adding an approximate index or tuning the chunker.
 
 Verify idempotent reruns, fork/version preservation, interrupted import/index
 catch-up, offline asset reads, inert old tools and fenced Rex replacement.

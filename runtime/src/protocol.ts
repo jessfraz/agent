@@ -6,6 +6,9 @@ import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import { AuthError } from "./auth.js";
 
 const ajv = new Ajv2020({ strict: true });
+ajv.addFormat("int64", { type: "number", validate: (value: number) => Number.isSafeInteger(value) });
+ajv.addFormat("float", { type: "number", validate: (value: number) => Number.isFinite(value) });
+ajv.addFormat("double", { type: "number", validate: (value: number) => Number.isFinite(value) });
 ajv.addFormat("uuid", /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
 ajv.addFormat("uint16", {
   type: "number",

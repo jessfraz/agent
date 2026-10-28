@@ -1,6 +1,6 @@
 //! The coordinator owns routing; each connected node owns its local effects.
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, path::Path, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use tokio::{
@@ -28,16 +28,19 @@ struct Peer {
 struct Effect {
     command: HostCommand,
     reply: oneshot::Sender<HostResult>,
+    cancelled: watch::Receiver<bool>,
 }
 
 pub struct Broker {
     local: Option<AgentNode>,
     contexts: ContextStore,
+    executor: host::Executor,
+    instructions: std::path::PathBuf,
     peers: Mutex<HashMap<String, Peer>>,
 }
 
 impl Broker {
-    pub fn new(bootstrap: Option<&CoordinatorBootstrap>) -> Result<Self> {
+    pub fn new(bootstrap: Option<&CoordinatorBootstrap>, state: &Path) -> Result<Self> {
         let local = bootstrap.and_then(|bootstrap| bootstrap.node.clone());
         if let Some(node) = &local {
             validate_node(node)?;
@@ -56,6 +59,12 @@ impl Broker {
         Ok(Self {
             local,
             contexts,
+            executor: host::Executor::new(state),
+            instructions: bootstrap
+                .and_then(|value| value.node.as_ref())
+                .and_then(|node| node.launch.instructions.as_ref())
+                .map(std::path::PathBuf::from)
+                .unwrap_or(crate::instructions::default_path()?),
             peers: Mutex::new(HashMap::new()),
         })
     }
@@ -136,9 +145,14 @@ impl Broker {
         .await;
     }
 
-    async fn node(&self, id: &str, command: HostCommand) -> HostResult {
+    async fn node(
+        &self,
+        id: &str,
+        command: HostCommand,
+        cancelled: watch::Receiver<bool>,
+    ) -> HostResult {
         if self.local.as_ref().is_some_and(|node| node.host_id == id) {
-            return host::execute(command).await;
+            return self.executor.execute_cancelled(command, cancelled).await;
         }
         let sender = self
             .peers
@@ -153,10 +167,19 @@ impl Broker {
             HostCommand::Exec {
                 timeout_seconds, ..
             } => Duration::from_secs(u64::from(*timeout_seconds) + 10),
+            HostCommand::History { .. } | HostCommand::Embed { .. } => Duration::from_secs(930),
             _ => Duration::from_secs(305),
         };
         let (reply, received) = oneshot::channel();
-        if sender.send(Effect { command, reply }).await.is_err() {
+        if sender
+            .send(Effect {
+                command,
+                reply,
+                cancelled,
+            })
+            .await
+            .is_err()
+        {
             return unavailable();
         }
         match timeout(deadline, received).await {
@@ -166,54 +189,86 @@ impl Broker {
     }
 
     pub async fn execute(&self, command: HostCommand) -> HostResult {
-        let result = match command {
-            HostCommand::ReadContext {
-                repository_id,
-                path,
-                offset,
-                limit,
-            } => {
-                self.contexts
-                    .read(&repository_id, &path, offset, limit)
-                    .await
-            }
-            HostCommand::SearchContext {
-                repository_id,
-                path,
-                query,
-                limit,
-            } => {
-                self.contexts
-                    .search(&repository_id, path.as_deref(), &query, limit)
-                    .await
-            }
-            HostCommand::OnNode { host_id, command } => {
-                if matches!(
-                    *command,
-                    HostCommand::OnNode { .. }
-                        | HostCommand::ReadContext { .. }
-                        | HostCommand::SearchContext { .. }
-                ) {
-                    return HostResult::Failed {
-                        message: "Nested node routing and remote context access are unsupported"
-                            .into(),
-                    };
+        let (_owner, cancelled) = watch::channel(false);
+        self.execute_cancelled(command, cancelled).await
+    }
+
+    pub async fn execute_cancelled(
+        &self,
+        command: HostCommand,
+        cancelled: watch::Receiver<bool>,
+    ) -> HostResult {
+        let result =
+            match command {
+                HostCommand::ReloadGuidance => {
+                    let refreshed = ContextStore::load(
+                        &self
+                            .contexts
+                            .repositories()
+                            .iter()
+                            .map(|item| item.root.clone().into())
+                            .collect::<Vec<_>>(),
+                    );
+                    match refreshed {
+                        Ok(contexts) => crate::instructions::global_snapshot(&self.instructions)
+                            .map(|global| HostResult::SharedGuidance {
+                                global,
+                                workflow_policy: crate::instructions::WORKFLOW_POLICY.into(),
+                                context_repositories: contexts.repositories().to_vec(),
+                                context_sources: contexts.instruction_sources().to_vec(),
+                            }),
+                        Err(error) => Err(error),
+                    }
                 }
-                if target(&command).is_some_and(|target| target != host_id) {
-                    return HostResult::Failed {
-                        message: "The explicit node differs from the resource's native owner"
-                            .into(),
-                    };
+                HostCommand::ReadContext {
+                    repository_id,
+                    path,
+                    offset,
+                    limit,
+                } => {
+                    self.contexts
+                        .read(&repository_id, &path, offset, limit)
+                        .await
                 }
-                return self.node(&host_id, *command).await;
-            }
-            command => {
-                if let Some(id) = target(&command).map(str::to_owned) {
-                    return self.node(&id, command).await;
+                HostCommand::SearchContext {
+                    repository_id,
+                    path,
+                    query,
+                    limit,
+                } => {
+                    self.contexts
+                        .search(&repository_id, path.as_deref(), &query, limit)
+                        .await
                 }
-                return host::execute(command).await;
-            }
-        };
+                HostCommand::OnNode { host_id, command } => {
+                    if matches!(
+                        *command,
+                        HostCommand::OnNode { .. }
+                            | HostCommand::ReloadGuidance
+                            | HostCommand::ReadContext { .. }
+                            | HostCommand::SearchContext { .. }
+                    ) {
+                        return HostResult::Failed {
+                            message:
+                                "Nested node routing and remote context access are unsupported"
+                                    .into(),
+                        };
+                    }
+                    if target(&command).is_some_and(|target| target != host_id) {
+                        return HostResult::Failed {
+                            message: "The explicit node differs from the resource's native owner"
+                                .into(),
+                        };
+                    }
+                    return self.node(&host_id, *command, cancelled).await;
+                }
+                command => {
+                    if let Some(id) = target(&command).map(str::to_owned) {
+                        return self.node(&id, command, cancelled).await;
+                    }
+                    return self.executor.execute_cancelled(command, cancelled).await;
+                }
+            };
         result.unwrap_or_else(|error| HostResult::Failed {
             message: error.to_string(),
         })
@@ -230,16 +285,31 @@ impl Broker {
         let (stop, mut stopped) = watch::channel(false);
         let generation = self.register(runtime, &node, calls, stop).await?;
         let mut pending: HashMap<String, oneshot::Sender<HostResult>> = HashMap::new();
+        let mut cancellations = tokio::task::JoinSet::new();
         let result: Result<()> = async {
             crate::service::write_frame(&mut writer, &RuntimeEventKind::WorkerReady { connection_id: generation.to_string() }).await?;
             loop {
                 tokio::select! {
                     changed = stopped.changed() => { let _ = changed; anyhow::bail!("A newer connection owns this node"); }
                     _ = runtime.stopped() => anyhow::bail!("Coordinator stopped"),
+                    finished = cancellations.join_next(), if !cancellations.is_empty() => {
+                        if let Some(Ok((call_id, true))) = finished
+                            && pending.contains_key(&call_id) {
+                            crate::service::write_frame(&mut writer, &RuntimeEventKind::HostCancel { call_id }).await?;
+                        }
+                    }
                     effect = incoming.recv() => {
                         let Some(effect) = effect else { return Ok(()); };
                         let call_id = Uuid::new_v4().to_string();
                         pending.insert(call_id.clone(), effect.reply);
+                        let watched = call_id.clone();
+                        let mut cancelled = effect.cancelled;
+                        cancellations.spawn(async move {
+                            loop {
+                                if *cancelled.borrow_and_update() { return (watched, true); }
+                                if cancelled.changed().await.is_err() { return (watched, false); }
+                            }
+                        });
                         crate::service::write_frame(&mut writer, &RuntimeEventKind::HostCall { call_id, command: Box::new(effect.command) }).await?;
                     }
                     frame = reader.next_frame() => {
@@ -269,7 +339,9 @@ fn target(command: &HostCommand) -> Option<&str> {
         | HostCommand::ResourceCollect { record, .. } => Some(&record.host_id),
         HostCommand::SpawnWorker { host, .. } => host.host_id.as_deref(),
         HostCommand::SpawnSubagent { parent, .. } => Some(&parent.host_id),
-        HostCommand::ResumeWorker { binding, .. } => Some(&binding.host_id),
+        HostCommand::ResumeWorker { binding, .. } | HostCommand::InspectWorker { binding } => {
+            Some(&binding.host_id)
+        }
         _ => None,
     }
 }
@@ -420,7 +492,7 @@ mod tests {
     #[tokio::test]
     async fn replacement_connections_own_new_effects_and_old_cleanup_cannot_remove_them() {
         let (_directory, runtime) = runtime().await;
-        let broker = Arc::new(Broker::new(None).unwrap());
+        let broker = Arc::new(Broker::new(None, std::path::Path::new("/tmp")).unwrap());
         let id = "11111111-1111-4111-8111-111111111111";
         let mut old = Worker::connect(broker.clone(), runtime.clone(), id).await;
         let first = {
@@ -485,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn lost_effect_reply_is_uncertain_without_fallback_or_automatic_replay() {
         let (directory, runtime) = runtime().await;
-        let broker = Arc::new(Broker::new(None).unwrap());
+        let broker = Arc::new(Broker::new(None, std::path::Path::new("/tmp")).unwrap());
         let id = "22222222-2222-4222-8222-222222222222";
         let mut worker = Worker::connect(broker.clone(), runtime.clone(), id).await;
         let marker = directory.path().join("side-effect");
@@ -531,7 +603,7 @@ mod tests {
     #[tokio::test]
     async fn remote_exec_reply_wait_follows_its_requested_deadline_and_never_replays() {
         let (directory, runtime) = runtime().await;
-        let broker = Arc::new(Broker::new(None).unwrap());
+        let broker = Arc::new(Broker::new(None, std::path::Path::new("/tmp")).unwrap());
         let id = "44444444-4444-4444-8444-444444444444";
         let mut worker = Worker::connect(broker.clone(), runtime.clone(), id).await;
         let marker = directory.path().join("must-not-run-on-coordinator");
@@ -618,7 +690,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_worker_replies_cannot_complete_another_connections_effects() {
         let (_directory, runtime) = runtime().await;
-        let broker = Arc::new(Broker::new(None).unwrap());
+        let broker = Arc::new(Broker::new(None, std::path::Path::new("/tmp")).unwrap());
         let worker = Worker::connect(
             broker.clone(),
             runtime.clone(),

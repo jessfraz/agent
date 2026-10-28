@@ -1,5 +1,11 @@
 //! Effects run on the attached CLI's machine, never an implicit fallback host.
-use std::{future::Future, path::Path, process::Stdio, time::Duration};
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
 use tokio::{
@@ -10,12 +16,118 @@ use tokio::{
 };
 
 use crate::{
+    embeddings::{EmbeddingProvider, llama::LlamaProvider},
+    history::{HistorySource, codex::CodexHistory},
     protocol::{HostCommand, HostResult, TaskId, WorkerHost, WorkerRef},
     resources::{ResourceBackend, git::GitBackend},
     rex::{BlockId, HostId, RexClient, RexError, SessionId, WindowId, WorkerBinding, WorkerResume},
 };
 
 pub const DEFAULT_TIMEOUT_SECONDS: u16 = 15 * 60;
+
+/// One service owns its history connection and warm embedding child.
+pub struct Executor {
+    history: CodexHistory,
+    embeddings: tokio::sync::Mutex<Option<Arc<LlamaProvider>>>,
+    state: PathBuf,
+}
+
+impl Executor {
+    pub fn new(state: &Path) -> Self {
+        Self {
+            history: CodexHistory::new(),
+            embeddings: tokio::sync::Mutex::new(None),
+            state: state.to_owned(),
+        }
+    }
+
+    pub async fn execute(&self, command: HostCommand) -> HostResult {
+        let result = match command {
+            HostCommand::History { request } => self
+                .history
+                .request(request)
+                .await
+                .map(|response| HostResult::History { response }),
+            HostCommand::Embed { texts, purpose } => {
+                async {
+                    let provider = {
+                        let mut saved = self.embeddings.lock().await;
+                        if saved.is_none() {
+                            *saved = Some(Arc::new(LlamaProvider::from_environment(&self.state)?));
+                        }
+                        saved
+                            .as_ref()
+                            .cloned()
+                            .context("Embedding provider did not initialize")?
+                    };
+                    Ok(HostResult::Embeddings {
+                        batch: provider.embed(&texts, purpose).await?,
+                    })
+                }
+                .await
+            }
+            command => execute_inner(command).await,
+        };
+        result.unwrap_or_else(|error| HostResult::Failed {
+            message: error.to_string(),
+        })
+    }
+
+    pub async fn execute_cancelled(
+        &self,
+        command: HostCommand,
+        mut cancelled: tokio::sync::watch::Receiver<bool>,
+    ) -> HostResult {
+        if let HostCommand::Exec {
+            program,
+            args,
+            cwd,
+            timeout_seconds,
+        } = &command
+            && !crate::sources::messages_read::is_read(program, args)
+        {
+            if *cancelled.borrow() {
+                return HostResult::Process {
+                    exit_code: 143,
+                    stdout: String::new(),
+                    stderr: "Command cancelled before starting.".into(),
+                    truncated: false,
+                };
+            }
+            let result = async {
+                ensure!(
+                    *timeout_seconds > 0 && !program.is_empty() && Path::new(cwd).is_absolute(),
+                    "Command needs a program, absolute directory and positive timeout"
+                );
+                run_process_until(
+                    program,
+                    args,
+                    Path::new(cwd),
+                    Duration::from_secs(u64::from(*timeout_seconds)),
+                    256 * 1024,
+                    async move {
+                        loop {
+                            if *cancelled.borrow_and_update() {
+                                break;
+                            }
+                            if cancelled.changed().await.is_err() {
+                                std::future::pending::<()>().await;
+                            }
+                        }
+                    },
+                )
+                .await
+            }
+            .await;
+            return result.unwrap_or_else(|error| HostResult::Failed {
+                message: error.to_string(),
+            });
+        }
+        // Non-process effects may have already committed an external write.
+        // Keep ownership until their real result arrives instead of guessing.
+        self.execute(command).await
+    }
+}
 
 pub async fn execute(command: HostCommand) -> HostResult {
     match execute_inner(command).await {
@@ -28,6 +140,32 @@ pub async fn execute(command: HostCommand) -> HostResult {
 
 async fn execute_inner(command: HostCommand) -> Result<HostResult> {
     match command {
+        HostCommand::History { .. } | HostCommand::Embed { .. } => {
+            anyhow::bail!("This operation requires a service-owned host executor")
+        }
+        HostCommand::ReloadGuidance => anyhow::bail!("Shared guidance belongs to the coordinator"),
+        HostCommand::ProjectGuidance { cwd } => {
+            ensure!(
+                Path::new(&cwd).is_absolute(),
+                "Project guidance requires an absolute directory"
+            );
+            Ok(HostResult::ProjectGuidance {
+                snapshot: crate::instructions::project_snapshot(Path::new(&cwd))?,
+            })
+        }
+        HostCommand::InspectWorker { binding } => {
+            let client = RexClient::new(None);
+            let identity = client.whoami().await?;
+            ensure!(
+                identity.host_id == HostId::parse(&binding.host_id)?,
+                "Worker belongs to another host"
+            );
+            Ok(HostResult::WorkerPresence {
+                presence: client
+                    .worker_presence(&native_binding(&binding)?, &identity.host_id)
+                    .await?,
+            })
+        }
         HostCommand::OnNode { .. }
         | HostCommand::ReadContext { .. }
         | HostCommand::SearchContext { .. } => {
@@ -204,10 +342,47 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
                 identity.host_id == HostId::parse(&binding.host_id)?,
                 "Worker host identity changed"
             );
-            client
-                .inspect_session(&native.session_id)
-                .await?
-                .verify_binding(&native, &identity.host_id)?;
+            let presence = client.worker_presence(&native, &identity.host_id).await?;
+            if matches!(presence, crate::protocol::WorkerPresence::MissingSession) {
+                anyhow::bail!(
+                    "The task session was closed; reconcile its allocation before reopening"
+                );
+            }
+            if matches!(presence, crate::protocol::WorkerPresence::MissingTerminal) {
+                return match client
+                    .create_worker_window(
+                        &native.session_id,
+                        "Chat",
+                        &host.agent_program,
+                        &worker_args(&host, &task_id, &allocation_id),
+                        Path::new(&host.cwd),
+                    )
+                    .await
+                {
+                    Ok(restored)
+                        if confirmed_binding(&client, &restored, &identity.host_id).await =>
+                    {
+                        promote(&client, &restored.session_id).await;
+                        Ok(HostResult::Spawned {
+                            binding: WorkerRef {
+                                host_id: binding.host_id,
+                                session_id: restored.session_id.to_string(),
+                                window_id: restored.window_id.to_string(),
+                                block_id: restored.block_id.to_string(),
+                            },
+                        })
+                    }
+                    Ok(_) => Ok(HostResult::CreationUncertain {
+                        session_id: Some(binding.session_id),
+                    }),
+                    Err(RexError::CreationUncertain { session_id }) => {
+                        Ok(HostResult::CreationUncertain {
+                            session_id: session_id.map(|id| id.to_string()),
+                        })
+                    }
+                    Err(error) => Err(error.into()),
+                };
+            }
             // A running client drains new pending inputs itself. An exited pane
             // needs a new execution in this same session, handled by Rex below.
             resume_worker(&client, &host, &task_id, &allocation_id, &binding).await

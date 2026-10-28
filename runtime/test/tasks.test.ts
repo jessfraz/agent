@@ -33,6 +33,134 @@ const binding: WorkerRef = {
   block_id: "block:44444444-4444-4444-8444-444444444444",
 };
 
+test("interrupt drains the current native turn before admitting queued steering in the same interactive actor", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-interrupt-")); const app = await open(directory);
+  const controller = new AbortController(); let running: Promise<unknown> | undefined; let release = () => {};
+  try {
+    const task = await app.tasks.create({ title: "Steer work", outcome: "Finish the corrected request" });
+    await app.tasks.enqueue(task.id, "Start the old direction");
+    await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    const saved = await app.tasks.get(task.id); assert.ok(saved.worker.state === "bound");
+    const command: Extract<RuntimeCommand, { type: "run_task" }> = { type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id,
+      binding, instructions: "Current rules", model: fixtureModel, cwd: host.cwd, interactive: true };
+    let started = () => {}; const startedTurn = new Promise<void>((resolve) => { started = resolve; });
+    const drain = new Promise<void>((resolve) => { release = resolve; }); let abortSeen = () => {};
+    const aborted = new Promise<void>((resolve) => { abortSeen = resolve; });
+    app.faux.setResponses([async (_context, options) => {
+      const signal = options?.signal; assert.ok(signal); started();
+      await new Promise<void>((resolve) => { if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true }); });
+      abortSeen(); await drain; return fauxAssistantMessage("Discarded old direction");
+    }, fauxAssistantMessage("Corrected direction completed")]);
+    const conversation = await app.tasks.conversation(task.conversation_id); const answers: string[] = [];
+    let idle = () => {}; const idleTurn = new Promise<void>((resolve) => { idle = resolve; });
+    let interrupt: Promise<void> | undefined;
+    running = app.tasks.run(command, () => () => {}, () => {}, [], undefined, undefined, {
+      signal: controller.signal, async ready() {}, answer(_id, value) { answers.push(value); }, idle() { idle(); },
+      beforeTurn() { return interrupt ?? Promise.resolve(); },
+    });
+    await startedTurn;
+    interrupt = (async () => { await conversation.abort(BACKGROUND_CONTEXT); })();
+    await aborted;
+    await app.tasks.input(command, "Use the corrected direction instead", "steering");
+    assert.equal(app.tasks.isRunning(task.id), true, "Interrupted work stays guarded until native cancellation drains");
+    assert.equal(app.faux.state.callCount, 1);
+    release(); await interrupt; await idleTurn;
+    assert.deepEqual(answers, ["Corrected direction completed"]); assert.equal(app.faux.state.callCount, 2);
+    const idleAgain = new Promise<void>((resolve) => { idle = resolve; });
+    let restarted = () => {}; const nextStarted = new Promise<void>((resolve) => { restarted = resolve; });
+    app.faux.setResponses([async (_context, options) => {
+      const signal = options?.signal; assert.ok(signal); restarted();
+      await new Promise<void>((resolve) => { if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true }); });
+      return fauxAssistantMessage("Discarded second direction");
+    }, fauxAssistantMessage("Second correction completed")]);
+    await app.tasks.input(command, "Start another direction", "second-direction"); await nextStarted;
+    interrupt = (async () => { await conversation.abort(BACKGROUND_CONTEXT); })();
+    await app.tasks.input(command, "Correct that direction too", "second-steering"); await interrupt; await idleAgain;
+    assert.deepEqual(answers, ["Corrected direction completed", "Second correction completed"]); assert.equal(app.faux.state.callCount, 4);
+    assert.deepEqual((await app.tasks.get(task.id)).pending, []);
+    const visible = (await history(conversation, null)).flatMap((frame) => frame.messages);
+    assert.deepEqual(visible.filter((message) => message.role === "user").map((message) => message.text),
+      ["Start the old direction", "Use the corrected direction instead", "Start another direction", "Correct that direction too"]);
+    assert.equal(visible.some((message) => message.text === "Discarded old direction"), false);
+    assert.equal(visible.some((message) => message.text === "Discarded second direction"), false);
+    controller.abort(); await running; running = undefined;
+    assert.equal((await app.tasks.get(task.id)).conversation_id, task.conversation_id);
+  } finally { release(); controller.abort(); await running?.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("confirmed session loss fences the old actor before reopening the same history and preserves child assignments", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-session-reopen-")); const app = await open(directory);
+  const controller = new AbortController(); let running: Promise<unknown> | undefined; let release = () => {};
+  try {
+    const task = await app.tasks.create({ title: "Continue closed work", outcome: "Finish the same task", model: fixtureModel });
+    await app.tasks.enqueue(task.id, "Original request");
+    await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    const child = await app.tasks.createAgent(task.id, { id: "review", title: "Review", outcome: "Review the work", input: "Keep the assignment", inputId: "review", model: fixtureModel });
+    await app.tasks.dispatchAgent(task.id, child.id, async () => ({ type: "spawned", binding: { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" } }));
+    const saved = await app.tasks.get(task.id); assert.ok(saved.worker.state === "bound");
+    const old: Extract<RuntimeCommand, { type: "run_task" }> = { type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id,
+      binding, instructions: "Current rules", model: fixtureModel, cwd: host.cwd, interactive: true };
+    const conversation = await app.tasks.conversation(task.conversation_id);
+    let started = () => {}; const startedTurn = new Promise<void>((resolve) => { started = resolve; });
+    let cancelled = () => {}; const cancelSeen = new Promise<void>((resolve) => { cancelled = resolve; });
+    const drain = new Promise<void>((resolve) => { release = resolve; });
+    app.faux.setResponses([async (_context, options) => {
+      const signal = options?.signal; assert.ok(signal); started();
+      await new Promise<void>((resolve) => { if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true }); });
+      cancelled(); await drain; return fauxAssistantMessage("A late stale result");
+    }, fauxAssistantMessage("Continued after the closed tab")]);
+    let fenced = false;
+    running = app.tasks.run(old, () => () => {}, () => {}, [], undefined, undefined, {
+      signal: controller.signal, async ready() {}, answer() {}, idle() {}, async fence() { fenced = true; await conversation.abort(BACKGROUND_CONTEXT); },
+    });
+    await startedTurn; controller.abort();
+    await app.tasks.enqueue(task.id, "Continue after closing the session", "after-close");
+    const replacement = { ...binding, session_id: "session:66666666-6666-4666-8666-666666666666", block_id: "block:77777777-7777-4777-8777-777777777777" };
+    let creates = 0;
+    const recovering = app.tasks.dispatch(task.id, host, async (command) => {
+      if (command.type === "on_node") { assert.equal(command.host_id, binding.host_id); assert.equal(command.command.type, "inspect_worker"); return { type: "worker_presence", presence: { state: "missing_session" } }; }
+      assert.equal(command.type, "spawn_worker"); creates += 1; assert.equal(fenced, true); return { type: "spawned", binding: replacement };
+    });
+    await cancelSeen; assert.equal(creates, 0); assert.equal(app.tasks.isRunning(task.id), true);
+    release(); const reopened = await recovering; await running; running = undefined;
+    assert.equal(creates, 1); assert.equal(reopened.conversation_id, task.conversation_id); assert.equal(reopened.id, task.id);
+    assert.deepEqual(reopened.model, fixtureModel); assert.equal(reopened.agents[0]?.conversation_id, child.conversation_id);
+    assert.equal(reopened.agents[0]?.worker.state, "unassigned"); assert.equal(reopened.agents[0]?.pending[0]?.content, "Keep the assignment");
+    assert.equal(reopened.pending[0]?.id, "after-close"); assert.equal(reopened.summary, ""); assert.ok(reopened.worker.state === "bound");
+    assert.notEqual(reopened.worker.allocation_id, old.allocation_id);
+    await assert.rejects(app.tasks.run(old, () => () => {}, () => {}), /binding is not confirmed/);
+    const result = await app.tasks.run({ ...old, allocation_id: reopened.worker.allocation_id, binding: replacement, interactive: false }, () => () => {}, () => {});
+    assert.equal(result.text, "Continued after the closed tab"); assert.equal(app.faux.state.callCount, 2);
+    const visible = (await history(conversation, null)).flatMap((frame) => frame.messages);
+    assert.equal(visible.some((message) => message.text === "A late stale result"), false);
+    assert.equal((await app.tasks.get(task.id)).pending.length, 0);
+    let childCreates = 0;
+    const continued = await app.tasks.continueAgent(task.id, child.id, "Continue the retained review", "review-after-close", async (command) => {
+      assert.equal(command.type, "spawn_subagent"); assert.equal(command.parent.session_id, replacement.session_id); childCreates += 1;
+      return { type: "spawned", binding: { ...replacement, block_id: "block:88888888-8888-4888-8888-888888888888" } };
+    });
+    assert.equal(childCreates, 1); assert.equal(continued.agents[0]?.conversation_id, child.conversation_id);
+    assert.deepEqual(continued.agents[0]?.pending.map((input) => input.content), ["Keep the assignment", "Continue the retained review"]);
+  } finally { release(); controller.abort(); await running?.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a failed Rex inspection remains uncertain and never substitutes an allocation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-session-unknown-")); const app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "Retain work", outcome: "Keep its ownership" });
+    await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    await app.tasks.enqueue(task.id, "Keep this request", "pending"); let creates = 0;
+    const uncertain = await app.tasks.dispatch(task.id, host, async (command) => {
+      if (command.type === "spawn_worker") creates += 1;
+      return { type: "failed", message: "The owning host is unreachable" };
+    });
+    assert.equal(uncertain.worker.state, "uncertain"); assert.equal(creates, 0);
+    assert.equal(uncertain.pending[0]?.id, "pending"); assert.equal(uncertain.conversation_id, task.conversation_id);
+    await assert.rejects(app.tasks.dispatch(task.id, host, async () => { creates += 1; return { type: "spawned", binding }; }), /needs reconciliation/);
+    assert.equal(creates, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("an interactive task serializes local and chief inputs, wakes while idle and reopens its actual history", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-interactive-")); let app = await open(directory);
   const controller = new AbortController(); let running: Promise<unknown> | undefined;

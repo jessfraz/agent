@@ -67,6 +67,7 @@ struct Pending {
     host_calls: HashSet<String>,
     login: bool,
     worker: bool,
+    interruptible: bool,
 }
 
 impl Runtime {
@@ -187,7 +188,9 @@ impl Runtime {
         ensure!(
             matches!(
                 command,
-                RuntimeCommand::WorkerInput { .. } | RuntimeCommand::DetachWorker
+                RuntimeCommand::WorkerInput { .. }
+                    | RuntimeCommand::DetachWorker
+                    | RuntimeCommand::Interrupt
             ),
             "Invalid worker control"
         );
@@ -306,11 +309,12 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                         let command = *command;
                         let login = matches!(command, RuntimeCommand::Login);
                         let worker = matches!(command, RuntimeCommand::RunTask { interactive: Some(true), .. });
+                        let interruptible = worker || matches!(command, RuntimeCommand::Chat { .. });
                         let id = next_id;
                         next_id = id.checked_add(1).context("Runtime request IDs exhausted")?;
                         let (sender, events) = mpsc::channel(64);
                         send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id, command }).await?;
-                        pending.insert(id, Pending { events: Some(sender), host_calls: HashSet::new(), login, worker });
+                        pending.insert(id, Pending { events: Some(sender), host_calls: HashSet::new(), login, worker, interruptible });
                         if admitted.send(Ok(RuntimeCall { request_id: id, events })).is_err()
                             && let Some(call) = pending.get_mut(&id) {
                             reject_host_calls(&mut stdin, id, call).await?;
@@ -335,7 +339,8 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                         }
                     }
                     Some(CommandMessage::WorkerControl { request_id, command }) => {
-                        if pending.get(&request_id).is_some_and(|request| request.worker && request.events.is_some()) {
+                        if pending.get(&request_id).is_some_and(|request| request.events.is_some() &&
+                            (request.worker || (request.interruptible && matches!(*command, RuntimeCommand::Interrupt)))) {
                             send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id: request_id, command: *command }).await?;
                         }
                     }

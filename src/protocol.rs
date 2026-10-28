@@ -1,3 +1,6 @@
+use crate::embeddings::{EmbeddingBatch, EmbeddingPurpose};
+use crate::history::{HistoryGap, HistoryItem, HistoryRequest, HistoryResponse, HistoryThread};
+use crate::instructions::{GuidanceSnapshot, GuidanceSource};
 use crate::models::ModelSelection;
 use crate::resources::{CleanupPlan, ResourceRecord, ResourceReport, WorktreeAllocation};
 use crate::sources::{SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage, SourceKey};
@@ -184,6 +187,22 @@ pub enum RuntimeCommand {
         agent_id: Option<String>,
         cursor: Option<String>,
     },
+    ImportCodex {
+        hosts: Vec<String>,
+    },
+    ImportStatus,
+    SearchHistory {
+        query: String,
+        limit: u32,
+    },
+    ReadConversation {
+        conversation_id: String,
+        cursor: Option<String>,
+    },
+    OpenConversation {
+        conversation_id: String,
+        host: Option<String>,
+    },
     RevokeAllocation {
         task_id: TaskId,
         allocation_id: String,
@@ -210,6 +229,7 @@ pub enum RuntimeCommand {
         input: String,
     },
     DetachWorker,
+    Interrupt,
     HostReply {
         call_id: String,
         result: HostResult,
@@ -375,6 +395,20 @@ pub struct SourceState {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostCommand {
+    ReloadGuidance,
+    ProjectGuidance {
+        cwd: String,
+    },
+    History {
+        request: HistoryRequest,
+    },
+    Embed {
+        texts: Vec<String>,
+        purpose: EmbeddingPurpose,
+    },
+    InspectWorker {
+        binding: WorkerRef,
+    },
     OnNode {
         host_id: String,
         command: Box<HostCommand>,
@@ -449,6 +483,24 @@ pub enum HostCommand {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostResult {
+    SharedGuidance {
+        global: GuidanceSnapshot,
+        workflow_policy: String,
+        context_repositories: Vec<ContextRepository>,
+        context_sources: Vec<GuidanceSource>,
+    },
+    ProjectGuidance {
+        snapshot: GuidanceSnapshot,
+    },
+    History {
+        response: HistoryResponse,
+    },
+    Embeddings {
+        batch: EmbeddingBatch,
+    },
+    WorkerPresence {
+        presence: WorkerPresence,
+    },
     ContextMatches {
         matches: Vec<ContextMatch>,
         truncated: bool,
@@ -495,6 +547,13 @@ pub struct RuntimeEvent {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEventKind {
+    ImportProgress {
+        progress: ImportProgress,
+    },
+    SavedMatches {
+        matches: Vec<SavedMatch>,
+        gaps: Vec<String>,
+    },
     Configured,
     NodeRegistered {
         host_id: String,
@@ -563,6 +622,10 @@ pub enum RuntimeEventKind {
     Message {
         message: HistoryMessage,
     },
+    Interrupted,
+    HostCancel {
+        call_id: String,
+    },
     Failure {
         code: ErrorCode,
         message: String,
@@ -585,6 +648,84 @@ pub enum HistoryRole {
     Assistant,
     Thinking,
     Tool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryProvider {
+    Codex,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ImportedConversation {
+    pub source: HistoryProvider,
+    pub thread: HistoryThread,
+    pub conversation_id: String,
+    pub adopted_task_id: Option<TaskId>,
+    pub complete: bool,
+    pub gaps: Vec<HistoryGap>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct HistoryImportBatch {
+    pub host_id: String,
+    pub thread: HistoryThread,
+    pub items: Vec<HistoryItem>,
+    pub next_cursor: Option<String>,
+    pub gaps: Vec<HistoryGap>,
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct HistoryImportReceipt {
+    pub conversation: ImportedConversation,
+    pub added_items: u32,
+    pub existing_items: u32,
+    pub entry_ids: Vec<String>,
+    pub watermark: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportPhase {
+    Discovering,
+    Importing,
+    Indexing,
+    Complete,
+    Partial,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ImportProgress {
+    pub phase: ImportPhase,
+    pub host_id: Option<String>,
+    pub threads_seen: u32,
+    pub threads_imported: u32,
+    pub threads_unchanged: u32,
+    pub items_added: u32,
+    pub items_unchanged: u32,
+    pub assets_saved: u32,
+    pub gap_count: u32,
+    pub gaps: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct SavedMatch {
+    pub conversation_id: String,
+    pub title: String,
+    pub excerpt: String,
+    pub entry_ids: Vec<String>,
+    pub score: f64,
+    pub task_id: Option<TaskId>,
+    pub imported: Option<ImportedConversation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WorkerPresence {
+    Present { running: bool },
+    MissingSession,
+    MissingTerminal,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]

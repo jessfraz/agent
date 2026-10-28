@@ -20,12 +20,14 @@ use crate::{
 #[derive(Clone, Default)]
 pub struct ContextStore {
     repositories: Vec<ContextRepository>,
+    sources: Vec<crate::instructions::GuidanceSource>,
 }
 
 impl ContextStore {
     pub fn load(roots: &[PathBuf]) -> Result<Self> {
         let mut seen = HashSet::new();
         let mut repositories = Vec::new();
+        let mut sources = Vec::new();
         for root in roots {
             let root = std::fs::canonicalize(root).context("Context repository is unavailable")?;
             ensure!(root.is_dir(), "Context repository must be a directory");
@@ -36,22 +38,28 @@ impl ContextStore {
                 .to_str()
                 .context("Context repository path must be UTF-8")?
                 .to_owned();
-            let instructions = match std::fs::read_to_string(Path::new(&root).join("AGENTS.md")) {
-                Ok(value) => value,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(error) => return Err(error).context("Could not read context instructions"),
-            };
+            let snapshot =
+                crate::instructions::global_snapshot(&Path::new(&root).join("AGENTS.md"))?;
+            let instructions = snapshot.text;
+            sources.extend(snapshot.sources);
             repositories.push(ContextRepository {
                 id: format!("context-{:x}", Sha256::digest(root.as_bytes())),
                 root,
                 instructions,
             });
         }
-        Ok(Self { repositories })
+        Ok(Self {
+            repositories,
+            sources,
+        })
     }
 
     pub fn repositories(&self) -> &[ContextRepository] {
         &self.repositories
+    }
+
+    pub fn instruction_sources(&self) -> &[crate::instructions::GuidanceSource] {
+        &self.sources
     }
 
     fn repository(&self, id: &str) -> Result<&ContextRepository> {
