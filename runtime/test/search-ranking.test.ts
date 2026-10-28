@@ -60,3 +60,23 @@ test("keyword intent prioritizes literal errors while exact references and lexic
     }
   } finally { index.close(); }
 });
+
+test("candidate evidence retains distinct original entries instead of overlapping chunks from one long log", async () => {
+  const index = new SearchIndex(":memory:");
+  const entries: SearchRecord[] = [
+    { entry_id: "long-log", ordinal: 0, text: "Connector inspection log. ".repeat(400), source_refs: [] },
+    { entry_id: "decision", ordinal: 1, text: "Connector decision: choose variant Z3 after reviewing the fit.", source_refs: [] },
+    { entry_id: "verification", ordinal: 2, text: "Connector verification: variant Z3 passed the fit check.", source_refs: [] },
+  ];
+  const embed: Embed = async (texts) => ({ space, vectors: texts.map((text) => {
+    const cosine = text.includes("decision:") ? 0.95 : text.includes("verification:") ? 0.9 : 1;
+    return [cosine, Math.sqrt(1 - cosine * cosine), 0];
+  }) });
+  async function* originals() { yield* entries; }
+  try {
+    await index.upsert("substantive", "one", originals(), embed);
+    const result = await index.search("connector inspection", embed);
+    assert.deepEqual(result.gaps, []);
+    assert.deepEqual(result.candidates[0]?.matches.map((match) => match.entry_id), ["long-log", "decision", "verification"]);
+  } finally { index.close(); }
+});

@@ -252,7 +252,10 @@ export class SearchIndex {
     for (const row of rows.sort((left, right) => (scores.get(number(right, "id")) ?? 0) - (scores.get(number(left, "id")) ?? 0))) {
       const id = string(row, "conversation_id"); let candidate = candidates.get(id);
       if (candidate === undefined) { candidate = { conversation_id: id, score: scores.get(number(row, "id")) ?? 0, matches: [] }; candidates.set(id, candidate); }
-      if (candidate.matches.length < 3) candidate.matches.push({ entry_id: string(row, "entry_id"), text: string(row, "text"), source_refs: refs(string(row, "source_refs")) });
+      const entry_id = string(row, "entry_id");
+      if (candidate.matches.length < 3 && !candidate.matches.some((match) => match.entry_id === entry_id)) {
+        candidate.matches.push({ entry_id, text: string(row, "text"), source_refs: refs(string(row, "source_refs")) });
+      }
     }
     return { candidates: [...candidates.values()].sort((left, right) => right.score - left.score).slice(0, limit), gaps };
   }
