@@ -21,6 +21,7 @@ import type { HistoryImportBatch } from "../src/generated/HistoryImportBatch.js"
 import type { HistoryItem } from "../src/generated/HistoryItem.js";
 import type { WorkerHost } from "../src/generated/WorkerHost.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
+import type { SearchMode } from "../src/generated/SearchMode.js";
 
 const host: WorkerHost = { host_id: null, name: "fixture", rex_server: null, coordinator: null, cwd: "/workspace/current", agent_program: "/example/agent" };
 const binding: WorkerRef = { host_id: "11111111-1111-4111-8111-111111111111", session_id: "session:22222222-2222-4222-8222-222222222222",
@@ -233,10 +234,11 @@ test("native tools search and inspect several historical candidates before expli
     const otherBatch = batch([item("item1", "Another unresolved violet component quote.")]); otherBatch.thread.id = "native-two";
     const other = await app.imported.import(otherBatch); const entry = chosen.entry_ids.at(-1); assert.ok(entry);
     const root = await app.session.root(BACKGROUND_CONTEXT); let creates = 0; let resumes = 0; let queries = 0;
+    const modes: SearchMode[] = [];
     const candidates = [chosen, other].map((result) => ({ conversation_id: result.conversation.conversation_id, score: 1,
       matches: [{ entry_id: result.entry_ids.at(-1)!, text: "Related historical quote", source_refs: [] }] }));
     const unbind = app.executions.bind(root.id.toString(), { cwd: host.cwd, hosts: [host], model: fixtureModel,
-      async search() { queries += 1; return { candidates, gaps: [] }; }, async call(command) {
+      async search(_query, _refs, _limit, mode = "semantic") { queries += 1; modes.push(mode); return { candidates, gaps: [] }; }, async call(command) {
         if (command.type === "spawn_worker") { creates += 1; return { type: "spawned", binding }; }
         assert.equal(command.type, "resume_worker"); resumes += 1; return { type: "written" };
       } });
@@ -247,7 +249,7 @@ test("native tools search and inspect several historical candidates before expli
     };
     await app.tasks.inference.configure(root, fixtureModel, { instructions: "Use current instructions and inspect historical evidence", cwd: host.cwd, extensions: [app.tools.main] });
     app.faux.setResponses([
-      fauxAssistantMessage(fauxToolCall("search_tasks", { query: "Continue the approved part quote" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage(fauxToolCall("search_tasks", { query: "Continue the approved part quote", mode: "keyword" }), { stopReason: "toolUse" }),
       async (context) => {
         const result = lastResult(context); assert.ok(result !== null && typeof result === "object" && "matches" in result && Array.isArray(result.matches));
         assert.equal(result.matches.length, 2); assert.deepEqual(await app.tasks.list(), []); assert.equal(creates, 0);
@@ -271,8 +273,10 @@ test("native tools search and inspect several historical candidates before expli
     await (await root.submit({ type: "input", content: "Continue the related quote" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
     const task = (await app.tasks.list())[0]; assert.ok(task); assert.equal(task.conversation_id, chosen.conversation.conversation_id);
     assert.equal(creates, 1); assert.equal(queries, 3); assert.equal((await app.imported.get("native-two"))?.adopted_task_id, null);
+    assert.deepEqual(modes, ["keyword", "semantic", "semantic"]);
     await (await root.submit({ type: "input", content: "And check the same one again" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
     assert.equal(creates, 1); assert.equal(resumes, 1); assert.equal((await app.tasks.list()).length, 1);
+    assert.deepEqual(modes, ["keyword", "semantic", "semantic"], "An explicit task ID needs no additional search");
     assert.equal((await app.tasks.get(task.id)).pending.length, 2); unbind();
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

@@ -21,6 +21,7 @@ import { createAppTools, Executions, HostRequests } from "./tools.js";
 import { createSourceTools, SourceJournal } from "./sources.js";
 import { createResourceTools, ResourceStore } from "./resources.js";
 import { activity, history } from "./transcript.js";
+import type { SearchMode } from "./generated/SearchMode.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 
 const VERSION = 1;
@@ -80,8 +81,8 @@ const interrupts = new Map<number, Promise<void>>();
 const workers = new Map<number, { command: Extract<RuntimeCommand, { type: "run_task" }>; controller: AbortController }>();
 
 function searchFor(application: Awaited<ReturnType<typeof openApplication>>, id: number) {
-  return (query: string, refs: string[], limit: number) => application.retrieval.search(query, refs, limit,
-    (command) => hostRequests.call(id, command), application.importer.isRunning());
+  return (query: string, refs: string[], limit: number, mode: SearchMode = "semantic") => application.retrieval.search(query, refs, limit,
+    (command) => hostRequests.call(id, command), application.importer.isRunning(), mode);
 }
 async function interrupt(id: number): Promise<void> {
   interrupted.add(id);
@@ -131,7 +132,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
       case "import_status": emit(id, { type: "import_progress", progress: await (await app()).importer.status() }); break;
       case "search_history": {
         const application = await app();
-        const result = await application.tasks.find(command.query, [], command.limit, searchFor(application, id));
+        const result = await application.tasks.find(command.query, [], command.limit, searchFor(application, id), command.mode);
         emit(id, { type: "saved_matches", ...result }); break;
       }
       case "read_conversation": {

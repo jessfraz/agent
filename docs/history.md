@@ -8,6 +8,7 @@ agent import codex                  # all registered online hosts
 agent import codex --host desktop   # one announced host name
 agent import status
 agent history search "fabrication files"
+agent history search "ERR_SURFACE_413" --mode keyword
 agent history read CONVERSATION_ID
 agent history open CONVERSATION_ID
 ```
@@ -92,6 +93,8 @@ FTS5 and `sqlite-vec` vectors. Pi remains authoritative. Commit Pi first, then
 atomically update derived rows and their indexing checkpoint. Per-conversation
 watermarks and dirty index rows support catch-up and rebuilding. Pi commit
 subscriptions only enqueue work; they must not await or re-enter a Session.
+Completed embedding batches survive interruptions privately. Only a complete
+conversation generation replaces the published index; retries reuse its vectors.
 Startup reconciliation compares conversation tails with saved watermarks, so
 missed notifications cannot permanently hide a conversation. Internal feed
 judgment transcripts are retained in Pi but are not retrieval candidates.
@@ -104,8 +107,11 @@ A conversation may need many chunks; conversation count is not vector
 count. Avoid indexing only generated summaries, which can omit the needed fact.
 
 Independently retrieve exact source links, FTS matches and dense neighbors.
-Never restrict dense search to FTS matches. Fuse ranked lists, group by
-conversation and read bounded original excerpts from the strongest candidates.
+Exact source references rank first. Semantic search is the default; keyword
+mode prioritizes literal identifiers, paths and errors. The other channel breaks
+ties, fills remaining slots and provides fallback when inference is unavailable.
+Never restrict dense search to FTS matches. Group results by conversation and
+read bounded original excerpts from the strongest candidates.
 Several conversations can inform one task; similarity does not authorize
 merging them or changing state.
 An unavailable embedding runner is a retrieval gap, not "no related work."
@@ -151,8 +157,7 @@ positive closure permits same-host reopening after the previous actor drains.
 
 ## Validation and scope
 
-The index uses independent exact-reference, FTS and dense retrieval. Exact
-references rank first; fused results are grouped by conversation. An embedding
+The index uses independent exact-reference, FTS and dense retrieval. An embedding
 failure still permits lexical results and reports the semantic coverage gap.
 `sqlite-vec` uses exact scans. Larger-corpus latency and recall need measurement
 before adding an approximate index or tuning the chunker.

@@ -6,6 +6,7 @@ import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { HostCommand } from "./generated/HostCommand.js";
 import type { HostResult } from "./generated/HostResult.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
+import type { SearchMode } from "./generated/SearchMode.js";
 import { TaskError, TaskStore, type HostCall, type SearchQuery } from "./tasks.js";
 
 export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; default_host?: WorkerHost | null; call: HostCall; role?: "worker" | "triage";
@@ -174,9 +175,10 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
       return output(await tasks.record(task.id, args, { conversation_id: api.conversationId.toString(),
         call_id: api.callId, settled: api.conversationId === ROOT_CONVERSATION_ID || execution.role === "triage" }));
     } });
-  const searchTask = defineTool({ name: "search_tasks", description: "Find related tasks and imported conversations before starting new work. Read matching originals before continuing them.",
-      replay: "safe", parameters: Type.Object({ query: Type.String(), sources: Type.Optional(Type.Array(source)) }),
-      async execute(args, api) { return output(await tasks.find(args.query, args.sources ?? [], 8, executions.search(api.conversationId.toString()))); } });
+  const searchModes = { semantic: "semantic", keyword: "keyword" } satisfies Record<SearchMode, SearchMode>;
+  const searchTask = defineTool({ name: "search_tasks", description: "Find related tasks and imported conversations before starting new work. Semantic search is the default; use keyword for literal identifiers, paths or errors. Read matching originals before continuing them.",
+      replay: "safe", parameters: Type.Object({ query: Type.String(), sources: Type.Optional(Type.Array(source)), mode: Type.Optional(Type.Enum(searchModes)) }),
+      async execute(args, api) { return output(await tasks.find(args.query, args.sources ?? [], 8, executions.search(api.conversationId.toString()), args.mode)); } });
   const readTask = defineTool({ name: "read_task", description: "Read task state or an imported conversation's original evidence before continuing it.",
       replay: "safe", parameters: Type.Object({ task_id: Type.Optional(Type.String()), conversation_id: Type.Optional(Type.String()), agent_id: Type.Optional(Type.String()),
         entry_ids: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 16 })), offset: Type.Optional(Type.Integer({ minimum: 0 })) }),

@@ -21,9 +21,10 @@ import { HistoryStore, ImportedItemEntry, importedText } from "./history.js";
 import type { SavedMatch } from "./generated/SavedMatch.js";
 import type { ImportedConversation } from "./generated/ImportedConversation.js";
 import type { SearchRecord, SearchResult } from "./search.js";
+import type { SearchMode } from "./generated/SearchMode.js";
 
 export type HostCall = (command: HostCommand) => Promise<HostResult>;
-export type SearchQuery = (query: string, sourceRefs: string[], limit: number) => Promise<SearchResult>;
+export type SearchQuery = (query: string, sourceRefs: string[], limit: number, mode?: SearchMode) => Promise<SearchResult>;
 export function sourceReference(source: SourceRef): string { return JSON.stringify([source.provider, source.account, source.thread_id]); }
 type TaskIndex = { tasks: TaskRecord[] };
 type WorkerInput = Extract<RuntimeCommand, { type: "run_task" }>;
@@ -305,9 +306,9 @@ export class TaskStore {
     return scored.sort((a, b) => b.score - a.score || b.task.updated_at - a.task.updated_at)
       .slice(0, Math.min(20, Math.max(1, limit))).map((item) => item.task);
   }
-  async find(query: string, sources: readonly SourceRef[] = [], limit = 8, search?: SearchQuery): Promise<{ matches: SavedMatch[]; gaps: string[] }> {
+  async find(query: string, sources: readonly SourceRef[] = [], limit = 8, search?: SearchQuery, mode: SearchMode = "semantic"): Promise<{ matches: SavedMatch[]; gaps: string[] }> {
     const indexed = search === undefined ? { candidates: [], gaps: this.histories === undefined ? [] : ["Semantic history search is unavailable"] }
-      : await search(query, sources.map(sourceReference), limit);
+      : await search(query, sources.map(sourceReference), limit, mode);
     const tasks = await this.list(); const matches: SavedMatch[] = [];
     const add = (match: SavedMatch) => { if (!matches.some((saved) => saved.conversation_id === match.conversation_id)) matches.push(match); };
     for (const task of tasks) if (sources.some((source) => task.sources.some((saved) => related(saved, source)))) {

@@ -5,6 +5,7 @@ import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import type { EmbeddingBatch } from "./generated/EmbeddingBatch.js";
 import type { EmbeddingPurpose } from "./generated/EmbeddingPurpose.js";
 import type { EmbeddingSpace } from "./generated/EmbeddingSpace.js";
+import type { SearchMode } from "./generated/SearchMode.js";
 
 export type SearchRecord = { entry_id: string; ordinal: number; text: string; source_refs: string[] };
 export type SearchWatermark = { conversation_id: string; watermark: string };
@@ -14,6 +15,7 @@ export type SearchResult = { candidates: SearchCandidate[]; gaps: string[] };
 export type Embed = (texts: string[], purpose: EmbeddingPurpose) => Promise<EmbeddingBatch>;
 type Row = Record<string, SQLOutputValue>;
 type Chunk = SearchRecord & { part: number; hash: string };
+type RankedChunk = { id: number; value: number };
 const CHUNKER = "message-utf8-2048-overlap-256-v4";
 const BATCH = 16;
 
@@ -205,17 +207,18 @@ export class SearchIndex {
     }));
     await this.reconcile(inventory, records, embed);
   }
-  async search(query: string, embed: Embed, source_refs: string[] = [], limit = 8): Promise<SearchResult> {
+  async search(query: string, embed: Embed, source_refs: string[] = [], limit = 8, mode: SearchMode = "semantic"): Promise<SearchResult> {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new Error("Search limit must be 1 to 50");
-    const ranks: number[][] = []; const gaps: string[] = []; const take = Math.min(200, limit * 10);
+    let dense: RankedChunk[] = []; let lexical: RankedChunk[] = [];
+    const gaps: string[] = []; const take = Math.min(200, limit * 10);
     const exactIds = new Set<number>();
     const dirty = this.db.prepare("SELECT count(*) AS count FROM conversations WHERE dirty<>0").get();
     if (dirty !== undefined && number(dirty, "count") > 0) gaps.push(`${number(dirty, "count")} conversations await indexing`);
     try {
       if (query.trim().length > 0) {
         const batch = await embed([query], "query"); validate(batch, 1); this.setSpace(batch.space);
-        ranks.push(this.db.prepare("SELECT rowid AS id FROM chunk_vectors WHERE embedding MATCH ? AND k=? ORDER BY distance")
-          .all(new Uint8Array(new Float32Array(batch.vectors[0]!).buffer), take).map((row) => number(row, "id")));
+        dense = this.db.prepare("SELECT rowid AS id,distance AS value FROM chunk_vectors WHERE embedding MATCH ? AND k=? ORDER BY distance")
+          .all(new Uint8Array(new Float32Array(batch.vectors[0]!).buffer), take).map((row) => ({ id: number(row, "id"), value: number(row, "value") }));
       }
     } catch (error) { gaps.push(error instanceof Error ? error.message : "Semantic retrieval is unavailable"); }
     // No awaits between ranked reads and hydration: a publication may replace/reuse chunk rowids.
@@ -223,15 +226,23 @@ export class SearchIndex {
     if (exact.length > 0) {
       const matches = this.db.prepare(`SELECT DISTINCT chunk_id AS id FROM source_refs WHERE ref IN (${exact.map(() => "?").join(",")}) LIMIT ?`).all(...exact, take).map((row) => number(row, "id"));
       for (const id of matches) exactIds.add(id);
-      ranks.push(matches);
     }
     const tokens = query.match(/[\p{L}\p{N}_]+/gu)?.slice(0, 32) ?? [];
-    if (tokens.length > 0) ranks.push(this.db.prepare("SELECT rowid AS id FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?")
-      .all(tokens.map((token) => `"${token.replaceAll('"', '""')}"`).join(" OR "), take).map((row) => number(row, "id")));
+    if (tokens.length > 0) lexical = this.db.prepare("SELECT rowid AS id,rank AS value FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?")
+      .all(tokens.map((token) => `"${token.replaceAll('"', '""')}"`).join(" OR "), take).map((row) => ({ id: number(row, "id"), value: number(row, "value") }));
     const scores = new Map<number, number>();
-    for (const rank of ranks) rank.forEach((id, index) => scores.set(id, (scores.get(id) ?? 0) + 1 / (60 + index + 1)));
-    // The fractional RRF score breaks ties inside a tier. Exact source identity outranks similarity.
-    for (const id of exactIds) scores.set(id, 1 + (scores.get(id) ?? 0));
+    const rank = (ids: number[], tier: 1 | 2 | 3) => ids.forEach((id, index) => scores.set(id, tier + 1 / (60 + index + 1)));
+    // Incidental word overlap must not displace a semantic match. The other
+    // channel breaks equal distances/ranks and fills remaining slots.
+    const primary = mode === "semantic" ? dense : lexical;
+    const secondary = mode === "semantic" ? lexical : dense;
+    const secondaryRanks = new Map(secondary.map((chunk, index) => [chunk.id, index]));
+    primary.sort((left, right) => left.value - right.value ||
+      (secondaryRanks.get(left.id) ?? take) - (secondaryRanks.get(right.id) ?? take) || left.id - right.id);
+    rank(secondary.map((chunk) => chunk.id), 1);
+    rank(primary.map((chunk) => chunk.id), 2);
+    // Exact source identity outranks either search mode.
+    rank([...exactIds].sort((left, right) => (scores.get(right) ?? 0) - (scores.get(left) ?? 0) || left - right), 3);
     if (scores.size === 0) return { candidates: [], gaps };
     const rows = this.db.prepare(`SELECT id,conversation_id,entry_id,text,source_refs FROM chunks WHERE id IN (${[...scores].map(() => "?").join(",")})`).all(...scores.keys());
     const candidates = new Map<string, SearchCandidate>();

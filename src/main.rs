@@ -21,7 +21,7 @@ use agent_cli::{
     models::{ModelProvider, ModelSelection, Reasoning},
     protocol::{
         AuthStatus, CoordinatorBootstrap, CoordinatorSettings, ImportPhase, RuntimeCommand,
-        RuntimeEventKind, TaskId, WorkerLaunch, WorkerRef,
+        RuntimeEventKind, SearchMode, TaskId, WorkerLaunch, WorkerRef,
     },
     rex::{BlockId, RexClient, SessionId},
     runtime::FrameReader,
@@ -230,6 +230,8 @@ enum HistoryAction {
         query: String,
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=50))]
         limit: u32,
+        #[arg(long, value_enum, default_value_t = SearchMode::Semantic)]
+        mode: SearchMode,
     },
     Read {
         conversation_id: String,
@@ -539,8 +541,8 @@ async fn main() -> Result<()> {
             ImportAction::Status => RuntimeCommand::ImportStatus,
         },
         Action::History { command } => match command {
-            HistoryAction::Search { query, limit } => {
-                RuntimeCommand::SearchHistory { query, limit }
+            HistoryAction::Search { query, limit, mode } => {
+                RuntimeCommand::SearchHistory { query, limit, mode }
             }
             HistoryAction::Read {
                 conversation_id,
@@ -2024,6 +2026,7 @@ fn import_phase_name(phase: &ImportPhase) -> &'static str {
 mod tests {
     use crate::{Action, Arguments, ModelArgs, local_service_command};
     use agent_cli::models::{ModelProvider, ModelSelection, Reasoning};
+    use agent_cli::protocol::SearchMode;
     use clap::Parser;
     use std::path::Path;
 
@@ -2047,7 +2050,31 @@ mod tests {
         ])
         .unwrap();
         assert!(
-            matches!(parsed.command, Some(Action::History { command: crate::HistoryAction::Search { query, limit: 5 } }) if query == "a different phrase")
+            matches!(parsed.command, Some(Action::History { command: crate::HistoryAction::Search { query, limit: 5, mode: SearchMode::Semantic } }) if query == "a different phrase")
+        );
+        let parsed = Arguments::try_parse_from([
+            "agent",
+            "history",
+            "search",
+            "ERR_FIXTURE",
+            "--mode",
+            "keyword",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Action::History {
+                command: crate::HistoryAction::Search {
+                    mode: SearchMode::Keyword,
+                    ..
+                }
+            })
+        ));
+        assert!(
+            Arguments::try_parse_from(
+                ["agent", "history", "search", "query", "--mode", "unknown",]
+            )
+            .is_err()
         );
         assert!(
             Arguments::try_parse_from(["agent", "history", "search", "query", "--limit", "0"])

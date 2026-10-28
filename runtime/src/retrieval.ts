@@ -3,6 +3,7 @@ import type { Harness } from "@earendil-works/pi-durable";
 import type { HostCall, TaskStore } from "./tasks.js";
 import type { HistoryStore } from "./history.js";
 import { SearchIndex, type Embed, type SearchResult } from "./search.js";
+import type { SearchMode } from "./generated/SearchMode.js";
 
 /** Commit notifications enqueue work; indexing never reenters the Pi commit. */
 export class Retrieval {
@@ -50,14 +51,14 @@ export class Retrieval {
     });
     this.syncing = operation.catch(() => {}); return operation;
   }
-  async search(query: string, sources: string[], limit: number, call: HostCall, importing = false): Promise<SearchResult> {
+  async search(query: string, sources: string[], limit: number, call: HostCall, importing = false, mode: SearchMode = "semantic"): Promise<SearchResult> {
     const gaps: string[] = [];
     if (!importing) {
       try { await this.sync(call); }
       catch (error) { gaps.push(error instanceof Error ? error.message : "History indexing is unavailable"); }
     } else gaps.push("Codex history import and indexing are in progress");
     try {
-      const result = await this.open().search(query, this.embed(call), sources, limit);
+      const result = await this.open().search(query, this.embed(call), sources, limit, mode);
       return { candidates: result.candidates, gaps: [...gaps, ...result.gaps] };
     } catch (error) { return { candidates: [], gaps: [...gaps, error instanceof Error ? error.message : "History search is unavailable"] }; }
   }

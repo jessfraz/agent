@@ -1637,6 +1637,10 @@
               "format": "uint32",
               "minimum": 0
             },
+            "mode": {
+              "$ref": "#/$defs/SearchMode",
+              "default": "semantic"
+            },
             "query": {
               "type": "string"
             },
@@ -1833,6 +1837,13 @@
             "result"
           ]
         }
+      ]
+    },
+    "SearchMode": {
+      "type": "string",
+      "enum": [
+        "semantic",
+        "keyword"
       ]
     },
     "SourceBatch": {

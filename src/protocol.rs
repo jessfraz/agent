@@ -194,6 +194,8 @@ pub enum RuntimeCommand {
     SearchHistory {
         query: String,
         limit: u32,
+        #[serde(default)]
+        mode: SearchMode,
     },
     ReadConversation {
         conversation_id: String,
@@ -650,6 +652,26 @@ pub enum HistoryRole {
     Tool,
 }
 
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Deserialize,
+    Serialize,
+    JsonSchema,
+    TS,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    #[default]
+    Semantic,
+    Keyword,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryProvider {
@@ -746,4 +768,40 @@ pub enum ErrorCode {
     ProviderUnavailable,
     StorageUnavailable,
     Internal,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::protocol::{RuntimeCommand, SearchMode};
+
+    #[test]
+    fn history_search_mode_defaults_and_rejects_unknown_values() {
+        let command: RuntimeCommand =
+            serde_json::from_str(r#"{"type":"search_history","query":"saved context","limit":8}"#)
+                .unwrap();
+        assert!(matches!(
+            command,
+            RuntimeCommand::SearchHistory {
+                mode: SearchMode::Semantic,
+                ..
+            }
+        ));
+        let command: RuntimeCommand = serde_json::from_str(
+            r#"{"type":"search_history","query":"ERR_FIXTURE","limit":8,"mode":"keyword"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            command,
+            RuntimeCommand::SearchHistory {
+                mode: SearchMode::Keyword,
+                ..
+            }
+        ));
+        assert!(
+            serde_json::from_str::<RuntimeCommand>(
+                r#"{"type":"search_history","query":"saved context","limit":8,"mode":"unknown"}"#,
+            )
+            .is_err()
+        );
+    }
 }

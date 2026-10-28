@@ -150,8 +150,8 @@ test("real bridge confines malformed host replies to their matching operation", 
   const invalid = { type: "embeddings", batch: { space, vectors: [["private payload must not enter diagnostics"]] } };
   const malformed = (id: number, call_id: string) => write({ version: 1, id, command: { type: "host_reply", call_id, result: invalid } });
   try {
-    send(1, { type: "search_history", query: "synthetic first", limit: 8 });
-    send(2, { type: "search_history", query: "synthetic second", limit: 8 });
+    send(1, { type: "search_history", query: "synthetic first", limit: 8, mode: "semantic" });
+    send(2, { type: "search_history", query: "synthetic second", limit: 8, mode: "semantic" });
     const [first, second] = await Promise.all([event(1, "host_call"), event(2, "host_call")]);
     assert.ok(first.type === "host_call" && second.type === "host_call");
     assert.equal(first.command.type, "embed"); assert.equal(second.command.type, "embed");

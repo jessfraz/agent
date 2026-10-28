@@ -272,8 +272,8 @@ test("bounded Unicode chunks retain entry provenance and representative queries 
       assert.ok(typeof run === "string");
       const plans = {
         exact: db.prepare("EXPLAIN QUERY PLAN SELECT DISTINCT chunk_id FROM source_refs WHERE ref IN (?) LIMIT ?").all("mail:synthetic:10", 20),
-        fts: db.prepare("EXPLAIN QUERY PLAN SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?").all('"maintenance"', 20),
-        dense: db.prepare("EXPLAIN QUERY PLAN SELECT rowid FROM chunk_vectors WHERE embedding MATCH ? AND k=? ORDER BY distance").all(new Uint8Array(new Float32Array([1, 0, 0]).buffer), 20),
+        fts: db.prepare("EXPLAIN QUERY PLAN SELECT rowid AS id,rank AS value FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?").all('"maintenance"', 20),
+        dense: db.prepare("EXPLAIN QUERY PLAN SELECT rowid AS id,distance AS value FROM chunk_vectors WHERE embedding MATCH ? AND k=? ORDER BY distance").all(new Uint8Array(new Float32Array([1, 0, 0]).buffer), 20),
         cache: db.prepare("EXPLAIN QUERY PLAN SELECT c.hash,v.embedding FROM chunks c JOIN chunk_vectors v ON v.rowid=c.id WHERE c.conversation_id=? AND c.hash IN (?)").all("representative", "synthetic"),
         stagingBeforeHashIndex: before,
         stagingCache: db.prepare("EXPLAIN QUERY PLAN " + stagedCache).all("partial-plan", ...hashes),
