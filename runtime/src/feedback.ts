@@ -8,6 +8,7 @@ import type { FeedbackContext } from "./generated/FeedbackContext.js";
 import type { FeedbackEntry } from "./generated/FeedbackEntry.js";
 import type { FeedbackEvidence } from "./generated/FeedbackEvidence.js";
 import { DelegationDecisionEntry } from "./delegation.js";
+import { AllocationDecisionEntry } from "./allocation.js";
 import { TaskStore } from "./tasks.js";
 
 const SAFE_DECISIONS = new Set(["search_tasks", "delegate_task", "spawn_agent", "continue_agent", "record_task", "report_result", "read_agents", "wait_agents"]);
@@ -19,9 +20,9 @@ function object(value: unknown): value is Record<string, unknown> {
 
 /** Minimize known credential forms, without pretending arbitrary prose is secret-free. */
 function redact(value: string): string {
-  return value.replace(/\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{12,}|github_pat_[A-Za-z0-9_]{12,})\b/g, "[credential omitted]")
-    .replace(/\bBearer\s+[^\s"']+/gi, "Bearer [credential omitted]")
-    .replace(/((?:password|access[_-]?token|refresh[_-]?token|api[_-]?key|client[_-]?secret)\s*["']?\s*[:=]\s*["']?)[^\s"',;}]+/gi, "$1[credential omitted]");
+  return value.replace(/\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{12,}|github_pat_[A-Za-z0-9_]{12,})\b/g, "[redacted]")
+    .replace(/\bBearer\s+[^\s"']+/gi, "Bearer [redacted]")
+    .replace(/((?:password|access[_-]?token|refresh[_-]?token|api[_-]?key|client[_-]?secret)\s*["']?\s*[:=]\s*["']?)[^\s"',;}]+/gi, "$1[redacted]");
 }
 
 class Capture {
@@ -50,6 +51,17 @@ async function privateWrite(path: string, content: string): Promise<void> {
 
 function diagnostic(entry: EntryRecord, capture: Capture): FeedbackEntry {
   const evidence: FeedbackEvidence[] = [];
+  if (AllocationDecisionEntry.is(entry)) {
+    if (capture.evidence <= 0) { capture.truncated = true; return { entry_id: entry.id.toString(), kind: entry.kind, evidence }; }
+    capture.evidence -= 1;
+    const decision = { ...entry.data, reason: capture.text(entry.data.reason, 2048),
+      result: entry.data.result.type === "failed" ? { ...entry.data.result, message: capture.text(entry.data.result.message, 2048) } : entry.data.result };
+    // Keep typed identities intact. Omit a receipt that cannot fit or contains
+    // credential forms elsewhere, rather than emitting partial lifecycle state.
+    const serialized = JSON.stringify(decision);
+    if (capture.text(serialized, 131_072) === serialized) evidence.push({ type: "allocation", decision });
+    else capture.truncated = true;
+  }
   if (DelegationDecisionEntry.is(entry)) {
     const decision = entry.data;
     if (capture.evidence <= 0) { capture.truncated = true; return { entry_id: entry.id.toString(), kind: entry.kind, evidence }; }
@@ -115,7 +127,7 @@ export class FeedbackStore {
       if (actor === undefined) throw new Error("The feedback task agent is unavailable.");
       if (input.conversation_id !== null && actor.conversation_id !== input.conversation_id) throw new Error("Feedback conversation does not belong to this task.");
       conversation_id = actor.conversation_id; model = actor.model ?? task.model ?? model;
-      if (actor.worker.state === "bound") binding = actor.worker.binding;
+      if ("binding" in actor.worker) binding = actor.worker.binding;
     } else if (input.agent_id !== null) throw new Error("Choose a task for agent feedback.");
     const conversation = conversation_id === root.id.toString() ? root : await this.tasks.conversation(conversation_id);
     const page = await conversation.entries({ order: "descending" }, 40, undefined, BACKGROUND_CONTEXT);

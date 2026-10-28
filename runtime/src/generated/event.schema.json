@@ -83,6 +83,159 @@
         "launch"
       ]
     },
+    "AllocationDecision": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "current": {
+          "$ref": "#/$defs/WorkerState"
+        },
+        "operation": {
+          "$ref": "#/$defs/AllocationOperation"
+        },
+        "previous": {
+          "$ref": "#/$defs/WorkerState"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "result": {
+          "$ref": "#/$defs/AllocationResult"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        }
+      },
+      "required": [
+        "task_id",
+        "operation",
+        "previous",
+        "current",
+        "result",
+        "reason"
+      ]
+    },
+    "AllocationOperation": {
+      "type": "string",
+      "enum": [
+        "create",
+        "resume",
+        "reconcile",
+        "revoke",
+        "reopen"
+      ]
+    },
+    "AllocationResult": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pending"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "written"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "binding": {
+              "$ref": "#/$defs/WorkerRef"
+            },
+            "type": {
+              "type": "string",
+              "const": "spawned"
+            }
+          },
+          "required": [
+            "type",
+            "binding"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "presence": {
+              "$ref": "#/$defs/WorkerPresence"
+            },
+            "type": {
+              "type": "string",
+              "const": "presence"
+            }
+          },
+          "required": [
+            "type",
+            "presence"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "creation_uncertain"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "failed"
+            }
+          },
+          "required": [
+            "type",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "rejected"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
     "AuthStatus": {
       "oneOf": [
         {
@@ -263,6 +416,16 @@
           "items": {
             "type": "string"
           }
+        },
+        "input_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InputMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "query": {
           "type": [
@@ -634,6 +797,22 @@
             "type": {
               "type": "string",
               "const": "delegation"
+            }
+          },
+          "required": [
+            "type",
+            "decision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "decision": {
+              "$ref": "#/$defs/AllocationDecision"
+            },
+            "type": {
+              "type": "string",
+              "const": "allocation"
             }
           },
           "required": [
@@ -2999,6 +3178,62 @@
         }
       }
     },
+    "WorkerPresence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "pending"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "running": {
+              "type": "boolean"
+            },
+            "state": {
+              "type": "string",
+              "const": "present"
+            }
+          },
+          "required": [
+            "state",
+            "running"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "missing_session"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "missing_terminal"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        }
+      ]
+    },
     "WorkerRef": {
       "type": "object",
       "properties": {
@@ -3071,6 +3306,54 @@
             "state": {
               "type": "string",
               "const": "bound"
+            }
+          },
+          "required": [
+            "state",
+            "allocation_id",
+            "host",
+            "binding"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allocation_id": {
+              "type": "string"
+            },
+            "binding": {
+              "$ref": "#/$defs/WorkerRef"
+            },
+            "host": {
+              "$ref": "#/$defs/WorkerHost"
+            },
+            "state": {
+              "type": "string",
+              "const": "resuming"
+            }
+          },
+          "required": [
+            "state",
+            "allocation_id",
+            "host",
+            "binding"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allocation_id": {
+              "type": "string"
+            },
+            "binding": {
+              "$ref": "#/$defs/WorkerRef"
+            },
+            "host": {
+              "$ref": "#/$defs/WorkerHost"
+            },
+            "state": {
+              "type": "string",
+              "const": "resume_uncertain"
             }
           },
           "required": [

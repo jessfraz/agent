@@ -316,6 +316,9 @@ pub struct DelegationDecision {
     pub candidates: Vec<DelegationCandidate>,
     pub gaps: Vec<String>,
     pub selection: DelegationSelection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub input_mode: Option<InputMode>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -339,11 +342,56 @@ pub enum WorkerState {
         host: WorkerHost,
         binding: WorkerRef,
     },
+    Resuming {
+        allocation_id: String,
+        host: WorkerHost,
+        binding: WorkerRef,
+    },
+    ResumeUncertain {
+        allocation_id: String,
+        host: WorkerHost,
+        binding: WorkerRef,
+    },
     Uncertain {
         allocation_id: String,
         host: WorkerHost,
         session_id: Option<String>,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum AllocationOperation {
+    Create,
+    Resume,
+    Reconcile,
+    Revoke,
+    Reopen,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AllocationResult {
+    Pending,
+    Written,
+    Spawned { binding: WorkerRef },
+    Presence { presence: WorkerPresence },
+    CreationUncertain { session_id: Option<String> },
+    Failed { message: String },
+    Rejected,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct AllocationDecision {
+    pub task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_id: Option<String>,
+    pub operation: AllocationOperation,
+    pub previous: WorkerState,
+    pub current: WorkerState,
+    pub result: AllocationResult,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]

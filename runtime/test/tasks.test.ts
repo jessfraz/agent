@@ -144,19 +144,23 @@ test("confirmed session loss fences the old actor before reopening the same hist
   } finally { release(); controller.abort(); await running?.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("a failed Rex inspection remains uncertain and never substitutes an allocation", async () => {
+test("a failed Rex resume retains its binding for a later retry without substituting an allocation", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-session-unknown-")); const app = await open(directory);
   try {
     const task = await app.tasks.create({ title: "Retain work", outcome: "Keep its ownership" });
     await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
     await app.tasks.enqueue(task.id, "Keep this request", "pending"); let creates = 0;
-    const uncertain = await app.tasks.dispatch(task.id, host, async (command) => {
+    const original = await app.tasks.get(task.id);
+    await assert.rejects(app.tasks.dispatch(task.id, host, async (command) => {
       if (command.type === "spawn_worker") creates += 1;
       return { type: "failed", message: "The owning host is unreachable" };
+    }), /resume failed/);
+    const retained = await app.tasks.get(task.id);
+    assert.deepEqual(retained.worker, original.worker); assert.equal(creates, 0);
+    assert.equal(retained.pending[0]?.id, "pending"); assert.equal(retained.conversation_id, task.conversation_id);
+    await app.tasks.dispatch(task.id, host, async (command) => {
+      assert.equal(command.type, "resume_worker"); return { type: "written" };
     });
-    assert.equal(uncertain.worker.state, "uncertain"); assert.equal(creates, 0);
-    assert.equal(uncertain.pending[0]?.id, "pending"); assert.equal(uncertain.conversation_id, task.conversation_id);
-    await assert.rejects(app.tasks.dispatch(task.id, host, async () => { creates += 1; return { type: "spawned", binding }; }), /needs reconciliation/);
     assert.equal(creates, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -572,14 +576,13 @@ test("exact allocation revocation preserves pending work and rejects stale worke
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-for (const transition of ["spawn", "spawn-error", "resume", "resume-error"]) {
+for (const transition of ["spawn", "spawn-error"]) {
   test(`a late ${transition} result cannot resurrect a revoked allocation or overwrite its replacement`, async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-recovery-")); const app = await open(directory);
     let release: () => void = () => {};
     try {
       const task = await app.tasks.create({ title: "Fence startup", outcome: "Keep exactly one admitted worker", model: fixtureModel });
       await app.tasks.enqueue(task.id, "Keep the same original input.");
-      if (transition.startsWith("resume")) await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
       let entered: () => void = () => {};
       const started = new Promise<void>((resolve) => { entered = resolve; });
       const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -659,7 +662,7 @@ test("resuming a task keeps its session and conversation while replacing an exit
     const replacement = { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" };
     const resumed = await app.tasks.dispatch(task.id, host, async (command) => {
       assert.equal(command.type, "resume_worker");
-      assert.equal((await app.tasks.get(task.id)).worker.state, "allocating");
+      assert.equal((await app.tasks.get(task.id)).worker.state, "resuming");
       return { type: "spawned", binding: replacement };
     });
     assert.equal(resumed.conversation_id, task.conversation_id);

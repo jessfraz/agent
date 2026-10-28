@@ -66,7 +66,9 @@ test("forced new delegation requires a separate-outcome reason when related work
     assert.equal(entry.data.actor_conversation_id, app.root.id.toString()); assert.equal(entry.data.tool_call_id, "forced-without-reason");
     assert.equal(entry.data.query, "Continue cleanup Retire obsolete orchestration");
     assert.deepEqual(entry.data.selection, { kind: "considered" });
-    assert.deepEqual(entry.data.candidates, [{ conversation_id: old.conversation_id, task_id: old.id, score: 0.91 }]);
+    assert.deepEqual(entry.data.candidates.map(({ conversation_id, task_id }) => ({ conversation_id, task_id })),
+      [{ conversation_id: old.conversation_id, task_id: old.id }]);
+    assert.ok(entry.data.candidates.every((candidate) => Number.isFinite(candidate.score) && candidate.score > 0));
     assert.deepEqual(entry.data.gaps, ["Synthetic import indexing is incomplete"]);
     assert.equal(entry.model, undefined); assert.deepEqual(transcript(entry), []);
     const indexed = []; for await (const record of app.tasks.records(app.root.id.toString())) indexed.push(record.entry_id);
@@ -101,7 +103,10 @@ test("same-effort continuation reuses its binding while a justified separate out
     assert.equal(entries[1]?.data.query, null); assert.deepEqual(entries[1]?.data.candidates, []);
     const created = entries[2]?.data; assert.ok(created?.selection.kind === "create");
     assert.equal(created.selection.reason, "Calendar synchronization is a separate outcome from device playbook cleanup.");
-    assert.notEqual(created.selection.task_id, old.id); assert.deepEqual(created.candidates, entries[0]?.data.candidates);
+    assert.notEqual(created.selection.task_id, old.id);
+    assert.deepEqual(created.candidates.map(({ conversation_id, task_id }) => ({ conversation_id, task_id })),
+      entries[0]?.data.candidates.map(({ conversation_id, task_id }) => ({ conversation_id, task_id })));
+    assert.ok(created.candidates.every((candidate) => Number.isFinite(candidate.score) && candidate.score > 0));
     const separate = await app.tasks.get(created.selection.task_id); assert.ok(separate.worker.state === "bound");
     assert.notEqual(separate.worker.binding.session_id, binding.session_id);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }

@@ -9,6 +9,7 @@ import type { HostResult } from "./generated/HostResult.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 import type { DelegationDecision } from "./generated/DelegationDecision.js";
+import type { InputMode } from "./generated/InputMode.js";
 import { TaskError, TaskStore, type HostCall, type SearchQuery } from "./tasks.js";
 
 export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; default_host?: WorkerHost | null; call: HostCall; role?: "worker" | "triage";
@@ -40,6 +41,7 @@ function hostOutput(result: HostResult) {
     (result.type === "process" && result.exit_code !== 0));
 }
 const source = Type.Object({ provider: Type.String(), account: Type.String(), thread_id: Type.String() });
+const inputModes = { steer: "steer", follow_up: "follow_up" } satisfies Record<InputMode, InputMode>;
 const taskState = Type.Union([
   Type.Object({ state: Type.Literal("open") }),
   Type.Object({ state: Type.Literal("waiting"), actor: Type.String({ minLength: 1 }),
@@ -197,11 +199,12 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         return output({ task: await tasks.get(args.task_id), history: await tasks.history(args.task_id, 120_000, args.agent_id) });
       } });
   const main = defineExtension({ name: "task-main", tools: [searchTask, readTask,
-    defineTool({ name: "revoke_allocation", description: "Revoke one exact unresolved worker allocation after inspecting it. Preserves pending input and history; does not retry work or delete Rex sessions.",
+    defineTool({ name: "revoke_allocation", description: "Cancel one exact unresolved new allocation with no known Rex session. Preserves input and history; known sessions must be reconciled.",
       parameters: Type.Object({ task_id: Type.String(), allocation_id: Type.String(), agent_id: Type.Optional(Type.String()) }),
       async execute(args) { return output(await tasks.revokeAllocation(args.task_id, args.allocation_id, args.agent_id)); } }),
-    defineTool({ name: "delegate_task", description: "Continue work by task_id or conversation_id. A separate top-level outcome needs new_task:true and new_task_reason when related work exists. Queues the instruction durably.",
+    defineTool({ name: "delegate_task", description: "Continue existing work by task_id or conversation_id. Steers active work by default; use mode:follow_up for an independent later turn. A separate outcome needs new_task:true and new_task_reason when related work exists.",
       parameters: Type.Object({ task_id: Type.Optional(Type.String()), conversation_id: Type.Optional(Type.String()), input: Type.String({ minLength: 1, maxLength: 65536 }),
+        mode: Type.Optional(Type.Enum(inputModes)),
         title: Type.Optional(Type.String()), outcome: Type.Optional(Type.String()), host: Type.Optional(Type.String()),
         cwd: Type.Optional(Type.String({ minLength: 1 })), new_task: Type.Optional(Type.Boolean()),
         new_task_reason: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })), sources: Type.Optional(Type.Array(source)) }),
@@ -211,10 +214,11 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         let related: Awaited<ReturnType<TaskStore["find"]>> = { matches: [], gaps: [] };
         let action: "reuse" | "create" | "adopt" = "reuse";
         const reason = args.new_task_reason?.trim() || null;
+        const mode = args.mode ?? "steer";
         const record = (selection: DelegationDecision["selection"]) => api.commit((tx) => recordDelegation(tx, api.conversationId, {
           actor_conversation_id: api.conversationId.toString(), tool_call_id: api.callId, query,
           candidates: related.matches.map((match) => ({ conversation_id: match.conversation_id, task_id: match.task_id, score: match.score })),
-          gaps: related.gaps, selection,
+          gaps: related.gaps, selection, input_mode: mode,
         }), context);
         let task;
         if (args.task_id !== undefined && args.conversation_id !== undefined) throw new TaskError("Choose a task_id or conversation_id");
@@ -253,36 +257,38 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
           action = "create";
         } else task = await tasks.get(args.task_id);
         if (task.model === null) { await tasks.selection(task.id, execution.model ?? DEFAULT_MODEL); task = await tasks.get(task.id); }
-        if (task.worker.state === "bound" && args.cwd !== undefined && args.cwd !== task.worker.host.cwd) {
+        const known = task.worker.state === "bound" || task.worker.state === "resuming" || task.worker.state === "resume_uncertain" ? task.worker : undefined;
+        if (known !== undefined && args.cwd !== undefined && args.cwd !== known.host.cwd) {
           throw new TaskError("Continue this task in its existing working directory");
         }
-        const configured = args.host === undefined && task.worker.state === "bound" ? await tasks.workerHost(task.id)
+        const configured = args.host === undefined && known !== undefined ? await tasks.workerHost(task.id)
           : args.host === undefined ? execution.default_host === undefined ? execution.hosts[0] : execution.default_host
           : execution.hosts.find((host) => host.name === args.host || host.host_id === args.host);
         if (configured === undefined || configured === null) throw new TaskError("Choose a connected worker host");
-        if (task.worker.state === "bound" && (configured.host_id === null || configured.host_id === undefined
-          ? task.worker.host.name !== configured.name : task.worker.binding.host_id !== configured.host_id)) {
+        if (known !== undefined && (configured.host_id === null || configured.host_id === undefined
+          ? known.host.name !== configured.name : known.binding.host_id !== configured.host_id)) {
           throw new TaskError("Continue this task on its owning host");
         }
-        const host = task.worker.state === "bound" ? await tasks.workerHost(task.id)
+        const host = known !== undefined ? await tasks.workerHost(task.id)
           : args.cwd === undefined ? configured : { ...configured, cwd: args.cwd };
         await record(action === "create" ? { kind: "create", task_id: task.id, conversation_id: task.conversation_id, reason }
           : { kind: action, task_id: task.id, conversation_id: task.conversation_id });
         const inputId = await api.memo("input_id", randomUUID(), context);
-        await tasks.enqueue(task.id, args.input, inputId);
+        await tasks.enqueue(task.id, args.input, inputId, undefined, mode);
         return output(await tasks.dispatch(task.id, host, execution.call));
       } }),
     record,
   ] });
   const worker = defineExtension({ name: "task-worker", tools: [record, searchTask, readTask,
-    defineTool({ name: "continue_agent", description: "Give an agent a follow-up in its existing conversation. After a closed task session is reopened, an unassigned agent gets a new named terminal in that session.",
-      parameters: Type.Object({ agent_id: Type.String({ minLength: 1 }), input: Type.String({ minLength: 1, maxLength: 16000 }) }),
+    defineTool({ name: "continue_agent", description: "Steer an existing agent with corrections or current context. Use mode:follow_up for an independent later turn. Reuses its conversation and named terminal.",
+      parameters: Type.Object({ agent_id: Type.String({ minLength: 1 }), input: Type.String({ minLength: 1, maxLength: 16000 }),
+        mode: Type.Optional(Type.Enum(inputModes)) }),
       async execute(args, api, context) {
         const execution = executions.get(api.conversationId.toString());
         const owner = await tasks.owner(api.conversationId.toString());
         if (owner.agent !== undefined) throw new TaskError("Only the parent worker may continue task agents");
         const inputId = await api.memo("agent_input_id", randomUUID(), context);
-        return output(await tasks.continueAgent(owner.task.id, args.agent_id, args.input, inputId, execution.call));
+        return output(await tasks.continueAgent(owner.task.id, args.agent_id, args.input, inputId, execution.call, args.mode ?? "steer"));
       } }),
     defineTool({ name: "spawn_agent", description: "Give a bounded assignment to a named terminal in this task's Rex session. The parent retains the overall outcome.",
       parameters: Type.Object({ title: Type.String({ minLength: 1, maxLength: 80 }),

@@ -2,7 +2,7 @@
 
 use crate::{
     models::ModelSelection,
-    protocol::{DelegationDecision, HistoryRole, TaskId, WorkerRef},
+    protocol::{AllocationDecision, DelegationDecision, HistoryRole, TaskId, WorkerRef},
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,9 @@ pub enum FeedbackEvidence {
     },
     Delegation {
         decision: DelegationDecision,
+    },
+    Allocation {
+        decision: Box<AllocationDecision>,
     },
 }
 

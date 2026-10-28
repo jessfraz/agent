@@ -89,3 +89,27 @@ test("feedback bounds Unicode evidence and pending input, flags omissions, and r
     assert.equal(app.faux.state.callCount, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
+
+test("feedback retains native allocation recovery decisions and the known binding", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-feedback-allocation-")); let app = await open(directory);
+  try {
+    const host = { host_id: "11111111-1111-4111-8111-111111111111", name: "fixture", rex_server: null,
+      coordinator: null, cwd: "/example/project", agent_program: "/example/agent" };
+    const binding = { host_id: host.host_id, session_id: "session:22222222-2222-4222-8222-222222222222",
+      window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" };
+    const task = await app.tasks.create({ title: "Recover existing work", outcome: "Keep its folder", model: fixtureModel });
+    await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    await assert.rejects(app.tasks.dispatch(task.id, host, async () => ({ type: "failed", message: "Synthetic failure api_key=fixture-secret-value" })));
+    const bundle = await app.feedback.capture("Resume failed", { ...context(), task_id: task.id });
+    const decisions = bundle.entries.flatMap((entry) => entry.evidence).filter((evidence) => evidence.type === "allocation");
+    const failed = decisions.find((evidence) => evidence.decision.operation === "resume" && evidence.decision.result.type === "failed");
+    assert.ok(failed, "Automatic debugging needs the private native resume decision");
+    assert.equal(failed.decision.previous.state, "resuming");
+    assert.ok(failed.decision.current.state === "bound"); assert.deepEqual(failed.decision.current.binding, binding);
+    assert.deepEqual(bundle.context.binding, binding);
+    assert.equal(JSON.stringify(bundle).includes("fixture-secret-value"), false);
+    assert.equal(app.faux.state.callCount, 0);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    assert.deepEqual(await app.feedback.read(null), bundle);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});

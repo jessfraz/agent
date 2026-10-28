@@ -209,7 +209,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         });
         if (task === undefined) throw new TaskError("This conversation has no task; run agent chat for the main conversation");
         const hosts = await environment.hosts("/", null, []);
-        const host = task.worker.state === "bound" ? await tasks.workerHost(task.id)
+        const host = "binding" in task.worker ? await tasks.workerHost(task.id)
           : command.host === null ? await environment.defaultHost(hosts)
           : hosts.find((host) => host.name === command.host || host.host_id === command.host);
         if (host === null || host === undefined) throw new TaskError("Choose an online execution host");

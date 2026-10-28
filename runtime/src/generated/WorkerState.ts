@@ -2,4 +2,4 @@
 import type { WorkerHost } from "./WorkerHost.js";
 import type { WorkerRef } from "./WorkerRef.js";
 
-export type WorkerState = { "state": "unassigned" } | { "state": "allocating", allocation_id: string, host: WorkerHost, } | { "state": "bound", allocation_id: string, host: WorkerHost, binding: WorkerRef, } | { "state": "uncertain", allocation_id: string, host: WorkerHost, session_id: string | null, };
+export type WorkerState = { "state": "unassigned" } | { "state": "allocating", allocation_id: string, host: WorkerHost, } | { "state": "bound", allocation_id: string, host: WorkerHost, binding: WorkerRef, } | { "state": "resuming", allocation_id: string, host: WorkerHost, binding: WorkerRef, } | { "state": "resume_uncertain", allocation_id: string, host: WorkerHost, binding: WorkerRef, } | { "state": "uncertain", allocation_id: string, host: WorkerHost, session_id: string | null, };

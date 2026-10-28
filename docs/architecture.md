@@ -134,16 +134,19 @@ replies. Main and task CLIs render stored history with older pages available
 through `/history`; reading it does not submit it back to the model. Live
 activity exposes tool names and provider-supplied thinking text, without tool
 arguments, signatures or encrypted state.
-The Rust TUI renders Markdown with model, reasoning and directory status. A
-request-scoped interrupt cancels the current Pi turn and drains owned host
-operations before admitting the correction. Tool results remain recorded;
-interrupting cannot undo an external effect that already completed.
+The Rust TUI renders Markdown with model, reasoning and directory status.
+Enter steers, Tab queues a separate turn, and Esc stops the current Pi turn and
+drains owned host operations. Tool results remain recorded; stopping cannot
+undo an external effect that already completed.
 
 Persist allocation intent before creating a session or terminal. A missing
 creation receipt becomes uncertain and requires reconciliation. History sync
 must never create an execution. Find matching tasks regardless of process state.
-A live worker receives the follow-up in its existing terminal: idle workers
-wake, busy workers queue it, and an explicit interrupt stops the current turn.
+A live worker receives input in its existing terminal. Corrections steer active
+work by default; `mode:follow_up` queues a separate turn. The same choice is
+available to parent workers when continuing their child agents.
+Resuming an existing terminal retains its complete binding through failures and
+coordinator restarts. An uncertain resume cannot discard a known folder.
 Only an exited process needs a replacement terminal in the same session; close
 its old pane after the replacement exists.
 Rex server restart recovery remains an open question below.

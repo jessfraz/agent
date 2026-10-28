@@ -1,8 +1,8 @@
 use std::{fs, path::PathBuf};
 
 use agent_cli::protocol::{
-    DelegationDecision, HistoryImportBatch, HistoryImportReceipt, RuntimeEvent, RuntimeRequest,
-    TaskOutcome,
+    AllocationDecision, DelegationDecision, HistoryImportBatch, HistoryImportReceipt, RuntimeEvent,
+    RuntimeRequest, TaskOutcome,
 };
 use anyhow::Result;
 use schemars::schema_for;
@@ -16,6 +16,7 @@ fn main() -> Result<()> {
     RuntimeEvent::export_all(&config)?;
     TaskOutcome::export_all(&config)?;
     DelegationDecision::export_all(&config)?;
+    AllocationDecision::export_all(&config)?;
     HistoryImportBatch::export_all(&config)?;
     HistoryImportReceipt::export_all(&config)?;
     fs::write(

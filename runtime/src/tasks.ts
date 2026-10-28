@@ -23,6 +23,9 @@ import type { ImportedConversation } from "./generated/ImportedConversation.js";
 import type { SearchRecord, SearchResult } from "./search.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 import type { InputMode } from "./generated/InputMode.js";
+import type { AllocationOperation } from "./generated/AllocationOperation.js";
+import type { AllocationResult } from "./generated/AllocationResult.js";
+import { AllocationDecisionEntry, allocationResult } from "./allocation.js";
 
 export type HostCall = (command: HostCommand) => Promise<HostResult>;
 export type SearchQuery = (query: string, sourceRefs: string[], limit: number, mode?: SearchMode) => Promise<SearchResult>;
@@ -95,6 +98,7 @@ function sameBinding(left: WorkerRef, right: WorkerRef): boolean {
 /** Application metadata lives on Pi's commit line, beside its conversations. */
 export class TaskStore {
   private readonly running = new Map<string, AttachedWorker>();
+  private readonly resuming = new Set<string>();
   private readonly nativeIds = new Map<string, ConversationId>();
   private scanning: Promise<void> | undefined;
   private resources: { attach(taskId: string): Promise<void> } | undefined;
@@ -114,10 +118,12 @@ export class TaskStore {
     const task = await this.get(id); const actor = this.actor(task, agentId);
     if (actor.worker.state === "unassigned") throw new TaskError("This task has no execution host.");
     return await this.environment?.deployment(actor.worker.host,
-      actor.worker.state === "bound" ? actor.worker.binding.host_id : undefined, actor.model ?? task.model) ?? actor.worker.host;
+      "binding" in actor.worker ? actor.worker.binding.host_id : undefined, actor.model ?? task.model) ?? actor.worker.host;
   }
   private savedWorker(worker: WorkerState): WorkerState {
-    return worker.state === "unassigned" ? worker : { ...worker, host: savedHost(worker.host) };
+    if (worker.state === "unassigned") return { state: "unassigned" };
+    if ("binding" in worker) return { ...worker, host: savedHost(worker.host), binding: { ...worker.binding } };
+    return { ...worker, host: savedHost(worker.host) };
   }
   private savedTask(task: TaskRecord): TaskRecord {
     return { ...task, model: savedModel(task.model), worker: this.savedWorker(task.worker),
@@ -208,7 +214,7 @@ export class TaskStore {
     if (task === undefined) return false;
     task.agents ??= [];
     return task.state.state === "resolved" && task.pending.length === 0 && !this.isRunning(id) &&
-      task.worker.state !== "allocating" && task.worker.state !== "uncertain" && this.canResolve(task);
+      (task.worker.state === "unassigned" || task.worker.state === "bound") && this.canResolve(task);
   }
   async conversation(id: string): Promise<Conversation> {
     const imported = await this.histories?.conversation(id);
@@ -311,23 +317,31 @@ export class TaskStore {
   async find(query: string, sources: readonly SourceRef[] = [], limit = 8, search?: SearchQuery, mode: SearchMode = "semantic"): Promise<{ matches: SavedMatch[]; gaps: string[] }> {
     const indexed = search === undefined ? { candidates: [], gaps: this.histories === undefined ? [] : ["Semantic history search is unavailable"] }
       : await search(query, sources.map(sourceReference), limit, mode);
-    const tasks = await this.list(); const matches: SavedMatch[] = [];
-    const add = (match: SavedMatch) => { if (!matches.some((saved) => saved.conversation_id === match.conversation_id)) matches.push(match); };
-    for (const task of tasks) if (sources.some((source) => task.sources.some((saved) => related(saved, source)))) {
-      add({ conversation_id: task.conversation_id, title: task.title, excerpt: task.summary || task.outcome, entry_ids: [], score: 1000, task_id: task.id, imported: null });
-    }
-    for (const candidate of indexed.candidates) {
+    const tasks = await this.list(); const matches = new Map<string, SavedMatch>(); const exact = new Set<string>();
+    const refs = new Set([...sources.map(sourceReference), query.trim()]);
+    // Fuse the independent rankings so current task metadata stays discoverable
+    // while a large history import has not yet indexed those conversations.
+    const add = (match: SavedMatch, rank: number) => {
+      const saved = matches.get(match.conversation_id) ?? { ...match, score: 0 };
+      saved.score += 1 / (60 + rank + 1); matches.set(saved.conversation_id, saved);
+    };
+    for (const [rank, candidate] of indexed.candidates.entries()) {
       const task = tasks.find((task) => task.conversation_id === candidate.conversation_id || task.agents.some((agent) => agent.conversation_id === candidate.conversation_id));
       const imported = await this.histories?.byConversation(candidate.conversation_id) ?? null;
       add({ conversation_id: candidate.conversation_id, title: task?.title ?? imported?.thread.title ?? "Main conversation",
         excerpt: candidate.matches.map((match) => match.text).join("\n").slice(0, 24_000), score: candidate.score,
         entry_ids: [...new Set(candidate.matches.map((match) => match.entry_id))],
-        task_id: task?.id ?? imported?.adopted_task_id ?? null, imported });
+        task_id: task?.id ?? imported?.adopted_task_id ?? null, imported }, rank);
+      if (candidate.matches.some((match) => match.source_refs.some((ref) => refs.has(ref)))) exact.add(candidate.conversation_id);
     }
-    for (const task of await this.rank(query, sources, limit, search === undefined)) add({
+    for (const [rank, task] of (await this.rank(query, sources, limit, search === undefined)).entries()) add({
       conversation_id: task.conversation_id, title: task.title, excerpt: task.summary || task.outcome, entry_ids: [], score: 1, task_id: task.id, imported: null,
-    });
-    return { matches: matches.slice(0, Math.min(20, Math.max(1, limit))), gaps: indexed.gaps };
+    }, rank);
+    for (const task of tasks) if (sources.some((source) =>
+      (source.provider === "task_outcomes" && source.account === "local" && source.thread_id === task.id) ||
+      task.sources.some((saved) => related(saved, source)))) exact.add(task.conversation_id);
+    return { matches: [...matches.values()].sort((left, right) => Number(exact.has(right.conversation_id)) - Number(exact.has(left.conversation_id)) || right.score - left.score)
+      .slice(0, Math.min(20, Math.max(1, limit))), gaps: indexed.gaps };
   }
   async adopt(conversationId: string, input: { id: string; title?: string; outcome: string; evidence: string; model: ModelSelection; sources?: SourceRef[] }): Promise<TaskRecord> {
     const imported = await this.histories?.byConversation(conversationId);
@@ -390,24 +404,43 @@ export class TaskStore {
     await this.session.commit((tx) => this.updateIn(tx, id, change), BACKGROUND_CONTEXT);
     return this.get(id);
   }
-  async enqueue(id: string, content: string, inputId: string = randomUUID(), delivered?: TaskOutcome): Promise<TaskRecord> {
-    return this.enqueueActor(id, content, inputId, undefined, delivered);
+  private async allocation(id: string, operation: AllocationOperation,
+    change: (task: TaskRecord) => { result: AllocationResult; reason: string }, agentId?: string): Promise<TaskRecord> {
+    const actor = this.actor(await this.get(id), agentId);
+    const conversation = await this.conversation(actor.conversation_id);
+    await this.session.commit(async (tx) => {
+      let previous: WorkerState | undefined;
+      let current: WorkerState | undefined;
+      let decision: { result: AllocationResult; reason: string } | undefined;
+      await this.updateIn(tx, id, (task) => {
+        previous = this.savedWorker(this.actor(task, agentId).worker);
+        decision = change(task);
+        current = this.savedWorker(this.actor(task, agentId).worker);
+      });
+      if (previous === undefined || current === undefined || decision === undefined) throw new TaskError("Allocation decision did not commit");
+      await tx.appendEntry(AllocationDecisionEntry, conversation.id, { data: { task_id: id,
+        ...(agentId === undefined ? {} : { agent_id: agentId }), operation, previous, current, ...decision } });
+    }, BACKGROUND_CONTEXT);
+    return this.get(id);
+  }
+  async enqueue(id: string, content: string, inputId: string = randomUUID(), delivered?: TaskOutcome, mode?: InputMode): Promise<TaskRecord> {
+    return this.enqueueActor(id, content, inputId, undefined, delivered, mode);
   }
   async input(input: WorkerInput, content: string, inputId: string, mode?: InputMode): Promise<TaskRecord> {
     const active = this.running.get(this.actorKey(input.task_id, input.agent_id));
     if (active?.attached !== true || active.input !== input) throw new TaskError("This worker is no longer attached");
     return this.enqueueActor(input.task_id, content, inputId, input.agent_id, undefined, mode);
   }
-  async continueAgent(id: string, agentId: string, content: string, inputId: string, call?: HostCall): Promise<TaskRecord> {
+  async continueAgent(id: string, agentId: string, content: string, inputId: string, call?: HostCall, mode?: InputMode): Promise<TaskRecord> {
     if (this.running.get(this.actorKey(id, agentId))?.attached !== true) {
       const task = await this.get(id);
       if (call !== undefined && this.actor(task, agentId).worker.state === "unassigned" && task.worker.state === "bound") {
-        await this.enqueueActor(id, content, inputId, agentId);
+        await this.enqueueActor(id, content, inputId, agentId, undefined, mode);
         return this.dispatchAgent(id, agentId, call);
       }
       throw new TaskError("This agent is no longer attached; its conversation is retained");
     }
-    return this.enqueueActor(id, content, inputId, agentId);
+    return this.enqueueActor(id, content, inputId, agentId, undefined, mode);
   }
   private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome, mode?: InputMode): Promise<TaskRecord> {
     if (content.trim().length === 0 || Buffer.byteLength(content, "utf8") > 65_536) throw new TaskError("Task input must contain 1 to 65536 UTF-8 bytes");
@@ -532,18 +565,23 @@ export class TaskStore {
   }
   canResolve(task: TaskRecord): boolean {
     return task.agents.every((agent) => agent.state.state !== "open" && agent.pending.length === 0 &&
-      agent.worker.state !== "allocating" && agent.worker.state !== "uncertain" && !this.busy(task.id, agent.id));
+      (agent.worker.state === "unassigned" || agent.worker.state === "bound") && !this.busy(task.id, agent.id));
   }
   /** Revoke admission before replacement; this never deletes a native session or retries input. */
   async revokeAllocation(id: string, allocationId: string, agentId?: string): Promise<TaskRecord> {
-    return this.update(id, (task) => {
-      if (this.running.has(this.actorKey(id, agentId))) throw new TaskError("An attached worker must finish before its allocation can be revoked");
+    let rejected: string | undefined;
+    const task = await this.allocation(id, "revoke", (task) => {
       const actor = this.actor(task, agentId);
-      if ((actor.worker.state !== "allocating" && actor.worker.state !== "uncertain") || actor.worker.allocation_id !== allocationId) {
-        throw new TaskError("Only this exact unresolved allocation can be revoked");
-      }
+      if (this.running.has(this.actorKey(id, agentId))) rejected = "An attached worker must finish before its allocation can be revoked";
+      else if ((actor.worker.state !== "allocating" && actor.worker.state !== "uncertain") || actor.worker.allocation_id !== allocationId) {
+        rejected = "Only this exact unresolved allocation can be revoked; a known session must be retained";
+      } else if (actor.worker.state === "uncertain" && actor.worker.session_id !== null) rejected = "A known session cannot be discarded by revoking its allocation";
+      if (rejected !== undefined) return { result: { type: "rejected" }, reason: rejected };
       actor.worker = { state: "unassigned" };
-    });
+      return { result: { type: "written" }, reason: "Revoked an unknown creation while retaining its conversation and pending input" };
+    }, agentId);
+    if (rejected !== undefined) throw new TaskError(rejected);
+    return task;
   }
   private requireAllocation(worker: WorkerState, allocationId: string): void {
     if (worker.state !== "allocating" || worker.allocation_id !== allocationId) {
@@ -564,51 +602,72 @@ export class TaskStore {
     if (current.worker.state === "allocating" || current.worker.state === "uncertain") {
       throw new TaskError("Worker allocation needs reconciliation; no duplicate session was created");
     }
+    if (this.resuming.has(id)) throw new TaskError("A worker resume is already in progress; its session is retained");
+    if (current.worker.state === "resuming" || current.worker.state === "resume_uncertain") {
+      const previous = current.worker;
+      this.resuming.add(id);
+      try {
+        const presence = await this.inspect(previous.binding, call);
+        if (presence?.state === "missing_session") return await this.reopen(id, previous, call);
+        const recovered = await this.allocation(id, "reconcile", (task) => {
+          this.requireResume(task.worker, previous);
+          if (presence?.state === "pending" || (presence?.state === "present" && presence.running)) {
+            task.worker = { ...previous, state: "bound" };
+          } else task.worker = { ...previous, state: "resume_uncertain" };
+          return { result: presence === undefined ? { type: "failed", message: "Worker inspection was unavailable" } : { type: "presence", presence },
+            reason: task.worker.state === "bound" ? "Recovered the original running terminal in its existing session"
+              : "Retained the known session because its replacement terminal is still unconfirmed" };
+        });
+        if (recovered.worker.state !== "bound") throw new TaskError("Worker resume needs reconciliation; its known session and pending input are retained");
+        return recovered;
+      } finally { this.resuming.delete(id); }
+    }
     if (current.worker.state === "bound") {
       const sameHost = host.host_id === undefined || host.host_id === null ? current.worker.host.name === host.name
         : current.worker.binding.host_id === host.host_id;
       if (!sameHost) throw new TaskError("Continue this task on its owning host");
       const previous = { ...current.worker, host: await this.workerHost(id) };
-      const claimed = await this.session.commit(async (tx) => {
-        const index = await tx.doc(Tasks);
-        const task = index.tasks.find((task) => task.id === id);
-        if (task === undefined || task.worker.state !== "bound" ||
-            task.worker.allocation_id !== previous.allocation_id || !sameBinding(task.worker.binding, previous.binding)) return false;
-        task.worker = { state: "allocating", allocation_id: previous.allocation_id, host: previous.host };
-        task.updated_at = Date.now();
-        return true;
-      }, BACKGROUND_CONTEXT);
-      if (!claimed) throw new TaskError("Another worker transition owns this task");
-      let result: HostResult;
-      try { result = await call({ type: "resume_worker", host: previous.host, allocation_id: previous.allocation_id,
-        binding: previous.binding, task_id: id }); }
-      catch { result = { type: "creation_uncertain", session_id: previous.binding.session_id }; }
-      if (result.type === "failed" || result.type === "creation_uncertain") {
-        const presence = await this.inspect(previous.binding, call);
-        if (presence?.state === "missing_session") return this.reopen(id, previous, call);
-      }
-      return this.update(id, (task) => {
-        this.requireAllocation(task.worker, previous.allocation_id);
-        if (result.type === "spawned" && result.binding.session_id === previous.binding.session_id &&
-            result.binding.host_id === previous.binding.host_id) {
-          task.worker = { ...previous, binding: result.binding };
-        } else if (result.type === "written" || (result.type === "worker_presence" && result.presence.state === "pending")) task.worker = previous;
-        else task.worker = { state: "uncertain", allocation_id: previous.allocation_id,
-          host: previous.host, session_id: previous.binding.session_id };
-      });
+      if (this.resuming.has(id)) throw new TaskError("A worker resume is already in progress; its session is retained");
+      this.resuming.add(id);
+      try {
+        await this.allocation(id, "resume", (task) => {
+          if (task.worker.state !== "bound" || task.worker.allocation_id !== previous.allocation_id ||
+              !sameBinding(task.worker.binding, previous.binding)) throw new TaskError("Another worker transition owns this task");
+          task.worker = { ...previous, state: "resuming" };
+          return { result: { type: "pending" }, reason: "Resuming the existing session without discarding its binding" };
+        });
+        let result: HostResult;
+        try { result = await call({ type: "resume_worker", host: previous.host, allocation_id: previous.allocation_id,
+          binding: previous.binding, task_id: id }); }
+        catch { result = { type: "creation_uncertain", session_id: previous.binding.session_id }; }
+        const resumed = await this.allocation(id, "resume", (task) => {
+          this.requireResume(task.worker, previous);
+          if (result.type === "spawned" && result.binding.session_id === previous.binding.session_id &&
+              result.binding.host_id === previous.binding.host_id) task.worker = { ...previous, binding: result.binding };
+          else if (result.type === "written" || result.type === "failed" ||
+              (result.type === "worker_presence" && result.presence.state === "pending")) task.worker = previous;
+          else task.worker = { ...previous, state: "resume_uncertain" };
+          return { result: allocationResult(result), reason: task.worker.state === "bound"
+            ? result.type === "failed" ? "Resume failed before confirmation; the original binding remains reusable"
+              : "Continued the same session with its confirmed terminal binding"
+            : "Resume response was uncertain; retained the complete original binding for reconciliation" };
+        });
+        if (result.type === "failed") {
+          const presence = await this.inspect(previous.binding, call);
+          if (presence?.state === "missing_session") return await this.reopen(id, previous, call);
+          throw new TaskError("Worker resume failed; its known session and pending input are retained for retry");
+        }
+        if (resumed.worker.state !== "bound") throw new TaskError("Worker resume needs reconciliation; its known session and pending input are retained");
+        return resumed;
+      } finally { this.resuming.delete(id); }
     }
     host = await this.environment?.deployment(host, undefined, current.model) ?? host;
     const allocation_id = randomUUID();
-    const claimed = await this.session.commit(async (tx) => {
-      const index = await tx.doc(Tasks);
-      const task = index.tasks.find((task) => task.id === id);
-      if (task === undefined) throw new TaskError("Unknown task");
-      if (task.worker.state !== "unassigned") return false;
+    await this.allocation(id, "create", (task) => {
+      if (task.worker.state !== "unassigned") throw new TaskError("A worker allocation already owns this task");
       task.worker = { state: "allocating", allocation_id, host };
-      task.updated_at = Date.now();
-      return true;
-    }, BACKGROUND_CONTEXT);
-    if (!claimed) throw new TaskError("A worker allocation already owns this task");
+      return { result: { type: "pending" }, reason: "Claimed one new session before requesting native creation" };
+    });
     return this.spawn(id, current.title, host, allocation_id, call);
   }
   private async inspect(binding: WorkerRef, call: HostCall) {
@@ -617,26 +676,33 @@ export class TaskStore {
       return result.type === "worker_presence" ? result.presence : undefined;
     } catch { return undefined; }
   }
+  private requireResume(worker: WorkerState, previous: { allocation_id: string; binding: WorkerRef }): void {
+    if ((worker.state !== "resuming" && worker.state !== "resume_uncertain") ||
+        worker.allocation_id !== previous.allocation_id || !sameBinding(worker.binding, previous.binding)) {
+      throw new TaskError("Worker resume changed; its late result was ignored");
+    }
+  }
   private async fenceActor(key: string): Promise<void> {
     const active = this.running.get(key); if (active === undefined) return;
     if (active.observer?.fence === undefined) throw new TaskError("The previous execution cannot be safely fenced yet");
     active.fenced = true; active.attached = false; active.wake?.();
     await active.observer.fence(); await active.finished;
   }
-  private async reopen(id: string, previous: Extract<WorkerState, { state: "bound" }>, call: HostCall): Promise<TaskRecord> {
+  private async reopen(id: string, previous: Extract<WorkerState, { state: "bound" | "resuming" | "resume_uncertain" }>, call: HostCall): Promise<TaskRecord> {
     await this.fenceActor(id);
     const before = await this.get(id);
     for (const agent of before.agents) await this.fenceActor(this.actorKey(id, agent.id));
     const host = await this.workerHost(id);
     const allocation_id = randomUUID();
-    const task = await this.update(id, (task) => {
-      if (task.worker.state !== "bound" && task.worker.state !== "allocating") throw new TaskError("The worker allocation changed during recovery");
+    const task = await this.allocation(id, "reopen", (task) => {
+      if (!("binding" in task.worker) || task.worker.state !== previous.state) throw new TaskError("The worker allocation changed during recovery");
       if (task.worker.allocation_id !== previous.allocation_id ||
-          (task.worker.state === "bound" && !sameBinding(task.worker.binding, previous.binding))) throw new TaskError("The worker allocation changed during recovery");
+          !sameBinding(task.worker.binding, previous.binding)) throw new TaskError("The worker allocation changed during recovery");
       task.worker = { state: "allocating", allocation_id, host };
       for (const agent of task.agents) {
         if (agent.worker.state !== "unassigned") agent.worker = { state: "unassigned" };
       }
+      return { result: { type: "pending" }, reason: "Confirmed that the original session is missing before reopening the same task history" };
     });
     return this.spawn(id, task.title, host, allocation_id, call);
   }
@@ -644,17 +710,20 @@ export class TaskStore {
     let result: HostResult;
     try { result = await call({ type: "spawn_worker", host, task_id: id, allocation_id, title }); }
     catch {
-      await this.update(id, (task) => {
+      await this.allocation(id, "create", (task) => {
         this.requireAllocation(task.worker, allocation_id);
         task.worker = { state: "uncertain", allocation_id, host, session_id: null };
+        return { result: { type: "creation_uncertain", session_id: null }, reason: "New session creation returned no confirmed receipt" };
       });
       throw new TaskError("Worker creation could not be confirmed; reconcile it before retrying");
     }
-    return this.update(id, (task) => {
+    return this.allocation(id, "create", (task) => {
       this.requireAllocation(task.worker, allocation_id);
       if (result.type === "spawned") task.worker = { state: "bound", allocation_id, host, binding: result.binding };
       else task.worker = { state: "uncertain", allocation_id, host,
         session_id: result.type === "creation_uncertain" ? result.session_id : null };
+      return { result: allocationResult(result), reason: task.worker.state === "bound"
+        ? "Confirmed the new session and its terminal binding" : "New session creation remains uncertain and cannot be repeated" };
     });
   }
   private async finishOutcome(id: string, conversationId: string, entryId: string, answer: string): Promise<TaskOutcome> {
@@ -714,7 +783,7 @@ export class TaskStore {
       const deadline = Date.now() + 10_000;
       let task = await this.get(input.task_id);
       let actor = this.actor(task, input.agent_id);
-      while (actor.worker.state === "allocating" && Date.now() < deadline) {
+      while ((actor.worker.state === "allocating" || actor.worker.state === "resuming") && Date.now() < deadline) {
         await new Promise<void>((resolve) => setTimeout(resolve, 25));
         task = await this.get(input.task_id);
         actor = this.actor(task, input.agent_id);

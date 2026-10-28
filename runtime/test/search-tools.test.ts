@@ -9,9 +9,11 @@ import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type Tr
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { EmbeddingSpace } from "../src/generated/EmbeddingSpace.js";
+import type { AgentNode } from "../src/generated/AgentNode.js";
 import type { HistoryImportBatch } from "../src/generated/HistoryImportBatch.js";
 import type { HistoryItem } from "../src/generated/HistoryItem.js";
 import { HistoryStore, ImportedItemEntry } from "../src/history.js";
+import { CodexImporter } from "../src/importer.js";
 import { ConversationModels } from "../src/models.js";
 import { Retrieval } from "../src/retrieval.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
@@ -115,4 +117,82 @@ test("main and worker tools find older substantive context beside a newer shallo
     assert.equal((await history.get("older-substantive"))?.adopted_task_id, null);
     assert.equal((await history.get("newer-shallow"))?.adopted_task_id, null);
   } finally { retrieval.close(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("main and worker search retain fresh matching tasks while an import fills the index results", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-search-live-tasks-"));
+  const models = createModels();
+  const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 }); models.setProvider(faux.provider);
+  const registry = createRegistry();
+  const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  const history = new HistoryStore(session); const tasks = new TaskStore(session, new ConversationModels(models)); tasks.useHistory(history);
+  const executions = new Executions(), tools = createAppTools(tasks, executions); registry.install(tools.main); registry.install(tools.worker);
+  const retrieval = new Retrieval(session, history, tasks, join(directory, "search.sqlite"));
+  const importer = new CodexImporter(session, history, join(directory, "assets"));
+  const node: AgentNode = { host_id: "fixture-source", name: "Desktop", rex_server: "https://desktop.example.test", coordinator: null,
+    agent_program: "agent", home_directory: "/example/home", launch: { state_dir: null, runtime: null, config: null, instructions: null, model: null } };
+  const query = "connector decisions";
+  const call: HostCall = async (command) => {
+    if (command.type === "embed") return { type: "embeddings", batch: { space, vectors: command.texts.map(() => [1, 0, 0]) } };
+    assert.ok(command.type === "on_node" && command.command.type === "history" && command.command.request.type === "list",
+      "Import and search must not allocate Rex sessions or run unrelated effects");
+    return { type: "history", response: { type: "list", threads: [], next_cursor: null } };
+  };
+  let release = () => {}, indexed = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const began = new Promise<void>((resolve) => { indexed = resolve; });
+  let importing: Promise<unknown> | undefined;
+  try {
+    for (let index = 0; index < 8; index += 1) {
+      await history.import(batch(`historical-${index}`, index, [item(`decision-${index}`, `Connector decisions: retain measured variant Z${index}.`, 0)]));
+    }
+    await retrieval.sync(call);
+    const old = await retrieval.search(query, [], 8, call, true); assert.equal(old.candidates.length, 8);
+    const fresh = await tasks.create({ title: "Connector decisions", outcome: "Continue the connector decision audit", model: fixtureModel });
+    const unrelated = await tasks.create({ title: "Unrelated transport repair", outcome: "Fix a bicycle tire", model: fixtureModel });
+    importing = importer.run([node], [node.host_id], [], call, () => {}, async () => { indexed(); await gate; });
+    await began; assert.equal(importer.isRunning(), true);
+    const root = await session.root(BACKGROUND_CONTEXT);
+    for (const role of ["main", "worker"]) {
+      const conversation = role === "main" ? root : await tasks.conversation(fresh.conversation_id);
+      const unbind = executions.bind(conversation.id.toString(), { cwd: "/example/project", hosts: [], call,
+        ...(role === "worker" ? { role: "worker" } : {}),
+        search: (text, refs, limit, mode) => retrieval.search(text, refs, limit, call, importer.isRunning(), mode) });
+      try {
+        await tasks.inference.configure(conversation, fixtureModel, { instructions: "Find related existing work before continuing it.", cwd: "/example/project",
+          extensions: [role === "main" ? tools.main : tools.worker] });
+        let failure: unknown;
+        faux.setResponses([
+          fauxAssistantMessage(fauxToolCall("search_tasks", { query }), { stopReason: "toolUse" }),
+          async (context) => {
+            try {
+              const found = lastResult(context); assert.ok(found !== null && typeof found === "object" && "matches" in found && Array.isArray(found.matches));
+              assert.equal(found.matches.length, 8);
+              assert.ok(found.matches.some((match: unknown) => match !== null && typeof match === "object" && "task_id" in match && match.task_id === fresh.id),
+                `${role}: a full historical index must not hide the fresh matching task`);
+              assert.ok(found.matches.some((match: unknown) => match !== null && typeof match === "object" && "entry_ids" in match && Array.isArray(match.entry_ids) && match.entry_ids.length > 0),
+                "Historical originals must remain available beside live task metadata");
+              assert.ok(found.matches.every((match: unknown) => match !== null && typeof match === "object" && "title" in match && match.title !== "Unrelated transport repair"));
+              assert.ok("gaps" in found); assert.deepEqual(found.gaps, ["Codex history import and indexing are in progress"]);
+            } catch (error) { failure ??= error; }
+            return fauxAssistantMessage(fauxToolCall("search_tasks", { query,
+              sources: [{ provider: "task_outcomes", account: "local", thread_id: unrelated.id }] }), { stopReason: "toolUse" });
+          },
+          async (context) => {
+            try {
+              const found = lastResult(context); assert.ok(found !== null && typeof found === "object" && "matches" in found && Array.isArray(found.matches));
+              const first: unknown = found.matches[0];
+              assert.ok(first !== null && typeof first === "object" && "task_id" in first && first.task_id === unrelated.id,
+                "An explicit task outcome source must outrank incidental text relevance");
+            } catch (error) { failure ??= error; }
+            return fauxAssistantMessage("Related work is available.");
+          },
+        ]);
+        await (await conversation.submit({ type: "input", content: "Continue the connector decisions." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+        if (failure !== undefined) throw failure;
+      } finally { unbind(); }
+    }
+    assert.equal((await tasks.list()).length, 2); assert.equal(importer.isRunning(), true);
+  } finally { release(); await importing; retrieval.close(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
