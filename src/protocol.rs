@@ -876,6 +876,7 @@ pub enum ModelActivity {
     Thinking { text: String },
     ToolStarted { call_id: String, name: String },
     ToolFinished { call_id: String, name: String },
+    Compaction { active: bool, failed: bool },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]

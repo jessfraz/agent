@@ -268,6 +268,7 @@ struct State {
     tools: HashMap<String, Tool>,
     tool_order: Vec<String>,
     working: bool,
+    compacting: bool,
     interrupting: bool,
     exiting: bool,
     worker: bool,
@@ -290,6 +291,7 @@ impl State {
             tools: HashMap::new(),
             tool_order: Vec::new(),
             working: false,
+            compacting: false,
             interrupting: false,
             exiting: false,
             worker: false,
@@ -407,24 +409,35 @@ impl State {
                 self.push(Role::Agent, text);
                 self.working(false);
             }
-            RuntimeEventKind::Activity { activity } => {
-                self.working = true;
-                match activity {
-                    ModelActivity::Thinking { text } => self.thinking.push_str(&text),
-                    ModelActivity::ToolStarted { call_id, name } => {
-                        if !self.tools.contains_key(&call_id) {
-                            self.tool_order.push(call_id.clone());
-                        }
-                        self.tools.insert(call_id, Tool { name, done: false });
+            RuntimeEventKind::Activity { activity } => match activity {
+                ModelActivity::Thinking { text } => {
+                    self.working = true;
+                    self.thinking.push_str(&text);
+                }
+                ModelActivity::ToolStarted { call_id, name } => {
+                    self.working = true;
+                    if !self.tools.contains_key(&call_id) {
+                        self.tool_order.push(call_id.clone());
                     }
-                    ModelActivity::ToolFinished { call_id, name } => {
-                        if !self.tools.contains_key(&call_id) {
-                            self.tool_order.push(call_id.clone());
-                        }
-                        self.tools.insert(call_id, Tool { name, done: true });
+                    self.tools.insert(call_id, Tool { name, done: false });
+                }
+                ModelActivity::ToolFinished { call_id, name } => {
+                    self.working = true;
+                    if !self.tools.contains_key(&call_id) {
+                        self.tool_order.push(call_id.clone());
+                    }
+                    self.tools.insert(call_id, Tool { name, done: true });
+                }
+                ModelActivity::Compaction { active, failed } => {
+                    self.compacting = active;
+                    if failed {
+                        self.push(
+                            Role::Failure,
+                            "Context compaction failed. Saved history is retained.".into(),
+                        );
                     }
                 }
-            }
+            },
             RuntimeEventKind::TaskReady { title, .. } => {
                 self.info.title = title;
                 self.worker = true;
@@ -439,6 +452,7 @@ impl State {
             RuntimeEventKind::Notice { text, .. } if !self.worker => self.push(Role::Notice, text),
             RuntimeEventKind::Done => self.loading_older = false,
             RuntimeEventKind::Failure { message, .. } => {
+                self.compacting = false;
                 self.push(Role::Failure, message);
                 self.working(false);
             }
@@ -446,6 +460,19 @@ impl State {
             _ => {}
         }
         self.changed = true;
+    }
+    fn status(&self) -> &'static str {
+        if self.exiting {
+            "Closing"
+        } else if self.interrupting {
+            "Interrupting"
+        } else if self.compacting {
+            "Compacting context"
+        } else if self.working {
+            "Working"
+        } else {
+            "Ready"
+        }
     }
     fn input(&mut self, event: Event) -> Option<TuiInput> {
         self.changed = true;
@@ -575,7 +602,7 @@ impl State {
         ])
         .split(frame.area());
         let header =
-            Layout::horizontal([Constraint::Min(1), Constraint::Length(13)]).split(areas[0]);
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(18)]).split(areas[0]);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
@@ -588,19 +615,10 @@ impl State {
             ])),
             header[0],
         );
-        let activity = if self.exiting {
-            "Closing"
-        } else if self.interrupting {
-            "Interrupting"
-        } else if self.working {
-            "Working"
-        } else {
-            "Ready"
-        };
         frame.render_widget(
-            Paragraph::new(activity)
+            Paragraph::new(self.status())
                 .right_aligned()
-                .style(Style::default().fg(if self.working {
+                .style(Style::default().fg(if self.working || self.compacting {
                     Color::Cyan
                 } else {
                     Color::DarkGray
@@ -643,15 +661,6 @@ impl State {
             .reasoning
             .map(|value| value.as_str())
             .unwrap_or("default");
-        let activity = if self.exiting {
-            "Closing"
-        } else if self.interrupting {
-            "Interrupting"
-        } else if self.working {
-            "Working"
-        } else {
-            "Ready"
-        };
         frame.render_widget(
             Paragraph::new(format!(
                 "{} · {}{} · {} · {}",
@@ -659,7 +668,7 @@ impl State {
                 reasoning,
                 if self.info.model.fast { " · fast" } else { "" },
                 markdown::plain(&self.info.cwd),
-                activity
+                self.status()
             ))
             .style(Style::default().fg(Color::DarkGray)),
             areas[3],
@@ -835,6 +844,89 @@ mod tests {
         assert!(after.contains("gpt-6.1-sol · high"));
         assert!(after.contains("/workspace/example · Ready"));
         assert!(after.contains("let ready = true;"));
+    }
+    #[test]
+    fn native_compaction_status_coexists_with_work_and_retains_model_context() {
+        let mut state = state();
+        state.working(true);
+        state.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Compaction {
+                active: true,
+                failed: false,
+            },
+        });
+        let compacting = rendered(&mut state, 110, 24);
+        assert_eq!(compacting.matches("Compacting context").count(), 2);
+        assert!(compacting.contains("gpt-6.1-sol · high"));
+        assert!(compacting.contains("/workspace/example · Compacting context"));
+        state.event(RuntimeEventKind::Answer {
+            conversation_id: "one".into(),
+            text: "Foreground work completed".into(),
+        });
+        assert_eq!(state.status(), "Compacting context");
+        state.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Compaction {
+                active: false,
+                failed: false,
+            },
+        });
+        assert_eq!(state.status(), "Ready");
+        state.working(true);
+        state.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Compaction {
+                active: true,
+                failed: false,
+            },
+        });
+        assert_eq!(
+            state.input(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(TuiInput::Interrupt)
+        );
+        assert_eq!(state.status(), "Interrupting");
+        state.event(RuntimeEventKind::Interrupted);
+        assert_eq!(
+            state.status(),
+            "Compacting context",
+            "Background compaction may survive an interrupted turn"
+        );
+        state.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Compaction {
+                active: false,
+                failed: false,
+            },
+        });
+        assert_eq!(state.status(), "Ready");
+    }
+    #[test]
+    fn compaction_failure_is_actionable_without_changing_unrelated_work_status() {
+        let mut state = state();
+        state.working(true);
+        state.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Compaction {
+                active: false,
+                failed: true,
+            },
+        });
+        assert_eq!(state.status(), "Working");
+        let text = rendered(&mut state, 110, 24);
+        assert!(text.contains("Context compaction failed. Saved history is retained."));
+        state.working(false);
+        assert_eq!(state.status(), "Ready");
+        state.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Compaction {
+                active: true,
+                failed: false,
+            },
+        });
+        state.event(RuntimeEventKind::Failure {
+            code: crate::protocol::ErrorCode::Internal,
+            message: "The coordinator disconnected".into(),
+        });
+        assert_eq!(
+            state.status(),
+            "Ready",
+            "A lost execution scope must not retain stale compaction status"
+        );
     }
     #[test]
     fn escape_keeps_an_idle_chat_and_its_draft_open() {

@@ -2063,6 +2063,17 @@ async fn request_presented(
                         eprintln!("[{name}]");
                     }
                     ModelActivity::ToolFinished { .. } => {}
+                    ModelActivity::Compaction { active, failed } => {
+                        if thinking {
+                            eprintln!();
+                            thinking = false;
+                        }
+                        if *failed {
+                            eprintln!("Context compaction failed. Saved history is retained.");
+                        } else if *active {
+                            eprintln!("Compacting context");
+                        }
+                    }
                 }
             }
             RuntimeEventKind::Notice { text, .. } if !arguments.json && presentation.is_none() => {

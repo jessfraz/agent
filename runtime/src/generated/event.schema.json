@@ -1671,6 +1671,26 @@
             "call_id",
             "name"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "failed": {
+              "type": "boolean"
+            },
+            "type": {
+              "type": "string",
+              "const": "compaction"
+            }
+          },
+          "required": [
+            "type",
+            "active",
+            "failed"
+          ]
         }
       ]
     },

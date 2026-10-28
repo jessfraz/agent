@@ -70,6 +70,8 @@ provider thinking text.
 TTY sessions use a Markdown TUI with model, reasoning, directory and activity
 status. Enter steers active work; Tab queues a separate follow-up turn. Queued
 messages run in order. Esc stops, and Shift+Enter or Alt+Enter inserts a newline.
+Pi's compaction shows as **Compacting context**; current instructions reload
+before the next model round.
 Select transcript text with the terminal's normal copy/paste controls;
 PgUp/PgDn scroll the transcript. `/history` or Ctrl+R loads older messages, and
 `/exit` detaches. Use `agent --no-tui chat` for plain output or `agent --json chat`

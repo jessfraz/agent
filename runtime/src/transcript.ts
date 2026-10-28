@@ -1,6 +1,6 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { JsonValue } from "@earendil-works/chord";
-import { watchEvents, type Conversation, type Cursor, type EntryRecord, type Harness } from "@earendil-works/pi-durable";
+import { CompactionEntry, watchEvents, type Conversation, type Cursor, type EntryRecord, type Harness } from "@earendil-works/pi-durable";
 import type { HistoryMessage } from "./generated/HistoryMessage.js";
 import type { HistoryRole } from "./generated/HistoryRole.js";
 import type { ModelActivity } from "./generated/ModelActivity.js";
@@ -45,7 +45,7 @@ export function transcript(entry: EntryRecord): HistoryMessage[] {
     }
   };
   if (ImportedItemEntry.is(entry)) { add(entry.data.item.role, entry.data.item.text); return messages; }
-  if (ImportedThreadEntry.is(entry)) return messages;
+  if (ImportedThreadEntry.is(entry) || CompactionEntry.is(entry)) return messages;
   for (const message of entry.model ?? []) {
     if (message.role === "system") continue;
     if (message.role === "toolResult") { add("tool", `${message.toolName} finished`); continue; }
@@ -77,11 +77,19 @@ export async function history(conversation: Conversation, value: string | null):
   return frames;
 }
 
-/** Only provider-exposed thinking text and tool identities cross this boundary. */
+/** Forward exposed activity and native compaction status, without summary payloads. */
 export async function activity(session: Harness, conversation: Conversation, emit: (event: ModelActivity) => void,
   message?: (message: HistoryMessage) => void): Promise<() => Promise<void>> {
   const stream = await watchEvents(session, conversation.id, BACKGROUND_CONTEXT);
   const thinking = new Map<number, string>();
+  const compactions = new Set<string>();
+  let compacting = false, compactionFailure = stream.snapshot.compactionFailure?.taskId.toString();
+  const reportCompaction = (failed = false) => {
+    const active = compactions.size > 0;
+    if (active !== compacting || failed) { compacting = active; emit({ type: "compaction", active, failed }); }
+  };
+  for (const status of stream.snapshot.compactions) compactions.add(status.taskId.toString());
+  reportCompaction();
   let assistantOpen = false;
   const update = (index: number, text: string) => {
     const previous = thinking.get(index) ?? "";
@@ -91,7 +99,19 @@ export async function activity(session: Harness, conversation: Conversation, emi
   };
   stream.start(async (events) => {
     for (const event of events) {
-      if (event.type === "message_start") {
+      if (event.type === "snapshot") {
+        compactions.clear();
+        for (const status of event.compactions) compactions.add(status.taskId.toString());
+        const failure = event.compactionFailure?.taskId.toString();
+        reportCompaction(failure !== undefined && failure !== compactionFailure);
+        compactionFailure = failure;
+      } else if (event.type === "compaction_start") {
+        compactions.add(event.taskId.toString()); reportCompaction();
+      } else if (event.type === "compaction_end") {
+        compactions.delete(event.taskId.toString());
+        if (event.error !== undefined) compactionFailure = event.taskId.toString();
+        reportCompaction(event.error !== undefined);
+      } else if (event.type === "message_start") {
         if (event.message.role === "assistant") {
           if (!assistantOpen) thinking.clear();
           assistantOpen = true;
@@ -119,5 +139,11 @@ export async function activity(session: Harness, conversation: Conversation, emi
       }
     }
   });
-  return async () => { await stream.stop(); };
+  return async () => {
+    try { await stream.stop(); }
+    finally {
+      // Detaching ends this status observation, not Pi's compaction task.
+      compactions.clear(); reportCompaction();
+    }
+  };
 }
