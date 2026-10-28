@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
+const MAX_ERROR_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RexError {
@@ -26,6 +27,7 @@ pub enum RexError {
     ReadFailed,
     InvalidResponse,
     BindingMismatch,
+    SessionNotFound,
     CreationUncertain { session_id: Option<SessionId> },
 }
 impl fmt::Display for RexError {
@@ -37,6 +39,7 @@ impl fmt::Display for RexError {
             Self::ReadFailed => f.write_str("Rex read failed or timed out"),
             Self::InvalidResponse => f.write_str("Rex returned an unsupported response"),
             Self::BindingMismatch => f.write_str("Rex session does not match its recorded worker binding"),
+            Self::SessionNotFound => f.write_str("The recorded Rex session no longer exists"),
             Self::CreationUncertain { .. } => f.write_str("Rex session creation is uncertain; reconcile the original allocation before retrying"),
         }
     }
@@ -177,22 +180,19 @@ pub struct RexClient {
     server: Option<String>,
 }
 impl RexClient {
-    /// Absence is established by successful native reads, never a failed RPC.
+    /// The live-session list is not an existence check. Inspect the recorded
+    /// session directly, and accept absence only from its native 404 status.
     pub async fn worker_presence(
         &self,
         binding: &WorkerBinding,
         host: &HostId,
     ) -> Result<crate::protocol::WorkerPresence, RexError> {
         use crate::protocol::WorkerPresence;
-        if !self
-            .list_sessions()
-            .await?
-            .iter()
-            .any(|session| session.session_id == binding.session_id)
-        {
-            return Ok(WorkerPresence::MissingSession);
-        }
-        let view = self.inspect_session(&binding.session_id).await?;
+        let view = match self.inspect_session(&binding.session_id).await {
+            Ok(view) => view,
+            Err(RexError::SessionNotFound) => return Ok(WorkerPresence::MissingSession),
+            Err(error) => return Err(error),
+        };
         let found = view
             .windows
             .iter()
@@ -487,7 +487,7 @@ impl RexClient {
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .env_remove("REX_SESSION")
             .env_remove("REX_BLOCK")
             .env_remove("REX_CLIENT")
@@ -500,17 +500,27 @@ impl RexClient {
         let mut child = command.spawn().map_err(|_| CallFailure::Unavailable)?;
         let result = tokio::time::timeout(CALL_TIMEOUT, async {
             let stdout = child.stdout.take().ok_or(CallFailure::Failed)?;
-            let mut bytes = Vec::new();
-            stdout
-                .take(MAX_OUTPUT_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .await
-                .map_err(|_| CallFailure::Failed)?;
+            let stderr = child.stderr.take().ok_or(CallFailure::Failed)?;
+            let (bytes, error, status) = tokio::try_join!(
+                bounded_output(stdout, MAX_OUTPUT_BYTES),
+                bounded_output(stderr, MAX_ERROR_BYTES),
+                child.wait(),
+            )
+            .map_err(|_| CallFailure::Failed)?;
             if bytes.len() as u64 > MAX_OUTPUT_BYTES {
                 return Err(CallFailure::Failed);
             }
-            let status = child.wait().await.map_err(|_| CallFailure::Failed)?;
+            if error.len() as u64 > MAX_ERROR_BYTES {
+                return Err(CallFailure::Failed);
+            }
             if !status.success() {
+                if std::str::from_utf8(&error).is_ok_and(|error| {
+                    error
+                        .trim_end()
+                        .ends_with("(status=404 code=session_not_found)")
+                }) {
+                    return Err(CallFailure::SessionNotFound);
+                }
                 return Err(CallFailure::Failed);
             }
             Ok(bytes)
@@ -529,17 +539,27 @@ impl RexClient {
         result
     }
 }
+async fn bounded_output(
+    input: impl tokio::io::AsyncRead + Unpin,
+    limit: u64,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    input.take(limit + 1).read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
 #[derive(Debug)]
 enum CallFailure {
     Unavailable,
     InvalidInput,
     Failed,
+    SessionNotFound,
 }
 fn read_failure(error: CallFailure) -> RexError {
     match error {
         CallFailure::Unavailable => RexError::Unavailable,
         CallFailure::InvalidInput => RexError::InvalidInput,
         CallFailure::Failed => RexError::ReadFailed,
+        CallFailure::SessionNotFound => RexError::SessionNotFound,
     }
 }
 fn decode<T: DeserializeOwned>(output: &[u8]) -> Result<T, RexError> {
@@ -904,7 +924,14 @@ mod tests {
             let presence = client
                 .worker_presence(&binding, &HostId::parse(HOST).unwrap())
                 .await;
-            if case == "invalid-exit" {
+            if case == "unlisted-read-failure" {
+                assert_eq!(presence.unwrap_err(), RexError::ReadFailed);
+            } else if case == "unlisted-missing" {
+                assert!(matches!(
+                    presence.unwrap(),
+                    crate::protocol::WorkerPresence::MissingSession
+                ));
+            } else if case == "invalid-exit" {
                 assert_eq!(presence.unwrap_err(), RexError::InvalidResponse);
                 assert!(matches!(
                     client
@@ -926,14 +953,14 @@ mod tests {
                     );
                 } else {
                     assert!(
-                        matches!(presence, crate::protocol::WorkerPresence::Present { running } if running == (case != "exited"))
+                        matches!(presence, crate::protocol::WorkerPresence::Present { running } if running == !matches!(case.as_str(), "exited" | "unlisted-exited"))
                     );
                 }
                 let resumed = client
                     .resume_worker(&binding, "/example/agent", &[], Path::new("/tmp"))
                     .await
                     .unwrap();
-                if case == "exited" {
+                if matches!(case.as_str(), "exited" | "unlisted-exited") {
                     assert!(
                         matches!(resumed, WorkerResume::Started(ref next) if next.session_id == binding.session_id && next.block_id != binding.block_id)
                     );
@@ -950,14 +977,14 @@ mod tests {
                     .lines()
                     .filter(|method| *method == "session.new_window")
                     .count(),
-                usize::from(case == "exited")
+                usize::from(matches!(case.as_str(), "exited" | "unlisted-exited"))
             );
             assert_eq!(
                 calls
                     .lines()
                     .filter(|method| *method == "block.close")
                     .count(),
-                usize::from(case == "exited")
+                usize::from(matches!(case.as_str(), "exited" | "unlisted-exited"))
             );
             return;
         }
@@ -982,14 +1009,20 @@ const block = 'block:33333333-3333-4333-8333-333333333333';
 const host = '44444444-4444-4444-8444-444444444444';
 const replacement = 'block:55555555-5555-4555-8555-555555555555';
 let value;
-if (method === 'session.list') value = { sessions: [{ session_id: session, label: 'Synthetic work' }] };
+if (method === 'session.list') value = { sessions: mode.startsWith('unlisted-') ? [] : [{ session_id: session, label: 'Synthetic work' }] };
 else if (method === 'session.view') {
+  if (mode === 'unlisted-missing' || mode === 'unlisted-read-failure') {
+    console.error(mode === 'unlisted-missing'
+      ? `Error: stream response "control-1" failed: session ${session} not found (status=404 code=session_not_found)`
+      : 'Error: session inspection denied (status=403 code=session_not_found)');
+    process.exit(3);
+  }
   const blocks = existsSync(join(root, 'closed')) ? [] : [block];
   if (existsSync(join(root, 'created'))) blocks.push(replacement);
   value = { session_id: session, revision: 2, windows: [{ window_id: window, layers: [{ blocks: blocks.map(id => ({ block_id: id, host_id: host, flavor: 'com.superlogical.terminal.shell' })) }] }] };
 } else if (method === 'com.superlogical.terminal.process') {
   const live = { pid: 123, user_id: 501, name: 'agent' };
-  value = { child: mode === 'child' ? live : null, foreground: mode === 'foreground' ? live : null,
+  value = { child: mode === 'child' || mode === 'unlisted-running' ? live : null, foreground: mode === 'foreground' ? live : null,
     last_exit: mode === 'invalid-exit' ? {} : mode === 'starting' || mode === 'child' ? null : { exit_code: 0 } };
 } else if (method === 'session.new_window') {
   writeFileSync(join(root, 'created'), ''); value = { window_id: window, block_ids: [replacement], revision: 2 };
@@ -1006,7 +1039,17 @@ process.stdout.write(JSON.stringify(value));
                 .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
         )
         .unwrap();
-        for case in ["starting", "foreground", "child", "exited", "invalid-exit"] {
+        for case in [
+            "unlisted-running",
+            "unlisted-exited",
+            "unlisted-read-failure",
+            "unlisted-missing",
+            "starting",
+            "foreground",
+            "child",
+            "exited",
+            "invalid-exit",
+        ] {
             std::fs::write(directory.path().join("calls"), "").unwrap();
             for marker in ["created", "closed"] {
                 let _ = std::fs::remove_file(directory.path().join(marker));

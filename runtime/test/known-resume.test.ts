@@ -5,11 +5,13 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
-import { createModels, fauxProvider } from "@earendil-works/pi-ai";
+import { createModels, fauxProvider, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { createRegistry, defineEntry, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { ConversationModels } from "../src/models.js";
 import { TaskStore } from "../src/tasks.js";
+import { createAppTools, Executions } from "../src/tools.js";
+import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import type { AllocationDecision } from "../src/generated/AllocationDecision.js";
 import { transcript } from "../src/transcript.js";
@@ -22,10 +24,68 @@ const binding = { host_id: host.host_id, session_id: "session:22222222-2222-4222
 const Decision = defineEntry<AllocationDecision>("agent.allocation");
 async function open(directory: string) {
   const models = createModels(), faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }] }); models.setProvider(faux.provider);
+  const registry = createRegistry();
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
-    { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
-  return { session, tasks: new TaskStore(session, new ConversationModels(models)), faux };
+    { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  return { session, tasks: new TaskStore(session, new ConversationModels(models)), faux, registry };
 }
+
+test("public delegation after SQLite reopen retains unknown sessions and resumes exited workers inside their existing folder", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-public-folder-reuse-")); let app = await open(directory);
+  let spawns = 0, resumes = 0;
+  const replacement = { ...binding, window_id: "window:55555555-5555-4555-8555-555555555555", block_id: "block:66666666-6666-4666-8666-666666666666" };
+  const childBinding = { ...binding, window_id: "window:77777777-7777-4777-8777-777777777777", block_id: "block:88888888-8888-4888-8888-888888888888" };
+  try {
+    const task = await app.tasks.create({ title: "Finish the existing cleanup", outcome: "Complete the same outcome", model: fixtureModel });
+    await app.tasks.enqueue(task.id, "Keep the original unfinished work", "original");
+    const original = await app.tasks.dispatch(task.id, host, async () => { spawns += 1; return { type: "spawned", binding }; });
+    assert.ok(original.worker.state === "bound");
+    const allocationId = original.worker.allocation_id;
+    const child = await app.tasks.createAgent(task.id, { id: "review", inputId: "child-input", input: "Keep the existing review",
+      title: "Review the cleanup", outcome: "Review the same outcome", model: fixtureModel });
+    await app.tasks.dispatchAgent(task.id, child.id, async () => ({ type: "spawned", binding: childBinding }));
+    const assigned = await app.tasks.get(task.id);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const executions = new Executions(), tools = createAppTools(app.tasks, executions);
+    app.registry.install(tools.main);
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    const commands: HostCommand[] = []; let available = false;
+    const unbind = executions.bind(root.id.toString(), { cwd: host.cwd, hosts: [host], default_host: host, model: fixtureModel,
+      async call(command): Promise<HostResult> {
+        commands.push(command);
+        if (command.type === "resume_worker") {
+          resumes += 1; assert.equal(command.binding.session_id, binding.session_id);
+          return available ? { type: "spawned", binding: replacement } : { type: "failed", message: "Session inspection unavailable" };
+        }
+        assert.ok(command.type === "on_node" && command.command.type === "inspect_worker");
+        return { type: "failed", message: "Native session-specific inspection could not complete" };
+      } });
+    try {
+      await app.tasks.inference.configure(root, fixtureModel, { extensions: [tools.main] });
+      for (const input of ["Add context while the host is unavailable", "Continue in the existing task folder"]) {
+        app.faux.setResponses([
+          fauxAssistantMessage(fauxToolCall("delegate_task", { task_id: task.id, input }), { stopReason: "toolUse" }),
+          fauxAssistantMessage("Recorded the requested update"),
+        ]);
+        assert.equal((await (await root.submit({ type: "input", content: input }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+        const current = await app.tasks.get(task.id);
+        assert.ok(current.worker.state === "bound");
+        assert.equal(current.worker.allocation_id, allocationId);
+        assert.equal(current.worker.binding.session_id, binding.session_id);
+        assert.equal(current.conversation_id, task.conversation_id);
+        assert.deepEqual(current.agents, assigned.agents, "Parent reuse must retain existing child tabs and assignments");
+        assert.ok(current.pending.some((pending) => pending.content === input));
+        await assert.rejects(app.tasks.revokeAllocation(task.id, allocationId), /known session/);
+        available = true;
+      }
+      const resumed = await app.tasks.get(task.id); assert.ok(resumed.worker.state === "bound");
+      assert.deepEqual(resumed.worker.binding, replacement); assert.equal(spawns, 1); assert.equal(resumes, 2);
+      assert.equal(commands.some((command) => command.type === "spawn_worker"), false);
+      assert.equal((await app.tasks.list()).length, 1);
+      assert.equal(resumed.pending.length, 3, "Original work and both public-tool updates remain owned by the same task");
+    } finally { unbind(); }
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
 
 test("failed resumption preserves the known binding and cannot revoke it into a duplicate folder", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-known-resume-")); const app = await open(directory);

@@ -149,17 +149,17 @@ billing are separate. Keep inference and embedding configuration independent.
 
 ## Rex shows active execution
 
-Closing a whole Rex session must preserve its task and conversation. Positively
-confirm closure and fence the old worker/allocation before admitting replacement
-execution. A disconnected GUI, offline host or missing receipt does not prove
-closure. Reconcile uncertain effects before retrying.
+Closing a whole Rex session preserves its task and conversation. When related
+work continues, inspect that exact session and reuse it, even when Rex's live
+session list omits it. An exited terminal can reopen in the same folder. Only
+an explicit session-not-found response permits a replacement folder, after
+fencing the old allocation. A transport or permission failure retains ownership.
 
-When related work later continues, open a clearly named replacement session on
-the same online execution host and bind it to the existing task. Retain history,
-pending inputs and saved task settings; do not create a duplicate conversation.
+Reopening restores saved messages, pending inputs and task settings. Recent
+history loads first; older pages remain available through `/history`. It does
+not create a duplicate conversation or submit old messages to the model.
 Imported history gets its first task/session only on adoption. Cross-host
-transfer remains separate. Failed inspection retains uncertain ownership;
-positive closure permits same-host reopening after the previous actor drains.
+transfer remains separate. Reconcile uncertain effects before retrying.
 
 ## Validation and scope
 
