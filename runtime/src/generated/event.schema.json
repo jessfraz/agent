@@ -926,11 +926,25 @@
         "entry_id": {
           "type": "string"
         },
+        "final_chunk": {
+          "type": "boolean",
+          "default": false
+        },
         "role": {
           "$ref": "#/$defs/HistoryRole"
         },
         "text": {
           "type": "string"
+        },
+        "tool": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolHistory"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -1021,12 +1035,24 @@
       ]
     },
     "HistoryRole": {
-      "type": "string",
-      "enum": [
-        "user",
-        "assistant",
-        "thinking",
-        "tool"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "user",
+            "commentary",
+            "partial_answer",
+            "final",
+            "notice",
+            "thinking",
+            "tool"
+          ]
+        },
+        {
+          "description": "Assistant text whose source did not identify a semantic phase.",
+          "type": "string",
+          "const": "assistant"
+        }
       ]
     },
     "HistoryThread": {
@@ -1084,6 +1110,22 @@
     },
     "HostCommand": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "expected_email": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "read_usage"
+            }
+          },
+          "required": [
+            "type",
+            "expected_email"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -1872,6 +1914,76 @@
         "head"
       ]
     },
+    "RateLimitBucket": {
+      "type": "object",
+      "properties": {
+        "limitId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limitName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "planType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "primary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RateLimitWindow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "secondary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RateLimitWindow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "RateLimitWindow": {
+      "type": "object",
+      "properties": {
+        "resetsAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "usedPercent": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "windowDurationMins": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
+    },
     "Reasoning": {
       "type": "string",
       "enum": [
@@ -2052,6 +2164,22 @@
     },
     "RuntimeEventKind": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "usage"
+            },
+            "usage": {
+              "$ref": "#/$defs/UsageAvailability"
+            }
+          },
+          "required": [
+            "type",
+            "usage"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -2427,6 +2555,12 @@
             "conversation_id": {
               "type": "string"
             },
+            "entry_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "text": {
               "type": "string"
             },
@@ -2536,6 +2670,27 @@
           "required": [
             "type",
             "input_id"
+          ]
+        },
+        {
+          "description": "The native submission has been placed into the conversation transcript.",
+          "type": "object",
+          "properties": {
+            "entry_id": {
+              "type": "string"
+            },
+            "input_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "input_placed"
+            }
+          },
+          "required": [
+            "type",
+            "input_id",
+            "entry_id"
           ]
         },
         {
@@ -3216,6 +3371,126 @@
             "evidence"
           ]
         }
+      ]
+    },
+    "ToolHistory": {
+      "type": "object",
+      "properties": {
+        "call_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ToolStatus"
+        }
+      },
+      "required": [
+        "call_id",
+        "name",
+        "status"
+      ]
+    },
+    "ToolStatus": {
+      "type": "string",
+      "enum": [
+        "running",
+        "finished",
+        "failed"
+      ]
+    },
+    "UsageAvailability": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "snapshot": {
+              "$ref": "#/$defs/UsageSnapshot"
+            },
+            "state": {
+              "type": "string",
+              "const": "available"
+            }
+          },
+          "required": [
+            "state",
+            "snapshot"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/UsageUnavailable"
+            },
+            "state": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "UsageSnapshot": {
+      "type": "object",
+      "properties": {
+        "buckets": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/RateLimitBucket"
+          }
+        },
+        "email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/UsageSource"
+        },
+        "unkeyed_bucket": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RateLimitBucket"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "source",
+        "buckets"
+      ]
+    },
+    "UsageSource": {
+      "type": "string",
+      "enum": [
+        "codex_account"
+      ]
+    },
+    "UsageUnavailable": {
+      "type": "string",
+      "enum": [
+        "unsupported_provider",
+        "not_signed_in",
+        "identity_unavailable",
+        "account_mismatch",
+        "codex_unavailable",
+        "read_failed"
       ]
     },
     "WorkerHost": {

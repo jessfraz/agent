@@ -78,13 +78,16 @@ generated from the same definitions used to parse them.
 Pi's compaction shows as **Compacting context**; current instructions reload
 before the next model round.
 Select transcript text with the terminal's normal copy/paste controls;
-PgUp/PgDn scroll messages or shortcut help. `/history` or Ctrl+R loads older
-messages. Use `agent --no-tui chat` for plain output or `agent --json chat` for
-protocol events.
+the wheel and trackpad use native terminal scrollback. PgUp/PgDn scroll the
+loaded conversation or shortcut help. On a Mac, use Fn+Up/Fn+Down. `/history`
+or Ctrl+R loads older saved messages. Up/Down recalls sent prompts when the
+editor is empty; slash commands offer completion. Use `agent --no-tui chat`
+for plain output or `agent --json chat` for protocol events.
 
 Use `/model`, `/reasoning` or `/fast` to change the current conversation, and
-`/status` to inspect its effective settings and connection. `/model` without an
-argument lists models; `/fast` alone toggles fast mode. Changes persist when the
+`/status` to inspect its effective settings, connection and available plan usage.
+`/model` without an argument lists models; `/fast` alone toggles fast mode.
+Changes persist when the
 conversation reopens and apply to the next model generation. TOML supplies
 defaults for new work. `/help` has the accepted arguments; Pi validates model
 capabilities.
@@ -191,9 +194,9 @@ If Rex configuration is managed elsewhere, include `require('agent_messages')`
 through that owner. The command reports any setup failure and preserves the
 existing configuration; other sources and chat can continue.
 
-`agent usage` reads quota from the installed, signed-in Codex app-server. Its
-reported account should match the intended plan. This integration does not
-expose a separate quota for agent, and requires Codex independently.
+`agent usage` and `/status` read quota through the coordinator's installed Codex
+app-server, after verifying its signed-in account matches the agent's. This
+does not expose a separate quota for agent, and requires Codex independently.
 
 ## nix-darwin service
 

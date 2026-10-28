@@ -30,8 +30,10 @@ test("real Pi bridge gives signed-out chat the login command before starting Pi 
     child.stdin.end([
       JSON.stringify({ version: 1, id: 1, command: { type: "status" } }),
       JSON.stringify({ version: 1, id: 2, command: { type: "invented" } }),
-      JSON.stringify({ version: 1, id: 3, command: { type: "chat", input: "Hello", instructions: "",
+      JSON.stringify({ version: 1, id: 3, command: { type: "chat", input: "Hello", input_id: "initial-input", instructions: "",
         model: DEFAULT_MODEL, origin_host_id: null, cwd: "/workspace/example", hosts: [] } }),
+      JSON.stringify({ version: 1, id: 4, command: { type: "usage", provider: "openai" } }),
+      JSON.stringify({ version: 1, id: 5, command: { type: "usage", provider: "anthropic" } }),
       "invalid json", "",
     ].join("\n"));
     const code = await exited;
@@ -46,12 +48,23 @@ test("real Pi bridge gives signed-out chat the login command before starting Pi 
       { version: 1, id: 1, event: { type: "done" } },
     ]);
     assert.deepEqual(events.filter((event) => event.id === 3), [
+      { version: 1, id: 3, event: { type: "input_rejected", input_id: "initial-input",
+        message: "Input was not submitted; its draft is restored." } },
       { version: 1, id: 3, event: { type: "failure", code: "authentication_required",
         message: "Not signed in to ChatGPT. Run agent login." } },
       { version: 1, id: 3, event: { type: "done" } },
     ]);
     assert.equal(events.filter((event) => event.event.type === "failure").length, 3);
-    assert.equal(events.filter((event) => event.event.type === "done").length, 4);
+    assert.deepEqual(events.filter((event) => event.id === 4), [
+      { version: 1, id: 4, event: { type: "usage", usage: { state: "unavailable", reason: "not_signed_in" } } },
+      { version: 1, id: 4, event: { type: "done" } },
+    ]);
+    assert.deepEqual(events.filter((event) => event.id === 5), [
+      { version: 1, id: 5, event: { type: "usage", usage: { state: "unavailable", reason: "unsupported_provider" } } },
+      { version: 1, id: 5, event: { type: "done" } },
+    ]);
+    assert.equal(events.some((event) => event.event.type === "host_call"), false, "Unknown or unsupported accounts must not query a different account or trigger login");
+    assert.equal(events.filter((event) => event.event.type === "done").length, 6);
     assert.deepEqual(await readdir(directory), ["auth.json"], "Signed-out chat must not open Pi conversation storage");
   } finally {
     child.kill();

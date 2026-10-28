@@ -104,6 +104,8 @@ async fn main_history(older: bool) {
                                     }
                                     .into(),
                                     continuation: false,
+                                    final_chunk: true,
+                                    tool: None,
                                 },
                                 HistoryMessage {
                                     entry_id: if older { "3" } else { "4" }.into(),
@@ -115,6 +117,8 @@ async fn main_history(older: bool) {
                                     }
                                     .into(),
                                     continuation: false,
+                                    final_chunk: true,
+                                    tool: None,
                                 },
                             ],
                             next_cursor: if older {

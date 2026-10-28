@@ -200,6 +200,11 @@ impl Broker {
     ) -> HostResult {
         let result =
             match command {
+                HostCommand::ReadUsage { expected_email } => {
+                    return HostResult::Usage {
+                        usage: crate::usage::account(&expected_email).await,
+                    };
+                }
                 HostCommand::ReloadGuidance => {
                     let refreshed = ContextStore::load(
                         &self
@@ -247,6 +252,7 @@ impl Broker {
                             | HostCommand::ReloadGuidance
                             | HostCommand::ReadContext { .. }
                             | HostCommand::SearchContext { .. }
+                            | HostCommand::ReadUsage { .. }
                     ) {
                         return HostResult::Failed {
                             message:
@@ -392,6 +398,37 @@ mod tests {
         task::JoinHandle,
         time::timeout,
     };
+
+    #[tokio::test]
+    async fn usage_stays_on_the_coordinator_and_rejects_an_unverified_account() {
+        let directory = tempfile::tempdir().unwrap();
+        let broker = Broker::new(None, directory.path()).unwrap();
+        let direct = broker
+            .execute(HostCommand::ReadUsage {
+                expected_email: String::new(),
+            })
+            .await;
+        assert!(matches!(
+            direct,
+            HostResult::Usage {
+                usage: crate::usage::UsageAvailability::Unavailable {
+                    reason: crate::usage::UsageUnavailable::IdentityUnavailable,
+                }
+            }
+        ));
+        let remote = broker
+            .execute(HostCommand::OnNode {
+                host_id: "11111111-1111-4111-8111-111111111111".into(),
+                command: Box::new(HostCommand::ReadUsage {
+                    expected_email: "reader@example.invalid".into(),
+                }),
+            })
+            .await;
+        assert!(
+            matches!(remote, HostResult::Failed { .. }),
+            "A client must not substitute another host's account for the coordinator"
+        );
+    }
 
     const FIXTURE: &str = r#"
       import {createInterface} from 'node:readline';

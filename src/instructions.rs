@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ts_rs::TS;
 
-pub const WORKFLOW_POLICY: &str = "Find relevant existing task conversations before creating a new one. Continue through them and report the result in the main conversation. Follow-ups and refinements of the same broader effort stay in its existing task, with named child terminals for subwork; create another task only for a separate outcome. Steer workers and child agents promptly with corrections or context for active work; queue only independent later work with mode:follow_up. Use allocate_worktree for new task worktrees so ownership and cleanup are recorded. Keep updates brief and actionable.";
+pub const WORKFLOW_POLICY: &str = "Find relevant existing task conversations before creating a new one. Continue through them and report the result in the main conversation. Follow-ups and refinements of the same broader effort stay in its existing task, with named child terminals for subwork; create another task only for a separate outcome. Run independent work concurrently. Steer active workers and child agents with relevant corrections or context; use mode:follow_up for a separate later turn on that task. Use allocate_worktree for new task worktrees so ownership and cleanup are recorded. Keep updates brief and actionable.";
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct GuidanceSource {

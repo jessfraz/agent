@@ -220,6 +220,9 @@ pub enum RuntimeCommand {
     },
     Login,
     Status,
+    Usage {
+        provider: crate::models::ModelProvider,
+    },
     AttachMain,
     DetachMain,
     ConversationSettings {
@@ -232,6 +235,9 @@ pub enum RuntimeCommand {
     Logout,
     Chat {
         input: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        input_id: Option<String>,
         instructions: String,
         model: Option<ModelSelection>,
         origin_host_id: Option<String>,
@@ -563,6 +569,9 @@ pub struct SourceState {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostCommand {
+    ReadUsage {
+        expected_email: String,
+    },
     ReloadGuidance,
     ProjectGuidance {
         cwd: String,
@@ -654,6 +663,9 @@ pub enum HostCommand {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostResult {
+    Usage {
+        usage: crate::usage::UsageAvailability,
+    },
     SharedGuidance {
         global: GuidanceSnapshot,
         workflow_policy: String,
@@ -718,6 +730,9 @@ pub struct RuntimeEvent {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEventKind {
+    Usage {
+        usage: crate::usage::UsageAvailability,
+    },
     FeedbackReady {
         receipt: FeedbackReceipt,
     },
@@ -786,6 +801,9 @@ pub enum RuntimeEventKind {
     Answer {
         conversation_id: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        entry_id: Option<String>,
     },
     History {
         conversation_id: String,
@@ -803,6 +821,11 @@ pub enum RuntimeEventKind {
     },
     InputAccepted {
         input_id: String,
+    },
+    /// The native submission has been placed into the conversation transcript.
+    InputPlaced {
+        input_id: String,
+        entry_id: String,
     },
     Activity {
         activity: ModelActivity,
@@ -827,13 +850,38 @@ pub struct HistoryMessage {
     pub role: HistoryRole,
     pub text: String,
     pub continuation: bool,
+    #[serde(default)]
+    pub final_chunk: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tool: Option<ToolHistory>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+pub struct ToolHistory {
+    pub call_id: String,
+    pub name: String,
+    pub status: ToolStatus,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStatus {
+    Running,
+    Finished,
+    Failed,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryRole {
     User,
+    /// Assistant text whose source did not identify a semantic phase.
     Assistant,
+    Commentary,
+    PartialAnswer,
+    Final,
+    Notice,
     Thinking,
     Tool,
 }
@@ -966,7 +1014,55 @@ pub enum ErrorCode {
 
 #[cfg(test)]
 mod tests {
-    use crate::protocol::{RuntimeCommand, SearchMode};
+    use crate::protocol::{
+        HistoryMessage, HistoryRole, RuntimeCommand, RuntimeEventKind, SearchMode, ToolHistory,
+        ToolStatus,
+    };
+
+    #[test]
+    fn old_history_without_tool_metadata_and_new_tool_identity_share_the_wire_contract() {
+        let legacy: HistoryMessage = serde_json::from_str(
+            r#"{"entry_id":"saved","role":"assistant","text":"Older response","continuation":false}"#,
+        ).unwrap();
+        assert!(matches!(legacy.role, HistoryRole::Assistant));
+        assert!(legacy.tool.is_none());
+        assert!(!legacy.final_chunk);
+        let message = HistoryMessage {
+            entry_id: "result".into(),
+            role: HistoryRole::Tool,
+            text: "check failed".into(),
+            continuation: false,
+            final_chunk: true,
+            tool: Some(ToolHistory {
+                call_id: "native-call".into(),
+                name: "check".into(),
+                status: ToolStatus::Failed,
+            }),
+        };
+        let decoded: HistoryMessage =
+            serde_json::from_slice(&serde_json::to_vec(&message).unwrap()).unwrap();
+        assert_eq!(decoded.tool, message.tool);
+        assert!(matches!(decoded.role, HistoryRole::Tool));
+        assert!(decoded.final_chunk);
+        let legacy_answer: RuntimeEventKind = serde_json::from_str(
+            r#"{"type":"answer","conversation_id":"main","text":"Older answer"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy_answer,
+            RuntimeEventKind::Answer { entry_id: None, .. }
+        ));
+        let answer = RuntimeEventKind::Answer {
+            conversation_id: "main".into(),
+            text: "Stored answer".into(),
+            entry_id: Some("native-entry".into()),
+        };
+        let decoded: RuntimeEventKind =
+            serde_json::from_slice(&serde_json::to_vec(&answer).unwrap()).unwrap();
+        assert!(
+            matches!(decoded, RuntimeEventKind::Answer { entry_id: Some(entry_id), .. } if entry_id == "native-entry")
+        );
+    }
 
     #[test]
     fn history_search_mode_defaults_and_rejects_unknown_values() {

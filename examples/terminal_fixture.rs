@@ -42,6 +42,10 @@ fn main() -> Result<ExitCode> {
     // final handle also hangs up the test CLI if its driver is terminated.
     let mut output = unsafe { File::from_raw_fd(master) };
     let mut input = output.try_clone()?;
+    let mut replies = output.try_clone()?;
+    let mut cursor = std::env::var_os("AGENT_TEST_TERMINAL_REPLY")
+        .is_some()
+        .then(CursorReport::default);
     std::thread::spawn(move || {
         let _ = io::copy(&mut io::stdin().lock(), &mut input);
     });
@@ -50,6 +54,9 @@ fn main() -> Result<ExitCode> {
         match output.read(&mut bytes) {
             Ok(0) => break,
             Ok(length) => {
+                if let Some(cursor) = &mut cursor {
+                    cursor.observe(&bytes[..length], &mut replies)?;
+                }
                 io::stdout().write_all(&bytes[..length])?;
                 io::stdout().flush()?;
             }
@@ -72,4 +79,48 @@ fn main() -> Result<ExitCode> {
         128 + libc::WTERMSIG(status)
     };
     Ok(ExitCode::from(u8::try_from(code)?))
+}
+
+/// The test PTY starts at the origin. Reply to cursor queries and track explicit
+/// CUP moves, including frames split across reads. This is a terminal-protocol
+/// fixture, not an emulator; normal fixture runs continue forwarding unchanged.
+#[derive(Default)]
+struct CursorReport {
+    sequence: Vec<u8>,
+    row: u16,
+    column: u16,
+}
+impl CursorReport {
+    fn observe(&mut self, bytes: &[u8], replies: &mut impl Write) -> io::Result<()> {
+        for byte in bytes {
+            if *byte == 0x1b {
+                self.sequence.clear();
+                self.sequence.push(*byte);
+            } else if !self.sequence.is_empty() {
+                self.sequence.push(*byte);
+                if self.sequence.len() == 2 {
+                    if *byte != b'[' {
+                        self.sequence.clear();
+                    }
+                } else if (0x40..=0x7e).contains(byte) {
+                    if self.sequence == b"\x1b[6n" {
+                        write!(replies, "\x1b[{};{}R", self.row.max(1), self.column.max(1))?;
+                        replies.flush()?;
+                    } else if matches!(*byte, b'H' | b'f') {
+                        let arguments = &self.sequence[2..self.sequence.len() - 1];
+                        if let Ok(arguments) = std::str::from_utf8(arguments) {
+                            let mut positions = arguments.split(';');
+                            self.row = positions.next().and_then(|n| n.parse().ok()).unwrap_or(1);
+                            self.column =
+                                positions.next().and_then(|n| n.parse().ok()).unwrap_or(1);
+                        }
+                    }
+                    self.sequence.clear();
+                } else if self.sequence.len() > 64 {
+                    self.sequence.clear();
+                }
+            }
+        }
+        Ok(())
+    }
 }

@@ -35,7 +35,7 @@ type WorkerInput = Extract<RuntimeCommand, { type: "run_task" }>;
 export type WorkerSession = {
   signal: AbortSignal;
   ready(conversation: Conversation, title: string): Promise<void>;
-  answer(conversationId: string, text: string): void;
+  answer(conversationId: string, text: string, entryId?: string): void;
   idle(): void;
   fence?(): Promise<void>;
   beforeTurn?(): Promise<void>;
@@ -762,7 +762,7 @@ export class TaskStore {
     bind: (conversation: Conversation, host: WorkerHost, model: ModelSelection) => () => void,
     notice: (task: TaskRecord, text: string) => void,
     extensions: readonly Extension[] = [], call?: HostCall, prepare?: (selection: ModelSelection) => Promise<void>,
-    observer?: WorkerSession): Promise<{ conversation_id: string; text: string }> {
+    observer?: WorkerSession): Promise<{ conversation_id: string; text: string; entry_id?: string }> {
     const actorKey = this.actorKey(input.task_id, input.agent_id);
     if (this.running.has(actorKey)) throw new TaskError("This task already has an attached worker");
     let finish = () => {};
@@ -923,9 +923,10 @@ export class TaskStore {
           if (input.agent_id === undefined || currentActor.state.state === "open") currentActor.summary = answer.slice(-4000);
         });
         if (input.agent_id === undefined) notice(task, answer);
-        observer?.answer(conversation.id.toString(), answer);
+        observer?.answer(conversation.id.toString(), answer, entry?.id.toString());
       }
-      return { conversation_id: conversation.id.toString(), text: answer };
+      return { conversation_id: conversation.id.toString(), text: answer,
+        ...(answerEntry === undefined ? {} : { entry_id: answerEntry.id.toString() }) };
     } catch (error) {
       if (active.fenced) return { conversation_id: this.actor(await this.get(input.task_id), input.agent_id).conversation_id, text: "" };
       // Native failures retain queued inbox inputs. Withdraw them explicitly

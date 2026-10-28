@@ -37,6 +37,7 @@ test("real CLI, coordinator and worker retain main history across an offline lap
       TMPDIR: directory, TERM: "xterm-256color", AGENT_SQLITE_VEC: process.env.AGENT_SQLITE_VEC, OPENAI_API_KEY: "sk-synthetic-fixture",
       AGENT_TEST_NODE_ID: host === 0 ? coordinator : laptop, AGENT_TEST_REX_STATE: join(home, "rex.json"),
       AGENT_TEST_MODEL_QUEUE: queue, AGENT_TEST_COORDINATOR_SOCKET: socket, AGENT_TEST_FEEDBACK_GATE: feedbackGate, ...extra,
+      ...(terminal ? { AGENT_TEST_TERMINAL_REPLY: "1" } : {}),
     } });
     let stdout = "", stderr = "";
     child.stdout.setEncoding("utf8").on("data", (text: string) => { stdout += text; });
@@ -241,6 +242,9 @@ test("real CLI, coordinator and worker retain main history across an offline lap
       await script(steering, [{ tool: "delegate_task", args: { task_id: old.id, input: workerInput } }, { text: answer }]);
       reopened.child.stdin.write(steering + "\r");
       await until(async () => liveFrames.some((frame) => frame.type === "input_accepted"), "The reopened main view must steer the existing execution");
+      await until(async () => reopened.output().includes("steering, waiting"), "Accepted steering must remain visibly pending at the held tool boundary");
+      assert.equal(await stat(path + ".finished").then(() => true, () => false), false,
+        "Steering must not cancel or restart the held action");
       const queuedInput = "fixture-queued-detached-" + name, queuedAnswer = "A separate queued " + name + " turn completed.";
       await script(queuedInput, [{ text: queuedAnswer }]); reopened.child.stdin.write(queuedInput + "\t");
       await until(async () => liveFrames.filter((frame) => frame.type === "input_accepted").length === 2,
@@ -259,8 +263,13 @@ test("real CLI, coordinator and worker retain main history across an offline lap
       const completed = await live;
       assert.deepEqual(completed.flatMap((frame) => frame.type === "answer" ? [frame.text] : []), [answer, queuedAnswer]);
       const followup = "fixture-after-detach-" + name, followupAnswer = "A new message follows the detached " + name + " work.";
-      await script(followup, [{ text: followupAnswer }]); reopened.child.stdin.write(followup + "\r");
+      const multiline = followup + "\nKeep both lines in one request.";
+      await script(followup, [{ text: followupAnswer }]);
+      reopened.child.stdin.write(followup + "\u001b[13;2uKeep both lines in one request.\r");
       await until(async () => (await mainHistory()).messages.some((message) => message.text === followupAnswer));
+      const recalled = (await mainHistory()).messages;
+      assert.equal(recalled.filter((message) => message.role === "user" && message.text === multiline).length, 1,
+        "Shift+Enter must create one native multiline message");
       reopened.child.stdin.write("/exit\r"); assert.equal(await reopened.exited, 0, reopened.errors());
       const resumedTask: TaskRecord | undefined = (await tasks()).find((task) => task.id === old.id); assert.ok(resumedTask?.worker.state === "bound");
       assert.deepEqual(resumedTask.worker.binding, original.binding);

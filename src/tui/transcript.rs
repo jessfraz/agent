@@ -2,9 +2,10 @@
 
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::Rect,
     text::Line,
-    widgets::{Paragraph, Wrap},
+    widgets::{Paragraph, Widget, Wrap},
 };
 
 pub(super) struct CachedText {
@@ -44,6 +45,23 @@ impl CachedText {
     }
 
     pub(super) fn draw(&mut self, frame: &mut Frame<'_>, area: Rect, top: usize) -> usize {
+        self.paint(area, top, |paragraph, area| {
+            frame.render_widget(paragraph, area);
+        })
+    }
+
+    pub(super) fn draw_buffer(&mut self, buffer: &mut Buffer, top: usize) -> usize {
+        self.paint(buffer.area, top, |paragraph, area| {
+            paragraph.render(area, buffer);
+        })
+    }
+
+    fn paint(
+        &mut self,
+        area: Rect,
+        top: usize,
+        mut draw: impl FnMut(&Paragraph<'static>, Rect),
+    ) -> usize {
         let first = self.row_ends.partition_point(|end| *end <= top);
         let mut start = first.checked_sub(1).map_or(0, |index| self.row_ends[index]);
         let mut drawn = 0;
@@ -62,7 +80,7 @@ impl CachedText {
             *paragraph =
                 std::mem::take(paragraph).scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0));
             let height = u16::try_from(rows).unwrap_or(area.height);
-            frame.render_widget(
+            draw(
                 &*paragraph,
                 Rect::new(
                     area.x,

@@ -594,6 +594,7 @@ mod tests {
             &mut chat,
             &RuntimeCommand::Chat {
                 input: "Start chat".into(),
+                input_id: None,
                 instructions: String::new(),
                 model: None,
                 origin_host_id: None,
@@ -813,7 +814,7 @@ mod tests {
         let answer: RuntimeEventKind =
             serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
         assert!(
-            matches!(answer, RuntimeEventKind::Answer { conversation_id, text } if conversation_id == "persisted-task" && text == "A reply in the existing tab")
+            matches!(answer, RuntimeEventKind::Answer { conversation_id, text, .. } if conversation_id == "persisted-task" && text == "A reply in the existing tab")
         );
         reader.next_frame().await.unwrap().unwrap();
         writer.shutdown().await.unwrap();

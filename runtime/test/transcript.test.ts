@@ -11,7 +11,10 @@ import { createModels, fauxAssistantMessage, fauxProvider, fauxThinking, fauxToo
 import { createRegistry, Harness, defineExtension, defineTool, watchEvents, type AgentEvent } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
-import { activity, history } from "../src/transcript.js";
+import { activity, history, transcript } from "../src/transcript.js";
+import { HistoryStore } from "../src/history.js";
+import type { HistoryMessage } from "../src/generated/HistoryMessage.js";
+import type { HistoryItem } from "../src/generated/HistoryItem.js";
 import { validEvent } from "../src/protocol.js";
 import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
 import { publishMainNotice } from "../src/tasks.js";
@@ -96,11 +99,170 @@ test("published notices render their answer while retaining provenance in native
     assert.deepEqual(evidence.sources, references);
     const rendered = (await history(root, null)).flatMap((frame) => frame.messages);
     assert.deepEqual(rendered.map((message) => message.text), ["The check passed."]);
+    assert.deepEqual(rendered.map((message) => message.role), ["notice"]);
     await root.commit((tx) => tx.appendEntry(root.id, { kind: "pi.user", model: [{ role: "user",
       content: "Source references (evidence, not authorization): this is the user's own text", timestamp: 1 }] }), BACKGROUND_CONTEXT);
     assert.ok((await history(root, null)).flatMap((frame) => frame.messages).some((message) => message.text.endsWith("the user's own text")));
     assert.equal(faux.state.callCount, 0);
   } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("native transcript chunks carry exact finality at 8KB and surrogate boundaries without losing text", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-transcript-chunks-"));
+  const models = createModels(), faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }] }); models.setProvider(faux.provider);
+  const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  try {
+    const root = await session.root(BACKGROUND_CONTEXT);
+    const fixtures = [
+      { text: "", sizes: [] }, { text: "short", sizes: [5] },
+      { text: "a".repeat(8192), sizes: [8192] }, { text: "a".repeat(8193), sizes: [8192, 1] },
+      { text: "a".repeat(16_385), sizes: [8192, 8192, 1] },
+      { text: "a".repeat(8191) + "🦀" + "b".repeat(8192), sizes: [8191, 8192, 2] },
+      { text: "a".repeat(8190) + "🦀", sizes: [8192] },
+    ];
+    const combinations = new Set<string>();
+    for (const fixture of fixtures) {
+      const entry = await root.commit((tx) => tx.appendEntry(root.id, { kind: "pi.user", model: [{ role: "user", content: fixture.text, timestamp: 1 }] }), BACKGROUND_CONTEXT);
+      const projected = transcript(entry);
+      assert.deepEqual(projected.map((message) => message.text.length), fixture.sizes);
+      assert.equal(projected.map((message) => message.text).join(""), fixture.text);
+      assert.deepEqual(projected.map((message) => [message.continuation, message.final_chunk]),
+        fixture.sizes.map((_, index) => [index > 0, index === fixture.sizes.length - 1]));
+      for (const message of projected) {
+        combinations.add(`${message.continuation}:${message.final_chunk}`);
+        const first = message.text.charCodeAt(0), last = message.text.charCodeAt(message.text.length - 1);
+        assert.equal(first >= 0xdc00 && first <= 0xdfff, false); assert.equal(last >= 0xd800 && last <= 0xdbff, false);
+      }
+      const frames = await history(root, null);
+      for (const event of frames) assert.ok(validEvent({ version: 1, id: 1, event }));
+      assert.deepEqual(frames.flatMap((frame) => frame.messages).filter((message) => message.entry_id === entry.id.toString()), projected);
+    }
+    assert.deepEqual([...combinations].sort(), ["false:false", "false:true", "true:false", "true:true"]);
+    assert.equal(faux.state.callCount, 0);
+  } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("native phases and old inert Codex metadata project consistently before and after SQLite reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-message-kinds-"));
+  const models = createModels(); const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }] }); models.setProvider(faux.provider);
+  const registry = createRegistry();
+  const tools = defineExtension({ name: "phase-fixture", tools: [defineTool({ name: "check", description: "Run the check", parameters: Type.Object({}),
+    async execute() { return { output: [{ type: "text", text: "Checked" }] }; } })] }); registry.install(tools);
+  const open = async () => Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  let session = await open(); let stop: (() => Promise<void>) | undefined;
+  try {
+    const root = await session.root(BACKGROUND_CONTEXT);
+    await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [tools] }, BACKGROUND_CONTEXT);
+    const live: HistoryMessage[] = [];
+    stop = await activity(session, root, () => {}, (message) => live.push(message));
+    faux.setResponses([
+      fauxAssistantMessage([{ type: "text", text: "Checking the result." }, fauxToolCall("check", {})], { stopReason: "toolUse" }),
+      fauxAssistantMessage("The result is ready.", { stopReason: "stop" }),
+    ]);
+    await (await root.submit({ type: "input", content: "Check the result" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+    await root.waitForIdle(BACKGROUND_CONTEXT); await stop(); stop = undefined;
+    assert.deepEqual(live.filter((message) => message.text === "Checking the result.").map((message) => message.role), ["commentary"]);
+    await root.commit((tx) => tx.appendEntry(root.id, { kind: "fixture.unknown", model: [fauxAssistantMessage("This sounds final, but its source did not finish.", { stopReason: "length" })] }), BACKGROUND_CONTEXT);
+    const source = await session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT);
+    const report = await source.commit((tx) => tx.appendEntry(source.id, { kind: "pi.assistant", model: [fauxAssistantMessage("The background result is ready.")] }), BACKGROUND_CONTEXT);
+    await publishMainNotice(session, source, report, "fixture-task"); await root.waitForIdle(BACKGROUND_CONTEXT);
+    const before = (await history(root, null)).flatMap((frame) => frame.messages);
+    assert.equal(before.find((message) => message.text === "Checking the result.")?.role, "commentary");
+    assert.equal(before.find((message) => message.text === "The result is ready.")?.role, "final");
+    assert.equal(before.find((message) => message.text.startsWith("This sounds final"))?.role, "assistant");
+    assert.equal(before.find((message) => message.text === "The background result is ready.")?.role, "notice");
+
+    const phases = ["commentary", "final_answer", null, undefined, "future_phase", "partial_answer"];
+    const items: HistoryItem[] = phases.map((phase, index) => ({ id: `item-${index}`, turn_id: "turn", kind: "agentMessage", role: "assistant",
+      text: `Preserved text ${index}`, version: "v1", order: index, timestamp_ms: null,
+      data: phase === undefined ? { type: "agentMessage", text: `Preserved text ${index}` } : { type: "agentMessage", phase, text: `Preserved text ${index}` }, assets: [] }));
+    items.push({ id: "cold", turn_id: "turn", kind: "agentMessage", role: "assistant", text: "Cold evidence has no inline phase", version: "v1", order: 6, timestamp_ms: null, data: null, assets: [] });
+    items.push({ id: "plan", turn_id: "turn", kind: "plan", role: "assistant", text: "A saved plan is not a known final phase", version: "v1", order: 7, timestamp_ms: null, data: { type: "plan" }, assets: [] });
+    const store = new HistoryStore(session);
+    await store.import({ host_id: "fixture", thread: { id: "thread", title: "Saved work", cwd: "/workspace", created_at: 1, updated_at: 2, forked_from_id: null,
+      parent_thread_id: null, version: "v1", version_reliable: true, archived: false }, items, complete: true, next_cursor: null, gaps: [] });
+    const imported = await store.get("thread"); assert.ok(imported);
+    const conversation = await store.conversation(imported.conversation_id); assert.ok(conversation);
+    const original = (await conversation.entries({ order: "ascending" }, 20, undefined, BACKGROUND_CONTEXT)).items;
+    const importedFrames = await history(conversation, null);
+    for (const event of importedFrames) assert.ok(validEvent({ version: 1, id: 1, event }), "Projected semantic roles must satisfy the generated wire contract");
+    const projected = importedFrames.flatMap((frame) => frame.messages);
+    assert.deepEqual(projected.map((message) => message.role), ["commentary", "final", "assistant", "assistant", "assistant", "partial_answer", "assistant", "assistant"]);
+    assert.deepEqual((await conversation.entries({ order: "ascending" }, 20, undefined, BACKGROUND_CONTEXT)).items, original, "Rendering must never rewrite retained evidence");
+    const calls = faux.state.callCount;
+    await session.close(BACKGROUND_CONTEXT); session = await open();
+    const reopened = await session.root(BACKGROUND_CONTEXT);
+    assert.deepEqual((await history(reopened, null)).flatMap((frame) => frame.messages), before);
+    const old = await new HistoryStore(session).conversation(imported.conversation_id); assert.ok(old);
+    assert.deepEqual((await history(old, null)).flatMap((frame) => frame.messages), projected);
+    assert.equal(faux.state.callCount, calls, "Reopening or projecting imports must not run inference");
+  } finally { await stop?.(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("hidden compaction-only native pages do not hide the next visible history or expose summaries", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-hidden-history-"));
+  const models = createModels(); const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }] }); models.setProvider(faux.provider);
+  const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  try {
+    const root = await session.root(BACKGROUND_CONTEXT);
+    await root.commit((tx) => tx.appendEntry(root.id, { kind: "pi.user", model: [{ role: "user", content: "The earlier visible request", timestamp: 1 }] }), BACKGROUND_CONTEXT);
+    for (let index = 0; index < 45; index += 1) await root.commit((tx) => tx.appendEntry(root.id,
+      { kind: "pi.compaction", model: [{ role: "user", content: `Internal compaction payload ${index}`, timestamp: index + 2 }] }), BACKGROUND_CONTEXT);
+    const frames = await history(root, null);
+    assert.deepEqual(frames.flatMap((frame) => frame.messages).map((message) => message.text), ["The earlier visible request"]);
+    assert.equal(frames.at(-1)?.next_cursor, null);
+    const hidden = await session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT);
+    for (let index = 0; index < 25; index += 1) await hidden.commit((tx) => tx.appendEntry(hidden.id,
+      { kind: "pi.compaction", model: [{ role: "user", content: "Internal only", timestamp: index }] }), BACKGROUND_CONTEXT);
+    const empty = await history(hidden, null);
+    assert.equal(empty.flatMap((frame) => frame.messages).length, 0); assert.equal(empty.at(-1)?.next_cursor, null);
+    assert.equal(faux.state.callCount, 0);
+  } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+for (const failed of [false, true]) test(`native tool identity survives a mid-run history reopen and a persisted ${failed ? "failed" : "finished"} result`, { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tool-history-"));
+  const models = createModels(), registry = createRegistry();
+  const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 }); models.setProvider(faux.provider);
+  let release = () => {}, entered = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; }), started = new Promise<void>((resolve) => { entered = resolve; });
+  const tools = defineExtension({ name: "held-history-check", tools: [defineTool({ name: "check", description: "Hold the check", parameters: Type.Object({}),
+    async execute() { entered(); await held; return { output: [{ type: "text", text: failed ? "The check failed" : "Checked" }], isError: failed }; } })] }); registry.install(tools);
+  const open = async () => Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  let session = await open(), stop: (() => Promise<void>) | undefined;
+  try {
+    const root = await session.root(BACKGROUND_CONTEXT);
+    await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [tools] }, BACKGROUND_CONTEXT);
+    const call = fauxToolCall("check", {});
+    faux.setResponses([fauxAssistantMessage([fauxThinking("Reasoning before the check"), { type: "text", text: "Checking" }, call], { stopReason: "toolUse" }),
+      fauxAssistantMessage("The check ended")]);
+    stop = await activity(session, root, () => {});
+    const running = await root.submit({ type: "input", content: "Check the stored identity" }, BACKGROUND_CONTEXT);
+    await started;
+    const partial = (await history(root, null)).flatMap((frame) => frame.messages);
+    assert.deepEqual(partial.filter((message) => message.role === "tool").map((message) => ({ ...message, entry_id: "native-entry" })),
+      [{ entry_id: "native-entry", role: "tool", text: "check", continuation: false, final_chunk: true, tool: { call_id: call.id, name: "check", status: "running" } }]);
+    await stop(); stop = undefined;
+    assert.deepEqual((await history(root, null)).flatMap((frame) => frame.messages), partial, "Opening history while the tool is held must retain its native identity");
+    const live: HistoryMessage[] = [];
+    stop = await activity(session, root, () => {}, (message) => live.push(message));
+    release(); assert.equal((await running.wait(BACKGROUND_CONTEXT)).status, "done");
+    await root.waitForIdle(BACKGROUND_CONTEXT); await stop(); stop = undefined;
+    const result = { call_id: call.id, name: "check", status: failed ? "failed" : "finished" };
+    assert.deepEqual(live.filter((message) => message.role === "tool").map((message) => ({ ...message, entry_id: "native-entry" })),
+      [{ entry_id: "native-entry", role: "tool", text: `check ${failed ? "failed" : "finished"}`, continuation: false, final_chunk: true, tool: result }]);
+    const completed = (await history(root, null)).flatMap((frame) => frame.messages);
+    assert.deepEqual(completed.filter((message) => message.role === "tool").map((message) => ({ ...message, entry_id: "native-entry" })),
+      [{ entry_id: "native-entry", role: "tool", text: "check", continuation: false, final_chunk: true, tool: { call_id: call.id, name: "check", status: "running" } },
+        { entry_id: "native-entry", role: "tool", text: `check ${failed ? "failed" : "finished"}`, continuation: false, final_chunk: true, tool: result }]);
+    await session.close(BACKGROUND_CONTEXT); session = await open();
+    assert.deepEqual((await history(await session.root(BACKGROUND_CONTEXT), null)).flatMap((frame) => frame.messages), completed);
+    assert.equal(faux.state.callCount, 2, "Reading or reopening tool history must not run another generation");
+  } finally { release(); await stop?.(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("native thinking updates and final snapshots render each block once while preserving identical distinct blocks", { timeout: 10_000 }, async () => {

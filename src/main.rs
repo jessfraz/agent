@@ -1,6 +1,5 @@
 mod mail;
 mod state;
-mod usage;
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -11,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use agent_cli::{
@@ -31,6 +30,7 @@ use agent_cli::{
     runtime::FrameReader,
     service,
     tui::{Tui, TuiHandle, TuiInfo, TuiInput},
+    usage,
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
@@ -373,15 +373,6 @@ async fn main() -> Result<()> {
             println!("Created {}", path.display());
             return Ok(());
         }
-        Action::Usage => {
-            let usage = usage::read(None).await?;
-            if arguments.json {
-                println!("{}", serde_json::to_string_pretty(&usage)?);
-            } else {
-                print!("{usage}");
-            }
-            return Ok(());
-        }
         Action::Mail { command } => {
             match command {
                 MailAction::Accounts => println!(
@@ -528,6 +519,20 @@ async fn main() -> Result<()> {
     let command = match action {
         Action::Login => RuntimeCommand::Login,
         Action::Status => RuntimeCommand::Status,
+        Action::Usage => RuntimeCommand::Usage {
+            provider: conversation_settings(
+                &config,
+                coordinator.as_deref(),
+                &script,
+                &directory,
+                None,
+                None,
+                false,
+            )
+            .await?
+            .model
+            .provider,
+        },
         Action::Logout => RuntimeCommand::Logout,
         Action::Sources => RuntimeCommand::SourceStates,
         Action::Nodes => RuntimeCommand::Environment,
@@ -1013,6 +1018,7 @@ async fn preserve_ui_recovery(
             queued_inputs: ui
                 .queued
                 .iter()
+                .map(|input| &input.text)
                 .chain(ui.submitted.iter().map(|(_, text, _)| text))
                 .cloned()
                 .collect(),
@@ -1046,16 +1052,22 @@ fn write_ui_recovery(directory: &Path, recovery: &UiRecovery) -> Result<PathBuf>
     saved?;
     Ok(path)
 }
+#[derive(Clone)]
+struct QueuedInput {
+    id: String,
+    text: String,
+    mode: InputMode,
+}
+
 struct UiSession {
     handle: TuiHandle,
     inputs: tokio::sync::mpsc::UnboundedReceiver<TuiInput>,
-    queued: VecDeque<String>,
+    queued: VecDeque<QueuedInput>,
     history_cursor: Option<String>,
     exiting: bool,
     failure_shown: bool,
     conversation_id: Option<String>,
     submitted: VecDeque<(String, String, InputMode)>,
-    observed_user: Option<(String, String)>,
     errors: VecDeque<String>,
     controls: tokio::task::JoinSet<()>,
 }
@@ -1070,41 +1082,23 @@ impl UiSession {
             failure_shown: false,
             conversation_id: None,
             submitted: VecDeque::new(),
-            observed_user: None,
             errors: VecDeque::new(),
             controls: tokio::task::JoinSet::new(),
         }
     }
-    fn enqueue(&mut self, input: String) -> Result<()> {
-        self.handle.queued_user(input.clone())?;
-        self.queued.push_back(input);
+    fn enqueue(&mut self, input: String, mode: InputMode) -> Result<()> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.handle.pending_input(id.clone(), input.clone(), mode)?;
+        self.queued.push_back(QueuedInput {
+            id,
+            text: input,
+            mode,
+        });
         Ok(())
     }
-    fn committed_input(&mut self, message: &agent_cli::protocol::HistoryMessage) {
-        if message.continuation {
-            if let Some((id, text)) = &mut self.observed_user
-                && id == &message.entry_id
-            {
-                text.push_str(&message.text);
-            }
-        } else {
-            self.observed_user = Some((message.entry_id.clone(), message.text.clone()));
-        }
-        if let Some((_, text)) = &self.observed_user {
-            if let Some(index) = self
-                .submitted
-                .iter()
-                .position(|(_, input, _)| input == text)
-            {
-                self.submitted.remove(index);
-                self.observed_user = None;
-            } else if !self
-                .submitted
-                .iter()
-                .any(|(_, input, _)| input.starts_with(text))
-            {
-                self.observed_user = None;
-            }
+    fn placed_input(&mut self, input_id: &str) {
+        if let Some(index) = self.submitted.iter().position(|(id, _, _)| id == input_id) {
+            self.submitted.remove(index);
         }
     }
 }
@@ -1154,6 +1148,7 @@ fn feedback_from_ui(
     let queued_inputs = ui
         .queued
         .iter()
+        .map(|input| &input.text)
         .chain(ui.submitted.iter().map(|(_, text, _)| text))
         .cloned()
         .collect();
@@ -1311,6 +1306,30 @@ async fn local_settings(
         .context("The coordinator returned no conversation settings")
 }
 
+async fn conversation_usage(
+    client: ClientContext<'_>,
+    provider: ModelProvider,
+) -> usage::UsageAvailability {
+    exchange(
+        client.config,
+        client.coordinator,
+        client.script,
+        client.directory,
+        RuntimeCommand::Usage { provider },
+    )
+    .await
+    .ok()
+    .and_then(|events| {
+        events.into_iter().find_map(|event| match event {
+            RuntimeEventKind::Usage { usage } => Some(usage),
+            _ => None,
+        })
+    })
+    .unwrap_or(usage::UsageAvailability::Unavailable {
+        reason: usage::UsageUnavailable::ReadFailed,
+    })
+}
+
 fn settings_from_ui(
     config: &ClientConfig,
     coordinator: Option<&str>,
@@ -1338,8 +1357,23 @@ fn settings_from_ui(
                 target,
             )
             .await?;
-            let text = settings_text(&command, &settings, &info, coordinator.as_deref());
+            let mut text = settings_text(&command, &settings, &info, coordinator.as_deref());
+            let provider = settings.model.provider;
             handle.event(RuntimeEventKind::ConversationSettings { settings })?;
+            if matches!(command, ChatCommand::Status) {
+                let usage = conversation_usage(
+                    ClientContext {
+                        config: &config,
+                        coordinator: coordinator.as_deref(),
+                        script: &script,
+                        directory: &directory,
+                    },
+                    provider,
+                )
+                .await;
+                text.push_str("\n\n");
+                text.push_str(&usage::format_status(&usage, SystemTime::now()));
+            }
             handle.notice(text)
         }
         .await;
@@ -1372,22 +1406,43 @@ async fn settings_plain(
         target,
     )
     .await?;
+    let quota = if matches!(command, ChatCommand::Status) {
+        Some(
+            conversation_usage(
+                ClientContext {
+                    config: client.config,
+                    coordinator: client.coordinator,
+                    script: client.script,
+                    directory: client.directory,
+                },
+                settings.model.provider,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
     if json {
         display(&RuntimeEventKind::ConversationSettings { settings }, true)?;
+        if let Some(usage) = quota {
+            display(&RuntimeEventKind::Usage { usage }, true)?;
+        }
     } else {
-        println!(
-            "{}",
-            settings_text(
-                command,
-                &settings,
-                &TuiInfo {
-                    title: "Agent".into(),
-                    model: settings.model.clone(),
-                    cwd: cwd.to_string_lossy().into_owned()
-                },
-                client.coordinator
-            )
+        let mut text = settings_text(
+            command,
+            &settings,
+            &TuiInfo {
+                title: "Agent".into(),
+                model: settings.model.clone(),
+                cwd: cwd.to_string_lossy().into_owned(),
+            },
+            client.coordinator,
         );
+        if let Some(usage) = quota {
+            text.push_str("\n\n");
+            text.push_str(&usage::format_status(&usage, SystemTime::now()));
+        }
+        println!("{text}");
     }
     Ok(())
 }
@@ -1430,13 +1485,14 @@ async fn chat_tui(
         ui.history_cursor = request_presented(arguments, config, coordinator, script, directory,
             RuntimeCommand::ReadHistory { task_id: None, agent_id: None, cursor: None },
             Some(Presentation { handle: ui.handle.clone(), session: None })).await?;
-        if let Some(prompt) = start.prompt { ui.enqueue(prompt)?; }
+        if let Some(prompt) = start.prompt { ui.enqueue(prompt, InputMode::Steer)?; }
         request_with_ui(arguments, config, coordinator, script, directory, RuntimeCommand::AttachMain, &mut ui).await?;
         let mut paused = false;
         while !ui.exiting {
             if paused || ui.queued.is_empty() {
                 match ui.inputs.recv().await.unwrap_or(TuiInput::Exit) {
-                    TuiInput::Submit(input) | TuiInput::Queue(input) => { ui.enqueue(input)?; paused = false; }
+                    TuiInput::Submit(input) => { ui.enqueue(input, InputMode::Steer)?; paused = false; }
+                    TuiInput::Queue(input) => { ui.enqueue(input, InputMode::FollowUp)?; paused = false; }
                     TuiInput::Feedback(description) => {
                         feedback_from_ui(config, coordinator, script, directory, &mut ui, None, description);
                         continue;
@@ -1461,7 +1517,9 @@ async fn chat_tui(
             let prepared = async {
                 let model = conversation_settings(config, coordinator, script, directory, None, None, false).await?.model;
                 ui.handle.set_status(TuiInfo { title: "Main agent".into(), model, cwd: cwd.to_string_lossy().into_owned() })?;
-                chat_command(input.clone(), None, cwd).await
+                let mut command = chat_command(input.text.clone(), None, cwd).await?;
+                if let RuntimeCommand::Chat { input_id, .. } = &mut command { *input_id = Some(input.id.clone()); }
+                Ok::<_, anyhow::Error>(command)
             }.await;
             let command = match prepared {
                 Ok(command) => command,
@@ -1473,7 +1531,7 @@ async fn chat_tui(
                 }
             };
             ui.queued.pop_front();
-            ui.handle.say_user(input)?;
+            ui.submitted.push_back((input.id, input.text, input.mode));
             ui.handle.working(true)?;
             if let Err(error) = request_with_ui(arguments, config, coordinator, script, directory, command, &mut ui).await {
                 ui.handle.working(false)?;
@@ -1706,6 +1764,7 @@ async fn chat_command(
     }
     Ok(RuntimeCommand::Chat {
         input,
+        input_id: None,
         instructions: instructions::project(cwd)?,
         model,
         origin_host_id: RexClient::new(None)
@@ -2064,9 +2123,10 @@ async fn request_presented(
                         if (chat && (!main_view || ready)) || (attached && ready) {
                             active_turn = true;
                             let input_id = uuid::Uuid::new_v4().to_string();
+                            ui.handle.pending_input(input_id.clone(), text.clone(), mode)?;
                             ui.submitted.push_back((input_id.clone(), text.clone(), mode));
                             write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: text, mode }).await?;
-                        } else { ui.enqueue(text)?; }
+                        } else { ui.enqueue(text, mode)?; }
                     }
                     TuiInput::Feedback(description) => {
                         if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
@@ -2190,24 +2250,8 @@ async fn request_presented(
                         ui.handle.restore_input(text)?;
                     }
                 }
-                RuntimeEventKind::InputAccepted { input_id } => {
-                    if let Some((_, _, mode)) =
-                        ui.submitted.iter().find(|(id, _, _)| id == input_id)
-                    {
-                        ui.handle.notice(
-                            if *mode == InputMode::Steer {
-                                "Steering accepted."
-                            } else {
-                                "Queued for the next turn."
-                            }
-                            .into(),
-                        )?;
-                    }
-                }
-                RuntimeEventKind::Message { message }
-                    if matches!(message.role, agent_cli::protocol::HistoryRole::User) =>
-                {
-                    ui.committed_input(message);
+                RuntimeEventKind::InputPlaced { input_id, .. } => {
+                    ui.placed_input(input_id);
                 }
                 RuntimeEventKind::Failure { message, .. } => {
                     if ui.errors.len() == 8 {
@@ -2304,11 +2348,10 @@ async fn request_presented(
             RuntimeEventKind::MainReady { .. } => {
                 ready = true;
                 if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
-                    while let Some(text) = ui.queued.pop_front() {
-                        ui.handle.say_user(text.clone())?;
-                        let input_id = uuid::Uuid::new_v4().to_string();
-                        ui.submitted.push_back((input_id.clone(), text.clone(), InputMode::Steer));
-                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: text, mode: InputMode::Steer }).await?;
+                    while let Some(input) = ui.queued.pop_front() {
+                        let input_id = input.id;
+                        ui.submitted.push_back((input_id.clone(), input.text.clone(), input.mode));
+                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: input.text, mode: input.mode }).await?;
                     }
                 }
                 if arguments.json { display(&event, true)?; }
@@ -2320,16 +2363,10 @@ async fn request_presented(
                     .as_mut()
                     .and_then(|view| view.session.as_deref_mut())
                 {
-                    while let Some(text) = ui.queued.pop_front() {
-                        ui.handle.say_user(text.clone())?;
-                        write_command(
-                            &mut *wire.writer,
-                            &RuntimeCommand::WorkerInput {
-                                input_id: uuid::Uuid::new_v4().to_string(),
-                                input: text,
-                            },
-                        )
-                        .await?;
+                    while let Some(input) = ui.queued.pop_front() {
+                        let input_id = input.id;
+                        ui.submitted.push_back((input_id.clone(), input.text.clone(), input.mode));
+                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: input.text, mode: input.mode }).await?;
                     }
                 } else if arguments.json {
                     display(&event, true)?;
@@ -2530,12 +2567,18 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
             ),
         },
         RuntimeEventKind::Answer { text, .. } => println!("{text}"),
+        RuntimeEventKind::Usage { usage } => {
+            print!("{}", usage::format_status(usage, SystemTime::now()))
+        }
         RuntimeEventKind::History { messages, .. } => {
             use agent_cli::protocol::HistoryRole;
             for message in messages {
                 let role = match message.role {
                     HistoryRole::User => "user",
-                    HistoryRole::Assistant => "agent",
+                    HistoryRole::Assistant | HistoryRole::Final => "agent",
+                    HistoryRole::Commentary => "update",
+                    HistoryRole::PartialAnswer => "partial answer",
+                    HistoryRole::Notice => "notice",
                     HistoryRole::Thinking => "thinking",
                     HistoryRole::Tool => "tool",
                 };

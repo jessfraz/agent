@@ -48,8 +48,8 @@ The terminal UI renders Markdown and shows the model, reasoning, directory and
 live activity. Enter steers, Tab queues a separate FIFO turn, Shift+Enter inserts
 a newline, and Esc stops. Press `?` in an empty editor or use `/help` for the
 current commands and shortcuts. `/model`, `/reasoning` and `/fast` control this
-conversation; `/status` shows its settings and connection. Use `--no-tui` for
-plain output.
+conversation; `/status` shows its settings, connection and available plan usage.
+Use `--no-tui` for plain output.
 
 `/feedback <description>` starts a background repair on the same machine with
 private diagnostic context. Its result returns to the main chat.

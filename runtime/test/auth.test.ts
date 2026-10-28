@@ -1,12 +1,19 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash, generateKeyPairSync, randomUUID, sign } from "node:crypto";
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { AuthError, ChatGptAuth } from "../src/auth.js";
-import { errorEvent } from "../src/protocol.js";
+import { errorEvent, validEvent } from "../src/protocol.js";
+import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
+import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
+import type { RuntimeRequest } from "../src/generated/RuntimeRequest.js";
+import type { UsageAvailability } from "../src/generated/UsageAvailability.js";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { ConversationModels, DEFAULT_MODEL } from "../src/models.js";
 
@@ -203,6 +210,43 @@ test("verified login persists one private registration and exposes only account 
     assert.equal((await stat(join(f.directory, "auth.json"))).mode & 0o777, 0o600);
     f.provider.check();
   } finally { await f.close() }
+});
+
+test("quota reads use only the coordinator's verified account and never refresh credentials or run a model", { timeout: 10_000 }, async () => {
+  const f = await fixture();
+  await login(f.auth); const authCalls = f.provider.control.calls;
+  const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("../src/bridge.js", import.meta.url)), f.directory],
+    { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, OPENAI_API_KEY: "" } });
+  const closed = new Promise<number | null>((resolve, reject) => { child.once("close", resolve); child.once("error", reject); });
+  const lines = createInterface({ input: child.stdout }); let sequence = 0, calls = 0;
+  const pending = new Map<number, { events: RuntimeEventKind[]; resolve(events: RuntimeEventKind[]): void }>();
+  let quota: UsageAvailability = { state: "available", snapshot: { source: "codex_account", email: "person@example.test", plan: "pro",
+    buckets: { codex: { limitId: "codex", limitName: null, planType: "pro", primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1_900_000_000 }, secondary: null } }, unkeyed_bucket: null } };
+  const send = (id: number, command: RuntimeCommand) => { const request: RuntimeRequest = { version: 1, id, command }; child.stdin.write(JSON.stringify(request) + "\n"); };
+  lines.on("line", (line) => {
+    const frame: unknown = JSON.parse(line); assert.ok(validEvent(frame));
+    const waiting = pending.get(frame.id); assert.ok(waiting); waiting.events.push(frame.event);
+    if (frame.event.type === "host_call") {
+      assert.deepEqual(frame.event.command, { type: "read_usage", expected_email: "person@example.test" }); calls += 1;
+      send(frame.id, { type: "host_reply", call_id: frame.event.call_id, result: { type: "usage", usage: quota } });
+    }
+    if (frame.event.type === "done") { pending.delete(frame.id); waiting.resolve(waiting.events); }
+  });
+  const request = (command: RuntimeCommand) => new Promise<RuntimeEventKind[]>((resolve) => {
+    const id = ++sequence; pending.set(id, { events: [], resolve }); send(id, command);
+  });
+  try {
+    const available = (await request({ type: "usage", provider: "openai" })).find((event) => event.type === "usage");
+    assert.ok(available?.type === "usage"); assert.deepEqual(available.usage, quota);
+    quota = { state: "unavailable", reason: "account_mismatch" };
+    const mismatch = (await request({ type: "usage", provider: "openai" })).find((event) => event.type === "usage");
+    assert.ok(mismatch?.type === "usage"); assert.deepEqual(mismatch.usage, quota);
+    const unsupported = await request({ type: "usage", provider: "anthropic" });
+    assert.deepEqual(unsupported, [{ type: "usage", usage: { state: "unavailable", reason: "unsupported_provider" } }, { type: "done" }]);
+    assert.equal(calls, 2); assert.equal(f.provider.control.calls, authCalls);
+    assert.deepEqual(await readdir(f.directory), ["auth.json"], "Quota reads must not start Pi or create another conversation");
+    child.stdin.end(); assert.equal(await closed, 0); f.provider.check();
+  } finally { lines.close(); child.kill(); await closed; await f.close(); }
 });
 
 test("registration survives failed exchange and is reused after logout", async () => {

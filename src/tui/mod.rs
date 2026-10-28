@@ -1,43 +1,31 @@
 //! Terminal presentation only. Request ownership, model calls and durable input stay outside this module.
+mod inline;
 mod markdown;
 mod transcript;
 
-use crate::tui::transcript::CachedText;
+use crate::tui::{
+    inline::{CellOutput, Output, Screen, View},
+    transcript::CachedText,
+};
 use crate::{
-    chat_commands::{ChatCommand, command_help},
+    chat_commands::{ChatCommand, Completion, command_help, completions},
     models::ModelSelection,
-    protocol::{HistoryMessage, HistoryRole, ModelActivity, RuntimeEventKind},
+    protocol::{
+        HistoryMessage, HistoryRole, InputMode, ModelActivity, RuntimeEventKind, ToolStatus,
+    },
 };
 use anyhow::{Context, Result, anyhow, ensure};
-use crossterm::{
-    cursor::{MoveTo, Show},
-    event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
-        KeyEventKind, KeyModifiers,
-    },
-    execute,
-    terminal::{
-        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode,
-    },
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
-    Frame, Terminal,
-    backend::CrosstermBackend,
+    Frame,
+    buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear as ClearWidget, Paragraph, Widget, Wrap},
 };
-use ratatui_textarea::{TextArea, WrapMode};
-use std::{
-    collections::HashMap,
-    io::{IsTerminal, Stdout},
-    path::Path,
-    sync::mpsc,
-    thread,
-    time::Duration,
-};
+use ratatui_textarea::{DataCursor, TextArea, WrapMode};
+use std::{io::IsTerminal, path::Path, sync::mpsc, thread, time::Duration};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 #[derive(Clone, Debug)]
@@ -58,16 +46,25 @@ pub enum TuiInput {
     Exit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryLoad {
+    Older,
+    Scroll,
+}
+
 enum Update {
     Event(Box<RuntimeEventKind>),
-    User(String),
-    QueuedUser(String),
     Status(TuiInfo),
     Working(bool),
     Draft(tokio::sync::oneshot::Sender<String>),
     Info(tokio::sync::oneshot::Sender<TuiInfo>),
     Notice(String),
     RestoreInput(String),
+    PendingInput {
+        input_id: String,
+        text: String,
+        mode: InputMode,
+    },
     Stop,
 }
 
@@ -83,12 +80,6 @@ impl TuiHandle {
     }
     pub fn event(&self, event: RuntimeEventKind) -> Result<()> {
         self.send(Update::Event(Box::new(event)))
-    }
-    pub fn say_user(&self, text: String) -> Result<()> {
-        self.send(Update::User(text))
-    }
-    pub fn queued_user(&self, text: String) -> Result<()> {
-        self.send(Update::QueuedUser(text))
     }
     pub fn set_status(&self, info: TuiInfo) -> Result<()> {
         self.send(Update::Status(info))
@@ -111,6 +102,13 @@ impl TuiHandle {
     }
     pub fn restore_input(&self, text: String) -> Result<()> {
         self.send(Update::RestoreInput(text))
+    }
+    pub fn pending_input(&self, input_id: String, text: String, mode: InputMode) -> Result<()> {
+        self.send(Update::PendingInput {
+            input_id,
+            text,
+            mode,
+        })
     }
 }
 
@@ -164,7 +162,7 @@ impl Tui {
                     }
                 };
                 let _ = ready.send(Ok(()));
-                run(&mut screen.terminal, updates, inputs, State::new(info))
+                run(&mut screen, updates, inputs, State::new(info))
             })
             .context("Could not start the terminal renderer")?;
         let guard = TuiGuard {
@@ -179,24 +177,6 @@ impl Tui {
 }
 
 struct TerminalModes;
-impl Drop for TerminalModes {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            std::io::stdout(),
-            DisableMouseCapture,
-            DisableBracketedPaste,
-            LeaveAlternateScreen,
-            WindowTitle(""),
-            Show
-        );
-    }
-}
-struct Screen {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-    _modes: TerminalModes,
-}
-
 struct WindowTitle<'a>(&'a str);
 impl crossterm::Command for WindowTitle<'_> {
     fn write_ansi(&self, output: &mut impl std::fmt::Write) -> std::fmt::Result {
@@ -204,33 +184,12 @@ impl crossterm::Command for WindowTitle<'_> {
         write!(output, "\x1b]0;{}\x07", self.0)
     }
 }
-impl Screen {
-    fn open() -> Result<Self> {
-        enable_raw_mode().context("Could not enable terminal editing")?;
-        let modes = TerminalModes;
-        let mut output = std::io::stdout();
-        execute!(
-            output,
-            EnterAlternateScreen,
-            Clear(ClearType::All),
-            MoveTo(0, 0),
-            EnableBracketedPaste,
-            // Leave drag selection to Rex and other native terminals.
-            DisableMouseCapture
-        )?;
-        let terminal = Terminal::new(CrosstermBackend::new(output))?;
-        Ok(Self {
-            terminal,
-            _modes: modes,
-        })
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
     User,
-    QueuedUser,
     Agent,
+    PartialAnswer,
+    Commentary,
     Thinking,
     Tool,
     Notice,
@@ -240,7 +199,10 @@ impl Role {
     fn from_history(role: &HistoryRole) -> Self {
         match role {
             HistoryRole::User => Self::User,
-            HistoryRole::Assistant => Self::Agent,
+            HistoryRole::Assistant | HistoryRole::Final => Self::Agent,
+            HistoryRole::PartialAnswer => Self::PartialAnswer,
+            HistoryRole::Commentary => Self::Commentary,
+            HistoryRole::Notice => Self::Notice,
             HistoryRole::Thinking => Self::Thinking,
             HistoryRole::Tool => Self::Tool,
         }
@@ -248,8 +210,9 @@ impl Role {
     fn label(self) -> &'static str {
         match self {
             Self::User => "You",
-            Self::QueuedUser => "You · queued, unsent",
             Self::Agent => "Agent",
+            Self::PartialAnswer => "Agent · partial",
+            Self::Commentary => "Update",
             Self::Thinking => "Thinking",
             Self::Tool => "Tool",
             Self::Notice => "Update",
@@ -258,8 +221,8 @@ impl Role {
     }
     fn color(self) -> Color {
         match self {
-            Self::User | Self::QueuedUser => Color::Cyan,
-            Self::Agent => Color::Green,
+            Self::User => Color::Cyan,
+            Self::Agent | Self::PartialAnswer => Color::Green,
             Self::Failure => Color::Red,
             _ => Color::DarkGray,
         }
@@ -270,6 +233,129 @@ struct Message {
     role: Role,
     text: String,
     rendered: Option<CachedText>,
+    kind: MessageKind,
+    output: CellOutput,
+}
+
+enum InputDelivery {
+    Submitting,
+    Waiting,
+    Placed { entry_id: String },
+}
+enum MessageKind {
+    Text,
+    Thinking(u64),
+    Tool {
+        call_id: String,
+        status: ToolStatus,
+    },
+    Input {
+        input_id: String,
+        mode: InputMode,
+        delivery: InputDelivery,
+    },
+}
+
+#[derive(Default)]
+struct InputHistory {
+    entries: Vec<(Option<String>, String)>,
+    cursor: Option<usize>,
+    recalled: Option<String>,
+}
+impl InputHistory {
+    fn remember(&mut self, text: String) {
+        self.cursor = None;
+        self.recalled = None;
+        if !text.is_empty() && self.entries.last().is_none_or(|(_, saved)| saved != &text) {
+            self.entries.push((None, text));
+        }
+    }
+    fn sync(&mut self, messages: &[Message], live_entry: Option<&str>) {
+        // Native IDs merge replayed pages and acknowledgements of local input.
+        // Only a live acknowledgement can claim local input by text. Older
+        // identical prompts must retain their own position and native identity.
+        let mut before = self.entries.len();
+        for message in messages
+            .iter()
+            .rev()
+            .filter(|message| message.role == Role::User && message.id.is_some())
+        {
+            if message.id.as_deref() == live_entry
+                && live_entry.is_some()
+                && let Some(mut pending) = self
+                    .entries
+                    .iter()
+                    .rposition(|(id, text)| id.is_none() && text == &message.text)
+            {
+                // A large submission may have arrived in partial frames before
+                // its complete text can acknowledge the locally recorded input.
+                if let Some(native) = self.entries.iter().position(|(id, _)| id == &message.id) {
+                    self.entries.remove(native);
+                    if native < pending {
+                        pending -= 1;
+                    }
+                    if let Some(cursor) = self.cursor.as_mut() {
+                        if *cursor == native {
+                            *cursor = pending;
+                        } else if *cursor > native {
+                            *cursor -= 1;
+                        }
+                    }
+                }
+                self.entries[pending].0 = message.id.clone();
+            }
+            let known = self.entries.iter().rposition(|(id, _)| id == &message.id);
+            if let Some(index) = known {
+                self.entries[index] = (message.id.clone(), message.text.clone());
+                before = index;
+            } else {
+                self.entries
+                    .insert(before, (message.id.clone(), message.text.clone()));
+                if let Some(cursor) = self.cursor.as_mut()
+                    && *cursor >= before
+                {
+                    *cursor += 1;
+                }
+            }
+        }
+    }
+    fn can_recall(&self, text: &str, boundary: bool) -> bool {
+        !self.entries.is_empty()
+            && (text.is_empty() || (boundary && self.recalled.as_deref() == Some(text)))
+    }
+    fn recall(&mut self, older: bool, text: &str, boundary: bool) -> Option<String> {
+        if !self.can_recall(text, boundary) {
+            return None;
+        }
+        let mut next = match (older, self.cursor) {
+            (true, None) => self.entries.len().checked_sub(1)?,
+            (true, Some(index)) => index.checked_sub(1)?,
+            (false, None) => return None,
+            (false, Some(index)) => index + 1,
+        };
+        while next < self.entries.len() && self.entries[next].1 == text {
+            next = if older {
+                next.checked_sub(1)?
+            } else {
+                next + 1
+            };
+        }
+        if next == self.entries.len() {
+            self.cursor = None;
+            self.recalled = None;
+            return Some(String::new());
+        }
+        self.cursor = Some(next);
+        let value = self.entries[next].1.clone();
+        self.recalled = Some(value.clone());
+        Some(value)
+    }
+}
+
+struct CompletionMenu {
+    query: String,
+    items: Vec<Completion>,
+    selected: usize,
 }
 impl Message {
     fn new(id: Option<String>, role: Role, text: String) -> Self {
@@ -278,12 +364,48 @@ impl Message {
             role,
             text,
             rendered: None,
+            kind: MessageKind::Text,
+            output: CellOutput::Ready,
         }
+    }
+    fn with_output(mut self, output: CellOutput) -> Self {
+        self.output = output;
+        self
     }
     fn cached(&mut self) -> &mut CachedText {
         self.rendered.get_or_insert_with(|| {
             let mut lines = Vec::new();
-            append(&mut lines, self.role, &self.text);
+            if let MessageKind::Tool { status, .. } = &self.kind {
+                lines.push(Line::styled(
+                    format!(
+                        "{} {}",
+                        match status {
+                            ToolStatus::Running => "•",
+                            ToolStatus::Finished => "✓",
+                            ToolStatus::Failed => "✗",
+                        },
+                        markdown::plain(&self.text)
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                lines.push(Line::default());
+            } else {
+                append(&mut lines, self.role, &self.text);
+                if let MessageKind::Input { mode, delivery, .. } = &self.kind {
+                    let label = match (mode, delivery) {
+                        (_, InputDelivery::Submitting) => "You · sending",
+                        (InputMode::Steer, InputDelivery::Waiting) => "You · steering, waiting",
+                        (InputMode::FollowUp, InputDelivery::Waiting) => "You · queued",
+                        (_, InputDelivery::Placed { .. }) => "You",
+                    };
+                    lines[0] = Line::styled(
+                        label,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+            }
             CachedText::new(lines)
         })
     }
@@ -300,24 +422,21 @@ struct LayoutWork {
     measured_messages: usize,
     painted_rows: usize,
 }
-struct Tool {
-    name: String,
-    done: bool,
-}
 struct State {
     info: TuiInfo,
     messages: Vec<Message>,
+    output: Output,
     row_ends: Vec<usize>,
     row_width: u16,
     dirty_from: Option<usize>,
-    tail: CachedText,
-    tail_dirty: bool,
     #[cfg(test)]
     layout_work: LayoutWork,
     editor: TextArea<'static>,
-    thinking: String,
-    tools: HashMap<String, Tool>,
-    tool_order: Vec<String>,
+    input_history: InputHistory,
+    completion: Option<CompletionMenu>,
+    dismissed_completion: Option<String>,
+    thinking: Option<u64>,
+    next_thinking: u64,
     working: bool,
     compacting: bool,
     interrupting: bool,
@@ -325,7 +444,8 @@ struct State {
     worker: bool,
     history_offset: Option<usize>,
     history_entry: Option<(String, bool)>,
-    loading_older: bool,
+    loading_history: Option<HistoryLoad>,
+    more_history: bool,
     help_open: bool,
     help_scroll: usize,
     history_changed: bool,
@@ -340,17 +460,18 @@ impl State {
         Self {
             info,
             messages: Vec::new(),
+            output: Output::default(),
             row_ends: Vec::new(),
             row_width: 0,
             dirty_from: Some(0),
-            tail: CachedText::new(Vec::new()),
-            tail_dirty: true,
             #[cfg(test)]
             layout_work: LayoutWork::default(),
             editor: editor(),
-            thinking: String::new(),
-            tools: HashMap::new(),
-            tool_order: Vec::new(),
+            input_history: InputHistory::default(),
+            completion: None,
+            dismissed_completion: None,
+            thinking: None,
+            next_thinking: 0,
             working: false,
             compacting: false,
             interrupting: false,
@@ -358,7 +479,8 @@ impl State {
             worker: false,
             history_offset: Some(0),
             history_entry: None,
-            loading_older: false,
+            loading_history: None,
+            more_history: false,
             help_open: false,
             help_scroll: 0,
             history_changed: false,
@@ -370,39 +492,52 @@ impl State {
         }
     }
     fn push(&mut self, role: Role, text: String) {
+        self.finish_thinking();
         self.invalidate(self.messages.len());
         self.messages.push(Message::new(None, role, text));
         self.changed = true;
     }
     fn invalidate(&mut self, index: usize) {
+        self.output.cursor = self.output.cursor.min(index);
         self.dirty_from = Some(self.dirty_from.map_or(index, |dirty| dirty.min(index)));
-    }
-    fn say_user(&mut self, text: String) {
-        if let Some(index) = self
-            .messages
-            .iter()
-            .position(|message| message.role == Role::QueuedUser && message.text == text)
-        {
-            self.messages[index].role = Role::User;
-            self.messages[index].rendered = None;
-            self.invalidate(index);
-            self.changed = true;
-        } else {
-            self.push(Role::User, text);
-        }
     }
     fn working(&mut self, working: bool) {
         self.working = working;
         if !working {
+            self.settle_legacy_answer();
             self.interrupting = false;
         }
         self.changed = true;
     }
     fn committed(&mut self, message: HistoryMessage, historical: bool) {
+        let output = if historical {
+            if self.loading_history.is_some() {
+                CellOutput::Retained
+            } else {
+                CellOutput::Ready
+            }
+        } else if message.final_chunk {
+            CellOutput::Ready
+        } else {
+            CellOutput::Mutable
+        };
+        if let Some(tool) = message.tool {
+            self.tool_message(message.entry_id, tool, historical);
+            return;
+        }
         let role = Role::from_history(&message.role);
+        if !historical && role == Role::User
+            && self.messages.iter().any(|saved| matches!(&saved.kind,
+                MessageKind::Input { delivery: InputDelivery::Placed { entry_id, .. }, .. } if entry_id == &message.entry_id))
+        {
+            // Placement identifies this exact submitted input. The immutable
+            // preview already contains its complete body, so native echo chunks
+            // do not create rows or mutate printed terminal scrollback.
+            return;
+        }
         if historical {
             self.history_changed = true;
-            if self.loading_older {
+            if self.loading_history == Some(HistoryLoad::Older) {
                 self.scroll = usize::MAX;
             }
             let offset = self.history_offset.get_or_insert(0);
@@ -434,101 +569,200 @@ impl State {
             {
                 let index = *offset - 1;
                 self.messages[index].append(&message.text);
-                self.dirty_from = Some(self.dirty_from.map_or(index, |dirty| dirty.min(index)));
+                self.messages[index].output = output;
+                self.invalidate(index);
             } else {
                 let index = *offset;
                 self.messages.insert(
                     index,
-                    Message::new(Some(message.entry_id), role, message.text),
+                    Message::new(Some(message.entry_id), role, message.text).with_output(output),
                 );
                 *offset += 1;
-                self.dirty_from = Some(self.dirty_from.map_or(index, |dirty| dirty.min(index)));
+                self.invalidate(index);
             }
         } else if message.continuation
-            && self.messages.last().is_some_and(|previous| {
+            && let Some(index) = self.messages.iter().rposition(|previous| {
                 previous.id.as_ref() == Some(&message.entry_id) && previous.role == role
             })
         {
-            if let Some(last) = self.messages.last_mut() {
-                last.append(&message.text);
-            }
-            self.invalidate(self.messages.len().saturating_sub(1));
-        } else if role == Role::User
-            && let Some(pending) = self.messages.iter_mut().find(|pending| {
-                pending.role == Role::User && pending.id.is_none() && pending.text == message.text
-            })
-        {
-            pending.id = Some(message.entry_id);
-            pending.text = message.text;
+            self.messages[index].append(&message.text);
+            self.messages[index].output = output;
+            self.invalidate(index);
         } else {
             self.invalidate(self.messages.len());
             self.messages
-                .push(Message::new(Some(message.entry_id), role, message.text));
-        }
-        if !historical && role == Role::User {
-            let acknowledged = self.messages.last().and_then(|last| {
-                last.id.as_ref()?;
-                self.messages.iter().position(|pending| {
-                    pending.role == Role::User && pending.id.is_none() && pending.text == last.text
-                })
-            });
-            if let Some(index) = acknowledged
-                && let Some(committed) = self.messages.pop()
-            {
-                self.messages[index].id = committed.id;
-                self.invalidate(self.messages.len());
-            }
+                .push(Message::new(Some(message.entry_id), role, message.text).with_output(output));
         }
         self.changed = true;
     }
     fn finish_thinking(&mut self) {
-        if !self.thinking.is_empty() {
-            let thinking = std::mem::take(&mut self.thinking);
-            self.push(Role::Thinking, thinking);
+        if let Some(id) = self.thinking.take()
+            && let Some(message) = self
+                .messages
+                .iter_mut()
+                .find(|message| matches!(message.kind, MessageKind::Thinking(saved) if saved == id))
+            && message.output == CellOutput::Mutable
+        {
+            message.output = CellOutput::Ready;
         }
-        self.tools.clear();
-        self.tool_order.clear();
-        self.tail_dirty = true;
+    }
+    fn pending_input(&mut self, input_id: String, text: String, mode: InputMode) {
+        if self.messages.iter().any(|message| matches!(&message.kind, MessageKind::Input { input_id: id, .. } if id == &input_id)) { return; }
+        self.push(Role::User, text);
+        if let Some(message) = self.messages.last_mut() {
+            message.output = CellOutput::Mutable;
+            message.kind = MessageKind::Input {
+                input_id,
+                mode,
+                delivery: InputDelivery::Submitting,
+            };
+        }
+    }
+    fn tool(&mut self, call_id: String, name: String, status: ToolStatus) {
+        if let Some(index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Tool { call_id: id, .. } if id == &call_id)) {
+            let message = &mut self.messages[index];
+            if matches!(&message.kind, MessageKind::Tool { status: ToolStatus::Failed, .. })
+                || (matches!(&message.kind, MessageKind::Tool { status: ToolStatus::Finished, .. }) && matches!(status, ToolStatus::Running | ToolStatus::Finished)) {
+                return;
+            }
+            message.text = name;
+            message.kind = MessageKind::Tool { call_id, status };
+            if message.output != CellOutput::Printed { message.output = CellOutput::Mutable; }
+            message.rendered = None;
+            self.invalidate(index);
+        } else {
+            self.push(Role::Tool, name);
+            if let Some(message) = self.messages.last_mut() { message.kind = MessageKind::Tool { call_id, status }; message.output = CellOutput::Mutable; }
+        }
+    }
+    fn tool_message(
+        &mut self,
+        entry_id: String,
+        tool: crate::protocol::ToolHistory,
+        historical: bool,
+    ) {
+        let identity = tool.call_id.clone();
+        let terminal = tool.status != ToolStatus::Running;
+        let index = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Tool { call_id, .. } if call_id == &tool.call_id));
+        if let Some(index) = index {
+            let call = matches!(tool.status, ToolStatus::Running);
+            self.tool(tool.call_id, tool.name, tool.status);
+            if historical && call && self.messages[index].id.as_ref() != Some(&entry_id) {
+                let offset = self.history_offset.get_or_insert(0);
+                let mut message = self.messages.remove(index);
+                message.id = Some(entry_id);
+                let insertion = (*offset).min(self.messages.len());
+                self.messages.insert(insertion, message);
+                *offset = insertion + 1;
+                self.invalidate(index.min(insertion));
+            } else if self.messages[index].id.is_none() {
+                self.messages[index].id = Some(entry_id);
+            }
+        } else {
+            let mut message = Message::new(Some(entry_id), Role::Tool, tool.name);
+            message.output = if historical && self.loading_history.is_some() {
+                CellOutput::Retained
+            } else {
+                CellOutput::Mutable
+            };
+            if !historical {
+                self.finish_thinking();
+            }
+            message.kind = MessageKind::Tool {
+                call_id: tool.call_id,
+                status: tool.status,
+            };
+            let index = if historical {
+                *self.history_offset.get_or_insert(0)
+            } else {
+                self.messages.len()
+            };
+            self.messages.insert(index, message);
+            if historical {
+                self.history_offset = Some(index + 1);
+            }
+            self.invalidate(index);
+        }
+        if historical {
+            if self.loading_history == Some(HistoryLoad::Older) {
+                self.scroll = usize::MAX;
+            }
+            if let Some(index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Tool { call_id, .. } if call_id == &identity)) {
+                let offset = self.history_offset.get_or_insert(0);
+                *offset = (*offset).max(index + 1);
+            }
+        }
+        if let Some(message) = self.messages.iter_mut().find(|message| matches!(&message.kind, MessageKind::Tool { call_id, .. } if call_id == &identity))
+            && !matches!(message.output, CellOutput::Printed | CellOutput::Retained)
+            && terminal
+        {
+            message.output = CellOutput::Ready;
+        }
+        self.history_changed |= historical;
     }
     fn event(&mut self, event: RuntimeEventKind) {
         match event {
-            RuntimeEventKind::History { messages, .. } => {
+            RuntimeEventKind::History {
+                messages,
+                next_cursor,
+                ..
+            } => {
+                self.output.collecting_history = true;
+                self.more_history = next_cursor.is_some();
                 for message in messages {
+                    self.output.historical_entries.insert(message.entry_id.clone());
                     self.committed(message, true);
                 }
+                self.input_history.sync(&self.messages, None);
             }
             RuntimeEventKind::Message { message } => {
-                if matches!(message.role, HistoryRole::User) {
+                // A replayed page contains whole immutable native entries.
+                // Ignore a delayed live delivery of that entry, not individual
+                // role/text blocks, which may legitimately repeat within it.
+                if self.output.historical_entries.contains(&message.entry_id) { return; }
+                if message.tool.is_none() { self.finish_thinking(); }
+                let user = matches!(message.role, HistoryRole::User);
+                let entry_id = user.then(|| message.entry_id.clone());
+                if user {
                     self.working(true);
                 }
                 self.committed(message, false);
+                if user {
+                    self.input_history.sync(&self.messages, entry_id.as_deref());
+                }
             }
-            RuntimeEventKind::Answer { text, .. } => {
+            RuntimeEventKind::Answer { text, entry_id, .. } => {
                 self.finish_thinking();
-                self.push(Role::Agent, text);
                 self.working(false);
+                if entry_id.as_ref().is_none_or(|id| !self.messages.iter().any(|message| message.id.as_ref() == Some(id))) {
+                    self.push(Role::Agent, text);
+                    if let Some(message) = self.messages.last_mut() {
+                        message.output = if entry_id.is_some() { CellOutput::Ready } else { CellOutput::AwaitingIdle };
+                        message.id = entry_id;
+                    }
+                }
             }
             RuntimeEventKind::Activity { activity } => match activity {
                 ModelActivity::Thinking { text } => {
                     self.working = true;
-                    self.thinking.push_str(&text);
-                    self.tail_dirty = true;
+                    if let Some(index) = self.messages.iter().position(|message| matches!(message.kind, MessageKind::Thinking(id) if Some(id) == self.thinking)) {
+                        self.messages[index].append(&text);
+                        self.invalidate(index);
+                    } else {
+                        let id = self.next_thinking;
+                        self.next_thinking = self.next_thinking.saturating_add(1);
+                        self.push(Role::Thinking, text);
+                        self.thinking = Some(id);
+                        if let Some(message) = self.messages.last_mut() { message.kind = MessageKind::Thinking(id); message.output = CellOutput::Mutable; }
+                    }
                 }
                 ModelActivity::ToolStarted { call_id, name } => {
                     self.working = true;
-                    if !self.tools.contains_key(&call_id) {
-                        self.tool_order.push(call_id.clone());
-                    }
-                    self.tools.insert(call_id, Tool { name, done: false });
-                    self.tail_dirty = true;
+                    self.tool(call_id, name, ToolStatus::Running);
                 }
                 ModelActivity::ToolFinished { call_id, name } => {
                     self.working = true;
-                    if !self.tools.contains_key(&call_id) {
-                        self.tool_order.push(call_id.clone());
-                    }
-                    self.tools.insert(call_id, Tool { name, done: true });
-                    self.tail_dirty = true;
+                    self.tool(call_id, name, ToolStatus::Finished);
                 }
                 ModelActivity::Compaction { active, failed } => {
                     self.compacting = active;
@@ -559,7 +793,9 @@ impl State {
             }
             RuntimeEventKind::Notice { text, .. } if !self.worker => self.push(Role::Notice, text),
             RuntimeEventKind::Done => {
-                self.loading_older = false;
+                self.output.collecting_history = false;
+                if !self.working { self.settle_legacy_answer(); }
+                self.loading_history = None;
                 self.history_entry = None;
             }
             RuntimeEventKind::Failure { message, .. } => {
@@ -567,7 +803,34 @@ impl State {
                 self.push(Role::Failure, message);
                 self.working(false);
             }
-            RuntimeEventKind::InputRejected { message, .. } => self.push(Role::Failure, message),
+            RuntimeEventKind::InputAccepted { input_id } => {
+                if let Some(index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Input { input_id: id, delivery: InputDelivery::Submitting, .. } if id == &input_id)) {
+                    if let MessageKind::Input { delivery, .. } = &mut self.messages[index].kind { *delivery = InputDelivery::Waiting; }
+                    self.messages[index].rendered = None;
+                    self.invalidate(index);
+                }
+            }
+            RuntimeEventKind::InputPlaced { input_id, entry_id } => {
+                if let Some(index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Input { input_id: id, .. } if id == &input_id)) {
+                    let message = &mut self.messages[index];
+                    message.id = Some(entry_id.clone());
+                    message.output = CellOutput::Ready;
+                    if let MessageKind::Input { delivery, .. } = &mut message.kind
+                        && !matches!(delivery, InputDelivery::Placed { .. }) {
+                        *delivery = InputDelivery::Placed { entry_id: entry_id.clone() };
+                    }
+                    message.rendered = None;
+                    self.input_history.sync(&self.messages, Some(&entry_id));
+                    self.invalidate(index);
+                }
+            }
+            RuntimeEventKind::InputRejected { input_id, message } => {
+                if let Some(index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Input { input_id: id, delivery: InputDelivery::Submitting | InputDelivery::Waiting, .. } if id == &input_id)) {
+                    self.messages.remove(index);
+                    self.invalidate(index);
+                }
+                self.push(Role::Failure, message);
+            }
             _ => {}
         }
         self.changed = true;
@@ -586,6 +849,91 @@ impl State {
         }
     }
     fn input(&mut self, event: Event) -> Option<TuiInput> {
+        self.sync_completion();
+        let input = self.input_event(event);
+        self.sync_completion();
+        input
+    }
+    fn load_history(&mut self, mode: HistoryLoad) -> Option<TuiInput> {
+        self.output.view = View::History;
+        self.changed = true;
+        if self.loading_history.is_some() {
+            return None;
+        }
+        if !self.more_history {
+            if mode == HistoryLoad::Older {
+                self.push(Role::Notice, "No older history.".into());
+            }
+            return None;
+        }
+        self.history_offset = Some(0);
+        self.loading_history = Some(mode);
+        Some(TuiInput::History)
+    }
+    fn sync_completion(&mut self) {
+        let text = self.editor.lines().join("\n");
+        let DataCursor(row, column) = self.editor.cursor();
+        let boundary = (row, column) == (0, 0)
+            || (row + 1 == self.editor.lines().len()
+                && column == self.editor.lines()[row].chars().count());
+        if self.help_open
+            || self.exiting
+            || row != 0
+            || self.input_history.can_recall(&text, boundary)
+        {
+            self.completion = None;
+            return;
+        }
+        let line = &self.editor.lines()[0];
+        let cursor = line
+            .char_indices()
+            .nth(column)
+            .map_or(line.len(), |(offset, _)| offset);
+        let items = completions(line, cursor);
+        let query = line[..cursor].to_owned();
+        if self.dismissed_completion.as_ref() == Some(&query) {
+            self.completion = None;
+            return;
+        }
+        self.dismissed_completion = None;
+        if items.is_empty() {
+            self.completion = None;
+        } else if let Some(menu) = &mut self.completion
+            && menu.query == query
+        {
+            menu.items = items;
+        } else {
+            self.completion = Some(CompletionMenu {
+                query,
+                items,
+                selected: 0,
+            });
+        }
+    }
+    fn complete(&mut self) {
+        let Some(menu) = self.completion.take() else {
+            return;
+        };
+        let Some(item) = menu.items.get(menu.selected) else {
+            return;
+        };
+        let mut lines = self.editor.lines().to_vec();
+        let suffix = &lines[0][item.range.end..];
+        let space = if suffix.is_empty() { " " } else { "" };
+        let replacement = format!("{}{space}", item.text);
+        lines[0].replace_range(item.range.clone(), &replacement);
+        let column = lines[0][..item.range.start + replacement.len()]
+            .chars()
+            .count();
+        self.editor = editor();
+        self.editor.insert_str(lines.join("\n"));
+        self.editor.move_cursor(ratatui_textarea::CursorMove::Jump(
+            0,
+            u16::try_from(column).unwrap_or(u16::MAX),
+        ));
+        self.dismissed_completion = Some(lines[0][..item.range.start + replacement.len()].into());
+    }
+    fn input_event(&mut self, event: Event) -> Option<TuiInput> {
         self.changed = true;
         if self.exiting {
             return None;
@@ -593,12 +941,47 @@ impl State {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let control = key.modifiers.contains(KeyModifiers::CONTROL);
+                if let Some(menu) = &mut self.completion {
+                    match key.code {
+                        KeyCode::Up => {
+                            menu.selected =
+                                (menu.selected + menu.items.len() - 1) % menu.items.len();
+                            return None;
+                        }
+                        KeyCode::Down => {
+                            menu.selected = (menu.selected + 1) % menu.items.len();
+                            return None;
+                        }
+                        KeyCode::Esc => {
+                            self.dismissed_completion = Some(menu.query.clone());
+                            self.completion = None;
+                            return None;
+                        }
+                        KeyCode::Tab => {
+                            self.complete();
+                            return None;
+                        }
+                        KeyCode::Enter if key.modifiers.is_empty() => {
+                            self.complete();
+                            if ChatCommand::parse(&self.editor.lines().join("\n"))
+                                .is_some_and(|command| command.is_err())
+                            {
+                                return None;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 match key.code {
                     KeyCode::Char('?') if self.editor.lines().iter().all(String::is_empty) => {
                         self.help_open = !self.help_open;
                         self.help_scroll = 0;
                     }
                     KeyCode::Esc if self.help_open => self.help_open = false,
+                    KeyCode::Esc if self.output.view == View::History && !self.working => {
+                        self.output.view = View::Live;
+                        self.scroll = 0;
+                    }
                     KeyCode::Esc => {
                         if self.working {
                             self.interrupting = true;
@@ -620,9 +1003,7 @@ impl State {
                         return Some(TuiInput::Exit);
                     }
                     KeyCode::Char('r') if control => {
-                        self.history_offset = Some(0);
-                        self.loading_older = true;
-                        return Some(TuiInput::History);
+                        return self.load_history(HistoryLoad::Older);
                     }
                     KeyCode::PageUp if self.help_open => {
                         self.help_scroll = self.help_scroll.saturating_sub(self.page)
@@ -632,10 +1013,41 @@ impl State {
                     }
                     KeyCode::Home if control && self.help_open => self.help_scroll = 0,
                     KeyCode::End if control && self.help_open => self.help_scroll = usize::MAX,
-                    KeyCode::PageUp => self.scroll = self.scroll.saturating_add(self.page),
+                    KeyCode::PageUp => {
+                        self.output.view = View::History;
+                        self.scroll = self.scroll.saturating_add(self.page);
+                        if self.scroll >= self.previous_rows.saturating_sub(self.page + 1) {
+                            self.scroll = self
+                                .scroll
+                                .min(self.previous_rows.saturating_sub(self.page + 1));
+                            return self.load_history(HistoryLoad::Scroll);
+                        }
+                    }
                     KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(self.page),
-                    KeyCode::Home if control => self.scroll = usize::MAX,
-                    KeyCode::End if control => self.scroll = 0,
+                    KeyCode::Home if control => {
+                        self.scroll = usize::MAX;
+                        return self.load_history(HistoryLoad::Older);
+                    }
+                    KeyCode::End if control => {
+                        self.scroll = 0;
+                        self.output.view = View::Live;
+                    }
+                    KeyCode::Up | KeyCode::Down if key.modifiers.is_empty() => {
+                        let text = self.editor.lines().join("\n");
+                        let DataCursor(row, column) = self.editor.cursor();
+                        let boundary = (row, column) == (0, 0)
+                            || (row + 1 == self.editor.lines().len()
+                                && column == self.editor.lines()[row].chars().count());
+                        if let Some(recalled) =
+                            self.input_history
+                                .recall(key.code == KeyCode::Up, &text, boundary)
+                        {
+                            self.editor = editor();
+                            self.editor.insert_str(recalled);
+                        } else {
+                            self.editor.input(key);
+                        }
+                    }
                     KeyCode::Enter
                         if key
                             .modifiers
@@ -652,6 +1064,7 @@ impl State {
                             match command {
                                 Err(error) => self.push(Role::Failure, error.to_string()),
                                 Ok(command) => {
+                                    self.input_history.remember(value.clone());
                                     self.editor = editor();
                                     self.help_open = false;
                                     match command {
@@ -663,9 +1076,7 @@ impl State {
                                             return Some(TuiInput::Feedback(description.join(" ")));
                                         }
                                         ChatCommand::History => {
-                                            self.history_offset = Some(0);
-                                            self.loading_older = true;
-                                            return Some(TuiInput::History);
+                                            return self.load_history(HistoryLoad::Older);
                                         }
                                         ChatCommand::Exit => {
                                             self.exiting = true;
@@ -678,9 +1089,11 @@ impl State {
                             return None;
                         }
                         if !value.trim().is_empty() {
+                            self.input_history.remember(value.clone());
                             self.editor = editor();
                             self.help_open = false;
                             self.scroll = 0;
+                            self.output.view = View::Live;
                             if key.code == KeyCode::Tab {
                                 return Some(TuiInput::Queue(value));
                             }
@@ -700,25 +1113,6 @@ impl State {
             _ => {}
         }
         None
-    }
-    fn live_lines(&self) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
-        if !self.thinking.is_empty() {
-            append(&mut lines, Role::Thinking, &self.thinking);
-        }
-        for id in &self.tool_order {
-            if let Some(tool) = self.tools.get(id) {
-                lines.push(Line::styled(
-                    format!(
-                        "{} {}",
-                        if tool.done { "✓" } else { "•" },
-                        markdown::plain(&tool.name)
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-        }
-        lines
     }
     fn layout_transcript(&mut self, width: u16) -> usize {
         if self.row_width != width {
@@ -743,11 +1137,7 @@ impl State {
                 self.row_ends.push(total);
             }
         }
-        if self.tail_dirty {
-            self.tail = CachedText::new(self.live_lines());
-            self.tail_dirty = false;
-        }
-        self.row_ends.last().copied().unwrap_or(0) + self.tail.layout(width)
+        self.row_ends.last().copied().unwrap_or(0)
     }
     fn draw_transcript(&mut self, frame: &mut Frame<'_>, area: Rect, top: usize) {
         let first = self.row_ends.partition_point(|end| *end <= top);
@@ -769,16 +1159,6 @@ impl State {
             }
             start = *end;
         }
-        if drawn < area.height {
-            let remaining = Rect::new(area.x, area.y + drawn, area.width, area.height - drawn);
-            let messages_rows = self.row_ends.last().copied().unwrap_or(0);
-            drawn += u16::try_from(self.tail.draw(
-                frame,
-                remaining,
-                top.saturating_sub(messages_rows),
-            ))
-            .unwrap_or(remaining.height);
-        }
         #[cfg(test)]
         {
             self.layout_work.painted_rows = usize::from(drawn);
@@ -792,10 +1172,11 @@ impl State {
             self.changed = false;
             return;
         }
-        let editor_rows = Paragraph::new(self.editor.lines().join("\n"))
-            .wrap(Wrap { trim: false })
-            .line_count(frame.area().width.saturating_sub(2));
-        let height = u16::try_from(editor_rows).unwrap_or(6).clamp(1, 6) + 2;
+        self.prepare_editor();
+        let height = self.editor_height(
+            frame.area().width,
+            frame.area().height.saturating_sub(6).clamp(1, 6),
+        );
         let areas = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
@@ -868,6 +1249,8 @@ impl State {
             );
         } else {
             let total = self.layout_transcript(areas[1].width);
+            let base = self.live_base();
+            let total = total.saturating_sub(base);
             let visible = usize::from(areas[1].height);
             let maximum = total.saturating_sub(visible);
             if self.scroll > 0 && self.previous_width == areas[1].width && !self.history_changed {
@@ -881,19 +1264,48 @@ impl State {
             self.history_changed = false;
             self.page = visible.saturating_sub(1).max(1);
             let top = maximum.saturating_sub(self.scroll);
-            self.draw_transcript(frame, areas[1], top);
+            self.draw_transcript(frame, areas[1], top + base);
         }
-        self.editor
-            .set_block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(if self.exiting {
-                        Color::DarkGray
-                    } else {
-                        Color::Cyan
-                    })),
-            );
         frame.render_widget(&self.editor, areas[2]);
+        if let Some(menu) = &self.completion {
+            let height = usize::from(areas[1].height).min(6).min(menu.items.len());
+            let start = menu.selected.saturating_sub(height.saturating_sub(1));
+            let lines = menu
+                .items
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(height)
+                .map(|(index, item)| {
+                    Line::from(vec![
+                        Span::styled(
+                            if index == menu.selected { "› " } else { "  " },
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            item.label.clone(),
+                            Style::default().fg(Color::Cyan).add_modifier(
+                                if index == menu.selected {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                },
+                            ),
+                        ),
+                        Span::raw(format!("  {}", item.description)),
+                    ])
+                })
+                .collect::<Vec<_>>();
+            let height = u16::try_from(height).unwrap_or(0);
+            let area = Rect::new(
+                areas[1].x,
+                areas[1].bottom().saturating_sub(height),
+                areas[1].width,
+                height,
+            );
+            frame.render_widget(ClearWidget, area);
+            frame.render_widget(Paragraph::new(lines), area);
+        }
         let reasoning = self
             .info
             .model
@@ -940,6 +1352,15 @@ impl State {
                     .enumerate()
                     .flat_map(|(index, shortcut)| {
                         let (key, hint, _) = shortcut.definition();
+                        let hint = if self.completion.is_some() {
+                            match shortcut {
+                                Shortcut::Steer => "run",
+                                Shortcut::Queue => "complete",
+                                _ => hint,
+                            }
+                        } else {
+                            hint
+                        };
                         [
                             Span::raw(if index == 0 { "" } else { " · " }),
                             Span::styled(key, Style::default().fg(Color::Yellow)),
@@ -952,6 +1373,37 @@ impl State {
             areas[4],
         );
         self.changed = false;
+    }
+    fn prepare_editor(&mut self) {
+        self.editor
+            .set_block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(if self.exiting {
+                        Color::DarkGray
+                    } else {
+                        Color::Cyan
+                    })),
+            );
+    }
+    fn editor_height(&mut self, width: u16, maximum: u16) -> u16 {
+        // Use the editor's native WordOrGlyph map, including borders and tabs.
+        // A bounded render refreshes its width after resize without cloning the
+        // draft or maintaining a competing implementation of text wrapping.
+        let area = Rect::new(0, 0, width, maximum + 2);
+        (&self.editor).render(area, &mut Buffer::empty(area));
+        let last = self.editor.screen_to_data(usize::MAX, 0);
+        if let Some(row) =
+            (0..maximum).find(|row| self.editor.screen_to_data(usize::from(*row), 0) == last)
+        {
+            // Growing the viewport must reveal the whole draft when it fits.
+            let (top, _) = self.editor.scroll_offset();
+            self.editor
+                .scroll((-i16::try_from(top).unwrap_or(i16::MAX), 0));
+            row + 3
+        } else {
+            maximum + 2
+        }
     }
 }
 fn editor() -> TextArea<'static> {
@@ -982,6 +1434,7 @@ enum Shortcut {
     Exit,
     Scroll,
     History,
+    Recall,
     Help,
 }
 impl Shortcut {
@@ -1003,9 +1456,14 @@ impl Shortcut {
             Self::Scroll => (
                 "PgUp/PgDn",
                 "scroll",
-                "Scroll messages or shortcuts; Ctrl+Home/End jumps to edges",
+                "Browse saved messages; wheel/trackpad uses terminal scrollback",
             ),
             Self::History => ("Ctrl+R", "older", "Load older saved messages"),
+            Self::Recall => (
+                "Up/Down",
+                "recall",
+                "Recall previous prompts; select visible completions",
+            ),
             Self::Help => (
                 "?",
                 "shortcuts",
@@ -1044,7 +1502,7 @@ fn append(lines: &mut Vec<Line<'static>>, role: Role, text: &str) {
             .add_modifier(Modifier::BOLD),
     ));
     let rendered = markdown::render(text);
-    if role == Role::Thinking || role == Role::Tool {
+    if matches!(role, Role::Thinking | Role::Tool | Role::Commentary) {
         lines.extend(
             rendered
                 .into_iter()
@@ -1057,23 +1515,22 @@ fn append(lines: &mut Vec<Line<'static>>, role: Role, text: &str) {
 }
 
 fn run(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    screen: &mut Screen,
     updates: mpsc::Receiver<Update>,
     inputs: UnboundedSender<TuiInput>,
     mut state: State,
 ) -> Result<()> {
-    let mut title = String::new();
     loop {
         if inputs.is_closed() {
-            return Ok(());
+            return screen.finish(&mut state);
         }
         for _ in 0..256 {
             match updates.try_recv() {
-                Ok(Update::Stop) | Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                Ok(Update::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
+                    return screen.finish(&mut state);
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Ok(Update::Event(event)) => state.event(*event),
-                Ok(Update::User(text)) => state.say_user(text),
-                Ok(Update::QueuedUser(text)) => state.push(Role::QueuedUser, text),
                 Ok(Update::Status(info)) => {
                     state.info = info;
                     state.changed = true;
@@ -1096,15 +1553,15 @@ fn run(
                     state.editor.insert_str(text);
                     state.push(Role::Notice, "Unsent input returned to the draft.".into());
                 }
+                Ok(Update::PendingInput {
+                    input_id,
+                    text,
+                    mode,
+                }) => state.pending_input(input_id, text, mode),
             }
         }
         if state.changed {
-            let next_title = terminal_title(&state.info);
-            if title != next_title {
-                execute!(std::io::stdout(), WindowTitle(&next_title))?;
-                title = next_title;
-            }
-            terminal.draw(|frame| state.draw(frame))?;
+            screen.draw(&mut state)?;
         }
         if event::poll(Duration::from_millis(40))?
             && let Some(input) = state.input(event::read()?)
@@ -1179,16 +1636,14 @@ mod tests {
             },
         });
         rendered(&mut view, 80, 20);
-        assert_eq!(view.layout_work.parsed_messages, initial.parsed_messages);
-        assert_eq!(
-            view.layout_work.measured_messages,
-            initial.measured_messages
-        );
+        let after_live = view.layout_work;
+        assert_eq!(after_live.parsed_messages, initial.parsed_messages + 1);
+        assert_eq!(after_live.measured_messages, initial.measured_messages + 1);
         rendered(&mut view, 43, 20);
-        assert_eq!(view.layout_work.parsed_messages, initial.parsed_messages);
+        assert_eq!(view.layout_work.parsed_messages, after_live.parsed_messages);
         assert_eq!(
             view.layout_work.measured_messages,
-            initial.measured_messages + 1_000
+            after_live.measured_messages + 1_001
         );
         view.input(key(KeyCode::End, KeyModifiers::CONTROL));
         assert!(rendered(&mut view, 80, 20).contains("New live context"));
@@ -1201,6 +1656,8 @@ mod tests {
                 role: HistoryRole::Assistant,
                 text: text.into(),
                 continuation,
+                final_chunk: true,
+                tool: None,
             }],
             next_cursor: None,
         };
@@ -1208,16 +1665,28 @@ mod tests {
         rendered(&mut history, 80, 20);
         history.event(frame("context", true));
         assert!(rendered(&mut history, 80, 20).contains("Earlier context"));
-        history.push(crate::tui::Role::QueuedUser, "Next request".into());
-        assert!(rendered(&mut history, 80, 20).contains("queued, unsent"));
-        history.say_user("Next request".into());
-        assert!(!rendered(&mut history, 80, 20).contains("queued, unsent"));
+        history.pending_input(
+            "next-input".into(),
+            "Next request".into(),
+            crate::protocol::InputMode::FollowUp,
+        );
+        history.event(RuntimeEventKind::InputAccepted {
+            input_id: "next-input".into(),
+        });
+        assert!(rendered(&mut history, 80, 20).contains("You · queued"));
+        history.event(RuntimeEventKind::InputPlaced {
+            input_id: "next-input".into(),
+            entry_id: "next-user".into(),
+        });
+        assert!(!rendered(&mut history, 80, 20).contains("You · queued"));
         history.event(RuntimeEventKind::Message {
             message: HistoryMessage {
                 entry_id: "next".into(),
                 role: HistoryRole::Assistant,
                 text: "Live ".into(),
                 continuation: false,
+                final_chunk: true,
+                tool: None,
             },
         });
         rendered(&mut history, 80, 20);
@@ -1227,6 +1696,8 @@ mod tests {
                 role: HistoryRole::Assistant,
                 text: "continuation".into(),
                 continuation: true,
+                final_chunk: true,
+                tool: None,
             },
         });
         assert!(rendered(&mut history, 80, 20).contains("Live continuation"));
@@ -1317,6 +1788,7 @@ mod tests {
         assert!(before.contains("First second"));
         assert!(before.contains("✓ read_file"));
         state.event(RuntimeEventKind::Answer {
+            entry_id: None,
             conversation_id: "one".into(),
             text: "## Done\n\n- fixed **it**\n\n```rust\nlet ready = true;\n```".into(),
         });
@@ -1342,6 +1814,7 @@ mod tests {
         assert!(compacting.contains("gpt-6.1-sol · high"));
         assert!(compacting.contains("/workspace/example · Compacting context"));
         state.event(RuntimeEventKind::Answer {
+            entry_id: None,
             conversation_id: "one".into(),
             text: "Foreground work completed".into(),
         });
@@ -1479,7 +1952,11 @@ mod tests {
         use crate::{chat_commands::ChatCommand, protocol::FastMode};
         let mut view = state();
         view.working(true);
-        view.push(crate::tui::Role::QueuedUser, "A later request".into());
+        view.pending_input(
+            "later".into(),
+            "A later request".into(),
+            crate::protocol::InputMode::FollowUp,
+        );
         assert_eq!(
             view.input(key(KeyCode::Char('?'), KeyModifiers::NONE)),
             None
@@ -1616,6 +2093,11 @@ mod tests {
     fn history_prepends_in_frame_order_and_scroll_has_an_explicit_follow_mode() {
         let mut state = state();
         state.push(crate::tui::Role::Agent, "Latest answer".into());
+        state.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![],
+            next_cursor: Some("older".into()),
+        });
         assert_eq!(
             state.input(key(KeyCode::Char('r'), KeyModifiers::CONTROL)),
             Some(TuiInput::History)
@@ -1628,6 +2110,8 @@ mod tests {
                     role: HistoryRole::User,
                     text: text.into(),
                     continuation: false,
+                    final_chunk: true,
+                    tool: None,
                 }],
                 next_cursor: None,
             });
@@ -1655,6 +2139,559 @@ mod tests {
         assert!(rendered(&mut state, 100, 14).contains("Answer 29"));
     }
     #[test]
+    fn prompt_recall_traverses_sent_and_queued_input_without_submitting_it() {
+        let mut view = state();
+        view.input(Event::Paste("First request".into()));
+        assert_eq!(
+            view.input(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(TuiInput::Submit("First request".into()))
+        );
+        view.input(Event::Paste("Next request\nwith more context 界".into()));
+        assert_eq!(
+            view.input(key(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(TuiInput::Queue("Next request\nwith more context 界".into()))
+        );
+        assert_eq!(view.input(key(KeyCode::Up, KeyModifiers::NONE)), None);
+        assert_eq!(
+            view.editor.lines().join("\n"),
+            "Next request\nwith more context 界"
+        );
+        assert_eq!(
+            view.editor.cursor(),
+            (1, "with more context 界".chars().count())
+        );
+        assert!(rendered(&mut view, 80, 20).contains("with more context 界"));
+        view.input(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), "First request");
+        view.input(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            view.editor.lines().join("\n"),
+            "Next request\nwith more context 界"
+        );
+        view.input(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), "");
+        view.input(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), "");
+    }
+    #[test]
+    fn prompt_recall_preserves_fresh_drafts_and_edits_inside_recalled_multiline_text() {
+        let mut view = state();
+        for text in ["Older request", "First line\nSecond line"] {
+            view.input(Event::Paste(text.into()));
+            view.input(key(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        view.input(key(KeyCode::Up, KeyModifiers::NONE));
+        view.input(key(KeyCode::Left, KeyModifiers::NONE));
+        view.input(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), "First line\nSecond line");
+        assert_eq!(view.editor.cursor().0, 0);
+        view.input(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        let edited = view.editor.lines().join("\n");
+        view.input(key(KeyCode::Down, KeyModifiers::NONE));
+        view.input(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), edited);
+        view.editor = crate::tui::editor();
+        view.input(Event::Paste("Fresh draft\nstill being written".into()));
+        view.input(key(KeyCode::Up, KeyModifiers::NONE));
+        view.input(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            view.editor.lines().join("\n"),
+            "Fresh draft\nstill being written"
+        );
+    }
+    #[test]
+    fn prompt_recall_merges_saved_user_chunks_and_live_acknowledgements_by_entry_identity() {
+        let mut view = state();
+        let history = |messages| RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages,
+            next_cursor: None,
+        };
+        let message = |id: &str, role, text: &str, continuation| HistoryMessage {
+            entry_id: id.into(),
+            role,
+            text: text.into(),
+            continuation,
+            final_chunk: true,
+            tool: None,
+        };
+        view.event(history(vec![
+            message("old", HistoryRole::User, "Saved ", false),
+            message("old", HistoryRole::User, "request", true),
+            message(
+                "reply",
+                HistoryRole::Assistant,
+                "Never recall an assistant reply",
+                false,
+            ),
+        ]));
+        view.event(RuntimeEventKind::Done);
+        view.input(Event::Paste("New request".into()));
+        view.input(key(KeyCode::Enter, KeyModifiers::NONE));
+        view.event(RuntimeEventKind::Message {
+            message: message("new", HistoryRole::User, "New request", false),
+        });
+        view.event(history(vec![
+            message("old", HistoryRole::User, "Saved request", false),
+            message("new", HistoryRole::User, "New request", false),
+        ]));
+        view.event(RuntimeEventKind::Done);
+        view.input(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), "New request");
+        view.input(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), "Saved request");
+        view.input(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), "New request");
+        view.input(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), "");
+    }
+    #[test]
+    fn typed_commentary_is_visually_distinct_and_only_user_input_is_recalled() {
+        use ratatui::style::Color;
+        let mut view = state();
+        view.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: [
+                (HistoryRole::User, "Actual user request"),
+                (HistoryRole::Commentary, "PROGRESS_BODY"),
+                (HistoryRole::PartialAnswer, "PARTIAL_BODY"),
+                (HistoryRole::Final, "FINAL_BODY"),
+                (HistoryRole::Notice, "NOTICE_BODY"),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (role, text))| HistoryMessage {
+                entry_id: index.to_string(),
+                role,
+                text: text.into(),
+                continuation: false,
+                final_chunk: true,
+                tool: None,
+            })
+            .collect(),
+            next_cursor: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let body_color = |text: &str| {
+            buffer
+                .content
+                .windows(text.len())
+                .find(|cells| {
+                    cells
+                        .iter()
+                        .zip(text.chars())
+                        .all(|(cell, ch)| cell.symbol() == ch.to_string())
+                })
+                .unwrap()[0]
+                .fg
+        };
+        assert_eq!(body_color("PROGRESS_BODY"), Color::DarkGray);
+        assert_ne!(body_color("FINAL_BODY"), Color::DarkGray);
+        assert_ne!(body_color("PARTIAL_BODY"), Color::DarkGray);
+        assert!(rendered(&mut view, 100, 30).contains("Agent · partial"));
+        view.input(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), "Actual user request");
+    }
+    #[test]
+    fn older_identical_prompt_does_not_claim_an_unacknowledged_local_submission() {
+        let mut view = state();
+        let frame = |id: &str, text: &str| RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![HistoryMessage {
+                entry_id: id.into(),
+                role: HistoryRole::User,
+                text: text.into(),
+                continuation: false,
+                final_chunk: true,
+                tool: None,
+            }],
+            next_cursor: Some("older".into()),
+        };
+        view.event(frame("recent", "A different request"));
+        view.event(RuntimeEventKind::Done);
+        view.input(Event::Paste("Please continue".into()));
+        view.input(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            view.input(key(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Some(TuiInput::History)
+        );
+        view.event(frame("old", "Please continue"));
+        view.event(RuntimeEventKind::Done);
+        view.input(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), "Please continue");
+        view.input(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), "A different request");
+        view.input(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), "Please continue");
+    }
+    #[test]
+    fn slash_completion_uses_the_visible_choice_and_preserves_the_command_draft() {
+        let mut view = state();
+        view.input(Event::Paste("/f".into()));
+        let text = rendered(&mut view, 100, 20);
+        assert!(text.contains("/fast"));
+        assert!(text.contains("/feedback"));
+        view.input(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(view.input(key(KeyCode::Tab, KeyModifiers::NONE)), None);
+        assert_eq!(view.editor.lines().join("\n"), "/feedback ");
+        view.input(Event::Paste("Fix this behavior".into()));
+        assert_eq!(
+            view.input(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(TuiInput::Feedback("Fix this behavior".into()))
+        );
+        view.input(Event::Paste("Ordinary next turn".into()));
+        assert_eq!(
+            view.input(key(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(TuiInput::Queue("Ordinary next turn".into()))
+        );
+    }
+    #[test]
+    fn slash_completion_uses_typed_values_and_enter_dispatches_the_selected_command() {
+        use crate::{chat_commands::ChatCommand, protocol::FastMode};
+        let mut view = state();
+        view.input(Event::Paste("/fast o".into()));
+        let text = rendered(&mut view, 100, 20);
+        assert!(text.contains("/fast on"));
+        assert!(text.contains("/fast off"));
+        view.input(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            view.input(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(TuiInput::Command(ChatCommand::Fast {
+                mode: Some(FastMode::Off)
+            }))
+        );
+        view.input(Event::Paste("/rea".into()));
+        assert_eq!(
+            view.input(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(TuiInput::Command(ChatCommand::Reasoning { level: None }))
+        );
+        view.input(Event::Paste("/feedback".into()));
+        assert_eq!(view.input(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert_eq!(view.editor.lines().join("\n"), "/feedback ");
+    }
+    #[test]
+    fn slash_completion_dismissal_does_not_interrupt_or_replace_unmatched_text() {
+        let mut view = state();
+        view.working(true);
+        view.input(Event::Paste("/fa".into()));
+        assert_eq!(view.input(key(KeyCode::Esc, KeyModifiers::NONE)), None);
+        assert!(!view.interrupting);
+        assert_eq!(view.editor.lines().join("\n"), "/fa");
+        assert!(view.completion.is_none());
+        assert_eq!(
+            view.input(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(TuiInput::Interrupt)
+        );
+        view.input(Event::Paste("z".into()));
+        assert!(view.completion.is_none());
+        assert_eq!(view.input(key(KeyCode::Tab, KeyModifiers::NONE)), None);
+        assert_eq!(view.editor.lines().join("\n"), "/faz");
+        assert!(rendered(&mut view, 100, 20).contains("Error"));
+    }
+    #[test]
+    fn slash_completion_preserves_multiline_tails_and_recalled_commands_keep_arrow_navigation() {
+        let mut view = state();
+        view.input(Event::Paste("/feedback prior problem".into()));
+        view.input(key(KeyCode::Enter, KeyModifiers::NONE));
+        view.input(Event::Paste("/f\nKeep this text".into()));
+        assert!(view.completion.is_none());
+        view.editor
+            .move_cursor(ratatui_textarea::CursorMove::Jump(0, 2));
+        view.input(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), "/fast \nKeep this text");
+        view.editor = crate::tui::editor();
+        view.input(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), "/feedback prior problem");
+        assert!(view.completion.is_none());
+        view.input(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(view.editor.lines().join("\n"), "");
+    }
+    #[test]
+    fn scroll_requests_older_history_at_the_loaded_top_without_losing_the_visible_anchor() {
+        let mut view = state();
+        view.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![HistoryMessage {
+                entry_id: "latest".into(),
+                role: HistoryRole::Assistant,
+                text: (0..40).map(|i| format!("Line {i}\n\n")).collect(),
+                continuation: false,
+                final_chunk: true,
+                tool: None,
+            }],
+            next_cursor: Some("older".into()),
+        });
+        rendered(&mut view, 80, 20);
+        let mut request = None;
+        for _ in 0..8 {
+            request = view.input(key(KeyCode::PageUp, KeyModifiers::NONE));
+            if request.is_some() {
+                break;
+            }
+            rendered(&mut view, 80, 20);
+        }
+        assert_eq!(request, Some(TuiInput::History));
+        let before = rendered(&mut view, 80, 20);
+        assert_eq!(
+            view.input(key(KeyCode::PageUp, KeyModifiers::NONE)),
+            None,
+            "Only one page may be in flight"
+        );
+        view.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![HistoryMessage {
+                entry_id: "older".into(),
+                role: HistoryRole::Assistant,
+                text: "Older saved answer\n".repeat(30),
+                continuation: false,
+                final_chunk: true,
+                tool: None,
+            }],
+            next_cursor: None,
+        });
+        view.event(RuntimeEventKind::Done);
+        assert_eq!(
+            rendered(&mut view, 80, 20),
+            before,
+            "Prepending must retain the visible text"
+        );
+        view.input(key(KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(rendered(&mut view, 80, 20).contains("Older saved answer"));
+        assert_eq!(
+            view.input(key(KeyCode::Home, KeyModifiers::CONTROL)),
+            None,
+            "Exhausted pages are not requested again"
+        );
+    }
+    #[test]
+    fn pending_input_shows_delivery_state_and_same_text_inputs_keep_distinct_native_identities() {
+        let mut view = state();
+        view.pending_input(
+            "one".into(),
+            "Same correction".into(),
+            crate::protocol::InputMode::Steer,
+        );
+        assert!(rendered(&mut view, 100, 30).contains("You · sending"));
+        view.event(RuntimeEventKind::InputAccepted {
+            input_id: "one".into(),
+        });
+        assert!(rendered(&mut view, 100, 30).contains("You · steering, waiting"));
+        view.pending_input(
+            "two".into(),
+            "Same correction".into(),
+            crate::protocol::InputMode::Steer,
+        );
+        view.event(RuntimeEventKind::InputAccepted {
+            input_id: "two".into(),
+        });
+        view.event(RuntimeEventKind::InputPlaced {
+            input_id: "one".into(),
+            entry_id: "native-one".into(),
+        });
+        view.event(RuntimeEventKind::Message {
+            message: HistoryMessage {
+                entry_id: "native-one".into(),
+                role: HistoryRole::User,
+                text: "Same correction".into(),
+                continuation: false,
+                final_chunk: true,
+                tool: None,
+            },
+        });
+        assert_eq!(
+            view.messages
+                .iter()
+                .filter(|message| message.text == "Same correction")
+                .count(),
+            2
+        );
+        assert_eq!(view.messages[0].id.as_deref(), Some("native-one"));
+        assert!(view.messages[1].id.is_none());
+        view.event(RuntimeEventKind::InputRejected {
+            input_id: "two".into(),
+            message: "Not accepted".into(),
+        });
+        assert_eq!(
+            view.messages
+                .iter()
+                .filter(|message| message.text == "Same correction")
+                .count(),
+            1
+        );
+        view.event(RuntimeEventKind::InputRejected {
+            input_id: "one".into(),
+            message: "Late transport error".into(),
+        });
+        assert_eq!(view.messages[0].id.as_deref(), Some("native-one"));
+    }
+    #[test]
+    fn placed_input_replaces_preview_with_native_chunks_once_and_preserves_later_rows() {
+        let mut view = state();
+        let text = "x".repeat(8192) + "\nFinal native part";
+        view.pending_input(
+            "input".into(),
+            text.clone(),
+            crate::protocol::InputMode::Steer,
+        );
+        view.event(RuntimeEventKind::InputPlaced {
+            input_id: "input".into(),
+            entry_id: "native".into(),
+        });
+        view.push(crate::tui::Role::Notice, "A later update".into());
+        for (text, continuation) in [
+            ("x".repeat(8192), false),
+            ("\nFinal native part".into(), true),
+        ] {
+            view.event(RuntimeEventKind::Message {
+                message: HistoryMessage {
+                    entry_id: "native".into(),
+                    role: HistoryRole::User,
+                    text,
+                    continuation,
+                    final_chunk: true,
+                    tool: None,
+                },
+            });
+        }
+        assert_eq!(view.messages[0].text, text);
+        assert_eq!(view.messages[1].text, "A later update");
+        assert_eq!(view.messages.len(), 2);
+        view.event(RuntimeEventKind::InputAccepted {
+            input_id: "input".into(),
+        });
+        assert!(!rendered(&mut view, 100, 30).contains("waiting"));
+    }
+    #[test]
+    fn completed_tools_and_reasoning_keep_their_original_chronological_positions() {
+        let mut view = state();
+        view.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Thinking {
+                text: "EARLY_THOUGHT".into(),
+            },
+        });
+        view.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::ToolStarted {
+                call_id: "call".into(),
+                name: "earlier_tool".into(),
+            },
+        });
+        view.push(crate::tui::Role::Notice, "LATER_NOTICE".into());
+        view.push(crate::tui::Role::User, "NEW_CORRECTION".into());
+        view.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Thinking {
+                text: "LATER_THOUGHT".into(),
+            },
+        });
+        view.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::ToolFinished {
+                call_id: "call".into(),
+                name: "earlier_tool".into(),
+            },
+        });
+        let text = rendered(&mut view, 100, 40);
+        let positions = [
+            "EARLY_THOUGHT",
+            "✓ earlier_tool",
+            "LATER_NOTICE",
+            "NEW_CORRECTION",
+            "LATER_THOUGHT",
+        ]
+        .map(|value| text.find(value).unwrap());
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
+        view.event(RuntimeEventKind::Answer {
+            entry_id: None,
+            conversation_id: "main".into(),
+            text: "FINAL_ANSWER".into(),
+        });
+        let text = rendered(&mut view, 100, 40);
+        assert!(text.find("✓ earlier_tool").unwrap() < text.find("FINAL_ANSWER").unwrap());
+        assert_eq!(text.matches("earlier_tool").count(), 1);
+    }
+    #[test]
+    fn reopened_tools_update_by_native_call_identity_and_failure_is_not_downgraded() {
+        use crate::protocol::{ToolHistory, ToolStatus};
+        let mut view = state();
+        view.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![
+                HistoryMessage {
+                    entry_id: "call-entry".into(),
+                    role: HistoryRole::Tool,
+                    text: "read_source".into(),
+                    continuation: false,
+                    final_chunk: true,
+                    tool: Some(ToolHistory {
+                        call_id: "native-call".into(),
+                        name: "read_source".into(),
+                        status: ToolStatus::Running,
+                    }),
+                },
+                HistoryMessage {
+                    entry_id: "user".into(),
+                    role: HistoryRole::User,
+                    text: "NEW_REQUEST".into(),
+                    continuation: false,
+                    final_chunk: true,
+                    tool: None,
+                },
+            ],
+            next_cursor: None,
+        });
+        view.event(RuntimeEventKind::Done);
+        view.event(RuntimeEventKind::Message {
+            message: HistoryMessage {
+                entry_id: "result-entry".into(),
+                role: HistoryRole::Tool,
+                text: "read_source finished".into(),
+                continuation: false,
+                final_chunk: true,
+                tool: Some(ToolHistory {
+                    call_id: "native-call".into(),
+                    name: "read_source".into(),
+                    status: ToolStatus::Failed,
+                }),
+            },
+        });
+        view.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::ToolFinished {
+                call_id: "native-call".into(),
+                name: "read_source".into(),
+            },
+        });
+        let text = rendered(&mut view, 100, 30);
+        assert_eq!(text.matches("read_source").count(), 1);
+        assert!(text.find("✗ read_source").unwrap() < text.find("NEW_REQUEST").unwrap());
+        assert!(!text.contains("✓ read_source"));
+    }
+    #[test]
+    fn composer_expands_for_explicit_newlines_and_native_word_wrapping_on_small_terminals() {
+        let mut view = state();
+        view.input(Event::Paste("First line".into()));
+        view.input(key(KeyCode::Enter, KeyModifiers::SHIFT));
+        view.input(Event::Paste("Second line".into()));
+        let text = rendered(&mut view, 40, 15);
+        assert!(text.contains("First line"));
+        assert!(text.contains("Second line"));
+        assert_eq!(view.editor_height(40, 6), 4);
+        view.editor = crate::tui::editor();
+        view.input(Event::Paste("abcdefghijklmnopqrstuvwx".into()));
+        rendered(&mut view, 16, 15);
+        assert_eq!(
+            view.editor_height(16, 6),
+            4,
+            "Long words must wrap using the actual editor's glyph fallback"
+        );
+        view.editor = crate::tui::editor();
+        view.input(Event::Paste(
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\nCURSOR_END".into(),
+        ));
+        let text = rendered(&mut view, 24, 10);
+        assert!(text.contains("CURSOR_END"), "{text}");
+        assert_eq!(view.editor.cursor().0, 7);
+    }
+    #[test]
     fn refreshed_history_keeps_overlapping_entries_and_distinct_blocks_once() {
         let mut view = state();
         let old = vec![
@@ -1663,24 +2700,32 @@ mod tests {
                 role: HistoryRole::User,
                 text: "Original question".into(),
                 continuation: false,
+                final_chunk: true,
+                tool: None,
             },
             HistoryMessage {
                 entry_id: "old-answer".into(),
                 role: HistoryRole::Thinking,
                 text: "First thinking block".into(),
                 continuation: false,
+                final_chunk: true,
+                tool: None,
             },
             HistoryMessage {
                 entry_id: "old-answer".into(),
                 role: HistoryRole::Thinking,
                 text: "Second thinking block".into(),
                 continuation: false,
+                final_chunk: true,
+                tool: None,
             },
             HistoryMessage {
                 entry_id: "old-answer".into(),
                 role: HistoryRole::Assistant,
                 text: "Original answer".into(),
                 continuation: false,
+                final_chunk: true,
+                tool: None,
             },
         ];
         view.event(RuntimeEventKind::History {
@@ -1695,6 +2740,8 @@ mod tests {
             role: HistoryRole::Assistant,
             text: "Finished while attaching".into(),
             continuation: false,
+            final_chunk: true,
+            tool: None,
         });
         for message in refreshed {
             view.event(RuntimeEventKind::History {
@@ -1748,6 +2795,7 @@ mod tests {
         assert_eq!(handle.draft().await.unwrap(), "");
         handle
             .event(RuntimeEventKind::Answer {
+                entry_id: None,
                 conversation_id: "synthetic".into(),
                 text: "**Native terminal check**".into(),
             })
@@ -1766,13 +2814,23 @@ mod tests {
     #[test]
     fn committed_input_identity_and_rejection_preserve_drafts_and_active_work() {
         let mut view = state();
-        view.push(crate::tui::Role::User, "Review this complete input".into());
+        view.pending_input(
+            "review".into(),
+            "Review this complete input".into(),
+            crate::protocol::InputMode::Steer,
+        );
+        view.event(RuntimeEventKind::InputPlaced {
+            input_id: "review".into(),
+            entry_id: "chief".into(),
+        });
         view.event(RuntimeEventKind::Message {
             message: HistoryMessage {
                 entry_id: "chief".into(),
                 role: HistoryRole::User,
                 text: "Review".into(),
                 continuation: false,
+                final_chunk: true,
+                tool: None,
             },
         });
         assert_eq!(view.messages[0].text, "Review this complete input");
@@ -1790,7 +2848,15 @@ mod tests {
         assert!(rendered(&mut view, 100, 20).contains("Draft correction"));
         assert!(!view.working);
         let mut chunked = state();
-        chunked.push(crate::tui::Role::User, "Complete local input".into());
+        chunked.pending_input(
+            "local-input".into(),
+            "Complete local input".into(),
+            crate::protocol::InputMode::Steer,
+        );
+        chunked.event(RuntimeEventKind::InputPlaced {
+            input_id: "local-input".into(),
+            entry_id: "local".into(),
+        });
         for (text, continuation) in [("Complete ", false), ("local input", true)] {
             chunked.event(RuntimeEventKind::Message {
                 message: HistoryMessage {
@@ -1798,6 +2864,8 @@ mod tests {
                     role: HistoryRole::User,
                     text: text.into(),
                     continuation,
+                    final_chunk: true,
+                    tool: None,
                 },
             });
         }

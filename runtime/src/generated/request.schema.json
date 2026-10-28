@@ -737,12 +737,24 @@
       ]
     },
     "HistoryRole": {
-      "type": "string",
-      "enum": [
-        "user",
-        "assistant",
-        "thinking",
-        "tool"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "user",
+            "commentary",
+            "partial_answer",
+            "final",
+            "notice",
+            "thinking",
+            "tool"
+          ]
+        },
+        {
+          "description": "Assistant text whose source did not identify a semantic phase.",
+          "type": "string",
+          "const": "assistant"
+        }
       ]
     },
     "HistoryThread": {
@@ -800,6 +812,22 @@
     },
     "HostResult": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "usage"
+            },
+            "usage": {
+              "$ref": "#/$defs/UsageAvailability"
+            }
+          },
+          "required": [
+            "type",
+            "usage"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -1166,6 +1194,76 @@
         "branch",
         "head"
       ]
+    },
+    "RateLimitBucket": {
+      "type": "object",
+      "properties": {
+        "limitId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limitName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "planType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "primary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RateLimitWindow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "secondary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RateLimitWindow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "RateLimitWindow": {
+      "type": "object",
+      "properties": {
+        "resetsAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "usedPercent": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "windowDurationMins": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
     },
     "Reasoning": {
       "type": "string",
@@ -1616,6 +1714,22 @@
         {
           "type": "object",
           "properties": {
+            "provider": {
+              "$ref": "#/$defs/ModelProvider"
+            },
+            "type": {
+              "type": "string",
+              "const": "usage"
+            }
+          },
+          "required": [
+            "type",
+            "provider"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "type": {
               "type": "string",
               "const": "attach_main"
@@ -1705,6 +1819,12 @@
             },
             "input": {
               "type": "string"
+            },
+            "input_id": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "instructions": {
               "type": "string"
@@ -2461,6 +2581,99 @@
     "TaskId": {
       "type": "string",
       "format": "uuid"
+    },
+    "UsageAvailability": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "snapshot": {
+              "$ref": "#/$defs/UsageSnapshot"
+            },
+            "state": {
+              "type": "string",
+              "const": "available"
+            }
+          },
+          "required": [
+            "state",
+            "snapshot"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/UsageUnavailable"
+            },
+            "state": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "UsageSnapshot": {
+      "type": "object",
+      "properties": {
+        "buckets": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/RateLimitBucket"
+          }
+        },
+        "email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/UsageSource"
+        },
+        "unkeyed_bucket": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RateLimitBucket"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "source",
+        "buckets"
+      ]
+    },
+    "UsageSource": {
+      "type": "string",
+      "enum": [
+        "codex_account"
+      ]
+    },
+    "UsageUnavailable": {
+      "type": "string",
+      "enum": [
+        "unsupported_provider",
+        "not_signed_in",
+        "identity_unavailable",
+        "account_mismatch",
+        "codex_unavailable",
+        "read_failed"
+      ]
     },
     "WorkerHost": {
       "type": "object",

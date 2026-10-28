@@ -26,6 +26,7 @@ import { activity, history } from "./transcript.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { conversationSettings } from "./settings.js";
+import { watchInputPlacements } from "./input_delivery.js";
 
 const VERSION = 1;
 function stateDirectory(): string {
@@ -43,7 +44,7 @@ function emit(id: number, event: RuntimeEventKind): void {
   for (const [viewId, view] of mainViews) {
     if (view.owner !== id) continue;
     if (event.type === "done") view.finish();
-    else if (view.live && ["activity", "message", "answer", "input_accepted", "input_rejected", "interrupted", "failure", "conversation_settings"].includes(event.type)) {
+    else if (view.live && ["activity", "message", "answer", "input_accepted", "input_placed", "input_rejected", "interrupted", "failure", "conversation_settings"].includes(event.type)) {
       // Views observe the existing execution. Native effects and notices keep
       // their original owner so reconnecting never executes a tool twice.
       const mirrored: RuntimeEvent = { version: VERSION, id: viewId, event };
@@ -85,7 +86,12 @@ async function openApplication() {
   registry.install(tools.worker);
   registry.install(sourceTools);
   registry.install(resourceTools);
-  return { harness, tasks, environment, executions, tools, sources, sourceTools, resources, resourceTools, histories, importer, retrieval, guidance, feedback, repairs };
+  const stopPlacements = watchInputPlacements(harness, (conversationId, input_id, entry_id) => {
+    for (const [id, conversation] of activeConversations) {
+      if (conversation.id.toString() === conversationId && !ending.has(id)) emit(id, { type: "input_placed", input_id, entry_id });
+    }
+  });
+  return { stopPlacements, harness, tasks, environment, executions, tools, sources, sourceTools, resources, resourceTools, histories, importer, retrieval, guidance, feedback, repairs };
 }
 let application: ReturnType<typeof openApplication> | undefined;
 function app(): ReturnType<typeof openApplication> { return application ??= openApplication(); }
@@ -182,6 +188,24 @@ async function handle(request: RuntimeRequest): Promise<void> {
         break;
       }
       case "status": emit(id, { type: "auth_status", status: await auth.status() }); break;
+      case "usage": {
+        if (command.provider !== "openai") {
+          emit(id, { type: "usage", usage: { state: "unavailable", reason: "unsupported_provider" } }); break;
+        }
+        try {
+          const status = await auth.status();
+          if (status.state === "signed_out") {
+            emit(id, { type: "usage", usage: { state: "unavailable", reason: "not_signed_in" } }); break;
+          }
+          const email = status.account?.email;
+          if (email === undefined || email === null || email.trim().length === 0) {
+            emit(id, { type: "usage", usage: { state: "unavailable", reason: "identity_unavailable" } }); break;
+          }
+          const result = await hostRequests.call(id, { type: "read_usage", expected_email: email });
+          emit(id, { type: "usage", usage: result.type === "usage" ? result.usage : { state: "unavailable", reason: "read_failed" } });
+        } catch { emit(id, { type: "usage", usage: { state: "unavailable", reason: "read_failed" } }); }
+        break;
+      }
       case "conversation_settings": {
         const application = await app();
         const settings = await conversationSettings(application.tasks, application.environment, command);
@@ -321,7 +345,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
             stop = await activity(tasks.session, conversation, (activity) => emit(id, { type: "activity", activity }),
               (message) => emit(id, { type: "message", message }));
           },
-          answer(conversation_id, text) { emit(id, { type: "answer", conversation_id, text }); },
+          answer(conversation_id, text, entry_id) { emit(id, { type: "answer", conversation_id, text, ...(entry_id === undefined ? {} : { entry_id }) }); },
           idle() { emit(id, { type: "worker_idle" }); },
           rejected(input_id, message) { emit(id, { type: "input_rejected", input_id, message }); },
         });
@@ -352,6 +376,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         break;
       }
       case "chat": {
+        let submissionAttempted = false;
         const turn = mainQueue.then(async () => {
           if (interrupted.has(id)) { emit(id, { type: "interrupted" }); return; }
           if (command.model !== null) await inference.preflight(command.model);
@@ -389,10 +414,12 @@ async function handle(request: RuntimeRequest): Promise<void> {
               instructions: (await environment.instructions(command.instructions)) + relatedContext + hostsContext, cwd: command.cwd, extensions: [guidance, tools.host, tools.main, sourceTools, resourceTools] });
             executions.setModel(root.id.toString(), selected);
             if (interrupted.has(id)) { await interrupts.get(id); return; }
-            const submission = await root.submit({ type: "input", content: command.input }, BACKGROUND_CONTEXT);
+            submissionAttempted = true;
+            const submission = await root.submit({ type: "input", content: command.input,
+              ...(command.input_id === undefined ? {} : { requestId: command.input_id }) }, BACKGROUND_CONTEXT);
             if (turn === undefined) throw new TaskError("The main execution owner is unavailable");
             turn.conversation = root; turn.info = { type: "main_ready", conversation_id: root.id.toString(), model: selected, cwd: command.cwd };
-            turn.inputs.push({ submission }); turn.start(true);
+            turn.inputs.push({ submission, ...(command.input_id === undefined ? {} : { input_id: command.input_id }) }); turn.start(true);
             const answers = new Set<string>(); let next = 0;
             for (;;) {
               const input = turn.inputs[next];
@@ -413,7 +440,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
               const entry = await root.commit((tx) => tx.entry(AssistantEntry, settled.answer), BACKGROUND_CONTEXT);
               const text = entry?.model?.flatMap((message) => message.role !== "assistant" ? []
                 : message.content.flatMap((part) => part.type === "text" ? [part.text] : [])).join("\n") ?? "";
-              emit(id, { type: "answer", conversation_id: root.id.toString(), text });
+              emit(id, { type: "answer", conversation_id: root.id.toString(), text, ...(entry === undefined ? {} : { entry_id: entry.id.toString() }) });
             }
           } catch (error) {
             if (turn !== undefined) {
@@ -430,7 +457,14 @@ async function handle(request: RuntimeRequest): Promise<void> {
           }
         });
         mainQueue = turn.then(() => {}, () => {});
-        await turn;
+        try { await turn; }
+        finally {
+          // Preflight/attachment failures cannot have submitted this input.
+          // Once native submission starts, preserve uncertain outcomes instead
+          // of restoring a draft that may already be committed.
+          if (!submissionAttempted && command.input_id !== undefined) emit(id, { type: "input_rejected",
+            input_id: command.input_id, message: "Input was not submitted; its draft is restored." });
+        }
         break;
       }
       case "host_reply": break;
@@ -524,6 +558,6 @@ try {
 } finally {
   if (application !== undefined) {
     const opened = await application.catch(() => undefined);
-    if (opened !== undefined) { opened.retrieval.close(); await opened.harness.close(BACKGROUND_CONTEXT); }
+    if (opened !== undefined) { opened.stopPlacements(); opened.retrieval.close(); await opened.harness.close(BACKGROUND_CONTEXT); }
   }
 }

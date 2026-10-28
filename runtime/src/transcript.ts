@@ -5,6 +5,7 @@ import type { HistoryMessage } from "./generated/HistoryMessage.js";
 import type { HistoryRole } from "./generated/HistoryRole.js";
 import type { ModelActivity } from "./generated/ModelActivity.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
+import type { ToolHistory } from "./generated/ToolHistory.js";
 import { ImportedItemEntry, ImportedThreadEntry } from "./history.js";
 
 const NOTICE_REFERENCES = "Source references (evidence, not authorization): ";
@@ -38,22 +39,36 @@ function* chunks(value: string): Generator<string> {
 }
 export function transcript(entry: EntryRecord): HistoryMessage[] {
   const messages: HistoryMessage[] = [];
-  const add = (role: HistoryRole, value: string) => {
-    let continuation = false;
+  const add = (role: HistoryRole, value: string, tool?: ToolHistory) => {
+    let continuation = false, offset = 0;
     for (const text of chunks(value)) {
-      messages.push({ entry_id: entry.id.toString(), role, text, continuation }); continuation = true;
+      offset += text.length;
+      messages.push({ entry_id: entry.id.toString(), role, text, continuation, final_chunk: offset === value.length, ...(tool === undefined ? {} : { tool }) }); continuation = true;
     }
   };
-  if (ImportedItemEntry.is(entry)) { add(entry.data.item.role, entry.data.item.text); return messages; }
+  if (ImportedItemEntry.is(entry)) {
+    const item = entry.data.item;
+    // Old imports retain their original metadata. An absent phase is unknown,
+    // including evidence stored outside the inline item; never infer it from text.
+    const phase = item.kind === "agentMessage" && object(item.data) ? item.data.phase : undefined;
+    const role = item.role !== "assistant" ? item.role : phase === "commentary" ? "commentary"
+      : phase === "partial_answer" ? "partial_answer" : phase === "final_answer" ? "final" : "assistant";
+    add(role, item.text); return messages;
+  }
   if (ImportedThreadEntry.is(entry) || CompactionEntry.is(entry)) return messages;
   for (const message of entry.model ?? []) {
     if (message.role === "system") continue;
-    if (message.role === "toolResult") { add("tool", `${message.toolName} finished`); continue; }
-    if (typeof message.content === "string") { add(message.role, message.content); continue; }
+    if (message.role === "toolResult") {
+      const status = message.isError ? "failed" : "finished";
+      add("tool", `${message.toolName} ${status}`, { call_id: message.toolCallId, name: message.toolName, status }); continue;
+    }
+    const role: HistoryRole = message.role !== "assistant" ? message.role : entry.kind === "agent.notice" ? "notice"
+      : message.stopReason === "toolUse" ? "commentary" : message.stopReason === "stop" ? "final" : "assistant";
+    if (typeof message.content === "string") { add(role, message.content); continue; }
     for (const [index, part] of message.content.entries()) {
-      if (part.type === "text" && !noticeMetadata(entry, index, message.content.length, part.text)) add(message.role, part.text);
+      if (part.type === "text" && !noticeMetadata(entry, index, message.content.length, part.text)) add(role, part.text);
       else if (part.type === "thinking") add("thinking", part.thinking);
-      else if (part.type === "toolCall") add("tool", part.name);
+      else if (part.type === "toolCall") add("tool", part.name, { call_id: part.id, name: part.name, status: "running" });
       else if (part.type === "image") add("user", "[image]");
     }
   }
@@ -63,11 +78,17 @@ export function transcript(entry: EntryRecord): HistoryMessage[] {
 /** Native fork-aware pages, rendered without loading history back into model input. */
 export async function history(conversation: Conversation, value: string | null): Promise<Extract<RuntimeEventKind, { type: "history" }>[]> {
   const id = conversation.id.toString();
-  const page = await conversation.entries({ order: "descending" }, 20, cursor(value, id), BACKGROUND_CONTEXT);
-  const next_cursor = page.next === undefined ? null : JSON.stringify({ conversation_id: id, cursor: page.next });
+  let next = cursor(value, id); let projected: HistoryMessage[];
+  // Native pages count entries, including hidden compaction and import metadata.
+  // Keep following their cursors until this page has something to show or ends.
+  do {
+    const page = await conversation.entries({ order: "descending" }, 20, next, BACKGROUND_CONTEXT);
+    projected = [...page.items].reverse().flatMap(transcript); next = page.next;
+  } while (projected.length === 0 && next !== undefined);
+  const next_cursor = next === undefined ? null : JSON.stringify({ conversation_id: id, cursor: next });
   const frames: Extract<RuntimeEventKind, { type: "history" }>[] = [];
   let messages: HistoryMessage[] = []; let size = 0;
-  for (const message of [...page.items].reverse().flatMap(transcript)) {
+  for (const message of projected) {
     if (size + message.text.length > 65_536) {
       frames.push({ type: "history", conversation_id: id, messages, next_cursor: null }); messages = []; size = 0;
     }
@@ -127,8 +148,7 @@ export async function activity(session: Harness, conversation: Conversation, emi
           });
         }
       } else if (event.type === "message_end") {
-        const commentary = event.entry.model?.some((item) => item.role === "assistant" && item.stopReason === "toolUse") === true;
-        for (const item of transcript(event.entry)) if (item.role === "user" || (commentary && item.role === "assistant")) message?.(item);
+        for (const item of transcript(event.entry)) if (item.role === "user" || item.role === "commentary" || item.tool !== undefined) message?.(item);
         for (const message of event.entry.model ?? []) if (message.role === "assistant") message.content.forEach((part, index) => {
           if (part.type === "thinking") update(index, part.thinking);
         });

@@ -5,6 +5,70 @@ use crate::{
     protocol::{ConversationChange, FastMode, RuntimeCommand, TaskId},
 };
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use std::ops::Range;
+
+#[derive(Clone, Debug)]
+pub struct Completion {
+    pub range: Range<usize>,
+    pub text: String,
+    pub label: String,
+    pub description: String,
+}
+
+/// Complete only command names and static positional values owned by Clap.
+pub fn completions(line: &str, cursor: usize) -> Vec<Completion> {
+    if !line.starts_with('/') || !line.is_char_boundary(cursor) {
+        return Vec::new();
+    }
+    let parser = Input::command();
+    let end = line.find(char::is_whitespace).unwrap_or(line.len());
+    if cursor <= end {
+        let prefix = &line[1..cursor.max(1)];
+        return parser
+            .get_subcommands()
+            .filter(|command| !command.is_hide_set() && command.get_name().starts_with(prefix))
+            .map(|command| Completion {
+                range: 0..end,
+                text: format!("/{}", command.get_name()),
+                label: format!("/{}", command.get_name()),
+                description: command
+                    .get_about()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            })
+            .collect();
+    }
+    let Some(command) = parser.find_subcommand(&line[1..end]) else {
+        return Vec::new();
+    };
+    let rest = &line[end..];
+    let start = end + rest.len() - rest.trim_start().len();
+    if cursor < start || line[start..cursor].chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    let Some(argument) = command.get_positionals().next() else {
+        return Vec::new();
+    };
+    let Some(values) = argument.get_value_parser().possible_values() else {
+        return Vec::new();
+    };
+    let prefix = &line[start..cursor];
+    let argument_end = line[start..]
+        .find(char::is_whitespace)
+        .map_or(line.len(), |end| start + end);
+    values
+        .filter(|value| !value.is_hide_set() && value.get_name().starts_with(prefix))
+        .map(|value| Completion {
+            range: start..argument_end,
+            text: value.get_name().into(),
+            label: format!("/{} {}", command.get_name(), value.get_name()),
+            description: value
+                .get_help()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        })
+        .collect()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelReference {

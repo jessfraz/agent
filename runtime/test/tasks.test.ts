@@ -224,7 +224,7 @@ test("an interactive task serializes local and chief inputs, wakes while idle an
     const visible = frames.flatMap((frame) => frame.messages);
     assert.deepEqual(visible.filter((message) => message.role === "user").map((message) => message.text),
       ["Initial chief instruction", "Chief follow-up while the tab is idle", "Reply typed directly in the task tab", "Chief input while the local turn runs"]);
-    assert.deepEqual(visible.filter((message) => message.role === "assistant").map((message) => message.text), answers);
+    assert.deepEqual(visible.filter((message) => message.role === "final").map((message) => message.text), answers);
     assert.equal(app.faux.state.callCount, 0, "Rendering stored history must not run a model");
   } finally {
     releaseAdmission(); releaseTurn(); controller.abort(); await running?.catch(() => {}); await stop?.();

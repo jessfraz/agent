@@ -140,7 +140,7 @@ pub async fn execute(command: HostCommand) -> HostResult {
 
 async fn execute_inner(command: HostCommand) -> Result<HostResult> {
     match command {
-        HostCommand::History { .. } | HostCommand::Embed { .. } => {
+        HostCommand::History { .. } | HostCommand::Embed { .. } | HostCommand::ReadUsage { .. } => {
             anyhow::bail!("This operation requires a service-owned host executor")
         }
         HostCommand::ReloadGuidance => anyhow::bail!("Shared guidance belongs to the coordinator"),
