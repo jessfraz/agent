@@ -88,10 +88,13 @@ export class SearchIndex {
       CREATE INDEX IF NOT EXISTS refs_chunk ON source_refs(chunk_id);
       CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(text,content='chunks',content_rowid='id');
       CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN INSERT INTO chunks_fts(rowid,text) VALUES(new.id,new.text); END;
-      CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES('delete',old.id,old.text); END;
-      CREATE TABLE IF NOT EXISTS staging(run TEXT NOT NULL, entry_id TEXT NOT NULL, ordinal INTEGER NOT NULL, part INTEGER NOT NULL,
-        hash TEXT NOT NULL, text TEXT NOT NULL, source_refs TEXT NOT NULL, embedding BLOB NOT NULL, PRIMARY KEY(run,entry_id,part));
-      DELETE FROM staging;`);
+      CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES('delete',old.id,old.text); END;`);
+    // The previous staging table was ephemeral and had no conversation owner.
+    if (!this.db.prepare("PRAGMA table_info(staging)").all().some((row) => string(row, "name") === "conversation_id")) this.db.exec("DROP TABLE IF EXISTS staging");
+    this.db.exec(`CREATE TABLE IF NOT EXISTS staging(conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      run TEXT NOT NULL, entry_id TEXT NOT NULL, ordinal INTEGER NOT NULL, part INTEGER NOT NULL,
+      hash TEXT NOT NULL, text TEXT NOT NULL, source_refs TEXT NOT NULL, embedding BLOB NOT NULL, PRIMARY KEY(conversation_id,entry_id,part));
+      CREATE INDEX IF NOT EXISTS staging_hash ON staging(conversation_id,hash);`);
     const saved = this.db.prepare("SELECT value FROM metadata WHERE key='space'").get();
     if (saved !== undefined) {
       this.space = space(JSON.parse(string(saved, "value")));
@@ -142,6 +145,11 @@ export class SearchIndex {
             if (!(row.embedding instanceof Uint8Array)) throw new Error("Invalid cached embedding");
             cached.set(string(row, "hash"), row.embedding);
           }
+          for (const row of this.db.prepare(`SELECT hash,embedding FROM staging
+            WHERE conversation_id=? AND hash IN (${batch.map(() => "?").join(",")}) GROUP BY hash`).all(conversation_id, ...batch.map((chunk) => chunk.hash))) {
+            if (!(row.embedding instanceof Uint8Array)) throw new Error("Invalid staged embedding");
+            cached.set(string(row, "hash"), row.embedding);
+          }
         }
         const missing = [...new Map(batch.filter((chunk) => !cached.has(chunk.hash)).map((chunk) => [chunk.hash, chunk])).values()];
         if (missing.length > 0) {
@@ -149,26 +157,32 @@ export class SearchIndex {
           missing.forEach((chunk, index) => cached.set(chunk.hash, new Uint8Array(new Float32Array(embedded.vectors[index]!).buffer)));
         }
         this.transaction(() => {
-          const insert = this.db.prepare("INSERT INTO staging VALUES(?,?,?,?,?,?,?,?)");
-          for (const chunk of batch) insert.run(run, chunk.entry_id, chunk.ordinal, chunk.part, chunk.hash, chunk.text,
-            JSON.stringify(chunk.source_refs), cached.get(chunk.hash)!);
+          const insert = this.db.prepare(`INSERT INTO staging(conversation_id,run,entry_id,ordinal,part,hash,text,source_refs,embedding) VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(conversation_id,entry_id,part) DO UPDATE SET run=excluded.run,ordinal=excluded.ordinal,hash=excluded.hash,
+              text=excluded.text,source_refs=excluded.source_refs,embedding=excluded.embedding WHERE staging.run<>excluded.run`);
+          for (const chunk of batch) {
+            const written = insert.run(conversation_id, run, chunk.entry_id, chunk.ordinal, chunk.part, chunk.hash, chunk.text,
+              JSON.stringify(chunk.source_refs), cached.get(chunk.hash)!);
+            if (written.changes !== 1) throw new Error("Search source repeated an entry part");
+          }
         });
       };
-      try {
-        for await (const record of records) for (const chunk of chunks(record)) { pending.push(chunk); if (pending.length === BATCH) await stage(); }
-        await stage();
-        this.transaction(() => {
-          if (this.space !== undefined) this.db.prepare("DELETE FROM chunk_vectors WHERE rowid IN (SELECT id FROM chunks WHERE conversation_id=?)").run(conversation_id);
-          this.db.prepare("DELETE FROM chunks WHERE conversation_id=?").run(conversation_id);
-          this.db.prepare(`INSERT INTO chunks(conversation_id,entry_id,ordinal,part,hash,text,source_refs)
-            SELECT ?,entry_id,ordinal,part,hash,text,source_refs FROM staging WHERE run=? ORDER BY ordinal,part`).run(conversation_id, run);
-          if (this.space !== undefined) this.db.prepare(`INSERT INTO chunk_vectors(rowid,embedding)
-            SELECT c.id,s.embedding FROM staging s JOIN chunks c ON c.conversation_id=? AND c.entry_id=s.entry_id AND c.part=s.part WHERE s.run=?`).run(conversation_id, run);
-          this.db.prepare(`INSERT INTO source_refs SELECT j.value,c.id FROM chunks c,json_each(c.source_refs) j WHERE c.conversation_id=?`).run(conversation_id);
-          this.db.prepare("UPDATE conversations SET watermark=?,dirty=CASE WHEN revision=? THEN 0 ELSE 1 END WHERE id=?").run(watermark, revision, conversation_id);
-          this.db.prepare("DELETE FROM staging WHERE run=?").run(run);
-        });
-      } finally { this.db.prepare("DELETE FROM staging WHERE run=?").run(run); }
+      // Completed batches survive failure. Only rows observed in this attempt
+      // become visible; cached rows removed from the source keep their old tag.
+      for await (const record of records) for (const chunk of chunks(record)) { pending.push(chunk); if (pending.length === BATCH) await stage(); }
+      await stage();
+      this.transaction(() => {
+        if (this.space !== undefined) this.db.prepare("DELETE FROM chunk_vectors WHERE rowid IN (SELECT id FROM chunks WHERE conversation_id=?)").run(conversation_id);
+        this.db.prepare("DELETE FROM chunks WHERE conversation_id=?").run(conversation_id);
+        this.db.prepare(`INSERT INTO chunks(conversation_id,entry_id,ordinal,part,hash,text,source_refs)
+          SELECT conversation_id,entry_id,ordinal,part,hash,text,source_refs FROM staging WHERE conversation_id=? AND run=? ORDER BY ordinal,part`).run(conversation_id, run);
+        if (this.space !== undefined) this.db.prepare(`INSERT INTO chunk_vectors(rowid,embedding)
+          SELECT c.id,s.embedding FROM staging s JOIN chunks c ON c.conversation_id=s.conversation_id AND c.entry_id=s.entry_id AND c.part=s.part
+          WHERE s.conversation_id=? AND s.run=?`).run(conversation_id, run);
+        this.db.prepare(`INSERT INTO source_refs SELECT j.value,c.id FROM chunks c,json_each(c.source_refs) j WHERE c.conversation_id=?`).run(conversation_id);
+        this.db.prepare("UPDATE conversations SET watermark=?,dirty=CASE WHEN revision=? THEN 0 ELSE 1 END WHERE id=?").run(watermark, revision, conversation_id);
+        this.db.prepare("DELETE FROM staging WHERE conversation_id=?").run(conversation_id);
+      });
     });
   }
   delete(conversation_id: string): Promise<void> {

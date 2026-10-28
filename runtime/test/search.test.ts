@@ -77,6 +77,94 @@ test("streamed indexing reuses vectors and preserves the old checkpoint on inter
   } finally { index.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("completed partial embedding batches survive reopen without publishing stale source rows", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-search-resume-")); const path = join(directory, "search.sqlite");
+  let index = new SearchIndex(path); let batch = 0; let fail = false; const documents: string[] = [];
+  const embedding: Embed = async (texts, purpose) => {
+    if (purpose === "document") {
+      batch += 1; if (fail && batch === 3) throw new Error("Synthetic runner stopped");
+      documents.push(...texts);
+    }
+    return embed(texts, purpose);
+  };
+  try {
+    await index.upsert("large", "old", records([record("old", "Original published evidence")]), embedding);
+    const source = Array.from({ length: 48 }, (_, ordinal) => record(`e${ordinal}`, `Automobile evidence ${ordinal}`, ordinal, [`mail:synthetic:${ordinal}`]));
+    fail = true; batch = 0; documents.length = 0;
+    await assert.rejects(index.upsert("large", "unfinished", records(source), embedding), /Synthetic runner stopped/);
+    assert.equal(documents.length, 32);
+    assert.deepEqual(index.checkpoint("large"), { watermark: "old", dirty: true });
+    assert.deepEqual((await index.search("published", embed)).candidates[0]?.matches.map((match) => match.entry_id), ["old"]);
+    index.close(); index = new SearchIndex(path); fail = false; documents.length = 0;
+    const current = source.filter((row) => row.entry_id !== "e3").map((row) => row.entry_id === "e5"
+      ? record(row.entry_id, "Changed cobalt evidence", row.ordinal, ["mail:synthetic:changed"])
+      : row.entry_id === "e6" ? record("renamed-six", row.text, row.ordinal, ["mail:synthetic:current-six"]) : row);
+    await index.upsert("large", "current", records(current), embedding);
+    assert.deepEqual(documents.sort(), ["Changed cobalt evidence", ...source.slice(32).map((row) => row.text)].sort(),
+      "Completed vectors must survive failure and restart; only changed or unfinished text needs embedding");
+    assert.deepEqual(index.checkpoint("large"), { watermark: "current", dirty: false });
+    const db = new DatabaseSync(path);
+    try {
+      assert.deepEqual(db.prepare("SELECT entry_id,text,source_refs FROM chunks WHERE conversation_id=? ORDER BY ordinal,part").all("large")
+        .map((row) => [row.entry_id, row.text, row.source_refs]), current.map((row) => [row.entry_id, row.text, JSON.stringify(row.source_refs)]));
+      assert.equal(db.prepare("SELECT count(*) AS count FROM staging").get()?.count, 0);
+    } finally { db.close(); }
+  } finally { index.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("partial vector caches are conversation scoped and deleted or rebuilt with their owner", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-search-cache-owner-")); const path = join(directory, "search.sqlite");
+  const index = new SearchIndex(path); let requested = 0; let current = space;
+  const embedding: Embed = async (texts, purpose) => { if (purpose === "document") requested += texts.length; return { space: current, vectors: texts.map(vector) }; };
+  const data = Array.from({ length: 16 }, (_, ordinal) => record(`e${ordinal}`, `Automobile cache evidence ${ordinal}`, ordinal));
+  async function* interrupted() { yield* data; throw new Error("Synthetic source stopped"); }
+  try {
+    await assert.rejects(index.upsert("partial", "one", interrupted(), embedding), /Synthetic source stopped/);
+    requested = 0; await index.upsert("other", "one", records(data), embedding); assert.equal(requested, 16);
+    await index.delete("partial"); requested = 0;
+    await index.upsert("partial", "two", records(data), embedding); assert.equal(requested, 16, "Deleted ownership must remove unpublished cached vectors too");
+    await assert.rejects(index.upsert("rebuilt", "one", interrupted(), embedding), /Synthetic source stopped/);
+    requested = 0; current = { ...space, id: "rebuilt-space", instruction_version: 2 };
+    await index.rebuild(inventory([{ conversation_id: "rebuilt", watermark: "two" }]), () => records(data), embedding);
+    assert.equal(requested, 16, "An explicit rebuild cannot reuse vectors from the prior embedding space");
+    const db = new DatabaseSync(path);
+    try {
+      assert.equal(db.prepare("SELECT count(*) AS count FROM staging").get()?.count, 0);
+      assert.equal(db.prepare("SELECT count(*) AS count FROM conversations").get()?.count, 1);
+    } finally { db.close(); }
+  } finally { index.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("legacy ephemeral staging migrates without changing the published projection", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-search-staging-migration-")); const path = join(directory, "search.sqlite");
+  let index = new SearchIndex(path);
+  try {
+    await index.upsert("retained", "one", records([record("one", "Retained published evidence")]), embed); index.close();
+    const old = new DatabaseSync(path);
+    old.exec(`DROP TABLE staging;
+      CREATE TABLE staging(run TEXT NOT NULL, entry_id TEXT NOT NULL, ordinal INTEGER NOT NULL, part INTEGER NOT NULL,
+        hash TEXT NOT NULL, text TEXT NOT NULL, source_refs TEXT NOT NULL, embedding BLOB NOT NULL, PRIMARY KEY(run,entry_id,part));`);
+    old.prepare("INSERT INTO staging VALUES(?,?,?,?,?,?,?,?)").run("old-run", "not-published", 0, 0, "old-hash", "Unpublished legacy data", "[]", new Uint8Array(new Float32Array([1, 0, 0]).buffer)); old.close();
+    index = new SearchIndex(path);
+    assert.deepEqual(index.checkpoint("retained"), { watermark: "one", dirty: false });
+    assert.deepEqual((await index.search("Retained", embed)).candidates[0]?.matches.map((match) => match.entry_id), ["one"]);
+    await index.upsert("retained", "two", records([record("two", "Current published evidence")]), embed);
+    assert.deepEqual((await index.search("Current", embed)).candidates[0]?.matches.map((match) => match.entry_id), ["two"]);
+  } finally { index.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a repeated source entry cannot overwrite another part of the same indexing attempt", async () => {
+  const index = new SearchIndex(":memory:");
+  try {
+    await index.upsert("work", "old", records([record("old", "Original evidence")]), embed);
+    await assert.rejects(index.upsert("work", "bad", records([record("duplicate", "First value"), record("duplicate", "Conflicting value")]), embed), /repeated an entry part/);
+    assert.deepEqual(index.checkpoint("work"), { watermark: "old", dirty: true });
+    assert.equal((await index.search("Original", embed)).candidates[0]?.matches[0]?.entry_id, "old");
+    await index.upsert("work", "fixed", records([record("duplicate", "Corrected source")]), embed);
+    assert.equal((await index.search("Corrected", embed)).candidates[0]?.matches[0]?.text, "Corrected source");
+  } finally { index.close(); }
+});
+
 test("the old text generation is refreshed even when native conversation watermarks stay the same", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-search-")); const path = join(directory, "search.sqlite");
   let index = new SearchIndex(path);
@@ -165,14 +253,37 @@ test("bounded Unicode chunks retain entry provenance and representative queries 
     }
     await index.upsert("representative", "1000", records(Array.from({ length: 1000 }, (_, ordinal) =>
       record(`entry-${ordinal}`, `Automobile maintenance sample ${ordinal}`, ordinal, [`mail:synthetic:${ordinal}`]))), embed);
+    const partial = Array.from({ length: 1024 }, (_, ordinal) => record(`partial-${ordinal}`, `Partial automobile evidence ${ordinal}`, ordinal));
+    async function* interrupted() { yield* partial; throw new Error("Synthetic source stopped"); }
+    for (const id of ["partial-plan", "other-partial-plan"]) await assert.rejects(index.upsert(id, "1024", interrupted(), embed), /Synthetic source stopped/);
     const db = new DatabaseSync(path, { allowExtension: true });
     try {
       assert.ok(process.env.AGENT_SQLITE_VEC); db.loadExtension(process.env.AGENT_SQLITE_VEC);
+      const hashes = db.prepare("SELECT hash FROM staging WHERE conversation_id=? ORDER BY ordinal LIMIT 16").all("partial-plan").map((row) => {
+        assert.ok(typeof row.hash === "string"); return row.hash;
+      });
+      const stagedCache = `SELECT hash,embedding FROM staging WHERE conversation_id=? AND hash IN (${hashes.map(() => "?").join(",")}) GROUP BY hash`;
+      db.exec("DROP INDEX staging_hash");
+      const before = db.prepare("EXPLAIN QUERY PLAN " + stagedCache).all("partial-plan", ...hashes);
+      db.exec("CREATE INDEX staging_hash ON staging(conversation_id,hash)");
+      const staged = db.prepare(stagedCache).all("partial-plan", ...hashes);
+      assert.equal(staged.length, 16);
+      const run = db.prepare("SELECT run FROM staging WHERE conversation_id=? LIMIT 1").get("partial-plan")?.run;
+      assert.ok(typeof run === "string");
       const plans = {
         exact: db.prepare("EXPLAIN QUERY PLAN SELECT DISTINCT chunk_id FROM source_refs WHERE ref IN (?) LIMIT ?").all("mail:synthetic:10", 20),
         fts: db.prepare("EXPLAIN QUERY PLAN SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?").all('"maintenance"', 20),
         dense: db.prepare("EXPLAIN QUERY PLAN SELECT rowid FROM chunk_vectors WHERE embedding MATCH ? AND k=? ORDER BY distance").all(new Uint8Array(new Float32Array([1, 0, 0]).buffer), 20),
         cache: db.prepare("EXPLAIN QUERY PLAN SELECT c.hash,v.embedding FROM chunks c JOIN chunk_vectors v ON v.rowid=c.id WHERE c.conversation_id=? AND c.hash IN (?)").all("representative", "synthetic"),
+        stagingBeforeHashIndex: before,
+        stagingCache: db.prepare("EXPLAIN QUERY PLAN " + stagedCache).all("partial-plan", ...hashes),
+        stagingPublish: db.prepare(`EXPLAIN QUERY PLAN INSERT INTO chunks(conversation_id,entry_id,ordinal,part,hash,text,source_refs)
+          SELECT conversation_id,entry_id,ordinal,part,hash,text,source_refs FROM staging WHERE conversation_id=? AND run=? ORDER BY ordinal,part`).all("partial-plan", run),
+        vectorPublish: db.prepare(`EXPLAIN QUERY PLAN INSERT INTO chunk_vectors(rowid,embedding)
+          SELECT c.id,s.embedding FROM staging s JOIN chunks c ON c.conversation_id=s.conversation_id AND c.entry_id=s.entry_id AND c.part=s.part
+          WHERE s.conversation_id=? AND s.run=?`).all("partial-plan", run),
+        stagingCleanup: db.prepare("EXPLAIN QUERY PLAN DELETE FROM staging WHERE conversation_id=?").all("partial-plan"),
+        cascadeDelete: db.prepare("EXPLAIN QUERY PLAN DELETE FROM conversations WHERE id=?").all("partial-plan"),
       };
       t.diagnostic(JSON.stringify(plans));
       const count = db.prepare("SELECT count(*) AS count FROM chunks").get()?.count;
