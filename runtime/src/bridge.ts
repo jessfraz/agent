@@ -25,6 +25,7 @@ import { createResourceTools, ResourceStore } from "./resources.js";
 import { activity, history } from "./transcript.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
+import { conversationSettings } from "./settings.js";
 
 const VERSION = 1;
 function stateDirectory(): string {
@@ -39,6 +40,16 @@ function emit(id: number, event: RuntimeEventKind): void {
   const frame: RuntimeEvent = { version: VERSION, id, event };
   if (!validEvent(frame)) throw new Error("Invalid runtime event");
   process.stdout.write(`${JSON.stringify(frame)}\n`);
+  for (const [viewId, view] of mainViews) {
+    if (view.owner !== id) continue;
+    if (event.type === "done") view.finish();
+    else if (view.live && ["activity", "message", "answer", "input_accepted", "input_rejected", "interrupted", "failure", "conversation_settings"].includes(event.type)) {
+      // Views observe the existing execution. Native effects and notices keep
+      // their original owner so reconnecting never executes a tool twice.
+      const mirrored: RuntimeEvent = { version: VERSION, id: viewId, event };
+      process.stdout.write(`${JSON.stringify(mirrored)}\n`);
+    }
+  }
 }
 function failure(id: number, code: ErrorCode, message: string): void { emit(id, { type: "failure", code, message }); }
 const hostRequests = new HostRequests((id, call_id, command) => emit(id, { type: "host_call", call_id, command }),
@@ -85,6 +96,7 @@ const interrupted = new Set<number>();
 const interrupts = new Map<number, Promise<void>>();
 const workers = new Map<number, { command: Extract<RuntimeCommand, { type: "run_task" }>; controller: AbortController }>();
 type MainTurn = { conversation?: Conversation; accepting: boolean; admissions: number; wake?: () => void;
+  info?: Extract<RuntimeEventKind, { type: "main_ready" }>;
   ready: Promise<boolean>; start(ready: boolean): void; inputs: { input_id?: string; submission: Submission }[] };
 function mainTurn(): MainTurn {
   let start = (_ready: boolean) => {};
@@ -92,6 +104,7 @@ function mainTurn(): MainTurn {
   return { ready, start, accepting: true, admissions: 0, inputs: [] };
 }
 const mainTurns = new Map<number, MainTurn>();
+const mainViews = new Map<number, { owner: number; live: boolean; finish(): void }>();
 const inputControls = new Map<number, Set<Promise<void>>>();
 const ending = new Set<number>();
 
@@ -145,7 +158,7 @@ function submitInput(id: number, command: Extract<RuntimeCommand, { type: "submi
 }
 async function handle(request: RuntimeRequest): Promise<void> {
   const { id, command } = request;
-  if (command.type === "chat" || command.type === "run_task") activeCommands.add(id);
+  if (command.type === "chat" || command.type === "run_task" || command.type === "attach_main") activeCommands.add(id);
   if (command.type === "chat") mainTurns.set(id, mainTurn());
   if (command.type === "run_task" && command.interactive === true) {
     workers.set(id, { command, controller: new AbortController() });
@@ -169,6 +182,19 @@ async function handle(request: RuntimeRequest): Promise<void> {
         break;
       }
       case "status": emit(id, { type: "auth_status", status: await auth.status() }); break;
+      case "conversation_settings": {
+        const application = await app();
+        const settings = await conversationSettings(application.tasks, application.environment, command);
+        if (command.change !== null) {
+          application.executions.setModel(settings.conversation_id, settings.model);
+          for (const [request, conversation] of activeConversations) {
+            if (conversation.id.toString() === settings.conversation_id && !ending.has(request)) {
+              emit(request, { type: "conversation_settings", settings: { ...settings, catalog: [] } });
+            }
+          }
+        }
+        emit(id, { type: "conversation_settings", settings }); break;
+      }
       case "logout":
         await auth.logout();
         emit(id, { type: "auth_status", status: await auth.status() });
@@ -287,6 +313,10 @@ async function handle(request: RuntimeRequest): Promise<void> {
             activeConversations.set(id, conversation);
             if (interrupted.has(id)) await interrupt(id);
             emit(id, { type: "task_ready", conversation_id: conversation.id.toString(), title });
+            const model = executions.model(conversation.id.toString());
+            if (model === undefined) throw new TaskError("The worker execution model is unavailable");
+            emit(id, { type: "conversation_settings", settings: { conversation_id: conversation.id.toString(),
+              task_id: command.task_id, agent_id: command.agent_id ?? null, model, catalog: [] } });
             for (const frame of await history(conversation, null)) emit(id, frame);
             stop = await activity(tasks.session, conversation, (activity) => emit(id, { type: "activity", activity }),
               (message) => emit(id, { type: "message", message }));
@@ -299,16 +329,40 @@ async function handle(request: RuntimeRequest): Promise<void> {
         } finally { await stop?.(); }
         break;
       }
+      case "attach_main": {
+        const application = await app();
+        const snapshot = async () => {
+          const root = await application.harness.root(BACKGROUND_CONTEXT);
+          for (const frame of await history(root, null)) emit(id, frame);
+        };
+        const [owner, turn] = [...mainTurns].find(([owner]) => !ending.has(owner)) ?? [];
+        if (owner === undefined || turn === undefined) { await snapshot(); break; }
+        let finish = () => {};
+        const finished = new Promise<void>((resolve) => { finish = resolve; });
+        const view = { owner, live: false, finish }; mainViews.set(id, view);
+        try {
+          if (!await Promise.race([turn.ready, finished.then(() => false)]) || !mainTurns.has(owner)) { await snapshot(); break; }
+          if (turn.info !== undefined) {
+            const current = application.executions.model(turn.info.conversation_id);
+            emit(id, { ...turn.info, model: current ?? turn.info.model });
+            view.live = true;
+          }
+          await finished;
+        } finally { mainViews.delete(id); }
+        break;
+      }
       case "chat": {
         const turn = mainQueue.then(async () => {
           if (interrupted.has(id)) { emit(id, { type: "interrupted" }); return; }
-          const selected = command.model ?? await (await app()).environment.model(null);
-          await inference.preflight(selected);
+          if (command.model !== null) await inference.preflight(command.model);
           const application = await app();
           const { harness, tasks, environment, executions, tools, sourceTools, resourceTools, guidance } = application;
+          const root = await harness.root(BACKGROUND_CONTEXT);
+          if (command.model !== null) await inference.configure(root, command.model, {});
+          let selected = await inference.legacy(root, await environment.model(null));
+          await inference.preflight(selected);
           const hosts = await environment.hosts(command.cwd, command.origin_host_id, command.hosts);
           const default_host = await environment.defaultHost(hosts);
-          const root = await harness.root(BACKGROUND_CONTEXT);
           activeConversations.set(id, root);
           if (interrupted.has(id)) { emit(id, { type: "interrupted" }); return; }
           await root.waitForIdle(BACKGROUND_CONTEXT);
@@ -331,12 +385,14 @@ async function handle(request: RuntimeRequest): Promise<void> {
             const hostsContext = "\n\nConnected worker hosts: " +
               JSON.stringify({ default_host_id: default_host?.host_id ?? null, origin_host_id: command.origin_host_id, project_cwd: command.cwd,
                 hosts: hosts.map((host) => ({ host_id: host.host_id, name: host.name, cwd: host.cwd })) });
-            await inference.configure(root, selected, {
+            selected = await inference.configureCurrent(root, selected, {
               instructions: (await environment.instructions(command.instructions)) + relatedContext + hostsContext, cwd: command.cwd, extensions: [guidance, tools.host, tools.main, sourceTools, resourceTools] });
+            executions.setModel(root.id.toString(), selected);
             if (interrupted.has(id)) { await interrupts.get(id); return; }
             const submission = await root.submit({ type: "input", content: command.input }, BACKGROUND_CONTEXT);
             if (turn === undefined) throw new TaskError("The main execution owner is unavailable");
-            turn.conversation = root; turn.inputs.push({ submission }); turn.start(true);
+            turn.conversation = root; turn.info = { type: "main_ready", conversation_id: root.id.toString(), model: selected, cwd: command.cwd };
+            turn.inputs.push({ submission }); turn.start(true);
             const answers = new Set<string>(); let next = 0;
             for (;;) {
               const input = turn.inputs[next];
@@ -420,15 +476,19 @@ try {
     if (request.version !== VERSION) {
       failure(request.id, "invalid_request", "Unsupported protocol version"); emit(request.id, { type: "done" }); continue;
     }
+    if (request.command.type === "detach_main") {
+      mainViews.get(request.id)?.finish();
+      continue;
+    }
     if (request.command.type === "interrupt") {
       // Done may already be buffered while Rust still owns the request and sends its last control.
       if (!activeCommands.has(request.id)) continue;
-      void interrupt(request.id).catch(() => {
+      void interrupt(mainViews.get(request.id)?.owner ?? request.id).catch(() => {
         if (activeCommands.has(request.id)) failure(request.id, "internal", "Interruption could not be confirmed; inspect current work");
       });
       continue;
     }
-    if (request.command.type === "submit_input") { submitInput(request.id, request.command); continue; }
+    if (request.command.type === "submit_input") { submitInput(mainViews.get(request.id)?.owner ?? request.id, request.command); continue; }
     if (request.command.type === "host_reply") {
       hostRequests.reply(request.id, request.command.call_id, request.command.result);
       continue;

@@ -2,7 +2,7 @@ use crate::embeddings::{EmbeddingBatch, EmbeddingPurpose};
 use crate::feedback::{FeedbackBundle, FeedbackContext, FeedbackReceipt};
 use crate::history::{HistoryGap, HistoryItem, HistoryRequest, HistoryResponse, HistoryThread};
 use crate::instructions::{GuidanceSnapshot, GuidanceSource};
-use crate::models::ModelSelection;
+use crate::models::{ModelProvider, ModelSelection, Reasoning};
 use crate::resources::{CleanupPlan, ResourceRecord, ResourceReport, WorktreeAllocation};
 use crate::sources::{SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage, SourceKey};
 use schemars::JsonSchema;
@@ -122,6 +122,63 @@ pub enum AuthStatus {
     },
 }
 
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Deserialize,
+    Serialize,
+    JsonSchema,
+    TS,
+    clap::ValueEnum,
+    PartialEq,
+    Eq,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FastMode {
+    #[default]
+    Toggle,
+    On,
+    Off,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConversationChange {
+    SetSelection {
+        model: ModelSelection,
+    },
+    SetModel {
+        provider: Option<ModelProvider>,
+        model_id: String,
+    },
+    SetReasoning {
+        reasoning: Option<Reasoning>,
+    },
+    SetFast {
+        mode: FastMode,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ModelOption {
+    pub provider: ModelProvider,
+    pub model_id: String,
+    pub name: String,
+    pub reasoning: Vec<Reasoning>,
+    pub fast: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ConversationSettings {
+    pub conversation_id: String,
+    pub task_id: Option<TaskId>,
+    pub agent_id: Option<String>,
+    pub model: ModelSelection,
+    pub catalog: Vec<ModelOption>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct RuntimeRequest {
     pub version: u32,
@@ -163,6 +220,15 @@ pub enum RuntimeCommand {
     },
     Login,
     Status,
+    AttachMain,
+    DetachMain,
+    ConversationSettings {
+        task_id: Option<TaskId>,
+        agent_id: Option<String>,
+        change: Option<ConversationChange>,
+        #[serde(default)]
+        catalog: bool,
+    },
     Logout,
     Chat {
         input: String,
@@ -708,6 +774,14 @@ pub enum RuntimeEventKind {
     },
     AuthStatus {
         status: AuthStatus,
+    },
+    ConversationSettings {
+        settings: ConversationSettings,
+    },
+    MainReady {
+        conversation_id: String,
+        model: ModelSelection,
+        cwd: String,
     },
     Answer {
         conversation_id: String,

@@ -67,6 +67,7 @@ struct Pending {
     host_calls: HashSet<String>,
     login: bool,
     worker: bool,
+    main_view: bool,
     interruptible: bool,
 }
 
@@ -151,6 +152,7 @@ impl Runtime {
                     | RuntimeCommand::WorkerInput { .. }
                     | RuntimeCommand::SubmitInput { .. }
                     | RuntimeCommand::DetachWorker
+                    | RuntimeCommand::DetachMain
             ),
             "Transport control commands do not create Pi requests"
         );
@@ -271,6 +273,18 @@ async fn reject_host_calls(stdin: &mut ChildStdin, id: u32, pending: &mut Pendin
         )
         .await?;
     }
+    if pending.main_view {
+        pending.main_view = false;
+        send(
+            stdin,
+            RuntimeRequest {
+                version: PROTOCOL_VERSION,
+                id,
+                command: RuntimeCommand::DetachMain,
+            },
+        )
+        .await?;
+    }
     for call_id in pending.host_calls.drain() {
         send(
             stdin,
@@ -311,12 +325,13 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                         let command = *command;
                         let login = matches!(command, RuntimeCommand::Login);
                         let worker = matches!(command, RuntimeCommand::RunTask { interactive: Some(true), .. });
-                        let interruptible = worker || matches!(command, RuntimeCommand::Chat { .. });
+                        let main_view = matches!(command, RuntimeCommand::AttachMain);
+                        let interruptible = worker || main_view || matches!(command, RuntimeCommand::Chat { .. });
                         let id = next_id;
                         next_id = id.checked_add(1).context("Runtime request IDs exhausted")?;
                         let (sender, events) = mpsc::channel(64);
                         send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id, command }).await?;
-                        pending.insert(id, Pending { events: Some(sender), host_calls: HashSet::new(), login, worker, interruptible });
+                        pending.insert(id, Pending { events: Some(sender), host_calls: HashSet::new(), login, worker, main_view, interruptible });
                         if admitted.send(Ok(RuntimeCall { request_id: id, events })).is_err()
                             && let Some(call) = pending.get_mut(&id) {
                             reject_host_calls(&mut stdin, id, call).await?;

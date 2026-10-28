@@ -255,3 +255,39 @@ test("native HTTP requests keep concurrent conversation fast policies separate a
     await new Promise<void>((resolve) => server.close(() => resolve())); await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("a model switch during authentication does not rewrite or fail an already chosen request", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-model-change-")), requests: WireRequest[] = [];
+  let release = () => {}, entered = () => {}, failure: unknown;
+  const held = new Promise<void>((resolve) => { release = resolve; }), started = new Promise<void>((resolve) => { entered = resolve; });
+  const server = createServer((request, response) => {
+    void (async () => {
+      let body = ""; for await (const chunk of request) body += chunk.toString();
+      requests.push(wireRequest(JSON.parse(body))); complete(response);
+    })().catch((error: unknown) => { failure = error; response.writeHead(500).end(); });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address(); assert.ok(address !== null && typeof address !== "string");
+  const native = openaiProvider(), original = native.getModels().find((model) => model.id === DEFAULT_MODEL.model_id); assert.ok(original);
+  const model = { ...original, baseUrl: `http://127.0.0.1:${address.port}/v1` };
+  const next = { ...model, id: "fixture-next" };
+  const models = createModels(); let resolutions = 0;
+  models.setProvider({ ...native, getModels: () => [model, next], auth: { apiKey: { name: "Synthetic key", resolve: async () => {
+    resolutions += 1; if (resolutions === 1) { entered(); await held; }
+    return { auth: { apiKey: "sk-synthetic" } };
+  } } } });
+  const app = await open(directory, models);
+  try {
+    const conversation = await app.session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT);
+    await app.inference.configure(conversation, DEFAULT_MODEL, {});
+    const input = await conversation.submit({ type: "input", content: "Finish the existing request" }, BACKGROUND_CONTEXT); await started;
+    await app.inference.configure(conversation, { ...DEFAULT_MODEL, model_id: next.id, fast: true }, {});
+    release(); assert.equal((await input.wait(BACKGROUND_CONTEXT)).status, "done");
+    if (failure !== undefined) throw failure;
+    assert.equal(requests.length, 1); assert.equal(requests[0]?.model, original.id); assert.equal(requests[0]?.tier, null);
+    assert.deepEqual((await app.session.snapshot(AgentDoc, conversation.id, BACKGROUND_CONTEXT))?.model, { provider: "openai", modelId: next.id });
+  } finally {
+    release(); await app.session.close(BACKGROUND_CONTEXT); server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve())); await rm(directory, { recursive: true, force: true });
+  }
+});

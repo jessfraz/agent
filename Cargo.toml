@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "export-protocol"
 path = "src/bin/export_protocol.rs"
 
+[[example]]
+name = "terminal-fixture"
+path = "examples/terminal_fixture.rs"
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"

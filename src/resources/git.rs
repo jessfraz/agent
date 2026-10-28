@@ -949,9 +949,15 @@ mod tests {
         );
         let mut request = fixture.request();
         request.branch = "../invalid".into();
+        let before = command(&fixture.repository, &["worktree", "list", "--porcelain"]);
+        let reason = held_reason(GitBackend::default().allocate(request).await);
         assert!(
-            held_reason(GitBackend::default().allocate(request).await)
-                .contains("Invalid worktree branch")
+            reason.contains("Invalid worktree branch"),
+            "Unexpected allocation refusal: {reason}"
+        );
+        assert_eq!(
+            command(&fixture.repository, &["worktree", "list", "--porcelain"]),
+            before
         );
     }
 

@@ -168,6 +168,90 @@
         "instructions"
       ]
     },
+    "ConversationChange": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "model": {
+              "$ref": "#/$defs/ModelSelection"
+            },
+            "type": {
+              "type": "string",
+              "const": "set_selection"
+            }
+          },
+          "required": [
+            "type",
+            "model"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "model_id": {
+              "type": "string"
+            },
+            "provider": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ModelProvider"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "set_model"
+            }
+          },
+          "required": [
+            "type",
+            "model_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reasoning": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Reasoning"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "set_reasoning"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "$ref": "#/$defs/FastMode"
+            },
+            "type": {
+              "type": "string",
+              "const": "set_fast"
+            }
+          },
+          "required": [
+            "type",
+            "mode"
+          ]
+        }
+      ]
+    },
     "CoordinatorBootstrap": {
       "type": "object",
       "properties": {
@@ -277,6 +361,14 @@
         "pooling",
         "normalization",
         "instruction_version"
+      ]
+    },
+    "FastMode": {
+      "type": "string",
+      "enum": [
+        "toggle",
+        "on",
+        "off"
       ]
     },
     "FeedbackContext": {
@@ -1515,6 +1607,72 @@
             "type": {
               "type": "string",
               "const": "status"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "attach_main"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "detach_main"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agent_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "catalog": {
+              "type": "boolean",
+              "default": false
+            },
+            "change": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ConversationChange"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "task_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TaskId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "conversation_settings"
             }
           },
           "required": [

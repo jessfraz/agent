@@ -2,16 +2,20 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
+import { createConnection } from "node:net";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { validEvent } from "../src/protocol.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
+import type { TaskRecord } from "../src/generated/TaskRecord.js";
+import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import { sessions } from "./fixtures/coordinator-native.js";
 import type { ModelQueue, ModelStep } from "./fixtures/coordinator-runtime.js";
 
 test("real CLI, coordinator and worker retain main history across an offline laptop and route restored work", { timeout: 60_000 }, async () => {
   const directory = await realpath(await mkdtemp("/tmp/agent-e2e-"));
   const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../target/debug/agent", import.meta.url));
+  const terminalFixture = fileURLToPath(new URL("../../../target/debug/examples/terminal-fixture", import.meta.url));
   const runtime = fileURLToPath(new URL("./fixtures/coordinator-runtime.js", import.meta.url));
   const coordinator = "11111111-1111-4111-8111-111111111111", laptop = "22222222-2222-4222-8222-222222222222";
   const bin = join(directory, "bin"), queue = join(directory, "responses.json"), feedbackGate = join(directory, "feedback-gate");
@@ -22,13 +26,15 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     const event: unknown = JSON.parse(line), frame = { version: 1, id: 1, event };
     assert.ok(validEvent(frame), "The real CLI must return typed protocol events"); return frame.event;
   });
-  function start(host: number, args: string[], input?: string, extra: NodeJS.ProcessEnv = {}, nativeArguments = false) {
+  function start(host: number, args: string[], input?: string, extra: NodeJS.ProcessEnv = {}, nativeArguments = false, terminal = false) {
     const home = homes[host]; assert.ok(home);
     const arguments_ = nativeArguments ? args : ["--state-dir", join(home, "state"), "--config", join(home, "agent.toml"),
       "--runtime", runtime, "--instructions", join(home, "AGENTS.md"), ...args];
-    const child = spawn(binary, ["--json", "--no-tui", ...arguments_], { cwd: home, detached: true, stdio: ["pipe", "pipe", "pipe"], env: {
+    const command = terminal ? [binary, ...arguments_]
+      : ["--json", "--no-tui", ...arguments_];
+    const child = spawn(terminal ? terminalFixture : binary, command, { cwd: home, detached: true, stdio: ["pipe", "pipe", "pipe"], env: {
       PATH: bin + delimiter + process.env.PATH, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local"),
-      TMPDIR: directory, AGENT_SQLITE_VEC: process.env.AGENT_SQLITE_VEC, OPENAI_API_KEY: "sk-synthetic-fixture",
+      TMPDIR: directory, TERM: "xterm-256color", AGENT_SQLITE_VEC: process.env.AGENT_SQLITE_VEC, OPENAI_API_KEY: "sk-synthetic-fixture",
       AGENT_TEST_NODE_ID: host === 0 ? coordinator : laptop, AGENT_TEST_REX_STATE: join(home, "rex.json"),
       AGENT_TEST_MODEL_QUEUE: queue, AGENT_TEST_COORDINATOR_SOCKET: socket, AGENT_TEST_FEEDBACK_GATE: feedbackGate, ...extra,
     } });
@@ -43,9 +49,25 @@ test("real CLI, coordinator and worker retain main history across an offline lap
   async function cli(host: number, args: string[], input = "") {
     const process = start(host, args, input); assert.equal(await process.exited, 0, process.errors()); return events(process.output());
   }
+  async function exchange(command: RuntimeCommand, observe?: (event: RuntimeEventKind) => void): Promise<RuntimeEventKind[]> {
+    const channel = createConnection(socket); let output = "", done = false, observed = 0;
+    try {
+      return await new Promise<RuntimeEventKind[]>((resolve, reject) => {
+        channel.on("error", reject).on("data", (bytes: Buffer) => {
+          try {
+            output += bytes.toString("utf8"); const frames = events(output);
+            for (const frame of frames.slice(observed)) observe?.(frame); observed = frames.length;
+            if (frames.some((frame) => frame.type === "done")) { done = true; resolve(frames); }
+          } catch (error) { reject(error); }
+        }).on("end", () => { if (!done) reject(new Error("The coordinator closed a main view before Done")); });
+        channel.write(JSON.stringify(command) + "\n");
+      });
+    } finally { channel.destroy(); }
+  }
   async function until(check: () => Promise<boolean>, message = ""): Promise<void> {
     const deadline = Date.now() + 10_000;
-    while (!await check()) { assert.ok(Date.now() < deadline, message + "\n" + children.map((process) => process.errors()).join("\n")); await new Promise((resolve) => setTimeout(resolve, 20)); }
+    while (!await check()) { assert.ok(Date.now() < deadline, message + "\n" + children.map((process) => process.errors()).join("\n") +
+      children.slice(-3).map((process) => process.output().slice(-2400)).join("\n")); await new Promise((resolve) => setTimeout(resolve, 20)); }
   }
   async function online(ids: string[]): Promise<void> {
     await until(async () => {
@@ -80,12 +102,16 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     let worker = start(1, ["maintain"]); await online([coordinator, laptop]);
     await script("fixture-initial-main", [exec, delegate("fixture-initial-worker", laptop), delegate("Initial desktop audit"), { text: "Sapphire main detail retained." }]);
     const first = (await cli(1, ["chat", "fixture-initial-main: remember the sapphire connector."])).find((event) => event.type === "answer"); assert.ok(first?.type === "answer");
+    const chiefConversationId = first.conversation_id;
     const old = (await tasks()).find((task) => task.title === "fixture-initial-worker"); assert.ok(old?.worker.state === "bound");
     const original = old.worker, launch = sessions(join(homes[1]!, "rex.json")).find((session) => session.session_id === original.binding.session_id); assert.ok(launch);
     const run = () => start(1, launch.command.slice(1), undefined, { REX_SESSION: launch.session_id, REX_BLOCK: launch.block_id }, true);
     await script("fixture-initial-worker", [{ text: "Sapphire laptop measurement retained." }]);
     let actor = run(); await until(async () => events(actor.output()).some((event) => event.type === "worker_idle"));
     actor.child.stdin.end("/exit\n"); assert.equal(await actor.exited, 0, actor.errors());
+    const taskSettings = (await exchange({ type: "conversation_settings", task_id: old.id, agent_id: null,
+      change: { type: "set_reasoning", reasoning: "high" }, catalog: false })).find((event) => event.type === "conversation_settings");
+    assert.ok(taskSettings?.type === "conversation_settings"); assert.equal(taskSettings.settings.model.reasoning, "high");
     worker.child.kill("SIGINT"); assert.equal(await worker.exited, 0, worker.errors()); await online([coordinator]);
     const retained = (await tasks()).find((task) => task.id === old.id); assert.ok(retained);
     await script("fixture-offline-main", [{ tool: "read_task", args: { task_id: old.id } }, exec, delegate("Offline desktop audit"),
@@ -96,6 +122,9 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     assert.equal(history.conversation_id, first.conversation_id); assert.ok(history.messages.some((message) => message.text === "Sapphire main detail retained."));
     worker = start(1, ["maintain"]); await online([coordinator, laptop]); actor = run();
     await until(async () => events(actor.output()).some((event) => event.type === "worker_idle"));
+    const reopenedSettings = events(actor.output()).find((event) => event.type === "conversation_settings");
+    assert.ok(reopenedSettings?.type === "conversation_settings", "A resumed worker must announce its actual persisted model instead of its old launch arguments");
+    assert.equal(reopenedSettings.settings.conversation_id, old.conversation_id); assert.equal(reopenedSettings.settings.model.reasoning, "high");
     await script("fixture-worker-followup", [{ text: "Retained laptop session continued." }]);
     await script("fixture-restored-main", [exec, { tool: "exec", args: { program: process.execPath, args: effect, host: laptop } },
       delegate("Restored desktop audit"), delegate("Restored laptop audit", laptop),
@@ -178,7 +207,117 @@ test("real CLI, coordinator and worker retain main history across an offline lap
       event.conversation_id === old.conversation_id && event.text === "The original task remains usable after both feedback reports."));
     const originalAfterFeedback = (await tasks()).find((task) => task.id === old.id); assert.ok(originalAfterFeedback?.worker.state === "bound");
     assert.deepEqual(originalAfterFeedback.worker.binding, original.binding);
+
+    // A native PTY exercises the same key and slash-command paths as an actual
+    // terminal. The held process belongs to the coordinator, not this client.
+    const held = (path: string): ModelStep => ({ tool: "exec", args: { program: process.execPath, args: ["-e",
+      'const fs=require("node:fs"),path=process.argv[1];fs.writeFileSync(path+".started",String(process.pid));' +
+      'async function run(){while(!fs.existsSync(path+".release"))await new Promise(resolve=>setTimeout(resolve,20));' +
+      'fs.appendFileSync(path+".finished","once\\n");process.stdout.write("Completed the held action.");}void run();', path] } });
+    async function mainHistory() {
+      const frame = (await cli(0, [], "/exit\n")).find((event) => event.type === "history");
+      assert.ok(frame?.type === "history"); assert.equal(frame.conversation_id, chiefConversationId); return frame;
+    }
+    for (const [name, key, host] of [["exit", "/exit\r", 1], ["control-c", "\u0003", 0]] satisfies [string, string, number][]) {
+      const path = join(directory, "detach-" + name), input = "fixture-detach-" + name, answer = "Detached " + name + " completed.";
+      const workerInput = "fixture-worker-detach-" + name, workerAnswer = "Worker continued after " + name + ".";
+      await script(input, [held(path), { tool: "delegate_task", args: { task_id: old.id, input: workerInput } }, { text: answer }]);
+      await script(workerInput, [{ text: workerAnswer }]);
+      const terminal = start(host, [], undefined, {}, false, true);
+      await until(async () => terminal.output().includes("Message the agent"), "The native main TUI did not start");
+      terminal.child.stdin.write(input + "\r");
+      await until(async () => stat(path + ".started").then(() => true, () => false), "The real coordinator action did not start");
+      terminal.child.stdin.write(key);
+      await until(async () => terminal.child.exitCode !== null || terminal.child.signalCode !== null,
+        "Detaching the main TUI must not wait for the held server action");
+      assert.equal(await terminal.exited, 0, terminal.errors());
+      assert.equal(await stat(path + ".finished").then(() => true, () => false), false);
+      const reopened = start(host, [], undefined, {}, false, true);
+      await until(async () => reopened.output().includes("Working"), "Reopening must attach to the active main execution");
+      const liveFrames: RuntimeEventKind[] = [];
+      const live = exchange({ type: "attach_main" }, (frame) => { liveFrames.push(frame); }); void live.catch(() => {});
+      await until(async () => liveFrames.some((frame) => frame.type === "main_ready"));
+      const steering = "fixture-steer-detached-" + name;
+      await script(steering, [{ tool: "delegate_task", args: { task_id: old.id, input: workerInput } }, { text: answer }]);
+      reopened.child.stdin.write(steering + "\r");
+      await until(async () => liveFrames.some((frame) => frame.type === "input_accepted"), "The reopened main view must steer the existing execution");
+      const queuedInput = "fixture-queued-detached-" + name, queuedAnswer = "A separate queued " + name + " turn completed.";
+      await script(queuedInput, [{ text: queuedAnswer }]); reopened.child.stdin.write(queuedInput + "\t");
+      await until(async () => liveFrames.filter((frame) => frame.type === "input_accepted").length === 2,
+        "The reopened main view must preserve Tab as a later turn");
+      await writeFile(path + ".release", "continue the server-owned action");
+      await until(async () => (await mainHistory()).messages.some((message) => message.text === answer),
+        "The admitted main action must finish after its terminal exits");
+      await until(async () => events(actor.output()).some((event) => event.type === "answer" && event.text === workerAnswer),
+        "Detached main work must still be able to continue its existing worker");
+      assert.equal(await readFile(path + ".finished", "utf8"), "once\n");
+      assert.equal((await mainHistory()).messages.filter((message) => message.text === answer).length, 1);
+      await until(async () => (await mainHistory()).messages.some((message) => message.text === queuedAnswer));
+      const separate = (await mainHistory()).messages;
+      assert.equal(separate.filter((message) => message.text === queuedAnswer).length, 1);
+      assert.notEqual(separate.find((message) => message.text === answer)?.entry_id, separate.find((message) => message.text === queuedAnswer)?.entry_id);
+      const completed = await live;
+      assert.deepEqual(completed.flatMap((frame) => frame.type === "answer" ? [frame.text] : []), [answer, queuedAnswer]);
+      const followup = "fixture-after-detach-" + name, followupAnswer = "A new message follows the detached " + name + " work.";
+      await script(followup, [{ text: followupAnswer }]); reopened.child.stdin.write(followup + "\r");
+      await until(async () => (await mainHistory()).messages.some((message) => message.text === followupAnswer));
+      reopened.child.stdin.write("/exit\r"); assert.equal(await reopened.exited, 0, reopened.errors());
+      const resumedTask: TaskRecord | undefined = (await tasks()).find((task) => task.id === old.id); assert.ok(resumedTask?.worker.state === "bound");
+      assert.deepEqual(resumedTask.worker.binding, original.binding);
+      assert.equal(new Set(sessions(join(homes[1]!, "rex.json")).map((window) => window.session_id)).size, 2);
+    }
+    const stopPath = join(directory, "explicit-stop"), stopAnswer = "An explicitly stopped action must not finish.";
+    await script("fixture-explicit-stop", [held(stopPath), { text: stopAnswer }]);
+    const detachedStop = start(0, [], undefined, {}, false, true);
+    await until(async () => detachedStop.output().includes("Message the agent"));
+    detachedStop.child.stdin.write("fixture-explicit-stop\r");
+    await until(async () => stat(stopPath + ".started").then(() => true, () => false));
+    detachedStop.child.stdin.write("/exit\r"); assert.equal(await detachedStop.exited, 0, detachedStop.errors());
+    const stopped = start(0, [], undefined, {}, false, true);
+    await until(async () => stopped.output().includes("Working"));
+    stopped.child.stdin.write("\u001b");
+    await until(async () => stopped.output().includes("Interrupted"), "Esc must stop the active turn");
+    await script("fixture-after-explicit-stop", [{ text: "The main chat accepts a new message after explicit stop." }]);
+    stopped.child.stdin.write("fixture-after-explicit-stop\r");
+    await until(async () => (await mainHistory()).messages.some((message) => message.text === "The main chat accepts a new message after explicit stop."));
+    await writeFile(stopPath + ".release", "a stopped action must remain stopped");
+    assert.equal(await stat(stopPath + ".finished").then(() => true, () => false), false);
+    assert.equal((await mainHistory()).messages.some((message) => message.text === stopAnswer), false);
+    stopped.child.stdin.write("/exit\r"); assert.equal(await stopped.exited, 0, stopped.errors());
+
+    const gapPath = join(directory, "finish-before-attach"), gapAnswer = "A completed turn remains visible across the attach boundary.";
+    await script("fixture-finish-before-attach", [held(gapPath), { text: gapAnswer }]);
+    const gapOwner = start(0, ["chat", "fixture-finish-before-attach"]);
+    await until(async () => stat(gapPath + ".started").then(() => true, () => false));
+    const earlierSnapshot = await mainHistory(); assert.equal(earlierSnapshot.messages.some((message) => message.text === gapAnswer), false);
+    await writeFile(gapPath + ".release", "finish before the new view attaches");
+    assert.equal(await gapOwner.exited, 0, gapOwner.errors());
+    const requestsBeforeAttach = await readFile(queue + ".requests", "utf8");
+    const attachedAfterFinish = (await exchange({ type: "attach_main" })).find((event) => event.type === "history");
+    assert.ok(attachedAfterFinish?.type === "history", "An idle main attach must refresh a snapshot taken before the previous execution finished");
+    assert.equal(attachedAfterFinish.conversation_id, chiefConversationId);
+    assert.equal(attachedAfterFinish.messages.filter((message) => message.text === gapAnswer).length, 1);
+    assert.equal(await readFile(queue + ".requests", "utf8"), requestsBeforeAttach, "Attaching an idle main view must not invoke a model");
+    assert.equal(await readFile(gapPath + ".finished", "utf8"), "once\n");
+
+    const localStatus = start(0, ["chat", "/status"], undefined, {}, false, true);
+    await until(async () => localStatus.child.exitCode !== null || localStatus.child.signalCode !== null,
+      "An initial slash command must complete locally before opening a chat turn");
+    assert.equal(await localStatus.exited, 0, localStatus.errors()); assert.ok(localStatus.output().includes("Coordinator:"));
+    assert.equal((await mainHistory()).messages.some((message) => message.role === "user" && message.text === "/status"), false);
+    assert.equal(await readFile(queue + ".requests", "utf8"), requestsBeforeAttach);
+
+    actor.child.stdin.write("/reasoning medium\n");
+    await until(async () => events(actor.output()).some((event) => event.type === "conversation_settings" && event.settings.model.reasoning === "medium"));
     repairActor.child.stdin.end("/exit\n"); assert.equal(await repairActor.exited, 0, repairActor.errors());
+    actor.child.stdin.end("/exit\n"); assert.equal(await actor.exited, 0, actor.errors());
+    actor = run();
+    await until(async () => events(actor.output()).some((event) => event.type === "worker_idle"));
+    const finalSettings = events(actor.output()).find((event) => event.type === "conversation_settings");
+    assert.ok(finalSettings?.type === "conversation_settings"); assert.equal(finalSettings.settings.model.reasoning, "medium");
+    assert.equal(finalSettings.settings.conversation_id, old.conversation_id);
+    const finalTask: TaskRecord | undefined = (await tasks()).find((task) => task.id === old.id); assert.ok(finalTask?.worker.state === "bound");
+    assert.deepEqual(finalTask.worker.binding, original.binding);
     actor.child.stdin.end("/exit\n"); assert.equal(await actor.exited, 0, actor.errors());
     worker.child.kill("SIGINT"); await worker.exited; server.child.kill("SIGTERM"); assert.equal(await server.exited, 0, server.errors());
   } finally {

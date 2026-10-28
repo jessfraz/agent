@@ -10,7 +10,10 @@ use std::{
 };
 
 use agent_cli::{
-    protocol::{HistoryMessage, HistoryRole, RuntimeCommand, RuntimeEventKind},
+    models::ModelSelection,
+    protocol::{
+        ConversationSettings, HistoryMessage, HistoryRole, RuntimeCommand, RuntimeEventKind,
+    },
     runtime::FrameReader,
 };
 use tokio::{
@@ -37,11 +40,14 @@ async fn main_history(older: bool) {
     fs::write(&config, "").unwrap();
     let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();
     let reads = Arc::new(AtomicUsize::new(0));
+    let settings_reads = Arc::new(AtomicUsize::new(0));
     let observed = reads.clone();
+    let observed_settings = settings_reads.clone();
     let server = tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let observed = observed.clone();
+            let observed_settings = observed_settings.clone();
             tokio::spawn(async move {
                 let (reader, mut writer) = stream.into_split();
                 let mut reader = FrameReader::new(BufReader::new(reader));
@@ -50,6 +56,27 @@ async fn main_history(older: bool) {
                 };
                 let command: RuntimeCommand = serde_json::from_slice(&bytes).unwrap();
                 match command {
+                    RuntimeCommand::ConversationSettings {
+                        task_id: None,
+                        agent_id: None,
+                        change: None,
+                        catalog: false,
+                    } => {
+                        observed_settings.fetch_add(1, Ordering::SeqCst);
+                        let event = RuntimeEventKind::ConversationSettings {
+                            settings: ConversationSettings {
+                                conversation_id: "persisted-main".into(),
+                                task_id: None,
+                                agent_id: None,
+                                model: ModelSelection::default(),
+                                catalog: vec![],
+                            },
+                        };
+                        let mut frame = serde_json::to_vec(&event).unwrap();
+                        frame.push(b'\n');
+                        writer.write_all(&frame).await.unwrap();
+                        writer.write_all(b"{\"type\":\"done\"}\n").await.unwrap();
+                    }
                     RuntimeCommand::Watch => {
                         assert!(reader.next_frame().await.unwrap().is_none());
                     }
@@ -155,6 +182,7 @@ async fn main_history(older: bool) {
         );
     }
     assert_eq!(reads.load(Ordering::SeqCst), if older { 4 } else { 2 });
+    assert_eq!(settings_reads.load(Ordering::SeqCst), 2);
     server.abort();
     let _ = server.await;
 }

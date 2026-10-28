@@ -60,22 +60,34 @@ configured coordinator. Caller project information accompanies the request;
 shared context and conversation storage stay on the coordinator. `agent nodes`
 shows registered machines and which are online.
 
-`agent` opens that same saved main conversation. Recent messages appear on
-startup; `/history` reads older pages and `/exit` detaches. Task sessions open
-directly into an interactive `Chat` tab. Reply there or through the main agent;
-both use the same task conversation. Named child tabs return results while
-remaining available for follow-ups. Live activity shows tool names and exposed
-provider thinking text.
+In the TUI, `agent` opens that same saved main conversation and attaches to
+ongoing work. `/exit` or Ctrl+C detaches main chat while the work continues.
+Reopen it to see live progress, steer or queue more context. Recent saved
+messages appear on startup; `/history` reads older pages.
+
+Task sessions open directly into an interactive `Chat` tab. Reply there or
+through the main agent; both use the same task conversation. Named child tabs
+return results while remaining available for follow-ups. Live activity shows
+tool names and exposed provider thinking text.
 
 TTY sessions use a Markdown TUI with model, reasoning, directory and activity
 status. Enter steers active work; Tab queues a separate follow-up turn. Queued
-messages run in order. Esc stops, and Shift+Enter or Alt+Enter inserts a newline.
+messages run in FIFO order. Esc stops, and Shift+Enter or Alt+Enter inserts a
+newline. Press `?` in an empty editor or use `/help` for commands and shortcuts,
+generated from the same definitions used to parse them.
 Pi's compaction shows as **Compacting context**; current instructions reload
 before the next model round.
 Select transcript text with the terminal's normal copy/paste controls;
-PgUp/PgDn scroll the transcript. `/history` or Ctrl+R loads older messages, and
-`/exit` detaches. Use `agent --no-tui chat` for plain output or `agent --json chat`
-for protocol events.
+PgUp/PgDn scroll messages or shortcut help. `/history` or Ctrl+R loads older
+messages. Use `agent --no-tui chat` for plain output or `agent --json chat` for
+protocol events.
+
+Use `/model`, `/reasoning` or `/fast` to change the current conversation, and
+`/status` to inspect its effective settings and connection. `/model` without an
+argument lists models; `/fast` alone toggles fast mode. Changes persist when the
+conversation reopens and apply to the next model generation. TOML supplies
+defaults for new work. `/help` has the accepted arguments; Pi validates model
+capabilities.
 
 `/feedback <description>` saves private diagnostics and starts a background
 repair worker on the originating machine. A repair started inside Rex uses a

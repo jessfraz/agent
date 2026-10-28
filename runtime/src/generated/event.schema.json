@@ -344,6 +344,44 @@
         "instructions"
       ]
     },
+    "ConversationSettings": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "catalog": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ModelOption"
+          }
+        },
+        "conversation_id": {
+          "type": "string"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelSelection"
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "conversation_id",
+        "model",
+        "catalog"
+      ]
+    },
     "CoordinatorSettings": {
       "type": "object",
       "properties": {
@@ -1694,6 +1732,36 @@
         }
       ]
     },
+    "ModelOption": {
+      "type": "object",
+      "properties": {
+        "fast": {
+          "type": "boolean"
+        },
+        "model_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "provider": {
+          "$ref": "#/$defs/ModelProvider"
+        },
+        "reasoning": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Reasoning"
+          }
+        }
+      },
+      "required": [
+        "provider",
+        "model_id",
+        "name",
+        "reasoning",
+        "fast"
+      ]
+    },
     "ModelProvider": {
       "type": "string",
       "enum": [
@@ -2311,6 +2379,46 @@
           "required": [
             "type",
             "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "settings": {
+              "$ref": "#/$defs/ConversationSettings"
+            },
+            "type": {
+              "type": "string",
+              "const": "conversation_settings"
+            }
+          },
+          "required": [
+            "type",
+            "settings"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "model": {
+              "$ref": "#/$defs/ModelSelection"
+            },
+            "type": {
+              "type": "string",
+              "const": "main_ready"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id",
+            "model",
+            "cwd"
           ]
         },
         {

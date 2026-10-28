@@ -40,11 +40,16 @@ connections share metadata, not duplicate executions. Offline workers retain
 their tasks; automatic transfer to another machine comes later.
 
 Rex task tabs open directly into chat and accept replies after a turn finishes.
-`agent` reopens the main conversation. Both show recent saved history;
-`/history` reads older pages and `/exit` detaches without deleting history.
-The terminal UI renders Markdown and shows the model, reasoning setting,
-directory and live activity. Enter steers active work, Tab queues a later turn,
-Shift+Enter inserts a newline, and Esc stops. Use `--no-tui` for plain output.
+The TUI reopens the saved main conversation with `agent` and reconnects to
+ongoing work. `/exit` or Ctrl+C detaches main chat while that work continues;
+reopen it to follow or steer the same execution. `/history` reads older pages.
+
+The terminal UI renders Markdown and shows the model, reasoning, directory and
+live activity. Enter steers, Tab queues a separate FIFO turn, Shift+Enter inserts
+a newline, and Esc stops. Press `?` in an empty editor or use `/help` for the
+current commands and shortcuts. `/model`, `/reasoning` and `/fast` control this
+conversation; `/status` shows its settings and connection. Use `--no-tui` for
+plain output.
 
 `/feedback <description>` starts a background repair on the same machine with
 private diagnostic context. Its result returns to the main chat.

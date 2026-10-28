@@ -1,13 +1,15 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { getSupportedThinkingLevels, type AuthResult, type MutableModels } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Api, type AuthResult, type Model, type MutableModels } from "@earendil-works/pi-ai";
 import { builtinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { MODEL_THINKING_LEVELS } from "@earendil-works/pi-ai/providers/model-schema";
-import { AgentDoc, configure, defineDoc, ProviderDoc, type AgentChange, type Conversation, type Harness } from "@earendil-works/pi-durable";
+import { AgentDoc, configure, defineDoc, ProviderDoc, type AgentChange, type Conversation, type Harness, type Tx } from "@earendil-works/pi-durable";
 import { AuthError, type ChatGptAuth } from "./auth.js";
 import type { ModelProvider } from "./generated/ModelProvider.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { Reasoning } from "./generated/Reasoning.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
+import type { ConversationChange } from "./generated/ConversationChange.js";
+import type { ModelOption } from "./generated/ModelOption.js";
 
 /** Keep application provider IDs aligned with the pinned upstream registry. */
 export const PROVIDERS: readonly ModelProvider[] = getBuiltinProviders();
@@ -18,6 +20,7 @@ function object(value: unknown): value is Record<string, unknown> {
 }
 function provider(value: unknown): value is ModelProvider { return PROVIDERS.some((id) => id === value); }
 function reasoning(value: unknown): value is Reasoning { return MODEL_THINKING_LEVELS.some((level) => level === value); }
+function supportsFast(model: Model<Api>): boolean { return model.provider === "openai" && model.api === "openai-responses"; }
 
 /** Old worker launch records held an OpenAI model ID. Configuration itself is strict. */
 export function savedModel(value: unknown): ModelSelection | null {
@@ -69,9 +72,9 @@ export class ConversationModels {
             const policy = options?.sessionId === undefined ? undefined
               : (await session.snapshot(Policies, BACKGROUND_CONTEXT))?.sessions[options.sessionId];
             if (policy?.fast !== true) return previous;
-            if (policy.provider !== actual.provider || policy.model_id !== actual.id) {
-              throw new ModelError("Saved request model differs from its conversation policy.");
-            }
+            // A settings change can commit after this generation chose its model.
+            // Its next request owns the new policy; do not alter this older one.
+            if (policy.provider !== actual.provider || policy.model_id !== actual.id) return previous;
             const selected = previous ?? payload;
             if (!object(selected)) throw new ModelError("The provider returned an invalid request payload.");
             return { ...selected, service_tier: "priority" };
@@ -87,7 +90,7 @@ export class ConversationModels {
     if (selection.reasoning !== null && !getSupportedThinkingLevels(model).includes(selection.reasoning)) {
       throw new ModelError(`Reasoning ${selection.reasoning} is unavailable for ${selection.provider}/${selection.model_id}.`);
     }
-    if (selection.fast && (model.provider !== "openai" || model.api !== "openai-responses")) {
+    if (selection.fast && !supportsFast(model)) {
       throw new ModelError(`Fast mode is unavailable for ${selection.provider}/${selection.model_id}.`);
     }
   }
@@ -120,19 +123,64 @@ export class ConversationModels {
   async configure(conversation: Conversation, selection: ModelSelection, change: AgentChange): Promise<void> {
     this.validate(selection);
     const session = await this.session;
-    await session.commit(async (tx) => {
-      const native = await tx.doc(ProviderDoc, conversation.id);
-      const policies = await tx.doc(Policies);
-      policies.sessions[native.sessionId] = { ...selection };
-      await configure(tx, conversation.id, { ...change, model: { provider: selection.provider, modelId: selection.model_id },
-        thinkingLevel: selection.reasoning });
+    await session.commit((tx) => this.configureIn(tx, conversation, selection, change), BACKGROUND_CONTEXT);
+  }
+  private async configureIn(tx: Tx, conversation: Conversation, selection: ModelSelection, change: AgentChange): Promise<void> {
+    const native = await tx.doc(ProviderDoc, conversation.id);
+    const policies = await tx.doc(Policies);
+    policies.sessions[native.sessionId] = { ...selection };
+    await configure(tx, conversation.id, { ...change, model: { provider: selection.provider, modelId: selection.model_id },
+      thinkingLevel: selection.reasoning });
+  }
+  private async currentIn(tx: Tx, conversation: Conversation, fallback: ModelSelection): Promise<ModelSelection> {
+    const native = await tx.doc(AgentDoc, conversation.id);
+    if (native.model === undefined) return { ...fallback };
+    if (!provider(native.model.provider)) throw new ModelError("The saved provider is unavailable; its conversation was retained.");
+    const connection = await tx.doc(ProviderDoc, conversation.id);
+    const saved = (await tx.doc(Policies)).sessions[connection.sessionId];
+    return { provider: native.model.provider, model_id: native.model.modelId, reasoning: native.thinkingLevel ?? null,
+      fast: saved?.provider === native.model.provider && saved.model_id === native.model.modelId && saved.fast };
+  }
+  /** Startup context must not overwrite a setting changed while it was loading. */
+  async configureCurrent(conversation: Conversation, fallback: ModelSelection, change: AgentChange): Promise<ModelSelection> {
+    const session = await this.session;
+    return session.commit(async (tx) => {
+      const selected = await this.currentIn(tx, conversation, fallback); this.validate(selected);
+      await this.configureIn(tx, conversation, selected, change); return selected;
+    }, BACKGROUND_CONTEXT);
+  }
+  catalog(): ModelOption[] {
+    return this.models.getModels().flatMap((model) => provider(model.provider) ? [{ provider: model.provider, model_id: model.id,
+      name: model.name, reasoning: [...getSupportedThinkingLevels(model)], fast: supportsFast(model) }] : [])
+      .sort((left, right) => left.provider.localeCompare(right.provider) || left.model_id.localeCompare(right.model_id));
+  }
+  private changed(current: ModelSelection, change: ConversationChange): ModelSelection {
+    if (change.type === "set_selection") return { ...change.model };
+    if (change.type === "set_fast") return { ...current, fast: change.mode === "toggle" ? !current.fast : change.mode === "on" };
+    if (change.type === "set_reasoning") return { ...current, reasoning: change.reasoning };
+    const provider = change.provider ?? current.provider;
+    const model = this.models.getModel(provider, change.model_id);
+    return { provider, model_id: change.model_id,
+      reasoning: model !== undefined && current.reasoning !== null && getSupportedThinkingLevels(model).includes(current.reasoning) ? current.reasoning : null,
+      fast: model !== undefined && supportsFast(model) && current.fast };
+  }
+  /** Native configuration and application actor metadata share the Pi commit. */
+  async edit(conversation: Conversation, fallback: ModelSelection, change: ConversationChange | null,
+    save?: (tx: Tx, selected: ModelSelection) => Promise<void>): Promise<ModelSelection> {
+    const session = await this.session;
+    const current = await this.legacy(conversation, fallback);
+    if (change === null) return current;
+    const resolved = change.type === "set_model" ? { ...change, provider: change.provider ?? current.provider } : change;
+    if (resolved.type === "set_model" || resolved.type === "set_selection") await this.preflight(this.changed(current, resolved));
+    return session.commit(async (tx) => {
+      const current = await this.currentIn(tx, conversation, fallback);
+      const selected = this.changed(current, resolved); this.validate(selected);
+      await this.configureIn(tx, conversation, selected, {});
+      await save?.(tx, selected); return selected;
     }, BACKGROUND_CONTEXT);
   }
   async legacy(conversation: Conversation, fallback: ModelSelection): Promise<ModelSelection> {
     const session = await this.session;
-    const native = await session.snapshot(AgentDoc, conversation.id, BACKGROUND_CONTEXT);
-    if (native?.model === undefined) return fallback;
-    if (!provider(native.model.provider)) throw new ModelError("The saved provider is unavailable; its conversation was retained.");
-    return { provider: native.model.provider, model_id: native.model.modelId, reasoning: native.thinkingLevel ?? null, fast: false };
+    return session.commit((tx) => this.currentIn(tx, conversation, fallback), BACKGROUND_CONTEXT);
   }
 }

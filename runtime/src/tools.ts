@@ -31,6 +31,10 @@ export class Executions {
   }
   search(id: string): SearchQuery | undefined { return this.attached.get(id)?.search; }
   model(id: string): ModelSelection | undefined { return this.attached.get(id)?.model; }
+  setModel(id: string, model: ModelSelection): void {
+    const execution = this.attached.get(id);
+    if (execution !== undefined) execution.model = { ...model };
+  }
 }
 
 function output(value: unknown, isError = false): ToolExecutionResult {

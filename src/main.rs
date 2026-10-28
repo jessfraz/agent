@@ -15,6 +15,7 @@ use std::{
 };
 
 use agent_cli::{
+    chat_commands::ChatCommand,
     config::{self, ClientConfig},
     context::ContextStore,
     discovery,
@@ -22,8 +23,9 @@ use agent_cli::{
     host, instructions, intake,
     models::{ModelProvider, ModelSelection, Reasoning},
     protocol::{
-        AuthStatus, CoordinatorBootstrap, CoordinatorSettings, ImportPhase, InputMode,
-        RuntimeCommand, RuntimeEventKind, SearchMode, TaskId, WorkerLaunch, WorkerRef,
+        AuthStatus, ConversationChange, ConversationSettings, CoordinatorBootstrap,
+        CoordinatorSettings, ImportPhase, InputMode, RuntimeCommand, RuntimeEventKind, SearchMode,
+        TaskId, WorkerLaunch, WorkerRef,
     },
     rex::{BlockId, RexClient, SessionId},
     runtime::FrameReader,
@@ -601,15 +603,69 @@ async fn main() -> Result<()> {
             prompt: Some(input),
             selection,
         } => {
+            let model = selected_model(
+                selection,
+                &config,
+                coordinator.as_deref(),
+                &script,
+                &directory,
+            )
+            .await?;
+            if let Some(command) = ChatCommand::parse(&input) {
+                let command = command?;
+                match command {
+                    ChatCommand::Help => {
+                        println!("{}", agent_cli::tui::help_text());
+                        return Ok(());
+                    }
+                    ChatCommand::Exit => return Ok(()),
+                    ChatCommand::History => {
+                        return request(
+                            &arguments,
+                            &config,
+                            coordinator.as_deref(),
+                            &script,
+                            &directory,
+                            RuntimeCommand::ReadHistory {
+                                task_id: None,
+                                agent_id: None,
+                                cursor: None,
+                            },
+                        )
+                        .await
+                        .map(|_| ());
+                    }
+                    ChatCommand::Feedback { .. } => {}
+                    command => {
+                        if let Some(model) = model {
+                            conversation_settings(
+                                &config,
+                                coordinator.as_deref(),
+                                &script,
+                                &directory,
+                                None,
+                                Some(ConversationChange::SetSelection { model }),
+                                false,
+                            )
+                            .await?;
+                        }
+                        return settings_plain(
+                            ClientContext {
+                                config: &config,
+                                coordinator: coordinator.as_deref(),
+                                script: &script,
+                                directory: &directory,
+                            },
+                            &command,
+                            None,
+                            &cwd,
+                            arguments.json,
+                        )
+                        .await;
+                    }
+                }
+            }
             if use_tui(&arguments) {
-                let model = selected_model(
-                    selection,
-                    &config,
-                    coordinator.as_deref(),
-                    &script,
-                    &directory,
-                )
-                .await?;
                 return chat_tui(
                     &arguments,
                     &config,
@@ -624,19 +680,7 @@ async fn main() -> Result<()> {
                 )
                 .await;
             }
-            chat_command(
-                input,
-                selected_model(
-                    selection,
-                    &config,
-                    coordinator.as_deref(),
-                    &script,
-                    &directory,
-                )
-                .await?,
-                &cwd,
-            )
-            .await?
+            chat_command(input, model, &cwd).await?
         }
         Action::Chat {
             prompt: None,
@@ -665,6 +709,17 @@ async fn main() -> Result<()> {
                 )
                 .await;
             }
+            conversation_settings(
+                &config,
+                coordinator.as_deref(),
+                &script,
+                &directory,
+                None,
+                model.map(|model| ConversationChange::SetSelection { model }),
+                false,
+            )
+            .await?;
+            let model: Option<ModelSelection> = None;
             let _watch = watch(
                 &config,
                 coordinator.as_deref(),
@@ -699,6 +754,40 @@ async fn main() -> Result<()> {
                     let Some(line) = input.next_line().await? else {
                         return Ok(());
                     };
+                    let local = ChatCommand::parse(&line);
+                    if let Some(command) = local {
+                        match command {
+                            Err(error) => {
+                                eprintln!("{error}");
+                                continue;
+                            }
+                            Ok(ChatCommand::Help) => {
+                                println!("{}", agent_cli::tui::help_text());
+                                continue;
+                            }
+                            Ok(ChatCommand::Exit) => return Ok(()),
+                            Ok(ChatCommand::History | ChatCommand::Feedback { .. }) => {}
+                            Ok(command) => {
+                                if let Err(error) = settings_plain(
+                                    ClientContext {
+                                        config: &config,
+                                        coordinator: coordinator.as_deref(),
+                                        script: &script,
+                                        directory: &directory,
+                                    },
+                                    &command,
+                                    None,
+                                    &cwd,
+                                    arguments.json,
+                                )
+                                .await
+                                {
+                                    eprintln!("Local command failed: {error}");
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     if line.trim() == "/exit" {
                         return Ok(());
                     }
@@ -777,7 +866,7 @@ async fn main() -> Result<()> {
                 }
             }
             .await;
-            finish_feedback(&mut feedback).await;
+            finish_controls(&mut feedback).await;
             return result;
         }
         _ => bail!("Unsupported client command"),
@@ -819,7 +908,7 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        finish_feedback(&mut ui.feedback).await;
+        finish_controls(&mut ui.controls).await;
         let stopped = guard.stop().await;
         match recovery {
             Some(Ok(Some(path))) => eprintln!(
@@ -968,7 +1057,7 @@ struct UiSession {
     submitted: VecDeque<(String, String, InputMode)>,
     observed_user: Option<(String, String)>,
     errors: VecDeque<String>,
-    feedback: tokio::task::JoinSet<()>,
+    controls: tokio::task::JoinSet<()>,
 }
 impl UiSession {
     fn new(handle: TuiHandle, inputs: tokio::sync::mpsc::UnboundedReceiver<TuiInput>) -> Self {
@@ -983,7 +1072,7 @@ impl UiSession {
             submitted: VecDeque::new(),
             observed_user: None,
             errors: VecDeque::new(),
-            feedback: tokio::task::JoinSet::new(),
+            controls: tokio::task::JoinSet::new(),
         }
     }
     fn enqueue(&mut self, input: String) -> Result<()> {
@@ -1069,8 +1158,8 @@ fn feedback_from_ui(
         .cloned()
         .collect();
     let client_errors = ui.errors.iter().cloned().collect();
-    while ui.feedback.try_join_next().is_some() {}
-    ui.feedback.spawn(async move {
+    while ui.controls.try_join_next().is_some() {}
+    ui.controls.spawn(async move {
         let result = async {
             let info = handle.info().await?;
             let draft = handle.draft().await?;
@@ -1107,14 +1196,200 @@ fn feedback_from_ui(
     });
 }
 
-async fn finish_feedback(admissions: &mut tokio::task::JoinSet<()>) {
-    // Admission ends once the coordinator owns the private bundle and repair
-    // task. Detaching never waits for the repair itself, or drops an unsent report.
+async fn finish_controls(admissions: &mut tokio::task::JoinSet<()>) {
+    // Wait for local settings or feedback admission, never for background repair.
     while let Some(result) = admissions.join_next().await {
         if let Err(error) = result {
-            eprintln!("Feedback admission stopped unexpectedly: {error}");
+            eprintln!("A local chat command stopped unexpectedly: {error}");
         }
     }
+}
+
+async fn conversation_settings(
+    config: &ClientConfig,
+    coordinator: Option<&str>,
+    script: &Path,
+    directory: &Path,
+    target: Option<(TaskId, Option<String>)>,
+    change: Option<ConversationChange>,
+    catalog: bool,
+) -> Result<ConversationSettings> {
+    let (task_id, agent_id) = target.map_or((None, None), |(task, agent)| (Some(task), agent));
+    exchange(
+        config,
+        coordinator,
+        script,
+        directory,
+        RuntimeCommand::ConversationSettings {
+            task_id,
+            agent_id,
+            change,
+            catalog,
+        },
+    )
+    .await?
+    .into_iter()
+    .find_map(|event| match event {
+        RuntimeEventKind::ConversationSettings { settings } => Some(settings),
+        _ => None,
+    })
+    .context("The coordinator returned no conversation settings")
+}
+
+fn settings_text(
+    command: &ChatCommand,
+    settings: &ConversationSettings,
+    info: &TuiInfo,
+    coordinator: Option<&str>,
+) -> String {
+    let model = &settings.model;
+    let selected = format!(
+        "{}/{} · reasoning {} · fast {}",
+        model.provider.as_str(),
+        model.model_id,
+        model.reasoning.map_or("default", Reasoning::as_str),
+        if model.fast { "on" } else { "off" }
+    );
+    match command {
+        ChatCommand::Model { model: None } => {
+            let models = settings
+                .catalog
+                .iter()
+                .filter(|option| option.provider == model.provider)
+                .collect::<Vec<_>>();
+            let mut text = format!("{selected}\n\nModels for {}:", model.provider.as_str());
+            for option in models.iter().take(12) {
+                text.push_str(&format!(
+                    "\n  {}{}",
+                    option.model_id,
+                    if option.model_id == model.model_id {
+                        " (selected)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            if models.len() > 12 {
+                text.push_str(&format!("\n  … {} more in Pi's catalog", models.len() - 12));
+            }
+            text.push_str("\nChoose with /model [provider/]model.");
+            text
+        }
+        ChatCommand::Status => format!(
+            "{}\n{selected}\n{}\nCoordinator: {}",
+            info.title,
+            info.cwd,
+            coordinator.unwrap_or("local")
+        ),
+        ChatCommand::Fast { .. } => format!("Fast mode {}.", if model.fast { "on" } else { "off" }),
+        ChatCommand::Reasoning { .. } => format!(
+            "Reasoning: {}.",
+            model.reasoning.map_or("default", Reasoning::as_str)
+        ),
+        _ => format!("Next generation: {selected}"),
+    }
+}
+
+async fn local_settings(
+    config: &ClientConfig,
+    coordinator: Option<&str>,
+    script: &Path,
+    directory: &Path,
+    command: &ChatCommand,
+    target: Option<(TaskId, Option<String>)>,
+) -> Result<ConversationSettings> {
+    let request = command
+        .settings(target)
+        .context("This command does not change conversation settings")?;
+    exchange(config, coordinator, script, directory, request)
+        .await?
+        .into_iter()
+        .find_map(|event| match event {
+            RuntimeEventKind::ConversationSettings { settings } => Some(settings),
+            _ => None,
+        })
+        .context("The coordinator returned no conversation settings")
+}
+
+fn settings_from_ui(
+    config: &ClientConfig,
+    coordinator: Option<&str>,
+    script: &Path,
+    directory: &Path,
+    ui: &mut UiSession,
+    target: Option<(TaskId, Option<String>)>,
+    command: ChatCommand,
+) {
+    let config = config.clone();
+    let coordinator = coordinator.map(str::to_owned);
+    let script = script.to_owned();
+    let directory = directory.to_owned();
+    let handle = ui.handle.clone();
+    while ui.controls.try_join_next().is_some() {}
+    ui.controls.spawn(async move {
+        let changed = async {
+            let info = handle.info().await?;
+            let settings = local_settings(
+                &config,
+                coordinator.as_deref(),
+                &script,
+                &directory,
+                &command,
+                target,
+            )
+            .await?;
+            let text = settings_text(&command, &settings, &info, coordinator.as_deref());
+            handle.event(RuntimeEventKind::ConversationSettings { settings })?;
+            handle.notice(text)
+        }
+        .await;
+        if let Err(error) = changed {
+            let _ = handle.notice(format!("Local command failed: {error}"));
+        }
+    });
+}
+
+struct ClientContext<'a> {
+    config: &'a ClientConfig,
+    coordinator: Option<&'a str>,
+    script: &'a Path,
+    directory: &'a Path,
+}
+
+async fn settings_plain(
+    client: ClientContext<'_>,
+    command: &ChatCommand,
+    target: Option<(TaskId, Option<String>)>,
+    cwd: &Path,
+    json: bool,
+) -> Result<()> {
+    let settings = local_settings(
+        client.config,
+        client.coordinator,
+        client.script,
+        client.directory,
+        command,
+        target,
+    )
+    .await?;
+    if json {
+        display(&RuntimeEventKind::ConversationSettings { settings }, true)?;
+    } else {
+        println!(
+            "{}",
+            settings_text(
+                command,
+                &settings,
+                &TuiInfo {
+                    title: "Agent".into(),
+                    model: settings.model.clone(),
+                    cwd: cwd.to_string_lossy().into_owned()
+                },
+                client.coordinator
+            )
+        );
+    }
+    Ok(())
 }
 struct Presentation<'a> {
     handle: TuiHandle,
@@ -1130,14 +1405,20 @@ async fn chat_tui(
     cwd: &Path,
     start: ChatStart,
 ) -> Result<()> {
-    let effective = match &start.model {
-        Some(model) => model.clone(),
-        None => {
-            environment(config, coordinator, script, directory)
-                .await?
-                .model
-        }
-    };
+    let effective = conversation_settings(
+        config,
+        coordinator,
+        script,
+        directory,
+        None,
+        start
+            .model
+            .clone()
+            .map(|model| ConversationChange::SetSelection { model }),
+        false,
+    )
+    .await?
+    .model;
     let (handle, inputs, guard) = Tui::start(TuiInfo {
         title: "Main agent".into(),
         model: effective,
@@ -1150,6 +1431,7 @@ async fn chat_tui(
             RuntimeCommand::ReadHistory { task_id: None, agent_id: None, cursor: None },
             Some(Presentation { handle: ui.handle.clone(), session: None })).await?;
         if let Some(prompt) = start.prompt { ui.enqueue(prompt)?; }
+        request_with_ui(arguments, config, coordinator, script, directory, RuntimeCommand::AttachMain, &mut ui).await?;
         let mut paused = false;
         while !ui.exiting {
             if paused || ui.queued.is_empty() {
@@ -1157,6 +1439,10 @@ async fn chat_tui(
                     TuiInput::Submit(input) | TuiInput::Queue(input) => { ui.enqueue(input)?; paused = false; }
                     TuiInput::Feedback(description) => {
                         feedback_from_ui(config, coordinator, script, directory, &mut ui, None, description);
+                        continue;
+                    }
+                    TuiInput::Command(command) => {
+                        settings_from_ui(config, coordinator, script, directory, &mut ui, None, command);
                         continue;
                     }
                     TuiInput::History => {
@@ -1173,12 +1459,9 @@ async fn chat_tui(
             }
             let Some(input) = ui.queued.front().cloned() else { continue; };
             let prepared = async {
-                let model = match &start.model {
-                    Some(model) => model.clone(),
-                    None => environment(config, coordinator, script, directory).await?.model,
-                };
+                let model = conversation_settings(config, coordinator, script, directory, None, None, false).await?.model;
                 ui.handle.set_status(TuiInfo { title: "Main agent".into(), model, cwd: cwd.to_string_lossy().into_owned() })?;
-                chat_command(input.clone(), start.model.clone(), cwd).await
+                chat_command(input.clone(), None, cwd).await
             }.await;
             let command = match prepared {
                 Ok(command) => command,
@@ -1201,7 +1484,7 @@ async fn chat_tui(
         }
         Ok(())
     }.await;
-    finish_feedback(&mut ui.feedback).await;
+    finish_controls(&mut ui.controls).await;
     let stopped = guard.stop().await;
     if !ui.queued.is_empty() {
         eprintln!("{} queued messages were not sent.", ui.queued.len());
@@ -1699,7 +1982,8 @@ async fn request_presented(
 ) -> Result<Option<String>> {
     let login = matches!(command, RuntimeCommand::Login);
     let attached = matches!(command, RuntimeCommand::RunTask { .. });
-    let chat = matches!(command, RuntimeCommand::Chat { .. });
+    let main_view = matches!(command, RuntimeCommand::AttachMain);
+    let chat = matches!(command, RuntimeCommand::Chat { .. }) || main_view;
     let mut active_turn = chat || attached;
     let importing = matches!(command, RuntimeCommand::ImportCodex { .. });
     let mut ui_controls = presentation
@@ -1777,7 +2061,7 @@ async fn request_presented(
                 match action {
                     TuiInput::Submit(text) | TuiInput::Queue(text) => {
                         let ui = presentation.as_mut().and_then(|view| view.session.as_deref_mut()).context("Missing terminal input owner")?;
-                        if chat || (attached && ready) {
+                        if (chat && (!main_view || ready)) || (attached && ready) {
                             active_turn = true;
                             let input_id = uuid::Uuid::new_v4().to_string();
                             ui.submitted.push_back((input_id.clone(), text.clone(), mode));
@@ -1787,6 +2071,11 @@ async fn request_presented(
                     TuiInput::Feedback(description) => {
                         if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
                             feedback_from_ui(config, coordinator, script, directory, ui, history_target.clone(), description);
+                        }
+                    }
+                    TuiInput::Command(command) => {
+                        if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
+                            settings_from_ui(config, coordinator, script, directory, ui, history_target.clone(), command);
                         }
                     }
                     TuiInput::Interrupt => {
@@ -1806,6 +2095,7 @@ async fn request_presented(
                     }
                     TuiInput::Exit => {
                         if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) { ui.exiting = true; }
+                        if chat { return Ok(history_cursor); }
                         if active_turn { write_command(&mut *wire.writer, &RuntimeCommand::Interrupt).await?; }
                         if attached { write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?; }
                         ui_controls = false;
@@ -1819,6 +2109,23 @@ async fn request_presented(
                     write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?;
                     interactive = false;
                 } else if let Some(line) = line {
+                    if let Some(command) = ChatCommand::parse(&line) {
+                        match command {
+                            Err(error) => { eprintln!("{error}"); continue; }
+                            Ok(ChatCommand::Help) => { println!("{}", agent_cli::tui::help_text()); continue; }
+                            Ok(ChatCommand::Exit) => {
+                                write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?;
+                                interactive = false;
+                                continue;
+                            }
+                            Ok(ChatCommand::History | ChatCommand::Feedback { .. }) => {}
+                            Ok(command) => {
+                                let cwd = feedback_settings.as_ref().map(|(_, cwd)| Path::new(cwd)).unwrap_or_else(|| Path::new("."));
+                                if let Err(error) = settings_plain(ClientContext { config, coordinator, script, directory }, &command, history_target.clone(), cwd, arguments.json).await { eprintln!("Local command failed: {error}"); }
+                                continue;
+                            }
+                        }
+                    }
                     if line.trim() == "/history" {
                         if let Some((task_id, agent_id)) = &history_target {
                             if history_cursor.is_none() {
@@ -1911,6 +2218,7 @@ async fn request_presented(
                 RuntimeEventKind::TaskReady {
                     conversation_id, ..
                 }
+                | RuntimeEventKind::MainReady { conversation_id, .. }
                 | RuntimeEventKind::Answer {
                     conversation_id, ..
                 } => ui.conversation_id = Some(conversation_id.clone()),
@@ -1918,7 +2226,8 @@ async fn request_presented(
             }
         }
         match &event {
-            RuntimeEventKind::Activity { .. }
+            RuntimeEventKind::MainReady { .. }
+            | RuntimeEventKind::Activity { .. }
             | RuntimeEventKind::Message {
                 message:
                     agent_cli::protocol::HistoryMessage {
@@ -1988,7 +2297,22 @@ async fn request_presented(
                 }
                 failure = Some(message);
             }
-            RuntimeEventKind::Done => break,
+            RuntimeEventKind::Done => {
+                if chat && let Some(view) = &presentation { view.handle.working(false)?; }
+                break;
+            }
+            RuntimeEventKind::MainReady { .. } => {
+                ready = true;
+                if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
+                    while let Some(text) = ui.queued.pop_front() {
+                        ui.handle.say_user(text.clone())?;
+                        let input_id = uuid::Uuid::new_v4().to_string();
+                        ui.submitted.push_back((input_id.clone(), text.clone(), InputMode::Steer));
+                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: text, mode: InputMode::Steer }).await?;
+                    }
+                }
+                if arguments.json { display(&event, true)?; }
+            }
             RuntimeEventKind::TaskReady { ref title, .. } => {
                 ready = true;
                 outcome = true;
@@ -2130,10 +2454,10 @@ async fn request_presented(
     if let Some(failure) = failure {
         bail!("{failure}");
     }
-    ensure!(outcome, "Coordinator completed without a result");
+    ensure!(outcome || main_view, "Coordinator completed without a result");
     Ok(history_cursor)
     }.await;
-    finish_feedback(&mut feedback).await;
+    finish_controls(&mut feedback).await;
     result
 }
 

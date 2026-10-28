@@ -277,6 +277,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         !matches!(
             command,
             RuntimeCommand::Interrupt
+                | RuntimeCommand::DetachMain
                 | RuntimeCommand::SubmitInput { .. }
                 | RuntimeCommand::WorkerInput { .. }
                 | RuntimeCommand::DetachWorker
@@ -314,7 +315,8 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     let attached = matches!(command, RuntimeCommand::RunTask { .. });
-    let interruptible = attached || matches!(command, RuntimeCommand::Chat { .. });
+    let main_view = matches!(command, RuntimeCommand::AttachMain);
+    let interruptible = attached || main_view || matches!(command, RuntimeCommand::Chat { .. });
     let interactive = matches!(
         command,
         RuntimeCommand::RunTask {
@@ -359,7 +361,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     let done = matches!(event, RuntimeEventKind::Done);
                     if !output_closed && let Err(error) = write_frame(&mut writer, &event).await {
-                        if attached { return Err(error); }
+                        if attached || main_view { return Err(error); }
                         input_closed = true;
                         output_closed = true;
                     }
@@ -368,7 +370,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                 frame = reader.next_frame(), if !input_closed => {
                     let bytes = match frame {
                         Ok(bytes) => bytes,
-                        Err(_) if !attached => {
+                        Err(_) if !attached && !main_view => {
                             // A dropped CLI does not revoke work it already
                             // admitted. Keep the effect owner alive through its
                             // real result, as with EOF or a failed output write.
@@ -379,6 +381,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                         Err(error) => return Err(error),
                     };
                     let Some(bytes) = bytes else {
+                        if main_view { return Ok(()); }
                         input_closed = true;
                         if interactive { runtime.worker_control(call.request_id, RuntimeCommand::DetachWorker).await?; }
                         for call_id in host_calls.drain() {
