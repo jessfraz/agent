@@ -235,6 +235,57 @@ test("a failed chunked asset transfer leaves a gap and retries the same item ver
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("operational asset transfer failures outrank missing media and recover without losing retained evidence", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-importer-transfer-")); let app = await open(directory);
+  try {
+    const before = thread("expired-before"), source = thread("transfer"), after = thread("expired-after", true);
+    const retained = item("retained"), evidence = item("asset-evidence"), original = evidence.data;
+    const bytes = Buffer.from(JSON.stringify(original)), digest = createHash("sha256").update(bytes).digest("hex");
+    const locator = "/native/source/evidence.json";
+    evidence.data = null;
+    evidence.assets = [{ path: locator, item_id: evidence.id, version: evidence.version, kind: "cold_evidence", media_type: "application/json", sha256: digest, size: bytes.length }];
+    const failure = "The execution client did not confirm the operation; inspect its state before retrying";
+    let fail = true, assetReads = 0;
+    const producer: Producer = (_host, request) => {
+      if (request.type === "list") return { type: "list", threads: request.archived ? [after] : [before, source], next_cursor: null };
+      if (request.type === "read") {
+        if (request.thread_id === source.id) return page(source, [retained, evidence]);
+        const expired = request.thread_id === before.id ? before : after;
+        const entries = Array.from({ length: expired.archived ? 3 : 55 }, (_, index) => item(`${expired.id}-${index}`));
+        return { ...page(expired, entries), complete: false,
+          gaps: entries.map((entry) => ({ code: "missing", item_id: entry.id, message: "A referenced media asset is unavailable" })) };
+      }
+      assert.equal(request.thread_id, source.id); assert.equal(request.path, locator); assetReads += 1;
+      if (fail && request.offset > 0) throw new Error(failure);
+      const end = Math.min(bytes.length, request.offset + 17);
+      return { type: "asset", path: locator, offset: request.offset, data_base64: bytes.subarray(request.offset, end).toString("base64"),
+        next_offset: end === bytes.length ? null : end, total_bytes: bytes.length, sha256: digest };
+    };
+    const failed = await app.run(producer);
+    assert.equal(failed.phase, "partial"); assert.equal(failed.gap_count, 59); assert.equal(failed.gaps.length, 50);
+    assert.equal(failed.gaps[0], `${source.id}: ${failure}`, "Operational failure must survive a full missing-media summary and later missing gaps");
+    const checkpoint = await app.histories.checkpoint(source.id, coordinator.host_id); assert.ok(checkpoint);
+    assert.equal(checkpoint.complete, false); assert.equal(checkpoint.next_cursor, null);
+    assert.deepEqual(checkpoint.gaps, [{ code: "unavailable", item_id: evidence.id, message: failure }]);
+    assert.ok((await app.histories.checkpoint(before.id, coordinator.host_id))?.gaps.every((gap) => gap.code === "missing"));
+    assert.deepEqual((await originals(app, source.id)).entries.map((entry) => entry.data.item.id), [retained.id]);
+    assert.deepEqual(await readdir(app.assets), []);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory); fail = false;
+    const recovered = await app.run(producer);
+    assert.equal(recovered.phase, "partial", "Native missing references remain coverage gaps");
+    assert.equal(recovered.gap_count, 58); assert.equal(recovered.items_added, 1); assert.equal(recovered.items_unchanged, 59);
+    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.complete, true);
+    assert.deepEqual((await app.histories.checkpoint(source.id, coordinator.host_id))?.gaps, []);
+    const entries = (await originals(app, source.id)).entries;
+    assert.deepEqual(entries.map((entry) => entry.data.item.id), [retained.id, evidence.id]);
+    const saved = entries.find((entry) => entry.data.item.id === evidence.id); assert.ok(saved);
+    assert.deepEqual(await app.histories.original(saved), original);
+    const reads = assetReads, repeated = await app.run(producer);
+    assert.equal(repeated.items_added, 0); assert.equal(repeated.threads_unchanged, 1); assert.equal(assetReads, reads);
+    assert.equal((await originals(app, source.id)).entries.length, 2); assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("changed or unreliable first-read failures replace stale completeness before a native read can fail", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-importer-first-read-")); const app = await open(directory);
   try {
