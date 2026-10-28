@@ -20,7 +20,11 @@ function initial(): ImportProgress { return { phase: "discovering", host_id: nul
   threads_unchanged: 0, items_added: 0, items_unchanged: 0, assets_saved: 0, gap_count: 0, gaps: [] }; }
 function unique(gaps: HistoryGap[]): HistoryGap[] { return [...new Map(gaps.map((gap) => [JSON.stringify(gap), gap])).values()]; }
 function message(error: unknown): string { return error instanceof Error ? error.message : "History is unavailable"; }
-function addGap(progress: ImportProgress, gap: string): void { progress.gap_count += 1; if (progress.gaps.length < 50) progress.gaps.push(gap); }
+function addGap(progress: ImportProgress, gap: string, priority = true): void {
+  progress.gap_count += 1;
+  if (priority) progress.gaps.unshift(gap); else progress.gaps.push(gap);
+  if (progress.gaps.length > 50) progress.gaps.pop();
+}
 
 /** One coordinator import; later callers attach to its progress instead of starting another walk. */
 export class CodexImporter {
@@ -28,7 +32,15 @@ export class CodexImporter {
   private readonly listeners = new Set<(progress: ImportProgress) => void>();
   constructor(private readonly session: Harness, private readonly history: HistoryStore, private readonly assetRoot: string) {}
   isRunning(): boolean { return this.active !== undefined; }
-  async status(): Promise<ImportProgress> { return (await this.session.snapshot(Progress, BACKGROUND_CONTEXT))?.progress ?? initial(); }
+  async status(): Promise<ImportProgress> {
+    const progress = (await this.session.snapshot(Progress, BACKGROUND_CONTEXT))?.progress;
+    if (progress === null || progress === undefined) return initial();
+    if (!this.isRunning() && ["discovering", "importing", "indexing"].includes(progress.phase)) return {
+      ...progress, phase: "partial", gap_count: progress.gap_count + 1,
+      gaps: ["Previous import was interrupted; run agent import codex to resume.", ...progress.gaps.slice(0, 49)],
+    };
+    return progress;
+  }
   async run(nodes: AgentNode[], online: string[], requested: string[], call: HostCall,
     notify: (progress: ImportProgress) => void, index: () => Promise<void>): Promise<ImportProgress> {
     this.listeners.add(notify);
@@ -119,7 +131,7 @@ export class CodexImporter {
       if (cursor !== null) { if (cursors.has(cursor)) throw new Error("History reader repeated a cursor"); cursors.add(cursor); }
     } while (cursor !== null);
     progress.threads_imported += 1;
-    for (const gap of gaps) addGap(progress, `${thread.id}: ${gap.message}`);
+    for (const gap of gaps) addGap(progress, `${thread.id}: ${gap.message}`, gap.code !== "missing" || gap.item_id === null);
   }
   private async asset(host: string, thread: string, source: HistoryAssetRef, call: HostCall): Promise<HistoryAssetRef> {
     await mkdir(this.assetRoot, { recursive: true, mode: 0o700 });

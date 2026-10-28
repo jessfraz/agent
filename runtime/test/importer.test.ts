@@ -119,6 +119,32 @@ test("an interrupted native page resumes its durable cursor after reopening Pi",
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("inventory failures remain visible after the media gap summary fills", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-importer-coverage-")); const app = await open(directory);
+  try {
+    const active = thread("active-media"), archived = thread("archived-media", true);
+    const producer: Producer = (_host, request) => {
+      if (request.type === "list") {
+        if (request.cursor !== null) throw new Error("Synthetic inventory failure");
+        return { type: "list", threads: [request.archived ? archived : active], next_cursor: request.archived ? null : "next-page" };
+      }
+      if (request.type !== "read") throw new Error("No available media is present");
+      const source = request.thread_id === active.id ? active : archived;
+      const entries = Array.from({ length: source.archived ? 3 : 55 }, (_, index) => item(`${source.id}-${index}`));
+      return { type: "read", thread_id: source.id, version: source.version,
+        items: entries, next_cursor: null, complete: false,
+        gaps: entries.map((entry) => ({ code: "missing", item_id: entry.id, message: "A referenced media asset is unavailable" })) };
+    };
+    const result = await app.run(producer);
+    assert.equal(result.phase, "partial"); assert.equal(result.items_added, 58);
+    assert.equal(result.gap_count, 59); assert.equal(result.gaps.length, 50);
+    assert.equal(result.gaps[0], "coordinator: active inventory: Synthetic inventory failure");
+    assert.equal((await app.histories.checkpoint(active.id, coordinator.host_id))?.gaps.length, 55);
+    assert.equal((await app.histories.checkpoint(archived.id, coordinator.host_id))?.gaps.length, 3);
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("a concurrent rerun attaches to the existing native walk instead of starting a second import", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-importer-concurrent-")); const app = await open(directory);
   let release = () => {}, started = () => {};
@@ -142,6 +168,37 @@ test("a concurrent rerun attaches to the existing native walk instead of startin
     assert.equal((await originals(app, source.id)).entries.length, 1); assert.equal(app.faux.state.callCount, 0);
     assert.equal(app.importer.isRunning(), false);
   } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("status reports a stopped import after reopening Pi and preserves its resumable page", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-importer-status-")); let app = await open(directory);
+  let release = () => {}, entered = () => {};
+  const waiting = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const source = thread("stopped");
+  const abandoned = app.run(async (_host, request) => {
+    if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+    if (request.type !== "read") throw new Error("No media is present");
+    if (request.cursor === null) return page(source, [item("before-stop")], "second-page");
+    entered(); await gate; throw new Error("Previous execution stopped");
+  });
+  void abandoned.catch(() => {});
+  try {
+    await waiting;
+    const active = await app.importer.status(); assert.notEqual(active.phase, "partial");
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const status = await app.importer.status(); assert.equal(status.phase, "partial");
+    assert.equal(status.gaps[0], "Previous import was interrupted; run agent import codex to resume.");
+    assert.deepEqual(await app.importer.status(), status);
+    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.next_cursor, "second-page");
+    const resumed = await app.run((_host, request) => {
+      if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+      if (request.type !== "read") throw new Error("No media is present");
+      assert.equal(request.cursor, "second-page"); return page(source, [item("after-stop")]);
+    });
+    assert.equal(resumed.phase, "complete"); assert.equal(resumed.items_added, 1);
+    assert.equal((await originals(app, source.id)).entries.length, 2);
+  } finally { release(); await abandoned.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("a failed chunked asset transfer leaves a gap and retries the same item version into private coordinator storage", async () => {
