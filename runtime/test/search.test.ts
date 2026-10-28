@@ -77,6 +77,24 @@ test("streamed indexing reuses vectors and preserves the old checkpoint on inter
   } finally { index.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("the old text generation is refreshed even when native conversation watermarks stay the same", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-search-")); const path = join(directory, "search.sqlite");
+  let index = new SearchIndex(path);
+  try {
+    await index.upsert("old-preview", "same-tail", records([record("title", "Legacy oversized preview")]), embed);
+    index.close();
+    const legacy = new DatabaseSync(path);
+    legacy.prepare("UPDATE metadata SET value=? WHERE key='chunker'").run("message-utf8-2048-overlap-256-v1"); legacy.close();
+    index = new SearchIndex(path);
+    assert.deepEqual(index.checkpoint("old-preview"), { watermark: "same-tail", dirty: true });
+    await index.reconcile(inventory([{ conversation_id: "old-preview", watermark: "same-tail" }]),
+      () => records([record("title", "Concise current title")]), embed);
+    assert.deepEqual(index.checkpoint("old-preview"), { watermark: "same-tail", dirty: false });
+    const result = await index.search("Concise", embed);
+    assert.equal(result.candidates[0]?.matches[0]?.text, "Concise current title");
+  } finally { index.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("a missed notification and a commit during embedding both remain reconcilable", async () => {
   let release = () => {}; let started = () => {}; let gate = false;
   const began = new Promise<void>((resolve) => { started = resolve; });

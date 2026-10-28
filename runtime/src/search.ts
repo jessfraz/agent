@@ -14,7 +14,7 @@ export type SearchResult = { candidates: SearchCandidate[]; gaps: string[] };
 export type Embed = (texts: string[], purpose: EmbeddingPurpose) => Promise<EmbeddingBatch>;
 type Row = Record<string, SQLOutputValue>;
 type Chunk = SearchRecord & { part: number; hash: string };
-const CHUNKER = "message-utf8-2048-overlap-256-v1";
+const CHUNKER = "message-utf8-2048-overlap-256-v2";
 const BATCH = 16;
 
 function string(row: Row, key: string): string {

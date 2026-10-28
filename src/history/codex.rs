@@ -783,11 +783,23 @@ struct NativeThread {
 impl NativeThread {
     fn metadata(&self, archived: bool) -> Result<HistoryThread> {
         ensure!(!self.id.is_empty(), "Codex returned an empty thread ID");
-        let title = self
+        let native_title = self
             .name
-            .clone()
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| self.preview.clone());
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(&self.preview);
+        // Native previews can be entire prompts. Only the sidebar label is
+        // bounded; the source version and canonical item evidence stay exact.
+        let title: String = native_title
+            .split_whitespace()
+            .flat_map(|word| word.chars().chain(std::iter::once(' ')))
+            .take(128)
+            .collect();
+        let title = if title.trim_end().is_empty() {
+            "Codex conversation".to_owned()
+        } else {
+            title.trim_end().to_owned()
+        };
         let fingerprint = self
             .path
             .as_ref()
@@ -801,7 +813,7 @@ impl NativeThread {
             });
         let version = digest(&serde_json::to_vec(&(
             &self.id,
-            &title,
+            native_title,
             &self.cwd,
             self.updated_at,
             &self.forked_from_id,
@@ -1397,7 +1409,9 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   if(r.method==='initialize') return send(r.id,{codexHome:dir});
   if(r.method==='thread/list') {
     if(p.sourceKinds.length!==10||!p.sourceKinds.includes('subAgentThreadSpawn')||p.sortKey!=='created_at')return fail(r.id,-32602,'incomplete enumeration');
-    const done=()=>send(r.id,{data:data.threads,nextCursor:null});
+    const start=data.paginateThreads?Number(p.cursor||0):0;
+    const end=data.paginateThreads?Math.min(start+p.limit,data.threads.length):data.threads.length;
+    const done=()=>send(r.id,{data:data.threads.slice(start,end),nextCursor:end<data.threads.length?String(end):null});
     if(fs.existsSync(path.join(dir,'block')))setTimeout(done,2000);else done();return;
   }
   if(r.method==='thread/read') {
@@ -1439,6 +1453,168 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             }],
         })
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn large_native_titles_keep_inventory_pages_bounded_without_trimming_source_evidence() {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Thread<'a> {
+            id: String,
+            name: Option<&'a str>,
+            preview: &'a str,
+            cwd: &'static str,
+            created_at: i64,
+            updated_at: i64,
+            history_mode: &'static str,
+        }
+        #[derive(serde::Serialize)]
+        struct Text<'a> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            text: &'a str,
+        }
+        #[derive(serde::Serialize)]
+        struct Message<'a> {
+            id: &'static str,
+            #[serde(rename = "type")]
+            kind: &'static str,
+            content: Vec<Text<'a>>,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let preview = "A spacecraft component 🚀\nneeds inspection. ".repeat(1000);
+        let body =
+            "Full conversation evidence 🚀. ".repeat(6000) + "The final detail remains available.";
+        let message = serde_json::to_value(Message {
+            id: "original",
+            kind: "userMessage",
+            content: vec![Text {
+                kind: "text",
+                text: &body,
+            }],
+        })
+        .unwrap();
+        let mut native = provider_fixture(vec![message]);
+        let threads = (0..53)
+            .map(|n| {
+                serde_json::to_value(Thread {
+                    id: format!("source-{n}"),
+                    name: (n % 2 == 0).then_some(preview.as_str()),
+                    preview: &preview,
+                    cwd: "/example/project",
+                    created_at: 1,
+                    updated_at: 2,
+                    history_mode: "legacy",
+                })
+                .unwrap()
+            })
+            .collect();
+        let object = native.as_object_mut().unwrap();
+        object.insert("threads".into(), Value::Array(threads));
+        object.insert("paginateThreads".into(), Value::Bool(true));
+        let source = fixture(directory.path(), &native);
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        let mut first = None;
+        let mut pages = 0;
+        loop {
+            let response = source.list(false, cursor).await.unwrap();
+            assert!(serde_json::to_vec(&response).unwrap().len() <= PAGE_BYTES);
+            let HistoryResponse::List {
+                threads,
+                next_cursor,
+            } = response
+            else {
+                panic!("Expected native inventory")
+            };
+            pages += 1;
+            for thread in threads {
+                assert!(thread.title.chars().count() <= 128);
+                assert!(!thread.title.contains(['\n', '\r']));
+                assert!(
+                    thread
+                        .title
+                        .starts_with("A spacecraft component 🚀 needs inspection.")
+                );
+                if first.is_none() {
+                    first = Some(thread.clone());
+                }
+                ids.push(thread.id);
+            }
+            match next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(pages, 2);
+        assert_eq!(
+            ids,
+            (0..53).map(|n| format!("source-{n}")).collect::<Vec<_>>()
+        );
+        let first = first.unwrap();
+        // A title-only display bound must not hide changes beyond the display prefix.
+        native.get_mut("threads").unwrap().as_array_mut().unwrap()[0]
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "name".into(),
+                Value::String(preview + "A different source suffix."),
+            );
+        std::fs::write(
+            directory.path().join("native.json"),
+            serde_json::to_vec(&native).unwrap(),
+        )
+        .unwrap();
+        let HistoryResponse::List { threads, .. } = source.list(false, None).await.unwrap() else {
+            panic!("Expected inventory")
+        };
+        assert_eq!(threads[0].title, first.title);
+        assert_ne!(threads[0].version, first.version);
+        let HistoryResponse::Read {
+            items,
+            complete,
+            gaps,
+            ..
+        } = source.read("source-0".into(), None).await.unwrap()
+        else {
+            panic!("Expected history")
+        };
+        assert!(complete);
+        assert!(gaps.is_empty());
+        assert_eq!(items.len(), 1);
+        let asset = items[0]
+            .assets
+            .iter()
+            .find(|asset| matches!(asset.kind, crate::history::HistoryAssetKind::ColdEvidence))
+            .unwrap();
+        let mut retained = Vec::new();
+        let mut offset = 0;
+        loop {
+            let HistoryResponse::Asset {
+                data_base64,
+                next_offset,
+                ..
+            } = source
+                .asset("source-0".into(), asset.path.clone(), offset)
+                .await
+                .unwrap()
+            else {
+                panic!("Expected evidence")
+            };
+            retained.extend(STANDARD.decode(data_base64).unwrap());
+            match next_offset {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        let evidence: Value = serde_json::from_slice(&retained).unwrap();
+        assert_eq!(
+            evidence.get("content").unwrap().as_array().unwrap()[0]
+                .get("text")
+                .unwrap()
+                .as_str(),
+            Some(body.as_str())
+        );
     }
 
     #[tokio::test]

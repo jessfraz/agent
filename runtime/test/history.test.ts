@@ -9,7 +9,7 @@ import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxThinking, fauxToolCall, type TranscriptContext } from "@earendil-works/pi-ai";
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
-import { HistoryStore, ImportedItemEntry } from "../src/history.js";
+import { HistoryStore, ImportedItemEntry, ImportedThreadEntry, importedText } from "../src/history.js";
 import { ConversationModels } from "../src/models.js";
 import { TaskStore } from "../src/tasks.js";
 import { createAppTools, Executions } from "../src/tools.js";
@@ -41,6 +41,29 @@ async function open(directory: string) {
   registry.install(tools.main); registry.install(tools.worker); registry.install(tools.host);
   return { session, storage, imported, tasks, faux, executions, tools };
 }
+
+test("legacy oversized previews stay intact as evidence and become bounded titles on reads and adoption", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-import-")); const app = await open(directory);
+  try {
+    const preview = "Synthetic 🦀 topic\n\t".repeat(20_000);
+    const source = batch([item("item1", preview)]); source.thread.title = preview;
+    const saved = await app.imported.import(source);
+    const expected = Array.from(preview.replace(/\s+/gu, " ").trim()).slice(0, 128).join("");
+    assert.equal(saved.conversation.thread.title, expected);
+    assert.equal((await app.imported.get(source.thread.id))?.thread.title, expected);
+    const conversation = await app.imported.conversation(saved.conversation.conversation_id); assert.ok(conversation);
+    const page = await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT);
+    const metadata = page.items.find(ImportedThreadEntry.is); assert.ok(metadata);
+    assert.equal(metadata.data.thread.title, preview, "Retained source metadata must not be rewritten");
+    assert.equal(importedText(metadata), expected);
+    const original = page.items.find(ImportedItemEntry.is); assert.ok(original);
+    assert.equal(await app.imported.indexText(original), preview, "The original message remains fully searchable");
+    const task = await app.tasks.adopt(saved.conversation.conversation_id, { id: randomUUID(),
+      outcome: "Continue the existing conversation", evidence: "Historical topic", model: fixtureModel });
+    assert.equal(task.title, expected);
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
 
 test("inert imports deduplicate overlapping hosts, survive page interruption and retain versions without creating tasks or executions", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-import-")); let app = await open(directory);

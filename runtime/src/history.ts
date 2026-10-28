@@ -35,8 +35,9 @@ function gaps(left: readonly HistoryGap[], right: readonly HistoryGap[]): Histor
   const known = new Map([...left, ...right].map((gap) => [JSON.stringify(gap), gap]));
   return [...known.values()].map((gap) => ({ ...gap }));
 }
+function title(text: string): string { return Array.from(text.replace(/\s+/gu, " ").trim()).slice(0, 128).join(""); }
 function detached(record: ImportedConversation): ImportedConversation {
-  return { ...record, thread: { ...record.thread }, gaps: record.gaps.map((gap) => ({ ...gap })) };
+  return { ...record, thread: { ...record.thread, title: title(record.thread.title) }, gaps: record.gaps.map((gap) => ({ ...gap })) };
 }
 function body(data: JsonValue): string {
   if (typeof data !== "object" || data === null || Array.isArray(data)) return "";
@@ -54,7 +55,7 @@ function body(data: JsonValue): string {
 function entryIdentity(value: unknown): value is EntryId { return typeof value === "number" && Number.isSafeInteger(value) && value > 0; }
 export function importedText(entry: EntryRecord): string | undefined {
   if (ImportedItemEntry.is(entry)) return entry.data.item.text;
-  if (ImportedThreadEntry.is(entry)) return entry.data.thread.title;
+  if (ImportedThreadEntry.is(entry)) return title(entry.data.thread.title);
   return undefined;
 }
 
