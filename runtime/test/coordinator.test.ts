@@ -242,7 +242,9 @@ test("real CLI, coordinator and worker retain main history across an offline lap
       await script(steering, [{ tool: "delegate_task", args: { task_id: old.id, input: workerInput } }, { text: answer }]);
       reopened.child.stdin.write(steering + "\r");
       await until(async () => liveFrames.some((frame) => frame.type === "input_accepted"), "The reopened main view must steer the existing execution");
-      await until(async () => reopened.output().includes("steering, waiting"), "Accepted steering must remain visibly pending at the held tool boundary");
+      // The native terminal emits changed cells. "sending" can donate the
+      // unchanged leading s to "steering", so assert the newly drawn status.
+      await until(async () => reopened.output().includes("waiting"), "Accepted steering must remain visibly pending at the held tool boundary");
       assert.equal(await stat(path + ".finished").then(() => true, () => false), false,
         "Steering must not cancel or restart the held action");
       const queuedInput = "fixture-queued-detached-" + name, queuedAnswer = "A separate queued " + name + " turn completed.";
