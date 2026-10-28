@@ -14,12 +14,12 @@ agent history open CONVERSATION_ID
 ```
 
 Run import again to catch up. Completed reliable source versions are skipped;
-partial reads resume their committed cursor. Interrupted indexing resumes from
-the retained corpus before the next fresh import. Explicit `--host` selection
-starts a fresh walk of those hosts. The same native thread and item
-versions are retained once across hosts. Neither importing nor searching opens
-Rex sessions. Opening a historical conversation adopts it into one task using
-current settings, then opens its named interactive session.
+partial reads resume their committed cursor. Interrupted or failed indexing
+resumes from the retained corpus before the next fresh import. Explicit
+`--host` selection starts a fresh walk of those hosts. The same native thread
+and item versions are retained once across hosts. Neither importing nor
+searching opens Rex sessions. Opening a historical conversation adopts it into
+one task using current settings, then opens its named interactive session.
 
 ```text
   registered online hosts

@@ -7,13 +7,14 @@ import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels, fauxProvider } from "@earendil-works/pi-ai";
-import { createRegistry, Harness } from "@earendil-works/pi-durable";
+import { createRegistry, defineDoc, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { AgentNode } from "../src/generated/AgentNode.js";
 import type { HistoryItem } from "../src/generated/HistoryItem.js";
 import type { HistoryRequest } from "../src/generated/HistoryRequest.js";
 import type { HistoryResponse } from "../src/generated/HistoryResponse.js";
 import type { HistoryThread } from "../src/generated/HistoryThread.js";
+import type { ImportProgress } from "../src/generated/ImportProgress.js";
 import { HistoryStore, ImportedItemEntry } from "../src/history.js";
 import { CodexImporter } from "../src/importer.js";
 import type { HostCall } from "../src/tasks.js";
@@ -72,6 +73,10 @@ async function stoppedDuringIndexing(directory: string, producer: Producer) {
   await began;
   const progress = await previous.importer.status(); assert.equal(progress.phase, "indexing");
   assert.equal(previous.faux.state.callCount, 0);
+  const legacy = defineDoc<{ progress: ImportProgress | null; indexing?: ImportProgress | null }>({
+    kind: "agent.import-progress", scope: "session", version: 1, initial: () => ({ progress: null }), checkpointWhen: () => true,
+  });
+  await previous.session.commit(async (tx) => { delete (await tx.doc(legacy)).indexing; }, BACKGROUND_CONTEXT);
   await previous.session.close(BACKGROUND_CONTEXT);
   return { app: await open(directory), progress, settle: async () => { release(); await pending.catch(() => {}); } };
 }
@@ -280,6 +285,43 @@ test("explicit host selection starts a new native walk instead of claiming an in
     assert.deepEqual(hosts, [laptop.host_id, laptop.host_id, laptop.host_id]); assert.equal(indexes, 1);
     assert.equal(app.faux.state.callCount, 0);
   } finally { await stopped.settle(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a failed index keeps source progress across reopen and clears resolved index errors on recovery", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-importer-index-failure-")); let app = await open(directory);
+  const source = thread("retained-source");
+  const producer: Producer = (_host, request) => {
+    if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+    if (request.type !== "read") throw new Error("No transferable assets are present");
+    return { ...page(source, [item("retained")]), complete: false, gaps: [
+      { code: "missing", item_id: "retained", message: "A referenced media asset is unavailable" },
+      { code: "unavailable", item_id: null, message: "Synthetic native evidence is temporarily unavailable" },
+    ] };
+  };
+  let sourceCalls = 0, indexes = 0;
+  const forbidden: HostCall = async () => { sourceCalls += 1; throw new Error("Index recovery must not call a source host"); };
+  try {
+    const failed = await app.importer.run([coordinator], [coordinator.host_id], [], native(producer), () => {}, async () => {
+      indexes += 1; throw new Error("The execution request ended before the host operation completed");
+    });
+    assert.equal(failed.phase, "partial"); assert.equal(failed.items_added, 1); assert.equal(failed.gap_count, 3);
+    assert.equal(failed.gaps[0], "Search indexing: The execution request ended before the host operation completed");
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    assert.deepEqual(await app.importer.status(), failed);
+    const repeated = await app.importer.run([coordinator], [coordinator.host_id], [], forbidden, () => {}, async () => {
+      indexes += 1; throw new Error("Synthetic second index failure");
+    });
+    assert.equal(sourceCalls, 0, "Public partial status must not discard the pending index checkpoint");
+    assert.equal(repeated.gap_count, 3); assert.equal(repeated.gaps[0], "Search indexing: Synthetic second index failure");
+    assert.deepEqual(repeated.gaps.slice(1), failed.gaps.slice(1));
+    const recovered = await app.importer.run([], [], [], forbidden, () => {}, async () => { indexes += 1; });
+    assert.deepEqual(recovered, { ...failed, gap_count: 2, gaps: failed.gaps.slice(1) });
+    assert.equal(sourceCalls, 0); assert.equal(indexes, 3);
+    assert.deepEqual((await originals(app, source.id)).entries.map((entry) => entry.data.item.id), ["retained"]);
+    const fresh = await app.run(producer);
+    assert.equal(fresh.items_added, 0); assert.equal(fresh.items_unchanged, 1); assert.equal(app.indexCount(), 1);
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("a failed chunked asset transfer leaves a gap and retries the same item version into private coordinator storage", async () => {

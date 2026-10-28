@@ -14,8 +14,9 @@ import type { ImportProgress } from "./generated/ImportProgress.js";
 import type { HostCall } from "./tasks.js";
 import type { HistoryStore } from "./history.js";
 
-const Progress = defineDoc<{ progress: ImportProgress | null }>({ kind: "agent.import-progress", scope: "session", version: 1,
-  initial: () => ({ progress: null }), checkpointWhen: () => true });
+// Keep source progress separate from index errors so retries need no native walk.
+const Progress = defineDoc<{ progress: ImportProgress | null; indexing?: ImportProgress | null }>({ kind: "agent.import-progress", scope: "session", version: 1,
+  initial: () => ({ progress: null, indexing: null }), checkpointWhen: () => true });
 function initial(): ImportProgress { return { phase: "discovering", host_id: null, threads_seen: 0, threads_imported: 0,
   threads_unchanged: 0, items_added: 0, items_unchanged: 0, assets_saved: 0, gap_count: 0, gaps: [] }; }
 function unique(gaps: HistoryGap[]): HistoryGap[] { return [...new Map(gaps.map((gap) => [JSON.stringify(gap), gap])).values()]; }
@@ -48,8 +49,9 @@ export class CodexImporter {
       if (this.active !== undefined) { notify(await this.status()); return await this.active; }
       // Claim the job before awaiting its checkpoint so concurrent callers attach.
       this.active = (async () => {
-        const saved = (await this.session.snapshot(Progress, BACKGROUND_CONTEXT))?.progress;
-        if (requested.length === 0 && saved?.phase === "indexing") return this.finish(structuredClone(saved), index);
+        const saved = await this.session.snapshot(Progress, BACKGROUND_CONTEXT);
+        const indexing = saved?.indexing ?? (saved?.progress?.phase === "indexing" ? saved.progress : null);
+        if (requested.length === 0 && indexing !== null) return this.finish(structuredClone(indexing), index);
         const selected = requested.length === 0 ? nodes : requested.map((value) => {
           const node = nodes.find((node) => node.host_id === value || node.name.toLocaleLowerCase() === value.toLocaleLowerCase());
           if (node === undefined) throw new Error("Choose a registered history host"); return node;
@@ -61,9 +63,12 @@ export class CodexImporter {
       return await this.active;
     } finally { this.listeners.delete(notify); if (this.listeners.size === 0) this.active = undefined; }
   }
-  private async publish(progress: ImportProgress): Promise<void> {
+  private async publish(progress: ImportProgress, indexing: ImportProgress | null = null): Promise<void> {
     const snapshot = structuredClone(progress);
-    await this.session.commit(async (tx) => { (await tx.doc(Progress)).progress = snapshot; }, BACKGROUND_CONTEXT);
+    const checkpoint = structuredClone(indexing);
+    await this.session.commit(async (tx) => {
+      const state = await tx.doc(Progress); state.progress = snapshot; state.indexing = checkpoint;
+    }, BACKGROUND_CONTEXT);
     for (const notify of this.listeners) notify(snapshot);
   }
   private async read(host: string, request: HistoryRequest, call: HostCall): Promise<HistoryResponse> {
@@ -98,10 +103,12 @@ export class CodexImporter {
     return this.finish(progress, index);
   }
   private async finish(progress: ImportProgress, index: () => Promise<void>): Promise<ImportProgress> {
-    progress.phase = "indexing"; progress.host_id = null; await this.publish(progress);
-    try { await index(); } catch (error) { addGap(progress, `Search indexing: ${message(error)}`); }
+    progress.phase = "indexing"; progress.host_id = null;
+    let checkpoint: ImportProgress | null = structuredClone(progress);
+    await this.publish(progress, checkpoint);
+    try { await index(); checkpoint = null; } catch (error) { addGap(progress, `Search indexing: ${message(error)}`); }
     progress.phase = progress.gaps.length === 0 ? "complete" : "partial";
-    await this.publish(progress); return progress;
+    await this.publish(progress, checkpoint); return progress;
   }
   private async thread(host: string, thread: HistoryThread, progress: ImportProgress, call: HostCall): Promise<void> {
     const saved = await this.history.checkpoint(thread.id, host);
