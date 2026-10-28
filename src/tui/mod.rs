@@ -707,6 +707,7 @@ impl State {
                 next_cursor,
                 ..
             } => {
+                self.output.banner.ready();
                 self.output.collecting_history = true;
                 self.more_history = next_cursor.is_some();
                 for message in messages {
@@ -716,6 +717,7 @@ impl State {
                 self.input_history.sync(&self.messages, None);
             }
             RuntimeEventKind::Message { message } => {
+                self.output.banner.ready();
                 // A replayed page contains whole immutable native entries.
                 // Ignore a delayed live delivery of that entry, not individual
                 // role/text blocks, which may legitimately repeat within it.
@@ -732,6 +734,7 @@ impl State {
                 }
             }
             RuntimeEventKind::Answer { text, entry_id, .. } => {
+                self.output.banner.ready();
                 self.finish_thinking();
                 self.working(false);
                 if entry_id.as_ref().is_none_or(|id| !self.messages.iter().any(|message| message.id.as_ref() == Some(id))) {
@@ -775,12 +778,14 @@ impl State {
                 }
             },
             RuntimeEventKind::TaskReady { title, .. } => {
+                self.output.banner.ready();
                 self.info.title = title;
                 self.worker = true;
                 self.history_offset = Some(0);
             }
             RuntimeEventKind::ConversationSettings { settings } => self.info.model = settings.model,
             RuntimeEventKind::MainReady { model, cwd, .. } => {
+                self.output.banner.ready();
                 self.info.model = model;
                 self.info.cwd = cwd;
                 self.working(true);
@@ -1167,7 +1172,7 @@ impl State {
         let _ = drawn;
     }
     fn draw(&mut self, frame: &mut Frame<'_>) {
-        if frame.area().width < 16 || frame.area().height < 7 {
+        if frame.area().width < 16 || frame.area().height < 6 {
             frame.render_widget(Paragraph::new("Enlarge the terminal"), frame.area());
             self.changed = false;
             return;
@@ -1175,40 +1180,15 @@ impl State {
         self.prepare_editor();
         let height = self.editor_height(
             frame.area().width,
-            frame.area().height.saturating_sub(6).clamp(1, 6),
+            frame.area().height.saturating_sub(5).clamp(1, 6),
         );
         let areas = Layout::vertical([
-            Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(height),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(frame.area());
-        let header =
-            Layout::horizontal([Constraint::Min(1), Constraint::Length(18)]).split(areas[0]);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " agent ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(markdown::plain(&self.info.title)),
-            ])),
-            header[0],
-        );
-        frame.render_widget(
-            Paragraph::new(self.status())
-                .right_aligned()
-                .style(Style::default().fg(if self.working || self.compacting {
-                    Color::Cyan
-                } else {
-                    Color::DarkGray
-                })),
-            header[1],
-        );
         if self.help_open {
             let mut lines = vec![Line::styled(
                 "Commands",
@@ -1238,37 +1218,37 @@ impl State {
                 ]));
             }
             let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-            let visible = usize::from(areas[1].height);
+            let visible = usize::from(areas[0].height);
             self.help_scroll = self
                 .help_scroll
-                .min(paragraph.line_count(areas[1].width).saturating_sub(visible));
+                .min(paragraph.line_count(areas[0].width).saturating_sub(visible));
             self.page = visible.saturating_sub(1).max(1);
             frame.render_widget(
                 paragraph.scroll((u16::try_from(self.help_scroll).unwrap_or(u16::MAX), 0)),
-                areas[1],
+                areas[0],
             );
         } else {
-            let total = self.layout_transcript(areas[1].width);
+            let total = self.layout_transcript(areas[0].width);
             let base = self.live_base();
             let total = total.saturating_sub(base);
-            let visible = usize::from(areas[1].height);
+            let visible = usize::from(areas[0].height);
             let maximum = total.saturating_sub(visible);
-            if self.scroll > 0 && self.previous_width == areas[1].width && !self.history_changed {
+            if self.scroll > 0 && self.previous_width == areas[0].width && !self.history_changed {
                 self.scroll = self
                     .scroll
                     .saturating_add(total.saturating_sub(self.previous_rows));
             }
             self.scroll = self.scroll.min(maximum);
             self.previous_rows = total;
-            self.previous_width = areas[1].width;
+            self.previous_width = areas[0].width;
             self.history_changed = false;
             self.page = visible.saturating_sub(1).max(1);
             let top = maximum.saturating_sub(self.scroll);
-            self.draw_transcript(frame, areas[1], top + base);
+            self.draw_transcript(frame, areas[0], top + base);
         }
-        frame.render_widget(&self.editor, areas[2]);
+        frame.render_widget(&self.editor, areas[1]);
         if let Some(menu) = &self.completion {
-            let height = usize::from(areas[1].height).min(6).min(menu.items.len());
+            let height = usize::from(areas[0].height).min(6).min(menu.items.len());
             let start = menu.selected.saturating_sub(height.saturating_sub(1));
             let lines = menu
                 .items
@@ -1298,9 +1278,9 @@ impl State {
                 .collect::<Vec<_>>();
             let height = u16::try_from(height).unwrap_or(0);
             let area = Rect::new(
-                areas[1].x,
-                areas[1].bottom().saturating_sub(height),
-                areas[1].width,
+                areas[0].x,
+                areas[0].bottom().saturating_sub(height),
+                areas[0].width,
                 height,
             );
             frame.render_widget(ClearWidget, area);
@@ -1343,7 +1323,7 @@ impl State {
                     }),
                 ),
             ])),
-            areas[3],
+            areas[2],
         );
         frame.render_widget(
             Paragraph::new(Line::from(
@@ -1370,7 +1350,7 @@ impl State {
                     .collect::<Vec<_>>(),
             ))
             .style(Style::default().fg(Color::DarkGray)),
-            areas[4],
+            areas[3],
         );
         self.changed = false;
     }
@@ -1629,7 +1609,7 @@ mod tests {
             view.layout_work.measured_messages,
             initial.measured_messages
         );
-        assert!(view.layout_work.painted_rows <= 14);
+        assert!(view.layout_work.painted_rows <= 15);
         view.event(RuntimeEventKind::Activity {
             activity: ModelActivity::Thinking {
                 text: "New **live** context".into(),
@@ -1810,7 +1790,7 @@ mod tests {
             },
         });
         let compacting = rendered(&mut state, 110, 24);
-        assert_eq!(compacting.matches("Compacting context").count(), 2);
+        assert_eq!(compacting.matches("Compacting context").count(), 1);
         assert!(compacting.contains("gpt-6.1-sol · high"));
         assert!(compacting.contains("/workspace/example · Compacting context"));
         state.event(RuntimeEventKind::Answer {
@@ -2047,7 +2027,22 @@ mod tests {
         assert_eq!(view.info.model, model);
         assert_eq!(view.info.title, "Review device configuration");
         assert_eq!(view.info.cwd, "/workspace/example");
-        let text = rendered(&mut view, 110, 24);
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(110, 24),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(9),
+            },
+        )
+        .unwrap();
+        view.flush_output(&mut terminal, false).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
         assert!(text.contains("updated-model · off · fast"));
         assert!(text.contains("Review device configuration"));
     }

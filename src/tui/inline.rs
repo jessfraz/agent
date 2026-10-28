@@ -15,7 +15,10 @@ use crossterm::{
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::{Backend, CrosstermBackend},
-    layout::Size,
+    layout::{Position, Size},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::Widget,
 };
 use std::{collections::HashSet, io::Stdout};
 
@@ -38,11 +41,44 @@ pub(super) enum View {
 }
 
 #[derive(Default)]
+pub(super) enum Banner {
+    #[default]
+    Waiting,
+    Ready,
+    Printed,
+}
+
+impl Banner {
+    pub(super) fn ready(&mut self) {
+        if matches!(self, Self::Waiting) {
+            *self = Self::Ready;
+        }
+    }
+}
+
+#[derive(Default)]
 pub(super) struct Output {
     pub(super) cursor: usize,
     pub(super) view: View,
     pub(super) collecting_history: bool,
     pub(super) historical_entries: HashSet<String>,
+    pub(super) banner: Banner,
+}
+
+fn fresh_inline<B: Backend>(mut backend: B) -> std::result::Result<Terminal<B>, B::Error> {
+    let size = backend.size()?;
+    // Move the previous page into native scrollback, never erase it. Starting
+    // at the last row makes this independent of the shell's cursor position.
+    backend.set_cursor_position(Position::new(0, size.height.saturating_sub(1)))?;
+    backend.append_lines(size.height)?;
+    backend.set_cursor_position(Position::ORIGIN)?;
+    backend.flush()?;
+    Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(6),
+        },
+    )
 }
 
 pub(super) struct Screen {
@@ -67,16 +103,11 @@ impl Screen {
             ),
             DisableMouseCapture
         )?;
-        let terminal = Terminal::with_options(
-            CrosstermBackend::new(output),
-            TerminalOptions {
-                viewport: Viewport::Inline(7),
-            },
-        )?;
+        let terminal = fresh_inline(CrosstermBackend::new(output))?;
         let size = terminal.size()?;
         Ok(Self {
             terminal,
-            height: 7,
+            height: 6,
             size,
             title: String::new(),
             _modes: modes,
@@ -98,7 +129,7 @@ impl Screen {
             let body = state
                 .pending_rows(size.width)
                 .max(if state.completion.is_some() { 6 } else { 1 });
-            let chrome = state.editor_height(size.width, 6) + 3;
+            let chrome = state.editor_height(size.width, 6) + 2;
             u16::try_from(body)
                 .unwrap_or(u16::MAX)
                 .saturating_add(chrome)
@@ -192,6 +223,24 @@ impl State {
         terminal: &mut Terminal<B>,
         ending: bool,
     ) -> std::result::Result<(), B::Error> {
+        if matches!(self.output.banner, Banner::Waiting) && !ending {
+            return Ok(());
+        }
+        if matches!(self.output.banner, Banner::Ready) {
+            terminal.insert_before(2, |buffer| {
+                Line::from(vec![
+                    Span::styled(
+                        "agent ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(crate::tui::markdown::plain(&self.info.title)),
+                ])
+                .render(buffer.area, buffer);
+            })?;
+            self.output.banner = Banner::Printed;
+        }
         if self.output.collecting_history && !ending {
             return Ok(());
         }
@@ -240,7 +289,7 @@ impl State {
     fn pending_rows(&mut self, width: u16) -> usize {
         let total = self.layout_transcript(width);
         let mut frontier = self.output.cursor;
-        if !self.output.collecting_history {
+        if !self.output.collecting_history && !matches!(self.output.banner, Banner::Waiting) {
             while self.messages.get(frontier).is_some_and(|message| {
                 !matches!(
                     message.output,
@@ -286,11 +335,13 @@ mod tests {
     };
 
     fn state() -> State {
-        State::new(TuiInfo {
+        let mut state = State::new(TuiInfo {
             title: "Main agent".into(),
             model: ModelSelection::default(),
             cwd: "/workspace".into(),
-        })
+        });
+        state.output.banner.ready();
+        state
     }
 
     fn terminal() -> Terminal<TestBackend> {
@@ -755,5 +806,142 @@ mod tests {
         ] {
             assert_eq!(saved.matches(body).count(), 1, "{body}");
         }
+    }
+
+    #[test]
+    fn session_banner_precedes_restored_history_and_only_the_footer_is_live() {
+        let mut state = state();
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(90, 24),
+            TerminalOptions {
+                viewport: Viewport::Inline(10),
+            },
+        )
+        .unwrap();
+        state.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![
+                message("question", HistoryRole::User, "Saved question", false, true),
+                message("answer", HistoryRole::Final, "Saved answer", false, true),
+            ],
+            next_cursor: None,
+        });
+        state.event(RuntimeEventKind::Done);
+        state.flush_output(&mut terminal, false).unwrap();
+        state.pending_input("next".into(), "Continue this task".into(), InputMode::Steer);
+        state.working(true);
+        terminal.draw(|frame| state.draw(frame)).unwrap();
+        let rendered = output(&terminal);
+        let banner = rendered.find("agent Main agent").unwrap();
+        let saved = rendered.find("Saved question").unwrap();
+        let answer = rendered.find("Saved answer").unwrap();
+        let pending = rendered.find("Continue this task").unwrap();
+        let composer = rendered.find("Message the agent").unwrap();
+        assert!(banner < saved, "{rendered}");
+        assert!(
+            saved < answer && answer < pending && pending < composer,
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches("agent Main agent").count(), 1);
+        assert_eq!(rendered.matches("Working").count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn fresh_session_moves_the_previous_page_into_scrollback_without_erasing_it() {
+        let mut previous = vec![String::new(); 24];
+        previous[0] = "Previous command".into();
+        previous[1] = "Previous connection error".into();
+        previous[2] = " ".repeat(90);
+        let mut backend = TestBackend::with_lines(previous);
+        ratatui::backend::Backend::set_cursor_position(&mut backend, Position::new(0, 4)).unwrap();
+        let mut terminal = crate::tui::inline::fresh_inline(backend).unwrap();
+        let mut state = state();
+        state.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![message(
+                "saved",
+                HistoryRole::Final,
+                "Saved answer",
+                false,
+                true,
+            )],
+            next_cursor: None,
+        });
+        state.event(RuntimeEventKind::Done);
+        state.flush_output(&mut terminal, false).unwrap();
+        terminal.draw(|frame| state.draw(frame)).unwrap();
+        let visible = text(terminal.backend().buffer());
+        assert!(visible.starts_with("agent Main agent\n"), "{visible}");
+        assert!(visible.contains("Saved answer"));
+        assert!(!visible.contains("Previous command"));
+        assert!(!visible.contains("Previous connection error"));
+        let retained = text(terminal.backend().scrollback());
+        assert_eq!(retained.matches("Previous command").count(), 1);
+        assert_eq!(retained.matches("Previous connection error").count(), 1);
+        let rendered = output(&terminal);
+        assert!(
+            rendered.find("Previous command").unwrap() < rendered.find("agent Main agent").unwrap()
+        );
+        assert!(
+            rendered.find("agent Main agent").unwrap() < rendered.find("Saved answer").unwrap()
+        );
+    }
+
+    #[test]
+    fn session_banner_waits_for_the_native_task_title_and_prints_once() {
+        let mut state = state();
+        state.output.banner = crate::tui::inline::Banner::Waiting;
+        state.info.title = "Connecting to task".into();
+        let mut terminal = terminal();
+        state.flush_output(&mut terminal, false).unwrap();
+        assert!(!output(&terminal).contains("Connecting to task"));
+        state.event(RuntimeEventKind::TaskReady {
+            conversation_id: "task".into(),
+            title: "Review device settings".into(),
+        });
+        state.flush_output(&mut terminal, false).unwrap();
+        state.working(true);
+        state.flush_output(&mut terminal, false).unwrap();
+        state.working(false);
+        state.flush_output(&mut terminal, false).unwrap();
+        let rendered = output(&terminal);
+        assert_eq!(rendered.matches("agent Review device settings").count(), 1);
+        assert!(!rendered.contains("Connecting to task"));
+    }
+
+    #[test]
+    fn early_watch_notice_waits_for_the_banner_and_restored_history() {
+        let mut state = state();
+        state.output.banner = crate::tui::inline::Banner::Waiting;
+        let mut terminal = terminal();
+        state.event(RuntimeEventKind::Notice {
+            task_id: None,
+            text: "New actionable update".into(),
+        });
+        state.flush_output(&mut terminal, false).unwrap();
+        assert!(!output(&terminal).contains("New actionable update"));
+        assert!(state.pending_rows(70) > 1);
+        state.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![message(
+                "saved",
+                HistoryRole::User,
+                "Saved question",
+                false,
+                true,
+            )],
+            next_cursor: None,
+        });
+        state.event(RuntimeEventKind::Done);
+        state.flush_output(&mut terminal, false).unwrap();
+        let rendered = output(&terminal);
+        assert!(
+            rendered.find("agent Main agent").unwrap() < rendered.find("Saved question").unwrap()
+        );
+        assert!(
+            rendered.find("Saved question").unwrap()
+                < rendered.find("New actionable update").unwrap()
+        );
+        assert_eq!(rendered.matches("New actionable update").count(), 1);
     }
 }
