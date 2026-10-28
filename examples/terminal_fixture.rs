@@ -26,7 +26,8 @@ fn main() -> Result<ExitCode> {
             &mut master,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            // libc exposes this as mutable on Darwin and const on Linux.
+            &raw mut size,
         )
     };
     ensure!(
