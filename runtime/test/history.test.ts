@@ -19,6 +19,7 @@ import { history } from "../src/transcript.js";
 import { fixtureModel } from "./model.js";
 import type { HistoryImportBatch } from "../src/generated/HistoryImportBatch.js";
 import type { HistoryItem } from "../src/generated/HistoryItem.js";
+import type { HistoryAssetRef } from "../src/generated/HistoryAssetRef.js";
 import type { WorkerHost } from "../src/generated/WorkerHost.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
 import type { SearchMode } from "../src/generated/SearchMode.js";
@@ -173,6 +174,43 @@ test("retained cold originals remain readable offline and full user text is avai
     await writeFile(foreign.assets[0]!.path, bytes);
     await assert.rejects(app.imported.import(batch([foreign])), /outside coordinator storage/);
     assert.equal((await app.imported.import(batch([original]))).added_items, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("verified assets merge across same-version host retries while complete repeats preserve the search watermark", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-asset-recovery-")); let app = await open(directory);
+  try {
+    const assets = join(directory, "assets"); await mkdir(assets);
+    const refs: HistoryAssetRef[] = [];
+    for (const name of ["first", "second"]) {
+      const bytes = Buffer.from(name), digest = createHash("sha256").update(bytes).digest("hex"), path = join(assets, digest);
+      await writeFile(path, bytes);
+      refs.push({ path, item_id: "item1", version: "v1", kind: "local_media", media_type: "image/png", sha256: digest, size: bytes.length });
+    }
+    const first = refs[0], second = refs[1]; assert.ok(first && second);
+    const original = item("item1", "Keep the insulation instruction while media recovers."); original.assets = [first];
+    const incomplete = batch([original], { complete: false, gaps: [{ code: "unavailable", item_id: original.id, message: "Some advertised media is unavailable" }] });
+    const initial = await app.imported.import(incomplete);
+    const conversation = await app.imported.conversation(initial.conversation.conversation_id); assert.ok(conversation);
+    const entries = await conversation.entries({ order: "ascending" }, 20, undefined, BACKGROUND_CONTEXT);
+    const retained = entries.items.find(ImportedItemEntry.is); assert.ok(retained);
+    const unchanged = await app.imported.import(incomplete);
+    assert.deepEqual(unchanged.entry_ids, []); assert.equal(unchanged.watermark, initial.watermark);
+    const recovered = await app.imported.import({ ...incomplete, host_id: "host-two", items: [{ ...original, assets: [second] }] });
+    assert.equal(recovered.added_items, 0); assert.notEqual(recovered.watermark, initial.watermark);
+    const complete = { ...incomplete, host_id: "host-three", items: [{ ...original, assets: refs }], complete: true, gaps: [] };
+    const finished = await app.imported.import(complete);
+    assert.deepEqual(finished.entry_ids, []); assert.equal(finished.watermark, recovered.watermark);
+    const repeated = await app.imported.import(complete);
+    assert.deepEqual(repeated.entry_ids, []); assert.equal(repeated.watermark, finished.watermark);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const result = (await app.tasks.originals(initial.conversation.conversation_id, [retained.id.toString()]))[0]; assert.ok(result);
+    assert.deepEqual(result.assets, refs);
+    const reopened = await app.imported.conversation(initial.conversation.conversation_id); assert.ok(reopened);
+    assert.deepEqual((await reopened.entries({ order: "ascending" }, 20, undefined, BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is), [retained]);
+    assert.deepEqual((await history(reopened, null)).flatMap((frame) => frame.messages).filter((message) => message.role === "user").map((message) => message.text), [original.text]);
+    const records = []; for await (const record of app.tasks.records(initial.conversation.conversation_id)) records.push(record);
+    assert.equal(records.filter((record) => record.text === original.text).length, 1); assert.equal(app.faux.state.callCount, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 

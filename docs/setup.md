@@ -87,10 +87,9 @@ for plain output or `agent --json chat` for protocol events.
 Use `/model`, `/reasoning` or `/fast` to change the current conversation, and
 `/status` to inspect its effective settings, connection and available plan usage.
 `/model` without an argument lists models; `/fast` alone toggles fast mode.
-Changes persist when the
-conversation reopens and apply to the next model generation. TOML supplies
-defaults for new work. `/help` has the accepted arguments; Pi validates model
-capabilities.
+Changes persist when the conversation reopens and apply to the next model
+generation. TOML supplies defaults for new work. `/help` has the accepted
+arguments; Pi validates model capabilities.
 
 `/feedback <description>` saves private diagnostics and starts a background
 repair worker on the originating machine. A repair started inside Rex uses a

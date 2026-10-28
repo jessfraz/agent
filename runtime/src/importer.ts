@@ -128,12 +128,10 @@ export class CodexImporter {
       const items: HistoryItem[] = [];
       for (const item of page.items) {
         const assets: HistoryAssetRef[] = [];
-        let retained = true;
         for (const source of item.assets) {
           try { assets.push(await this.asset(host, thread.id, source, call)); progress.assets_saved += 1; }
-          catch (error) { retained = false; gaps.push({ code: "unavailable", item_id: item.id, message: message(error) }); }
+          catch (error) { gaps.push({ code: "unavailable", item_id: item.id, message: message(error) }); }
         }
-        if (!retained) continue;
         // Native payloads already retain their original media locators. Keep
         // their shape so full text and cold evidence remain readable.
         items.push({ ...item, assets });

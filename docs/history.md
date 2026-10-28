@@ -53,8 +53,9 @@ Use the installed Codex app-server's read-only APIs. Page `thread/list` for
 active and archived threads with every native `sourceKinds` value explicitly
 selected; omission includes only interactive sources. Read metadata with
 `thread/read`, then use full turn/item pagination where supported, or the
-installed full-history read. Thread IDs establish identity; filenames and directories are
-locators, not thread IDs or assumptions about which threads are roots.
+installed full-history read. Thread IDs establish identity; filenames and
+directories are locators, not thread IDs or assumptions about which threads
+are roots.
 
 Rust owns a small `HistorySource` trait for enumeration, transcript reads and
 asset reads. Codex is its first implementation. Rust also owns import records
@@ -66,6 +67,11 @@ The same Codex ID imports idempotently across machines. Retain source versions,
 item IDs and real fork relationships. Divergent versions remain distinguishable;
 similar topics never merge conversations. Record incomplete reads as gaps and
 resume from committed checkpoints without duplicating entries.
+
+Missing or deleted attachments leave explicit gaps while available message text
+still imports. Later runs can recover files without repeating the message.
+An unavailable full payload remains incomplete; its excerpt is not a substitute
+for the original.
 
 ## Native Pi storage, inert history
 

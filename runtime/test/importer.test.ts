@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -18,6 +18,7 @@ import type { ImportProgress } from "../src/generated/ImportProgress.js";
 import { HistoryStore, ImportedItemEntry } from "../src/history.js";
 import { CodexImporter } from "../src/importer.js";
 import type { HostCall } from "../src/tasks.js";
+import { transcript } from "../src/transcript.js";
 
 function node(host_id: string): AgentNode {
   return { host_id, name: host_id, rex_server: null, agent_program: "/example/agent", home_directory: "/example/home", coordinator: null,
@@ -324,6 +325,48 @@ test("a failed index keeps source progress across reopen and clears resolved ind
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("deleted advertised media preserves mixed user text and same-version recovery attaches the verified file without another message", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-import-deleted-media-")); let app = await open(directory);
+  try {
+    const source = thread("mixed-media"), evidence = item("mixed-input");
+    const path = join(directory, "source-image"), bytes = Buffer.from("synthetic image");
+    const digest = createHash("sha256").update(bytes).digest("hex"); await writeFile(path, bytes);
+    const text = "The connector needs insulation before this image can be used.";
+    evidence.text = text; evidence.data = { type: "userMessage", content: [{ type: "text", text }, { type: "image", path }] };
+    evidence.assets = [{ path, item_id: evidence.id, version: evidence.version, kind: "local_media", media_type: "image/png", sha256: digest, size: bytes.length }];
+    let deleted = true;
+    const producer: Producer = async (_host, request) => {
+      if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+      if (request.type === "read") return page(source, [evidence]);
+      if (deleted) await rm(path, { force: true }); // Disappears after the native item advertised it.
+      const content = await readFile(path);
+      return { type: "asset", path, offset: request.offset, data_base64: content.toString("base64"), next_offset: null, total_bytes: content.length, sha256: digest };
+    };
+    const failed = await app.run(producer);
+    assert.equal(failed.phase, "partial"); assert.equal(failed.items_added, 1); assert.ok(failed.gap_count > 0);
+    const partial = await originals(app, source.id); const entry = partial.entries[0]; assert.ok(entry);
+    assert.equal(partial.entries.length, 1); assert.equal(entry.data.item.text, text); assert.deepEqual(entry.data.item.assets, []);
+    assert.deepEqual(await app.histories.original(entry), evidence.data); assert.ok((await app.histories.indexText(entry))?.includes(text));
+    const conversationId = partial.conversation.id.toString();
+    let beforeWatermark: string | undefined;
+    for await (const record of app.histories.inventory()) if (record.conversation_id === conversationId) beforeWatermark = record.watermark;
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    deleted = false; await writeFile(path, bytes);
+    const recovered = await app.run(producer, [laptop]);
+    assert.equal(recovered.phase, "complete"); assert.equal(recovered.items_added, 0); assert.equal(recovered.items_unchanged, 1);
+    const saved = await originals(app, source.id); assert.equal(saved.entries.length, 1); assert.deepEqual(saved.entries[0], entry);
+    const projected = saved.entries.flatMap(transcript); assert.deepEqual(projected.map((message) => message.text), [text]);
+    const updated = await app.histories.entry(conversationId, entry.id.toString()); assert.ok(ImportedItemEntry.is(updated));
+    assert.equal(updated.data.item.version, evidence.version); assert.equal(updated.data.item.assets[0]?.path, join(app.assets, digest));
+    assert.deepEqual(await readFile(join(app.assets, digest)), bytes); assert.deepEqual(await app.histories.original(updated), evidence.data);
+    let afterWatermark: string | undefined;
+    for await (const record of app.histories.inventory()) if (record.conversation_id === conversationId) afterWatermark = record.watermark;
+    assert.ok(beforeWatermark && afterWatermark); assert.notEqual(afterWatermark, beforeWatermark, "Recovered assets must invalidate the existing search watermark");
+    assert.equal((await app.histories.checkpoint(source.id, laptop.host_id))?.complete, true);
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("a failed chunked asset transfer leaves a gap and retries the same item version into private coordinator storage", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-importer-assets-")); const app = await open(directory);
   try {
@@ -342,14 +385,20 @@ test("a failed chunked asset transfer leaves a gap and retries the same item ver
         next_offset: end === bytes.length ? null : end, total_bytes: bytes.length, sha256: digest };
     };
     const failed = await app.run(producer);
-    assert.equal(failed.phase, "partial"); assert.equal(failed.items_added, 0); assert.ok(failed.gap_count > 0);
-    assert.equal((await originals(app, source.id)).entries.length, 0); assert.deepEqual(await readdir(app.assets), []);
+    assert.equal(failed.phase, "partial"); assert.equal(failed.items_added, 1); assert.ok(failed.gap_count > 0);
+    const initial = (await originals(app, source.id)).entries[0]; assert.ok(initial);
+    assert.equal(initial.data.item.text, evidence.text); assert.deepEqual(initial.data.item.assets, []);
+    await assert.rejects(app.histories.original(initial), /Full historical original is unavailable/);
+    assert.ok((await app.histories.indexText(initial))?.startsWith("Bounded historical excerpt (full original unavailable):\n"));
+    assert.deepEqual(await readdir(app.assets), []);
     assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.complete, false);
     fail = false; const recovered = await app.run(producer);
-    assert.equal(recovered.phase, "complete"); assert.equal(recovered.items_added, 1); assert.equal(recovered.assets_saved, 1);
+    assert.equal(recovered.phase, "complete"); assert.equal(recovered.items_added, 0); assert.equal(recovered.items_unchanged, 1); assert.equal(recovered.assets_saved, 1);
     const saved = await originals(app, source.id); assert.equal(saved.entries.length, 1);
     const entry = saved.entries[0]; assert.ok(entry);
-    const asset = entry.data.item.assets[0]; assert.ok(asset); assert.equal(asset.path, join(app.assets, digest));
+    assert.deepEqual(entry, initial, "Recovered assets must not rewrite the immutable item");
+    const updated = await app.histories.entry(saved.conversation.id.toString(), entry.id.toString()); assert.ok(ImportedItemEntry.is(updated));
+    const asset = updated.data.item.assets[0]; assert.ok(asset); assert.equal(asset.path, join(app.assets, digest));
     assert.deepEqual(await readFile(asset.path), bytes); assert.equal((await stat(asset.path)).mode & 0o777, 0o600);
     assert.deepEqual(await app.histories.original(entry), original);
     const before = assetReads; const repeated = await app.run(producer);
@@ -391,12 +440,12 @@ test("operational asset transfer failures outrank missing media and recover with
     assert.equal(checkpoint.complete, false); assert.equal(checkpoint.next_cursor, null);
     assert.deepEqual(checkpoint.gaps, [{ code: "unavailable", item_id: evidence.id, message: failure }]);
     assert.ok((await app.histories.checkpoint(before.id, coordinator.host_id))?.gaps.every((gap) => gap.code === "missing"));
-    assert.deepEqual((await originals(app, source.id)).entries.map((entry) => entry.data.item.id), [retained.id]);
+    assert.deepEqual((await originals(app, source.id)).entries.map((entry) => entry.data.item.id), [retained.id, evidence.id]);
     assert.deepEqual(await readdir(app.assets), []);
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory); fail = false;
     const recovered = await app.run(producer);
     assert.equal(recovered.phase, "partial", "Native missing references remain coverage gaps");
-    assert.equal(recovered.gap_count, 58); assert.equal(recovered.items_added, 1); assert.equal(recovered.items_unchanged, 59);
+    assert.equal(recovered.gap_count, 58); assert.equal(recovered.items_added, 0); assert.equal(recovered.items_unchanged, 60);
     assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.complete, true);
     assert.deepEqual((await app.histories.checkpoint(source.id, coordinator.host_id))?.gaps, []);
     const entries = (await originals(app, source.id)).entries;

@@ -5,6 +5,7 @@ import type { JsonValue } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { defineDocFamily, defineEntry, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Harness, type Tx } from "@earendil-works/pi-durable";
 import type { HistoryGap } from "./generated/HistoryGap.js";
+import type { HistoryAssetRef } from "./generated/HistoryAssetRef.js";
 import type { HistoryImportBatch } from "./generated/HistoryImportBatch.js";
 import type { HistoryImportReceipt } from "./generated/HistoryImportReceipt.js";
 import type { HistoryItem } from "./generated/HistoryItem.js";
@@ -22,10 +23,17 @@ const Reverse = defineDocFamily<{ thread_id: string | null }, null>({ kind: "age
   initial: () => ({ thread_id: null }), checkpointWhen: () => true });
 const Checkpoints = defineDocFamily<{ checkpoint: ImportCheckpoint | null }, null>({ kind: "agent.history.hosts", scope: "session", family: true, version: 1,
   initial: () => ({ checkpoint: null }), checkpointWhen: () => true });
+const RetainedAssets = defineDocFamily<{ assets: HistoryAssetRef[] }, null>({ kind: "agent.history.assets", scope: "session", family: true, version: 1,
+  initial: () => ({ assets: [] }), checkpointWhen: () => true });
+const AssetRefreshEntry = defineEntry<{ item_id: string; version: string }>("agent.history.asset-refresh");
 type Cache = { native_id: ConversationId | null; watermark: EntryId | null; receipts: Set<string> };
 export class HistoryError extends Error {}
+class OriginalUnavailable extends HistoryError {}
 function identity(...values: string[]): string { return createHash("sha256").update(JSON.stringify(["codex", ...values])).digest("hex"); }
 function receipt(item: HistoryItem): string { return JSON.stringify(["item", item.id, item.version]); }
+function mergeAssets(left: readonly HistoryAssetRef[], right: readonly HistoryAssetRef[]): HistoryAssetRef[] {
+  return [...new Map([...left, ...right].map((asset) => [JSON.stringify([asset.kind, asset.path]), asset])).values()];
+}
 function json(value: unknown): value is JsonValue {
   return value === null || typeof value === "string" || typeof value === "boolean" ||
     (typeof value === "number" && Number.isFinite(value)) || (Array.isArray(value) ? value.every(json)
@@ -86,21 +94,31 @@ export class HistoryStore {
     if (!entryIdentity(native) || native.toString() !== id) throw new HistoryError("Invalid native entry ID");
     const entry = await this.session.commit((tx) => tx.entry(native), BACKGROUND_CONTEXT);
     if (entry === undefined || entry.conversationId.toString() !== conversationId) throw new HistoryError("Entry does not belong to this conversation");
-    return entry;
+    return ImportedItemEntry.is(entry) ? { ...entry, data: { ...entry.data, item: { ...entry.data.item, assets: await this.retainedAssets(entry) } } } : entry;
+  }
+  private async retainedAssets(entry: EntryRecord): Promise<HistoryAssetRef[]> {
+    if (!ImportedItemEntry.is(entry)) return [];
+    const { thread_id, item } = entry.data;
+    const retained = await this.session.snapshot(RetainedAssets, identity(thread_id, item.id, item.version), BACKGROUND_CONTEXT);
+    return mergeAssets(item.assets, retained?.assets ?? []);
   }
   async indexText(entry: EntryRecord): Promise<string | undefined> {
     if (!ImportedItemEntry.is(entry)) return importedText(entry);
     const item = entry.data.item;
     if (item.kind === "imageGeneration") return "";
     if (item.role !== "user" && item.role !== "assistant") return item.text.slice(0, 32_000);
-    const data = await this.original(entry);
-    return body(data) || item.text;
+    try { return body(await this.original(entry)) || item.text; }
+    catch (error) {
+      if (error instanceof OriginalUnavailable) return "Bounded historical excerpt (full original unavailable):\n" + item.text;
+      throw error;
+    }
   }
   async original(entry: EntryRecord): Promise<JsonValue> {
     if (!ImportedItemEntry.is(entry)) throw new HistoryError("This is not imported source evidence");
     const item = entry.data.item; let data = item.data;
-    const cold = item.assets.find((asset) => asset.kind === "cold_evidence");
-    if (data === null && cold !== undefined) {
+    if (data === null) {
+      const cold = (await this.retainedAssets(entry)).find((asset) => asset.kind === "cold_evidence");
+      if (cold === undefined) throw new OriginalUnavailable("Full historical original is unavailable; only its bounded saved excerpt is retained");
       if (cold.size === null || cold.size > 64 * 1024 * 1024) throw new HistoryError("Historical text exceeds the bounded index reader; source evidence is retained");
       const bytes = await readFile(cold.path);
       if (createHash("sha256").update(bytes).digest("hex") !== cold.sha256) throw new HistoryError("Retained history evidence changed");
@@ -172,8 +190,26 @@ export class HistoryStore {
         const seen = new Set(cache.receipts);
         for (const item of items) {
           const itemKey = receipt(item);
-          if (seen.has(itemKey)) { existingItems += 1; continue; }
+          if (seen.has(itemKey)) {
+            existingItems += 1;
+            if (item.assets.length > 0) {
+              const refs = await tx.doc(RetainedAssets, identity(batch.thread.id, item.id, item.version), null);
+              const assets = mergeAssets(refs.assets, item.assets);
+              if (JSON.stringify(assets) !== JSON.stringify(refs.assets)) {
+                refs.assets = assets;
+                // Asset recovery changes searchable originals, not immutable
+                // chat items. An invisible entry advances existing index owners.
+                const refreshed = await tx.appendEntry(AssetRefreshEntry, native, { data: { item_id: item.id, version: item.version } });
+                state.watermark = refreshed.id; added.push(refreshed.id.toString());
+              }
+            }
+            continue;
+          }
           const entry = await tx.appendEntry(ImportedItemEntry, native, { data: { source: "codex", thread_id: batch.thread.id, item } });
+          if (item.assets.length > 0) {
+            const refs = await tx.doc(RetainedAssets, identity(batch.thread.id, item.id, item.version), null);
+            refs.assets = mergeAssets(refs.assets, item.assets);
+          }
           state.watermark = entry.id; added.push(entry.id.toString()); keys.push(itemKey); seen.add(itemKey); addedItems += 1;
         }
         const previous = state.record;
