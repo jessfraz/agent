@@ -131,8 +131,11 @@ interrupting cannot undo an external effect that already completed.
 
 Persist allocation intent before creating a session or terminal. A missing
 creation receipt becomes uncertain and requires reconciliation. History sync
-must never create an execution. Continuing an exited worker reuses its session;
-it creates a replacement terminal and closes only the recorded exited pane.
+must never create an execution. Find matching tasks regardless of process state.
+A live worker receives the follow-up in its existing terminal: idle workers wake,
+busy workers queue it, and an explicit interrupt stops the current turn.
+Only an exited process needs a replacement terminal in the same session; close
+its old pane after the replacement exists.
 Rex server restart recovery remains an open question below.
 Closing a whole session is different: positive native absence fences its old
 actor before a replacement session is bound to the same task on the same

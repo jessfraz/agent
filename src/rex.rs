@@ -347,7 +347,7 @@ impl RexClient {
         decode_creation(&output)
     }
 
-    /// Reuse the task session after its previous execution has exited.
+    /// Keep a live or starting worker; replace an exited process in the same session.
     pub async fn resume_worker(
         &self,
         binding: &WorkerBinding,
