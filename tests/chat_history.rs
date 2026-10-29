@@ -198,6 +198,8 @@ async fn observer_disconnect(after_admission: bool) {
         .arg("--config")
         .arg(config)
         .arg("chat")
+        // Keep footer geometry independent of Cargo/Nix's build directory.
+        .current_dir("/")
         .env("TERM", "xterm-256color")
         .env("AGENT_TEST_TERMINAL_REPLY", "1")
         .stdin(Stdio::piped())
@@ -266,8 +268,7 @@ async fn observer_disconnect(after_admission: bool) {
     })
     .await
     .unwrap();
-    let mut resumed = Vec::new();
-    read_terminal_until(&mut output, &mut resumed, "Ready").await;
+    read_terminal_until(&mut output, &mut bytes, "Ready").await;
     assert_eq!(inputs.lock().await.len(), usize::from(after_admission));
     input.write_all(b"\x03").await.unwrap();
     let exited = timeout(Duration::from_secs(3), child.wait_with_output())
@@ -656,35 +657,49 @@ async fn chief_startup(mode: ChiefStartup) {
 }
 
 fn terminal_text(bytes: &[u8]) -> String {
-    let value = String::from_utf8_lossy(bytes);
-    let mut chars = value.chars();
-    let mut text = String::new();
-    while let Some(ch) = chars.next() {
-        if ch != '\x1b' {
-            text.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('[') => {
-                for code in chars.by_ref() {
-                    if ('@'..='~').contains(&code) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                let mut escape = false;
-                for code in chars.by_ref() {
-                    if code == '\x07' || (escape && code == '\\') {
-                        break;
-                    }
-                    escape = code == '\x1b';
-                }
-            }
-            _ => {}
-        }
-    }
-    text
+    // Match the existing PTY fixture's actual geometry. Cursor movement and
+    // clearing determine the visible text; concatenated repaint bytes do not.
+    let mut terminal = vt100::Parser::new(
+        std::num::NonZeroU16::new(32).unwrap(),
+        std::num::NonZeroU16::new(100).unwrap(),
+        0,
+    );
+    terminal.process(bytes);
+    terminal.screen().contents()
+}
+
+#[test]
+fn terminal_observations_apply_native_cursor_redraws_and_do_not_keep_overwritten_text() {
+    use crossterm::{
+        cursor::MoveTo,
+        queue,
+        style::Print,
+        terminal::{Clear, ClearType},
+    };
+    let mut frames = Vec::new();
+    queue!(frames, MoveTo(4, 31), Print("Connecting")).unwrap();
+    // A terminal diff reuses unchanged cells instead of printing the whole
+    // new label. These are native cursor/print commands, not stripped prose.
+    queue!(
+        frames,
+        MoveTo(1, 31),
+        Print("Disc"),
+        MoveTo(11, 31),
+        Print("ed"),
+        Clear(ClearType::UntilNewLine)
+    )
+    .unwrap();
+    assert!(terminal_text(&frames).contains("Disconnected"));
+    queue!(
+        frames,
+        MoveTo(0, 31),
+        Print("Ready"),
+        Clear(ClearType::UntilNewLine)
+    )
+    .unwrap();
+    let visible = terminal_text(&frames);
+    assert!(visible.contains("Ready"));
+    assert!(!visible.contains("Disconnected"));
 }
 
 #[tokio::test]
