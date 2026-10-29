@@ -8,10 +8,10 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { ToolResultEntry, UserEntry } from "@earendil-works/pi-durable";
+import { ToolResultEntry, UserEntry, type Harness } from "@earendil-works/pi-durable";
 import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
-import { BackgroundScheduler } from "../src/background.js";
-import { runScheduled } from "../src/scheduled.js";
+import { BackgroundScheduler, JobRunReceiptEntry } from "../src/background.js";
+import { runScheduled, scheduledTaskId } from "../src/scheduled.js";
 import type { ScheduledOccurrence } from "../src/generated/ScheduledOccurrence.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import { DAY, START, exampleJob, FakeClock, openBackground, planned, pump } from "./fixtures/background-runtime.js";
@@ -25,6 +25,18 @@ function gate() {
   let release = () => {};
   const promise = new Promise<void>((resolve) => { release = resolve; });
   return { promise, release };
+}
+async function savedReceipt(app: { session: Harness }, requestId?: string) {
+  const root = await app.session.root(BACKGROUND_CONTEXT);
+  if (requestId === undefined) {
+    const receipt = (await root.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.find(JobRunReceiptEntry.is);
+    assert.ok(receipt); return receipt.data;
+  }
+  return app.session.commit(async (tx) => {
+    const submission = await tx.submissionByRequest(root.id, "job-run:" + requestId);
+    assert.ok(submission?.type === "write" && submission.status === "done");
+    const entry = await tx.entry(JobRunReceiptEntry, submission.entry); assert.ok(entry); return entry.data;
+  }, BACKGROUND_CONTEXT);
 }
 
 test("manual admissions retain every requested run in the existing serial job lane without changing timers", async () => {
@@ -42,8 +54,8 @@ test("manual admissions retain every requested run in the existing serial job la
     const first = await app.scheduler.runJob(request("first"));
     await pump(() => runs.length === 1);
     const second = await app.scheduler.runJob(request("second")), third = await app.scheduler.runJob(request("third"));
-    assert.equal(new Set([first.task_id, second.task_id, third.task_id]).size, 3);
-    assert.deepEqual((await app.tasks.get(second.task_id)).scheduled_run, second);
+    assert.equal(new Set([first.task_id, second.task_id, third.task_id]).size, 1);
+    assert.deepEqual(await savedReceipt(app, "second"), second);
     assert.equal((await app.tasks.get(second.task_id)).worker.state, "unassigned", "A queued run returns a task before its worker starts");
     assert.deepEqual((await app.scheduler.getJob("example-review")).schedules, before.schedules);
     clock.advance(2 * DAY);
@@ -75,6 +87,8 @@ test("manual request replay precedes current catalog validation and conflicting 
     assert.equal(new Set(receipts.map((receipt) => receipt.task_id)).size, 1);
     await pump(async () => (await app.scheduler.status()).pending === 0);
     assert.equal(executions, 1);
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    assert.equal((await root.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.filter(JobRunReceiptEntry.is).length, 1);
     const updated = exampleJob("two", "A newly reviewed prompt.");
     const schedule = updated.schedules[0]; assert.ok(schedule);
     updated.schedules.push({ ...schedule, id: "research", prompt: "Research only." });
@@ -87,7 +101,50 @@ test("manual request replay precedes current catalog validation and conflicting 
     assert.deepEqual(await app.scheduler.runJob(request("replayed")), receipts[0]);
     assert.equal((await app.tasks.list()).length, 1); assert.equal(executions, 1);
     const only = (await app.tasks.list())[0]; assert.ok(only);
-    assert.equal(only.scheduled_run?.revision, "one"); assert.equal(only.outcome, original.prompt);
+    assert.equal((await savedReceipt(app, "replayed")).revision, "one"); assert.equal(only.outcome, original.prompt);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a concurrent admission remains replayable when the catalog is removed during preparation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-manual-concurrent-replay-"));
+  const app = await openBackground(directory, new FakeClock()), prepared = gate(), resume = gate();
+  const commit = app.session.commit.bind(app.session); let pause = true;
+  try {
+    await app.scheduler.syncJobs([exampleJob()]);
+    // Pause after the first native preparation commit has released its line.
+    app.session.commit = async (change, context) => {
+      const result = await commit(change, context);
+      if (pause) { pause = false; prepared.release(); await resume.promise; }
+      return result;
+    };
+    const waiting = app.scheduler.runJob(request("concurrent"));
+    await prepared.promise;
+    const admitted = await app.scheduler.runJob(request("concurrent"));
+    await app.scheduler.syncJobs([]);
+    resume.release();
+    assert.deepEqual(await waiting, admitted);
+    await pump(async () => (await app.receipts())?.jobs.length === 1 && (await app.scheduler.status()).pending === 0);
+    assert.equal((await app.tasks.list()).length, 1);
+    assert.deepEqual(await savedReceipt(app, "concurrent"), admitted);
+  } finally {
+    resume.release(); app.session.commit = commit;
+    await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy per-request task receipts still replay after catalog removal without selecting another actor", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-manual-legacy-"));
+  const app = await openBackground(directory, new FakeClock(), { jobActor: async () => { throw new Error("Legacy replay must not select an actor"); } });
+  try {
+    const job = exampleJob();
+    const receipt = { request_id: "old-request", task_id: scheduledTaskId("manual:old-request"), job_id: job.id,
+      schedule_id: "daily", revision: job.revision, admitted_at: START };
+    await app.tasks.create({ id: receipt.task_id, title: job.title, outcome: job.prompt, model: job.model,
+      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }], scheduled_run: receipt });
+    assert.deepEqual(await app.scheduler.runJob(request("old-request")), receipt);
+    await assert.rejects(app.scheduler.runJob({ ...request("old-request"), job_id: "different-job" }), /another selection/);
+    assert.deepEqual((await app.tasks.get(receipt.task_id)).scheduled_run, receipt);
+    assert.equal((await app.scheduler.status()).pending, 0); assert.equal((await app.tasks.list()).length, 1);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -105,7 +162,7 @@ test("manual failure retries preserve the original task, request and immutable w
     clock.advance(60_000);
     await pump(async () => attempts.length === 2 && (await app.scheduler.status()).pending === 0);
     assert.equal(attempts[0]?.id, attempts[1]?.id); assert.equal(attempts[1]?.job.revision, "one");
-    assert.equal((await app.tasks.list()).length, 1); assert.deepEqual((await app.tasks.get(receipt.task_id)).scheduled_run, receipt);
+    assert.equal((await app.tasks.list()).length, 1); assert.deepEqual(await savedReceipt(app, "retry"), receipt);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -128,7 +185,7 @@ test("manual admission survives SIGKILL and catalog removal before queued execut
   let app: Awaited<ReturnType<typeof openManual>> | undefined;
   try {
     const id = await killAdmission(directory, "api"); app = await openManual(directory);
-    const stored = (await app.tasks.get(id)).scheduled_run; assert.ok(stored);
+    const stored = await savedReceipt(app, "crash-request"); assert.equal(stored.task_id, id);
     await app.scheduler.syncJobs([]);
     assert.deepEqual(await app.scheduler.runJob(request("crash-request")), stored);
     const restored = app;
@@ -143,7 +200,7 @@ test("native run_job tool memo replays its original admission after SIGKILL with
   let app: Awaited<ReturnType<typeof openManual>> | undefined;
   try {
     const id = await killAdmission(directory, "tool"); app = await openManual(directory);
-    const original = (await app.tasks.get(id)).scheduled_run; assert.ok(original);
+    const original = await savedReceipt(app); assert.equal(original.task_id, id);
     await app.scheduler.syncJobs([]);
     app.faux.setResponses([fauxAssistantMessage("The existing run was admitted; its task owns progress.")]);
     const input = await app.root.submit({ type: "input", content: "Run the example review now.", requestId: "manual-tool-input" }, BACKGROUND_CONTEXT);
@@ -185,7 +242,7 @@ test("a manually admitted task executes its reviewed focus through the actual sc
   let worker: Promise<unknown> | undefined;
   const scheduler = new BackgroundScheduler(app.session, app.registry, app.tasks, {
     plan: async (cadence, after, now) => planned(cadence, after, now), refreshSources: async () => {}, collectResources: async () => {},
-    runJob: (occurrence, signal) => runScheduled(occurrence, signal, app),
+    runJob: (occurrence, signal, actorId) => runScheduled(occurrence, signal, app, actorId),
   });
   try {
     const job = exampleJob("reviewed", "MANUAL_REVIEWED_DOMAIN_POLICY"); job.cwd = "/workspace/manual-review";
@@ -201,7 +258,7 @@ test("a manually admitted task executes its reviewed focus through the actual sc
       return fauxAssistantMessage(fauxToolCall("exec", { program: "example", args: [], timeout_seconds: 1 }), { stopReason: "toolUse" });
     }, fauxAssistantMessage("The requested manual review completed.")]);
     const receipt = await scheduler.runJob(request("real-worker"));
-    assert.deepEqual((await app.tasks.get(receipt.task_id)).scheduled_run, receipt);
+    assert.deepEqual(await savedReceipt(app, "real-worker"), receipt);
     await pump(async () => {
       assert.deepEqual((await scheduler.status()).errors, [], "Manual admission must reach its ordinary task handoff");
       return (await app.tasks.get(receipt.task_id)).worker.state === "bound";

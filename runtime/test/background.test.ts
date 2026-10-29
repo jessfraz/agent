@@ -58,6 +58,64 @@ test("sources, resource collection and jobs share Pi deadlines and coalesce miss
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("timer and manual runs reuse one owned job actor across reopen while equal titles stay separate", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-background-actor-")), clock = new FakeClock();
+  const job = exampleJob(), other = { ...exampleJob(), id: "other-review" };
+  const actorId = "99999999-9999-4999-8999-999999999999";
+  const runs: { job: string; actor: string }[] = []; let lookups = 0;
+  const runJob = async (occurrence: ScheduledOccurrence, _signal: AbortSignal, actor: string) => { runs.push({ job: occurrence.job.id, actor }); };
+  let app = await openBackground(directory, clock, { runJob, jobActor: async (candidate) => {
+    lookups += 1; return candidate.id === job.id ? actorId : undefined;
+  } });
+  try {
+    const owned = await app.tasks.create({ id: actorId, title: job.title, outcome: job.prompt, model: job.model,
+      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }] });
+    await app.scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: [job, other] });
+    await pump(async () => (await app.scheduler.getJob(job.id)).schedules[0]?.next_at === START + DAY);
+    const first = await app.scheduler.runJob({ type: "run_job", job_id: job.id, schedule_id: null, request_id: "first" });
+    const separate = await app.scheduler.runJob({ type: "run_job", job_id: other.id, schedule_id: null, request_id: "other" });
+    await pump(async () => runs.length === 2 && (await app.scheduler.status()).pending === 0);
+    assert.equal(first.task_id, actorId); assert.notEqual(separate.task_id, actorId);
+    clock.advance(DAY); await pump(async () => runs.length === 4 && (await app.scheduler.status()).pending === 0);
+    assert.ok(runs.filter((run) => run.job === job.id).every((run) => run.actor === actorId));
+    assert.ok(runs.filter((run) => run.job === other.id).every((run) => run.actor === separate.task_id));
+    assert.equal(lookups, 2);
+    await app.session.close(BACKGROUND_CONTEXT);
+    app = await openBackground(directory, clock, { runJob, jobActor: async () => { throw new Error("A bound job must not select another actor"); } });
+    await app.scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: null });
+    const later = await app.scheduler.runJob({ type: "run_job", job_id: job.id, schedule_id: null, request_id: "later" });
+    await pump(async () => runs.length === 5 && (await app.scheduler.status()).pending === 0);
+    assert.equal(later.task_id, actorId); assert.equal((await app.tasks.get(actorId)).conversation_id, owned.conversation_id);
+    assert.equal((await app.tasks.list()).length, 2);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("an occurrence's native actor memo and immutable snapshot survive a failed attempt and reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-background-actor-retry-")), clock = new FakeClock();
+  const attempts: { occurrence: ScheduledOccurrence; actor: string }[] = [];
+  let app = await openBackground(directory, clock, { runJob: async (occurrence, _signal, actor) => {
+    attempts.push({ occurrence, actor }); throw new Error("An admitted effect needs reconciliation");
+  } });
+  try {
+    await app.scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: [exampleJob()] });
+    await pump(async () => (await app.scheduler.getJob("example-review")).schedules[0]?.next_at === START + DAY);
+    clock.advance(DAY);
+    await pump(async () => (await app.scheduler.status()).errors.some((error) => error.message === "An admitted effect needs reconciliation"));
+    const original = attempts[0]; assert.ok(original);
+    const work = (await app.session.commit((tx) => tx.scanTasks({ kind: "agent.background" }, 100), BACKGROUND_CONTEXT)).items
+      .find((task) => task.memos?.job_actor_task_id === original.actor); assert.ok(work);
+    await app.scheduler.syncJobs([exampleJob("two", "Use the later reviewed instructions.")]);
+    await app.session.close(BACKGROUND_CONTEXT);
+    app = await openBackground(directory, clock, { jobActor: async () => { throw new Error("The native memo already owns actor selection"); },
+      runJob: async (occurrence, _signal, actor) => { attempts.push({ occurrence, actor }); } });
+    const restored = await app.session.commit((tx) => tx.task(work.id), BACKGROUND_CONTEXT);
+    assert.equal(restored?.memos?.job_actor_task_id, original.actor);
+    await app.scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: null });
+    clock.advance(60_000); await pump(async () => attempts.length === 2 && (await app.scheduler.status()).pending === 0);
+    assert.deepEqual(attempts[1], original); assert.equal((await app.tasks.list()).length, 1);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("job-only synchronization diffs definitions without altering built-in source deadlines", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-background-"));
   const clock = new FakeClock(); const app = await openBackground(directory, clock);

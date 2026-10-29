@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { defineDoc, defineTask, ROOT_CONVERSATION_ID, type Harness, type Registry,
+import { defineDoc, defineEntry, defineTask, ROOT_CONVERSATION_ID, type Harness, type Registry,
   type NextTaskState, type Task, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
 import type { BackgroundCadence } from "./generated/BackgroundCadence.js";
 import type { BackgroundCheckpoint } from "./generated/BackgroundCheckpoint.js";
@@ -24,17 +24,21 @@ type Trigger = { key: BackgroundTriggerKey; generation: number; revision: string
   task: NativeTaskId<null> | null; cursor: number | null; last: number | null; next: number | null; enabled: boolean;
   error: string | null; error_scope: "plan" | "work" | null };
 type QueuedWork = { key: BackgroundTriggerKey; work: BackgroundWork };
-type Lane = { id: string; active: NativeTaskId<null> | null; pending: QueuedWork[] };
+type JobPreparation = { type: "replay"; receipt: JobRunReceipt } | { type: "admit"; job: ScheduledJob };
+type Lane = { id: string; active: NativeTaskId<null> | null; pending: QueuedWork[]; actor_task_id: string | null };
 type State = { triggers: Trigger[]; lanes: Lane[]; jobs: ScheduledJob[] };
 const State = defineDoc<State>({ kind: "agent.background", scope: "session", version: 1,
   initial: () => ({ triggers: [], lanes: [], jobs: [] }), checkpointWhen: () => true });
 type NativeTask = Task<BackgroundTaskInput, BackgroundCheckpoint, null, object>;
+/** Native indexed admission evidence; omitted from model context. */
+export const JobRunReceiptEntry = defineEntry<JobRunReceipt>("agent.job_run");
 
 export type BackgroundCallbacks = {
   plan(cadence: BackgroundCadence, after: number | null, now: number, signal: AbortSignal): Promise<OccurrencePlan>;
   refreshSources(signal: AbortSignal): Promise<void>;
   collectResources(signal: AbortSignal): Promise<void>;
-  runJob(occurrence: ScheduledOccurrence, signal: AbortSignal): Promise<void>;
+  jobActor?(job: ScheduledJob): Promise<string | undefined>;
+  runJob(occurrence: ScheduledOccurrence, signal: AbortSignal, actorId: string): Promise<void>;
 };
 
 function key(value: BackgroundTriggerKey): string {
@@ -58,11 +62,20 @@ function revision(job: ScheduledJob, schedule: JobSchedule): string {
     job.model.provider, job.model.model_id, job.model.reasoning, job.model.fast, job.timezone, job.cwd,
     schedule.id, schedule.recurrence, schedule.focus, schedule.prompt])).digest("hex");
 }
+function selectedSchedule(job: ScheduledJob, request: Extract<RuntimeCommand, { type: "run_job" }>): JobSchedule {
+  const schedule = request.schedule_id === null
+    ? job.schedules.length === 1 ? job.schedules[0] : undefined
+    : job.schedules.find((schedule) => schedule.id === request.schedule_id);
+  if (schedule === undefined) throw new TaskError(request.schedule_id === null
+    ? `Choose a schedule for ${job.id}: ${job.schedules.map((schedule) => schedule.id).join(", ")}`
+    : `Unknown schedule for ${job.id}; choose ${job.schedules.map((schedule) => schedule.id).join(", ")}`);
+  return schedule;
+}
 
 /** Sources and jobs share this single native Pi state machine and its durable timer. */
 export class BackgroundScheduler {
   private readonly task: NativeTask;
-  constructor(private readonly session: Harness, registry: Registry, private readonly tasks: TaskStore, callbacks: BackgroundCallbacks) {
+  constructor(private readonly session: Harness, registry: Registry, private readonly tasks: TaskStore, private readonly callbacks: BackgroundCallbacks) {
     this.task = defineTask<BackgroundTaskInput, BackgroundCheckpoint, null>({
       name: "agent.background", version: 1,
       initial: (input) => input.type === "trigger" ? { phase: "tick", cursor: null } : { phase: "execute", attempt: 0 },
@@ -114,7 +127,22 @@ export class BackgroundScheduler {
               case "sources": await callbacks.refreshSources(runtime.signal); break;
               case "resources": await callbacks.collectResources(runtime.signal); break;
               case "job":
-              case "manual_job": await callbacks.runJob(input.work.occurrence, runtime.signal); break;
+              case "manual_job": {
+                const occurrence = input.work.occurrence;
+                let actorId = await runtime.memo<string>("job_actor_task_id", context);
+                if (actorId === undefined) {
+                  // Work admitted before actor reuse still owns its original task.
+                  const legacy = await this.session.commit(async (tx) =>
+                    (await this.tasks.findIn(tx, scheduledTaskId(occurrence.id)))?.id, context);
+                  const candidate = legacy ?? await this.actorCandidate(occurrence.job);
+                  const created = await this.session.commit(async (tx) =>
+                    this.actorIn(tx, await tx.doc(State), occurrence.job, candidate, legacy !== undefined), context);
+                  if (created.native !== undefined) this.tasks.rememberConversation(created.native);
+                  actorId = await runtime.memo("job_actor_task_id", created.id, context);
+                }
+                await callbacks.runJob(occurrence, runtime.signal, actorId);
+                break;
+              }
             }
           } catch (error) {
             if (runtime.signal.aborted) throw error;
@@ -151,16 +179,54 @@ export class BackgroundScheduler {
     });
   }
   private async enqueueIn(tx: Tx, state: State, work: QueuedWork): Promise<void> {
-    const identity = laneId(work.key);
-    if (!state.lanes.some((item) => item.id === identity)) state.lanes.push({ id: identity, active: null, pending: [] });
-    // Reacquire the committed document's draft after insertion. Mutating the
-    // plain object passed to push would bypass Chord's tracked update.
-    const lane = state.lanes.find((item) => item.id === identity);
-    if (lane === undefined) throw new Error("Background admission lost its serial lane");
+    const lane = this.laneIn(state, laneId(work.key));
     if (lane.active === null) { lane.active = await this.createWorkIn(tx, work); return; }
     if (work.work.type === "manual_job") { lane.pending.push(work); return; }
     const previous = lane.pending.findIndex((item) => item.work.type !== "manual_job" && same(item.key, work.key));
     if (previous < 0) lane.pending.push(work); else lane.pending[previous] = work;
+  }
+  private laneIn(state: State, identity: string): Lane {
+    if (!state.lanes.some((item) => item.id === identity)) state.lanes.push({ id: identity, active: null, pending: [], actor_task_id: null });
+    // Reacquire the committed document's draft after insertion. Mutating the
+    // plain object passed to push would bypass Chord's tracked update.
+    const lane = state.lanes.find((item) => item.id === identity);
+    if (lane === undefined) throw new Error("Background admission lost its serial lane");
+    lane.actor_task_id ??= null;
+    return lane;
+  }
+  private async actorCandidate(job: ScheduledJob): Promise<string> {
+    const lane = (await this.session.snapshot(State, BACKGROUND_CONTEXT))?.lanes.find((item) => item.id === JSON.stringify(["job", job.id]));
+    return lane?.actor_task_id ?? await this.callbacks.jobActor?.(job) ?? scheduledTaskId("job:" + job.id);
+  }
+  private async actorIn(tx: Tx, state: State, job: ScheduledJob, candidate: string, legacy = false) {
+    const lane = this.laneIn(state, JSON.stringify(["job", job.id]));
+    const id = legacy ? candidate : lane.actor_task_id ?? candidate;
+    const previous = await this.tasks.findIn(tx, id);
+    if (previous !== undefined && !previous.sources.some((source) => source.provider === "scheduled_jobs" &&
+        source.account === "local" && source.thread_id === job.id)) throw new TaskError("This task is not owned by the scheduled job");
+    if (previous === undefined && id !== scheduledTaskId("job:" + job.id)) throw new TaskError("The scheduled job's owned actor is unavailable; reconcile its existing task");
+    const created = await this.tasks.createIn(tx, { id, title: job.title, outcome: job.prompt, model: job.model,
+      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }] });
+    lane.actor_task_id ??= created.id;
+    return created;
+  }
+  private async receiptIn(tx: Tx, request: Extract<RuntimeCommand, { type: "run_job" }>): Promise<JobRunReceipt | undefined> {
+    const saved = await tx.submissionByRequest(ROOT_CONVERSATION_ID, "job-run:" + request.request_id);
+    let receipt: JobRunReceipt | undefined;
+    if (saved !== undefined) {
+      if (saved.type !== "write" || saved.status !== "done") throw new TaskError("The original job run admission needs reconciliation");
+      receipt = (await tx.entry(JobRunReceiptEntry, saved.entry))?.data;
+      if (receipt === undefined) throw new TaskError("The original job run receipt is unavailable");
+    } else {
+      const previous = await this.tasks.findIn(tx, scheduledTaskId("manual:" + request.request_id));
+      if (previous === undefined) return undefined;
+      receipt = previous.scheduled_run;
+    }
+    if (receipt === undefined || receipt.request_id !== request.request_id || receipt.job_id !== request.job_id ||
+        (request.schedule_id !== null && receipt.schedule_id !== request.schedule_id)) {
+      throw new TaskError("This job run request identity already belongs to another selection");
+    }
+    return { ...receipt };
   }
   async start(settings: BackgroundSettings): Promise<BackgroundStatus> {
     await this.session.root(BACKGROUND_CONTEXT);
@@ -171,31 +237,32 @@ export class BackgroundScheduler {
   }
   async runJob(request: Extract<RuntimeCommand, { type: "run_job" }>): Promise<JobRunReceipt> {
     if (request.request_id.trim().length === 0 || request.request_id.length > 128) throw new TaskError("A job run needs a stable request identity");
-    const occurrenceId = "manual:" + request.request_id, id = scheduledTaskId(occurrenceId);
+    const occurrenceId = "manual:" + request.request_id;
     await this.session.root(BACKGROUND_CONTEXT);
+    const prepared = await this.session.commit(async (tx): Promise<JobPreparation> => {
+      const receipt = await this.receiptIn(tx, request);
+      if (receipt !== undefined) return { type: "replay", receipt };
+      const job = (await tx.doc(State)).jobs.find((job) => job.id === request.job_id);
+      if (job === undefined) throw new TaskError("Unknown scheduled job; list jobs to choose its readable ID");
+      selectedSchedule(job, request);
+      return { type: "admit", job: { ...job, model: { ...job.model }, schedules: job.schedules.map((schedule) => ({ ...schedule })) } };
+    }, BACKGROUND_CONTEXT);
+    if (prepared.type === "replay") { this.session.resume(); return prepared.receipt; }
+    const candidate = await this.actorCandidate(prepared.job);
     const result = await this.session.commit(async (tx) => {
       // Replay must work after the source file was edited or removed.
-      const previous = await this.tasks.findIn(tx, id);
-      if (previous !== undefined) {
-        const receipt = previous.scheduled_run;
-        if (receipt === undefined || receipt === null || receipt.request_id !== request.request_id || receipt.job_id !== request.job_id ||
-            (request.schedule_id !== null && receipt.schedule_id !== request.schedule_id)) {
-          throw new TaskError("This job run request identity already belongs to another selection");
-        }
-        return { receipt: { ...receipt }, native: undefined };
-      }
+      const previous = await this.receiptIn(tx, request);
+      if (previous !== undefined) return { receipt: previous, native: undefined };
       const state = await tx.doc(State), job = state.jobs.find((job) => job.id === request.job_id);
       if (job === undefined) throw new TaskError("Unknown scheduled job; list jobs to choose its readable ID");
-      const schedule = request.schedule_id === null
-        ? job.schedules.length === 1 ? job.schedules[0] : undefined
-        : job.schedules.find((schedule) => schedule.id === request.schedule_id);
-      if (schedule === undefined) throw new TaskError(request.schedule_id === null
-        ? `Choose a schedule for ${job.id}: ${job.schedules.map((schedule) => schedule.id).join(", ")}`
-        : `Unknown schedule for ${job.id}; choose ${job.schedules.map((schedule) => schedule.id).join(", ")}`);
-      const receipt: JobRunReceipt = { request_id: request.request_id, task_id: id, job_id: job.id,
+      const schedule = selectedSchedule(job, request);
+      const created = await this.actorIn(tx, state, job, candidate);
+      const receipt: JobRunReceipt = { request_id: request.request_id, task_id: created.id, job_id: job.id,
         schedule_id: schedule.id, revision: job.revision, admitted_at: Date.now() };
-      const created = await this.tasks.createIn(tx, { id, title: job.title, outcome: job.prompt, model: job.model,
-        sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }], scheduled_run: receipt });
+      // This passive metadata write and queue admission share the native commit.
+      const entry = await tx.appendEntry(JobRunReceiptEntry, ROOT_CONVERSATION_ID, { data: receipt });
+      await tx.createSubmission({ type: "write", status: "done", conversationId: ROOT_CONVERSATION_ID,
+        requestId: "job-run:" + request.request_id, entry: entry.id });
       await this.enqueueIn(tx, state, { key: { type: "job", job_id: job.id, schedule_id: schedule.id },
         work: { type: "manual_job", occurrence: { id: occurrenceId, job, schedule_id: schedule.id, scheduled_at: receipt.admitted_at } } });
       return { receipt, native: created.native };

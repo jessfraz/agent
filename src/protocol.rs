@@ -668,6 +668,10 @@ pub struct TaskInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub attachments: Option<Vec<crate::attachments::AttachmentRef>>,
+    // The admitted file snapshot belongs to this turn, even in a reused chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub scheduled: Option<crate::background::ScheduledOccurrence>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]

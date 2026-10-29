@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import type { Harness } from "@earendil-works/pi-durable";
 import type { ScheduledOccurrence } from "./generated/ScheduledOccurrence.js";
+import type { ScheduledJob } from "./generated/ScheduledJob.js";
 import { CoordinatorEnvironment } from "./environment.js";
 import { SourceJournal } from "./sources.js";
 import { TaskError, TaskStore, type HostCall } from "./tasks.js";
@@ -24,6 +25,24 @@ export function occurrencePrompt(occurrence: ScheduledOccurrence): string {
   ].join("\n\n");
 }
 
+/** Adopt only a job-owned chat; a mutable, nonunique title is not ownership. */
+export async function openJobActor(job: ScheduledJob, tasks: TaskStore, call: HostCall): Promise<string | undefined> {
+  const candidates = (await tasks.list()).filter((task) => task.sources.some((source) =>
+    source.provider === "scheduled_jobs" && source.account === "local" && source.thread_id === job.id))
+    .sort((left, right) => right.updated_at - left.updated_at || left.id.localeCompare(right.id));
+  for (const task of candidates) {
+    if (!("binding" in task.worker)) {
+      if (task.worker.state !== "unassigned" || task.pending.length > 0) return task.id;
+      continue;
+    }
+    const result = await call({ type: "on_node", host_id: task.worker.binding.host_id,
+      command: { type: "inspect_worker", binding: task.worker.binding } });
+    if (result.type !== "worker_presence") throw new TaskError("The scheduled job's existing Rex session could not be inspected; no duplicate was opened");
+    if (result.presence.state !== "missing_session") return task.id;
+  }
+  return undefined;
+}
+
 async function requireReconciledTask(session: Harness, tasks: TaskStore, id: string): Promise<void> {
   if (!await session.commit((tx) => tasks.canReleaseIn(tx, id), BACKGROUND_CONTEXT)) {
     throw new TaskError("The scheduled turn stopped without an answer; reconcile and resolve its existing task before this occurrence can settle");
@@ -32,9 +51,9 @@ async function requireReconciledTask(session: Harness, tasks: TaskStore, id: str
 
 /** Dispatch through the existing task lifecycle, then await its exact Pi input. */
 export async function runScheduled(occurrence: ScheduledOccurrence, signal: AbortSignal,
-  services: { session: Harness; tasks: TaskStore; sources: SourceJournal; environment: CoordinatorEnvironment; executions: Executions; call: HostCall }): Promise<void> {
+  services: { session: Harness; tasks: TaskStore; sources: SourceJournal; environment: CoordinatorEnvironment; executions: Executions; call: HostCall },
+  id = scheduledTaskId(occurrence.id)): Promise<void> {
   const { session, tasks, sources, environment, executions, call } = services;
-  const id = scheduledTaskId(occurrence.id);
   const task = await tasks.create({ id, title: occurrence.job.title,
     outcome: occurrence.job.prompt, model: occurrence.job.model,
     sources: [{ provider: "scheduled_jobs", account: "local", thread_id: occurrence.job.id }] });
@@ -47,12 +66,13 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
     let submission = await session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
     if (submission?.status === "done") return;
     if (submission?.status === "unanswered") { await requireReconciledTask(session, tasks, id); return; }
+    const previousOutcome = (await sources.events({ provider: "task_outcomes", thread_id: id, limit: 1 }))[0]?.key;
     // A restored native input can progress only after its real worker binds.
     // Allocation confirmation and the worker's run_task connection are separate.
     executions.expect(conversation.id.toString());
     if (submission === undefined) {
       if (!task.pending.some((input) => input.id === occurrence.id)) {
-        await tasks.enqueue(id, occurrencePrompt(occurrence), occurrence.id);
+        await tasks.enqueueScheduled(id, occurrencePrompt(occurrence), occurrence);
       }
     }
     if (!tasks.isRunning(id)) {
@@ -76,8 +96,8 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
         return;
       }
       const outcomes = await sources.events({ provider: "task_outcomes", thread_id: id, limit: 1 });
-      const failure = outcomes[0]?.outcome;
-      if (failure?.state.state === "failed") throw new TaskError(failure.state.reason);
+      const latest = outcomes[0], failure = latest?.outcome;
+      if (latest?.key !== previousOutcome && failure?.state.state === "failed") throw new TaskError(failure.state.reason);
       await new Promise<void>((resolve) => { wake = resolve; if (revision !== observed || signal.aborted) resolve(); });
       wake = undefined;
     }

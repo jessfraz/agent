@@ -37,6 +37,8 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Scheduled jobs through the existing coordinator background process and
   task follow-through path. Reuse durable timers; persist occurrence identities
   so restarts and retries cannot run a job twice.
+- [x] Reuse each scheduled job's Rex chat and Pi conversation across timer and
+  manual runs, preserving each admitted run's prompt, model and identity.
 
 ## Retrieval, learning and proof
 

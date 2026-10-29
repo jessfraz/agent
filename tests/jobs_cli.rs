@@ -376,7 +376,6 @@ fn manual_job_runs_admit_durably_without_moving_timers_and_reject_invalid_select
     let tasks = fixture.tasks();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].id, first.task_id);
-    assert_eq!(tasks[0].scheduled_run.as_ref(), Some(&first));
     assert_eq!(tasks[0].model, Some(before.job.model.clone()));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -413,12 +412,14 @@ fn manual_job_runs_admit_durably_without_moving_timers_and_reject_invalid_select
     let third = fixture.run(&["chat", "/run-job Daily_Review.v2 --schedule Morning.v1"]);
     assert_eq!(second.schedule_id.as_str(), "Evening.v1");
     assert_eq!(third.schedule_id.as_str(), "Morning.v1");
-    assert_ne!(first.task_id, second.task_id);
-    assert_ne!(second.task_id, third.task_id);
+    assert_eq!(first.task_id, second.task_id);
+    assert_ne!(first.request_id, second.request_id);
+    assert_eq!(second.task_id, third.task_id);
+    assert_ne!(second.request_id, third.request_id);
     assert_eq!(
         fixture.tasks().len(),
-        3,
-        "Explicit runs remain separate queued requests"
+        1,
+        "Distinct run requests share the job conversation"
     );
     let current = fixture.get();
     let schedule_state = |job: &ScheduledJobStatus| {
@@ -460,21 +461,21 @@ fn manual_job_runs_admit_durably_without_moving_timers_and_reject_invalid_select
                 .any(|event| matches!(event, RuntimeEventKind::Failure { .. })),
             "A conflicting or empty request identity must fail before admission"
         );
-        assert_eq!(fixture.tasks().len(), 3);
+        assert_eq!(fixture.tasks().len(), 1);
     }
     server.stop();
     server = fixture.start();
     assert_eq!(admitted_run(fixture.rpc(replay(&first, None))), first);
     assert_eq!(
         fixture.tasks().len(),
-        3,
-        "Restart must not duplicate a manually admitted task"
+        1,
+        "Restart must retain the shared job task"
     );
     let read = fixture.events(&["tasks", "read", &first.task_id.to_string()]);
     assert!(
         read.iter()
             .any(|event| matches!(event, RuntimeEventKind::Task { task, .. }
-        if task.id == first.task_id && task.scheduled_run.as_ref() == Some(&first)))
+        if task.id == first.task_id))
     );
 
     fs::remove_file(&file).unwrap();
@@ -485,7 +486,7 @@ fn manual_job_runs_admit_durably_without_moving_timers_and_reject_invalid_select
         "The task receipt survives removal of its source job"
     );
     assert!(!fixture.cli(&["jobs", "run", JOB_ID]).status.success());
-    assert_eq!(fixture.tasks().len(), 3);
+    assert_eq!(fixture.tasks().len(), 1);
     assert!(!fixture.directory.path().join("external-calls").exists());
     server.stop();
 }
@@ -534,7 +535,7 @@ fn native_job_input_replay_reaches_one_durable_admission_after_restart() {
     assert_eq!(admitted_run(fixture.rpc(produce(control))), first);
     let tasks = fixture.tasks();
     assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].scheduled_run.as_ref(), Some(&first));
+    assert_eq!(tasks[0].id, first.task_id);
     assert!(!fixture.directory.path().join("external-calls").exists());
     server.stop();
 }

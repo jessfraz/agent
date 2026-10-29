@@ -42,6 +42,9 @@ owns the hosts, sessions and terminals. Reuse them.
 
 Every chat uses the coordinator. Each task gets one named Rex session on its
 execution machine; its subagents get named terminals inside that session.
+Scheduled jobs reuse their job's chat and Pi conversation across runs. Each run
+keeps its own admission identity and captured file settings. Closing a Rex
+session allows it to be reopened without losing the conversation.
 The coordinator and workers can run macOS or Linux; these hosts are one example.
 Results return to the main chat, so visiting task sessions is optional. Worker
 connections share metadata, not duplicate executions. Offline workers retain

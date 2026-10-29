@@ -34,7 +34,7 @@ import { conversationSettings } from "./settings.js";
 import { watchInputPlacements } from "./input_delivery.js";
 import { reconcileMainInput, watchMainNotices } from "./main_observation.js";
 import { BackgroundScheduler } from "./background.js";
-import { runScheduled } from "./scheduled.js";
+import { openJobActor, runScheduled } from "./scheduled.js";
 import type { SourcePollCursor } from "./generated/SourcePollCursor.js";
 
 const VERSION = 1;
@@ -154,7 +154,8 @@ async function openApplication(): Promise<Application> {
         await resources.collect(host.host_id, backgroundCall);
       }
     },
-    async runJob(occurrence, signal) { await runScheduled(occurrence, signal, { session: harness, tasks, sources, environment, executions, call: backgroundCall }); },
+    jobActor: (job) => openJobActor(job, tasks, backgroundCall),
+    async runJob(occurrence, signal, actor) { await runScheduled(occurrence, signal, { session: harness, tasks, sources, environment, executions, call: backgroundCall }, actor); },
   });
   const jobTools = createJobTools(background, executions); registry.install(jobTools);
   const toolsets = createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools });
@@ -483,8 +484,16 @@ async function handle(request: RuntimeRequest): Promise<void> {
         let stop: (() => Promise<void>) | undefined;
         try {
         const worker = workers.get(id);
+        const configured = async (conversation: Conversation, title: string) => {
+          if (interrupted.has(id)) await interrupt(id);
+          emit(id, { type: "task_ready", conversation_id: conversation.id.toString(), title });
+          const model = executions.model(conversation.id.toString());
+          if (model === undefined) throw new TaskError("The worker execution model is unavailable");
+          emit(id, { type: "conversation_settings", settings: { conversation_id: conversation.id.toString(),
+            task_id: command.task_id, agent_id: command.agent_id ?? null, model, catalog: [] } });
+        };
         const answer = await tasks.run(command, (conversation, host, model) => executions.bind(conversation.id.toString(), {
-          model, cwd: command.cwd, hosts: [host], role: "worker", search: searchFor(application, id), call: (operation) => hostRequests.call(id, operation),
+          model, cwd: host.cwd, hosts: [host], role: "worker", search: searchFor(application, id), call: (operation) => hostRequests.call(id, operation),
         }), (task, text) => emit(id, { type: "notice", task_id: task.id, text: `${task.title}: ${text}` }),
         command.agent_id === undefined ? toolsets.worker : toolsets.agent, (operation) => hostRequests.call(id, operation), (selected) => inference.preflight(selected),
         worker === undefined ? undefined : {
@@ -501,16 +510,12 @@ async function handle(request: RuntimeRequest): Promise<void> {
           },
           async ready(conversation, title) {
             activeConversations.set(id, conversation);
-            if (interrupted.has(id)) await interrupt(id);
-            emit(id, { type: "task_ready", conversation_id: conversation.id.toString(), title });
-            const model = executions.model(conversation.id.toString());
-            if (model === undefined) throw new TaskError("The worker execution model is unavailable");
-            emit(id, { type: "conversation_settings", settings: { conversation_id: conversation.id.toString(),
-              task_id: command.task_id, agent_id: command.agent_id ?? null, model, catalog: [] } });
+            await configured(conversation, title);
             for (const frame of await history(conversation, null)) emit(id, frame);
             stop = await activity(tasks.session, conversation, (activity) => emit(id, { type: "activity", activity }),
               (message) => emit(id, { type: "message", message }));
           },
+          configured,
           answer(conversation_id, text, entry_id) { emit(id, { type: "answer", conversation_id, text, ...(entry_id === undefined ? {} : { entry_id }) }); },
           idle() { emit(id, { type: "worker_idle" }); },
           rejected(input_id, message) { emit(id, { type: "input_rejected", input_id, message }); },

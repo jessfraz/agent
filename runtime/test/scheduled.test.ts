@@ -11,7 +11,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
 import { UserEntry } from "@earendil-works/pi-durable";
 import { BackgroundScheduler } from "../src/background.js";
-import { runScheduled } from "../src/scheduled.js";
+import { openJobActor, runScheduled } from "../src/scheduled.js";
 import type { ScheduledOccurrence } from "../src/generated/ScheduledOccurrence.js";
 import type { HostCall } from "../src/tasks.js";
 import { DAY, FakeClock, exampleJob, planned, pump } from "./fixtures/background-runtime.js";
@@ -60,7 +60,7 @@ test("same-task reconciliation releases an unanswered scheduled occurrence after
     return new BackgroundScheduler(current.session, current.registry, current.tasks, {
       plan: async (cadence, after, now) => planned(cadence, after, now),
       refreshSources: async () => {}, collectResources: async () => {},
-      runJob: async (occurrence, signal) => { first ??= occurrence; await runScheduled(occurrence, signal, current); },
+      runJob: async (occurrence, signal, actor) => { first ??= occurrence; await runScheduled(occurrence, signal, current, actor); },
     });
   };
   const hostCall: HostCall = async (command) => {
@@ -98,7 +98,7 @@ test("same-task reconciliation releases an unanswered scheduled occurrence after
     const original = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
     assert.ok(original); assert.equal(original.status, "unanswered");
     await pump(async () => (await scheduler.status()).errors.some((error) => /scheduled turn/.test(error.message)));
-    await assert.rejects(runScheduled(occurrence, controller.signal, app), /scheduled turn/);
+    await assert.rejects(runScheduled(occurrence, controller.signal, app, task.id), /scheduled turn/);
     clock.advance(DAY);
     await pump(async () => (await scheduler.status()).pending === 2);
     assert.equal((await app.tasks.list()).length, 1, "The unanswered occurrence retains its serial job lane");
@@ -120,12 +120,12 @@ test("same-task reconciliation releases an unanswered scheduled occurrence after
     worker = app.worker(task.id, controller, hostCall); await resolving;
     assert.equal((await app.tasks.get(task.id)).state.state, "resolved");
     assert.equal(app.tasks.isRunning(task.id), true);
-    await assert.rejects(runScheduled(occurrence, controller.signal, app), /scheduled turn/);
+    await assert.rejects(runScheduled(occurrence, controller.signal, app, task.id), /scheduled turn/);
     release(); await worker;
     const owningHost = await app.tasks.workerHost(task.id);
     await assert.rejects(app.tasks.dispatch(task.id, owningHost, async () => ({ type: "creation_uncertain", session_id: "session:22222222-2222-4222-8222-222222222222" })), /needs reconciliation/);
     assert.equal((await app.tasks.get(task.id)).worker.state, "resume_uncertain");
-    await assert.rejects(runScheduled(occurrence, controller.signal, app), /scheduled turn/);
+    await assert.rejects(runScheduled(occurrence, controller.signal, app, task.id), /scheduled turn/);
     await app.tasks.dispatch(task.id, owningHost, async (command) => {
       assert.equal(command.type, "on_node");
       if (command.type !== "on_node") throw new Error("Reconcile the existing worker allocation");
@@ -134,21 +134,20 @@ test("same-task reconciliation releases an unanswered scheduled occurrence after
     });
     await app.session.close(BACKGROUND_CONTEXT); app = await openScheduled(directory, "restored", clock); scheduler = background();
     await scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: [exampleJob()] });
-    await runScheduled(occurrence, controller.signal, app);
+    await runScheduled(occurrence, controller.signal, app, task.id);
     clock.advance(3_600_000);
-    await pump(async () => (await app.tasks.list()).some((current) => current.id !== task.id && current.worker.state === "bound"));
-    const next = (await app.tasks.list()).find((current) => current.id !== task.id); assert.ok(next);
+    await pump(async () => (await app.tasks.get(task.id)).pending.length > 0);
     app.faux.setResponses([fauxAssistantMessage("The next queued review completed.")]);
-    worker = app.worker(next.id, controller, hostCall); await worker;
+    worker = app.worker(task.id, controller, hostCall); await worker;
     await pump(async () => (await scheduler.status()).pending === 0);
     assert.deepEqual((await scheduler.status()).errors, []);
     assert.equal(await readFile(effectPath, "utf8"), "performed once\n");
-    assert.equal((await app.tasks.list()).length, 2);
+    assert.equal((await app.tasks.list()).length, 1);
     const restored = await app.tasks.conversation((await app.tasks.get(task.id)).conversation_id);
     const retained = await app.session.commit((tx) => tx.submissionByRequest(restored.id, occurrence.id), BACKGROUND_CONTEXT);
     assert.equal(retained?.id, original.id); assert.equal(retained?.status, "unanswered");
     const page = await restored.entries({}, 100, undefined, BACKGROUND_CONTEXT);
-    assert.equal(page.items.filter((entry) => UserEntry.is(entry)).length, 2, "Only the original input and explicit reconciliation follow-up exist");
+    assert.equal(page.items.filter((entry) => UserEntry.is(entry)).length, 3, "The next occurrence joins the retained original input and explicit reconciliation follow-up");
     assert.equal(app.commands.filter((command) => command.type === "exec" && command.program === "perform-effect").length, 0);
   } finally {
     release(); controller.abort(); await worker?.catch(() => {});
@@ -202,4 +201,27 @@ test("SIGKILL after scheduled input placement restores its actor without duplica
     child.kill("SIGKILL"); controller.abort(); await Promise.allSettled([worker, scheduled]);
     await app?.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("job migration adopts only an owned open Rex chat and retains unknown presence", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-scheduled-adopt-")), app = await openScheduled(directory);
+  try {
+    const job = exampleJob();
+    const host = await app.environment.defaultHost(await app.environment.hosts(job.cwd, null, [])); assert.ok(host);
+    const unrelated = await app.tasks.create({ title: job.title, outcome: "An ordinary interactive task" });
+    await app.tasks.dispatch(unrelated.id, host, app.call);
+    assert.equal(await openJobActor(job, app.tasks, app.call), undefined, "A matching title does not grant job ownership");
+    const owned = await app.tasks.create({ title: job.title, outcome: job.prompt,
+      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }] });
+    await app.tasks.dispatch(owned.id, host, app.call);
+    let inspections = 0;
+    const presence: HostCall = async (command) => {
+      assert.equal(command.type, "on_node"); inspections += 1;
+      return { type: "worker_presence", presence: { state: "present", running: true } };
+    };
+    assert.equal(await openJobActor(job, app.tasks, presence), owned.id); assert.equal(inspections, 1);
+    await assert.rejects(openJobActor(job, app.tasks, async () => ({ type: "failed", message: "Host offline" })), /could not be inspected/);
+    assert.equal(await openJobActor(job, app.tasks, async () => ({ type: "worker_presence", presence: { state: "missing_session" } })), undefined);
+    assert.equal(app.commands.filter((command) => command.type === "spawn_worker").length, 2, "Inspection creates no replacements");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

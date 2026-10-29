@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import { MAX_ATTACHMENTS } from "./generated/attachment-limits.js";
 import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { Type } from "typebox";
@@ -221,19 +222,22 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 0xffff_ffff })),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 262_144 })) }),
       async execute(args, api) {
-        return hostOutput(await executions.get(api.conversationId.toString()).call({
-          type: "read_file", path: args.path, offset: args.offset ?? 0, limit: args.limit ?? 64_000,
+        const execution = executions.get(api.conversationId.toString());
+        return hostOutput(await execution.call({
+          type: "read_file", path: resolve(execution.default_host?.cwd ?? execution.cwd, args.path), offset: args.offset ?? 0, limit: args.limit ?? 64_000,
         }));
       } }),
     defineTool({ name: "write_file", description: "Write a UTF-8 file on the attached host.",
       parameters: Type.Object({ path: Type.String(), content: Type.String() }),
       async execute(args, api) {
-        return hostOutput(await executions.get(api.conversationId.toString()).call({ type: "write_file", ...args }));
+        const execution = executions.get(api.conversationId.toString());
+        return hostOutput(await execution.call({ type: "write_file", ...args, path: resolve(execution.default_host?.cwd ?? execution.cwd, args.path) }));
       } }),
     defineTool({ name: "edit_file", description: "Replace one exact occurrence in a UTF-8 file on the attached host.",
       parameters: Type.Object({ path: Type.String(), old: Type.String({ minLength: 1 }), new: Type.String() }),
       async execute(args, api) {
-        return hostOutput(await executions.get(api.conversationId.toString()).call({ type: "edit_file", ...args }));
+        const execution = executions.get(api.conversationId.toString());
+        return hostOutput(await execution.call({ type: "edit_file", ...args, path: resolve(execution.default_host?.cwd ?? execution.cwd, args.path) }));
       } }),
   ] });
   const record = defineTool({ name: "record_task", description: "Save verified progress and the next actor/check or concrete resolution evidence.",

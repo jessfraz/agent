@@ -4140,6 +4140,29 @@
         "schedules"
       ]
     },
+    "ScheduledOccurrence": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "job": {
+          "$ref": "#/$defs/ScheduledJob"
+        },
+        "schedule_id": {
+          "$ref": "#/$defs/ScheduleId"
+        },
+        "scheduled_at": {
+          "$ref": "#/$defs/UtcMillis"
+        }
+      },
+      "required": [
+        "id",
+        "job",
+        "schedule_id",
+        "scheduled_at"
+      ]
+    },
     "SourceCheckpoint": {
       "description": "Opaque to the caller and meaningful only to the matching provider/account.",
       "type": "object",
@@ -4562,6 +4585,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/InputMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scheduled": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ScheduledOccurrence"
             },
             {
               "type": "null"

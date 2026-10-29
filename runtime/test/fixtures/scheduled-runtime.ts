@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { readFile } from "node:fs/promises";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels, fauxProvider } from "@earendil-works/pi-ai";
@@ -28,7 +29,7 @@ export const binding: WorkerRef = { host_id: node.host_id, session_id: "session:
 export async function openScheduled(directory: string, guidanceVersion = "original", clock?: FakeClock) {
   const database = await openNodeSqliteDatabase(join(directory, "session.sqlite"));
   await database.exec("PRAGMA synchronous = FULL");
-  const models = createModels(), faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 });
+  const models = createModels(), faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }, { id: "fixture-updated" }], tokensPerSecond: 1_000_000 });
   models.setProvider(faux.provider);
   const registry = createRegistry();
   const session = await Harness.open(await SqliteStorage.open(database), { models, registry,
@@ -50,13 +51,14 @@ export async function openScheduled(directory: string, guidanceVersion = "origin
       workflow_policy: "Current execution policy.", context_repositories: [], context_sources: [] };
     if (command.type === "project_guidance") return { type: "project_guidance", snapshot: { text: `FRESH_PROJECT_POLICY_${guidanceVersion}`, sources: [] } };
     if (command.type === "exec") return { type: "process", exit_code: 0, stdout: "owned host tool output", stderr: "", truncated: false };
+    if (command.type === "read_file") return { type: "file", content: await readFile(command.path, "utf8"), truncated: false };
     return { type: "failed", message: "The fixture received an unsupported host command" };
   };
-  async function worker(taskId: string, controller = new AbortController(), hostCall: HostCall = call) {
+  async function worker(taskId: string, controller = new AbortController(), hostCall: HostCall = call, interactive = false) {
     const task = await tasks.get(taskId);
     if (task.worker.state !== "bound") throw new Error("The scheduled fixture has no bound worker");
     return tasks.run({ type: "run_task", task_id: task.id, allocation_id: task.worker.allocation_id, binding: task.worker.binding,
-      model: fixtureModel, cwd: task.worker.host.cwd, instructions: "", interactive: false },
+      model: fixtureModel, cwd: task.worker.host.cwd, instructions: "", interactive },
     (conversation, host, model) => executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [host], role: "worker", model, call: hostCall }),
     () => {}, [guidance, tools.host, tools.worker], hostCall, undefined,
     { signal: controller.signal, async ready() {}, answer() {}, idle() {} });
