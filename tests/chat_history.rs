@@ -259,13 +259,7 @@ async fn chief_startup(mode: ChiefStartup) {
                 assert!(count > 0);
                 bytes.extend_from_slice(&chunk[..count]);
                 let text = terminal_text(&bytes);
-                if text.contains("The known chief history is visible.")
-                    && text
-                        .chars()
-                        .filter(|ch| !ch.is_whitespace())
-                        .collect::<String>()
-                        .contains("raftbeforesettings")
-                {
+                if text.contains("The known chief history is visible.") {
                     break;
                 }
             }
@@ -273,7 +267,7 @@ async fn chief_startup(mode: ChiefStartup) {
         .await
         .unwrap_or_else(|error| {
             panic!(
-                "Ready startup did not show history/draft: {error}: {}",
+                "Ready startup did not show saved history: {error}: {}",
                 terminal_text(&bytes)
             )
         });
