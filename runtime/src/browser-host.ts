@@ -204,6 +204,11 @@ export class BrowserHost {
         if (action.url !== "about:blank") result = await this.call("navigate_page", { pageId: activeId, url: action.url, timeout: 30_000 });
       } else {
         activeId = action.tab_id;
+        if (action.type === "click" || action.type === "fill" || action.type === "press_key") {
+          // Await native activation instead of relying on asynchronous focus emulation.
+          const selected = await this.call("select_page", { pageId: activeId, bringToFront: true });
+          if (selected.isError) throw new Error("Chrome did not confirm activating the owned tab");
+        }
         switch (action.type) {
           case "snapshot": result = await this.call("take_snapshot", { pageId: activeId }); break;
           case "navigate": result = await this.call("navigate_page", { pageId: activeId, url: action.url, timeout: 30_000 }); break;

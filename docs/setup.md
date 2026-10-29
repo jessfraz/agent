@@ -147,6 +147,9 @@ page IDs prevent user tab reordering from retargeting an action. Only owned
 tabs and popups attributed to their actions reach the model. Delayed popups
 outside that action's observation window remain unowned.
 
+Clicks, form input, and key presses bring their owned tab to the front. Reading
+snapshots leaves the foreground tab alone.
+
 Disposable tabs close when the turn finishes. `retain_tab` preserves a needed
 draft or result for the user; `browser_release` closes remaining owned tabs and
 disconnects while Chrome keeps running. The upstream server can retain its

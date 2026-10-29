@@ -48,12 +48,12 @@ class ChromeFixtureClient {
       this.pending.clear();
     });
   }
-  async call(method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  async call(method: string, params: Record<string, unknown> = {}, sessionId?: string): Promise<Record<string, unknown>> {
     await this.ready;
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
-      this.socket.send(JSON.stringify({ id, method, params }));
+      this.socket.send(JSON.stringify({ id, method, params, ...(sessionId === undefined ? {} : { sessionId }) }));
     });
   }
   async pages(): Promise<{ targetId: string; url: string }[]> {
@@ -61,6 +61,29 @@ class ChromeFixtureClient {
     assert.ok(Array.isArray(result.targetInfos));
     return result.targetInfos.flatMap((item: unknown) => object(item) && item.type === "page" && typeof item.targetId === "string" && typeof item.url === "string"
       ? [{ targetId: item.targetId, url: item.url }] : []);
+  }
+  async activate(url: string): Promise<void> {
+    const page = (await this.pages()).find(page => page.url === url); assert.ok(page);
+    const attached = await this.call("Target.attachToTarget", { targetId: page.targetId, flatten: true });
+    assert.ok(typeof attached.sessionId === "string");
+    try { await this.call("Page.bringToFront", {}, attached.sessionId); }
+    finally { await this.call("Target.detachFromTarget", { sessionId: attached.sessionId }); }
+  }
+  async nativeState(url: string): Promise<Record<string, unknown>> {
+    const page = (await this.pages()).find(page => page.url === url); assert.ok(page);
+    const attached = await this.call("Target.attachToTarget", { targetId: page.targetId, flatten: true });
+    assert.ok(typeof attached.sessionId === "string");
+    try {
+      // Inspect native foreground state, independently of MCP's focus emulation.
+      await this.call("Emulation.setFocusEmulationEnabled", { enabled: false }, attached.sessionId);
+      const inspected = await this.call("Runtime.evaluate", {
+        expression: `({ visible: document.visibilityState, focused: document.hasFocus(),
+          value: document.querySelector('input[name=name]')?.value ?? null,
+          active: document.activeElement?.getAttribute('name') ?? null })`, returnByValue: true,
+      }, attached.sessionId);
+      assert.ok(object(inspected.result) && object(inspected.result.value));
+      return inspected.result.value;
+    } finally { await this.call("Target.detachFromTarget", { sessionId: attached.sessionId }); }
   }
   close(): void { this.socket.close(); }
 }
@@ -257,6 +280,35 @@ test("real Chrome adapter owns exact tabs and scoped popups, preserves unrelated
   assert.equal(pages.some(page => page.url === `${f.origin}/done` || page.url === `${f.origin}/popup`), false);
   await host.close();
   assert.equal(f.browser.exitCode, null, "Disconnect must leave attached Chrome running");
+});
+
+test("direct input activates only its owned native page while snapshots stay in the background", { skip: skipChrome, timeout: 120_000 }, async t => {
+  const actions: ("snapshot" | "fill" | "click" | "press_key")[] = ["snapshot", "fill", "click", "press_key"];
+  for (const type of actions) await t.test(type, async t => {
+    const f = await fixture(t), request = requests();
+    const opened = (await f.host.execute(request({ type: "open", url: `${f.origin}/form` }))).response;
+    assert.ok(opened.type === "ready", JSON.stringify(opened)); assert.equal(opened.is_error, false);
+    const tab = opened.tabs[0]; assert.ok(tab);
+    await f.client.activate(`${f.origin}/unrelated`);
+    let action: BrowserAction;
+    switch (type) {
+      case "snapshot": action = { type, tab_id: tab.id }; break;
+      case "fill": action = { type, tab_id: tab.id, element_ref: elementRef(opened.output, "textbox", "Name"), value: "Synthetic user" }; break;
+      case "click": action = { type, tab_id: tab.id, element_ref: elementRef(opened.output, "textbox", "Name") }; break;
+      case "press_key": action = { type, tab_id: tab.id, key: "Tab" }; break;
+    }
+    const result = (await f.host.execute(request(action))).response;
+    assert.ok(result.type === "ready", JSON.stringify(result)); assert.equal(result.is_error, false);
+    // MCP emulates a visible focused page even when Chrome left it behind.
+    // Disconnect its real CDP session before asserting actual native focus.
+    await f.host.close();
+    const state = await f.client.nativeState(`${f.origin}/form`);
+    assert.equal(state.visible, type === "snapshot" ? "hidden" : "visible");
+    assert.equal(state.focused, type !== "snapshot");
+    assert.equal(state.value, type === "fill" ? "Synthetic user" : "");
+    assert.equal(state.active, type === "snapshot" ? null : "name");
+    assert.ok((await f.client.pages()).some(page => page.url === `${f.origin}/unrelated`));
+  });
 });
 
 test("lost browser transport leaves a submitted mutation uncertain without replaying or closing its tab", { skip: skipChrome, timeout: 60_000 }, async t => {
