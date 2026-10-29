@@ -121,7 +121,7 @@ async fn serve_until(
         script,
         state,
         None,
-        crate::tailnet::PeerPolicy::new(&[])?,
+        crate::tailnet::PeerPolicy::new(&[], &[])?,
         crate::tailnet::Daemon::default(),
         None,
         shutdown,

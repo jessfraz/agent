@@ -1,5 +1,6 @@
 use std::{
     env, fs, io,
+    num::NonZeroU64,
     path::{Path, PathBuf},
 };
 
@@ -28,6 +29,8 @@ pub struct ClientConfig {
     pub tailscale_socket: Option<PathBuf>,
     #[serde(default)]
     pub trusted_nodes: Vec<String>,
+    #[serde(default)]
+    pub trusted_user_ids: Vec<NonZeroU64>,
     pub node_name: Option<String>,
     /// Local Chrome connection settings never travel to another host.
     pub browser: Option<crate::browser::BrowserConfig>,
@@ -49,6 +52,7 @@ impl Default for ClientConfig {
             coordinator_program: None,
             tailscale_socket: None,
             trusted_nodes: Vec::new(),
+            trusted_user_ids: Vec::new(),
             node_name: None,
             browser: None,
             sources: Vec::new(),
@@ -258,7 +262,7 @@ fn validate(config: &mut ClientConfig) -> Result<()> {
     for directory in &mut config.job_directories {
         *directory = context_repository_path(directory, home.as_deref())?;
     }
-    crate::tailnet::PeerPolicy::new(&config.trusted_nodes)?;
+    crate::tailnet::PeerPolicy::new(&config.trusted_nodes, &config.trusted_user_ids)?;
     crate::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
     ensure!(
         (10..=3600).contains(&config.poll_interval_seconds),
@@ -454,6 +458,51 @@ mod tests {
             config.path.as_ref().unwrap(),
             &std::fs::canonicalize(&path).unwrap()
         );
+    }
+
+    #[test]
+    fn trusted_human_ids_are_numeric_nonzero_unique_private_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "trusted_user_ids = [42, 43]\n").unwrap();
+        let config = load(Some(&path)).unwrap();
+        assert_eq!(
+            config
+                .trusted_user_ids
+                .iter()
+                .map(|id| id.get())
+                .collect::<Vec<_>>(),
+            vec![42, 43]
+        );
+        let serialized = toml::to_string(&config).unwrap();
+        let decoded: crate::config::ClientConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(decoded.trusted_user_ids, config.trusted_user_ids);
+        let settings = directory.path().join("managed.toml");
+        std::fs::write(&settings, "poll_interval_seconds = 120\n").unwrap();
+        assert!(crate::config::apply(&path, &settings).unwrap().changed);
+        assert_eq!(
+            load(Some(&path)).unwrap().trusted_user_ids,
+            config.trusted_user_ids
+        );
+        std::fs::write(&settings, "trusted_user_ids = [44]\n").unwrap();
+        assert!(crate::config::apply(&path, &settings).is_err());
+        assert_eq!(
+            load(Some(&path)).unwrap().trusted_user_ids,
+            config.trusted_user_ids
+        );
+        for invalid in [
+            "[0]",
+            "[-1]",
+            "[42, 42]",
+            "['42']",
+            "[42.0]",
+            "[18446744073709551616]",
+        ] {
+            std::fs::write(&path, format!("trusted_user_ids = {invalid}\n")).unwrap();
+            assert!(load(Some(&path)).is_err(), "{invalid}");
+        }
+        std::fs::write(&path, "").unwrap();
+        assert!(load(Some(&path)).unwrap().trusted_user_ids.is_empty());
     }
 
     #[test]

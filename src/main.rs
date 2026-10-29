@@ -528,7 +528,8 @@ async fn main() -> Result<()> {
         if !no_sources {
             configure_messages(&config.sources).await;
         }
-        let policy = agent_cli::tailnet::PeerPolicy::new(&config.trusted_nodes)?;
+        let policy =
+            agent_cli::tailnet::PeerPolicy::new(&config.trusted_nodes, &config.trusted_user_ids)?;
         let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
         let contexts = ContextStore::load(&config.context_repositories)?;
         let global = arguments
@@ -2637,7 +2638,8 @@ async fn connection(
     };
     if let Some(address) = coordinator.strip_prefix("tailscale://") {
         let address = config::tailnet_address(address)?;
-        let policy = agent_cli::tailnet::PeerPolicy::new(&config.trusted_nodes)?;
+        let policy =
+            agent_cli::tailnet::PeerPolicy::new(&config.trusted_nodes, &config.trusted_user_ids)?;
         let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
         let stream = agent_cli::tailnet::connect(address, &policy, &daemon).await?;
         let (reader, writer) = stream.into_split();

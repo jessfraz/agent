@@ -215,9 +215,15 @@ or synchronize the database between machines.
 
 Both ends verify native Tailscale peer identity. The listener never binds to a
 LAN or wildcard address. By default, authorized untagged devices belonging to
-the same user are accepted. For a tagged server, set `trusted_nodes` on both
-ends to the exact stable node IDs allowed to connect. A nonempty list replaces
-the default same-user rule.
+the same user are accepted. Set `trusted_user_ids` to pinned numeric Tailscale
+user IDs to accept that human's authorized, untagged devices automatically,
+including a new phone, without adding each device's stable node ID. The daemon
+must verify that the node's user matches its identity profile; names and email
+addresses never grant trust. Set `trusted_nodes` to exact stable node IDs for
+tagged servers. When either list is nonempty, a peer must match a pinned node
+or a pinned user under the untagged-device rule; the default same-user rule no
+longer applies. For a tagged coordinator, pin its stable node ID on clients and
+pin the human user IDs allowed to connect in the coordinator's private config.
 
 When a machine has both GUI and system Tailscale daemons, set
 `tailscale_socket` to the intended daemon's socket. Identity checks and
@@ -360,6 +366,9 @@ user; logging failure does not block chat.
 
 A slow runtime write records one `write_backpressure` event with its request,
 command kind and byte counts. Event reads continue while that write is pending.
+A clean stop records `service_shutdown` with `SIGINT` or `SIGTERM` and its
+timestamp before pending requests close, distinguishing a managed restart from
+a runtime failure.
 
 `diagnostics/retention.json` records the policy, expiry watermark and cumulative
 timestamp bounds of capacity evictions, including uncertain timestamp coverage.

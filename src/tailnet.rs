@@ -85,7 +85,7 @@ struct PeerNode {
     stable_id: Option<String>,
     tags: Option<Vec<String>>,
     #[serde(default)]
-    machine_authorized: bool,
+    machine_authorized: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,12 +96,15 @@ pub struct PeerPolicy {
 #[derive(Clone, Debug)]
 enum PeerTrust {
     SameUser,
-    Explicit(BTreeSet<String>),
+    Explicit {
+        nodes: BTreeSet<String>,
+        users: BTreeSet<NonZeroU64>,
+    },
 }
 
 impl PeerPolicy {
-    pub fn new(stable_node_ids: &[String]) -> Result<Self> {
-        if stable_node_ids.is_empty() {
+    pub fn new(stable_node_ids: &[String], trusted_user_ids: &[NonZeroU64]) -> Result<Self> {
+        if stable_node_ids.is_empty() && trusted_user_ids.is_empty() {
             return Ok(Self {
                 trust: PeerTrust::SameUser,
             });
@@ -121,8 +124,15 @@ impl PeerPolicy {
                 "Trusted Tailscale stable node IDs must be unique"
             );
         }
+        let mut users = BTreeSet::new();
+        for id in trusted_user_ids {
+            ensure!(
+                users.insert(*id),
+                "Trusted Tailscale user IDs must be unique"
+            );
+        }
         Ok(Self {
-            trust: PeerTrust::Explicit(nodes),
+            trust: PeerTrust::Explicit { nodes, users },
         })
     }
 }
@@ -170,7 +180,7 @@ fn authorize(status: &Status, peer: SocketAddr, whois: &Whois, policy: &PeerPoli
     match &policy.trust {
         PeerTrust::SameUser => {
             ensure!(
-                whois.node.machine_authorized,
+                whois.node.machine_authorized == Some(true),
                 "Tailscale peer is not authorized"
             );
             ensure!(
@@ -182,17 +192,31 @@ fn authorize(status: &Status, peer: SocketAddr, whois: &Whois, policy: &PeerPoli
                 "Tailscale peer belongs to a different user"
             );
         }
-        PeerTrust::Explicit(nodes) => {
+        PeerTrust::Explicit { nodes, users } => {
             // A reachable WireGuard peer plus its pinned control-plane identity
             // is the authority. Tags and their synthetic owner grant no trust.
-            ensure!(
-                whois
-                    .node
-                    .stable_id
-                    .as_ref()
-                    .is_some_and(|id| nodes.contains(id)),
-                "Tailscale peer stable node ID is not explicitly trusted"
-            );
+            let pinned_node = whois
+                .node
+                .stable_id
+                .as_ref()
+                .is_some_and(|id| nodes.contains(id));
+            if !pinned_node {
+                ensure!(
+                    users.contains(&whois.node.user),
+                    "Tailscale peer identity is not explicitly trusted"
+                );
+                // Native whois omits legacy MachineAuthorized metadata for
+                // reachable peers. As with a pinned node, the authenticated
+                // tunnel plus this pinned, verified identity grants trust.
+                ensure!(
+                    whois.node.machine_authorized != Some(false),
+                    "Tailscale peer is not authorized"
+                );
+                ensure!(
+                    whois.node.tags.as_ref().is_none_or(Vec::is_empty),
+                    "Tagged Tailscale peers require an explicit stable node ID"
+                );
+            }
         }
     }
     let exact = whois.node.addresses.iter().any(|prefix| {
@@ -460,7 +484,7 @@ mod tests {
                 addresses: vec!["100.64.10.2/32".into()],
                 stable_id: Some("nSyntheticPeer".into()),
                 tags: None,
-                machine_authorized: true,
+                machine_authorized: Some(true),
             },
             user_profile: UserProfile {
                 id: NonZeroU64::new(42).unwrap(),
@@ -470,7 +494,7 @@ mod tests {
 
     #[test]
     fn requires_running_self_address_and_same_verified_peer_owner() {
-        let policy = PeerPolicy::new(&[]).unwrap();
+        let policy = PeerPolicy::new(&[], &[]).unwrap();
         let peer: SocketAddr = "100.64.10.2:12345".parse().unwrap();
         let mut current = status();
         let mut peer_identity = whois();
@@ -484,7 +508,7 @@ mod tests {
         peer_identity.node.addresses = vec!["100.64.10.3/32".into()];
         assert!(authorize(&current, peer, &peer_identity, &policy).is_err());
         peer_identity = whois();
-        peer_identity.node.machine_authorized = false;
+        peer_identity.node.machine_authorized = Some(false);
         assert!(authorize(&current, peer, &peer_identity, &policy).is_err());
         current.backend_state = "NeedsLogin".into();
         assert!(current_address(&current).is_err());
@@ -530,7 +554,7 @@ mod tests {
                 &status,
                 "100.64.10.2:1234".parse().unwrap(),
                 &peer,
-                &PeerPolicy::new(&[]).unwrap()
+                &PeerPolicy::new(&[], &[]).unwrap()
             )
             .is_ok()
         );
@@ -547,8 +571,8 @@ mod tests {
 
     #[test]
     fn peer_policy_validates_unique_bounded_opaque_stable_node_ids() {
-        assert!(PeerPolicy::new(&[]).is_ok());
-        assert!(PeerPolicy::new(&["nSyntheticPeer".into()]).is_ok());
+        assert!(PeerPolicy::new(&[], &[]).is_ok());
+        assert!(PeerPolicy::new(&["nSyntheticPeer".into()], &[]).is_ok());
         for ids in [
             vec![String::new()],
             vec!["  ".into()],
@@ -557,7 +581,87 @@ mod tests {
             vec!["x".repeat(129)],
             vec!["nSyntheticPeer".into(), "nSyntheticPeer".into()],
         ] {
-            assert!(PeerPolicy::new(&ids).is_err());
+            assert!(PeerPolicy::new(&ids, &[]).is_err());
+        }
+        let user = NonZeroU64::new(42).unwrap();
+        assert!(PeerPolicy::new(&[], &[user]).is_ok());
+        assert!(PeerPolicy::new(&[], &[user, user]).is_err());
+    }
+
+    #[test]
+    fn pinned_human_accepts_new_authorized_native_devices_on_a_differently_owned_server() {
+        let mut current = status();
+        current.this_node.owner = NonZeroU64::new(99).unwrap();
+        let policy = PeerPolicy::new(&[], &[NonZeroU64::new(42).unwrap()]).unwrap();
+        let peer: SocketAddr = "100.64.10.2:12345".parse().unwrap();
+        // Native whois includes a human profile for an untagged phone. Neither
+        // device name, email nor an individual phone's stable ID grants trust.
+        let mut phone: Whois = serde_json::from_str(r#"{
+            "Node":{"StableID":"nNewPhone","User":42,"Addresses":["100.64.10.2/32"],"Tags":null,"Name":"phone.example"},
+            "UserProfile":{"ID":42,"LoginName":"user@example.com","DisplayName":"Example"}
+        }"#).unwrap();
+        assert!(
+            phone.node.machine_authorized.is_none(),
+            "Native peer approval metadata may be omitted on a reachable phone"
+        );
+        assert!(authorize(&current, peer, &phone, &policy).is_ok());
+        phone.node.stable_id = Some("nReplacementPhone".into());
+        assert!(authorize(&current, peer, &phone, &policy).is_ok());
+        phone.node.stable_id = None;
+        assert!(authorize(&current, peer, &phone, &policy).is_ok());
+        phone.node.tags = Some(vec![]);
+        assert!(authorize(&current, peer, &phone, &policy).is_ok());
+
+        phone.node.machine_authorized = Some(false);
+        assert!(authorize(&current, peer, &phone, &policy).is_err());
+        phone.node.machine_authorized = Some(true);
+        assert!(authorize(&current, peer, &phone, &policy).is_ok());
+        phone.node.tags = Some(vec!["tag:fixture-server".into()]);
+        assert!(authorize(&current, peer, &phone, &policy).is_err());
+        phone.node.tags = None;
+        phone.user_profile.id = NonZeroU64::new(43).unwrap();
+        assert!(authorize(&current, peer, &phone, &policy).is_err());
+        phone.user_profile.id = current.this_node.owner;
+        phone.node.user = current.this_node.owner;
+        assert!(
+            authorize(&current, peer, &phone, &policy).is_err(),
+            "An unpinned human cannot inherit the server owner's trust"
+        );
+    }
+
+    #[test]
+    fn combined_pins_preserve_tagged_node_trust_without_a_tagged_user_fallback() {
+        let current = status();
+        let peer: SocketAddr = "100.64.10.2:12345".parse().unwrap();
+        let policy = PeerPolicy::new(
+            &["nSyntheticTagged".into()],
+            &[NonZeroU64::new(42).unwrap()],
+        )
+        .unwrap();
+        let mut tagged = tagged_native_identity();
+        assert!(authorize(&current, peer, &tagged, &policy).is_ok());
+        tagged.node.stable_id = Some("nOtherTagged".into());
+        tagged.node.user = NonZeroU64::new(42).unwrap();
+        tagged.user_profile.id = tagged.node.user;
+        tagged.node.machine_authorized = Some(true);
+        assert!(authorize(&current, peer, &tagged, &policy).is_err());
+        let mut human = whois();
+        assert!(authorize(&current, peer, &human, &policy).is_ok());
+        human.node.addresses = vec!["100.64.10.2/24".into()];
+        assert!(authorize(&current, peer, &human, &policy).is_err());
+        human.node.addresses = vec!["100.64.10.3/32".into()];
+        assert!(authorize(&current, peer, &human, &policy).is_err());
+    }
+
+    #[test]
+    fn native_identity_rejects_zero_or_unknown_user_profiles() {
+        for invalid in [
+            r#"{"Node":{"User":0,"Addresses":["100.64.10.2/32"],"MachineAuthorized":true},"UserProfile":{"ID":42}}"#,
+            r#"{"Node":{"User":42,"Addresses":["100.64.10.2/32"],"MachineAuthorized":true},"UserProfile":{"ID":0}}"#,
+            r#"{"Node":{"User":42,"Addresses":["100.64.10.2/32"],"MachineAuthorized":true},"UserProfile":{}}"#,
+            r#"{"Node":{"User":42,"Addresses":["100.64.10.2/32"],"MachineAuthorized":true}}"#,
+        ] {
+            assert!(serde_json::from_str::<Whois>(invalid).is_err());
         }
     }
 
@@ -574,31 +678,31 @@ mod tests {
         let peer: SocketAddr = "100.64.10.2:12345".parse().unwrap();
         let current = status();
         let mut native = tagged_native_identity();
-        let policy = PeerPolicy::new(&["nSyntheticTagged".into()]).unwrap();
+        let policy = PeerPolicy::new(&["nSyntheticTagged".into()], &[]).unwrap();
         assert!(
-            !native.node.machine_authorized,
-            "Native omitempty approval metadata defaults to false"
+            native.node.machine_authorized.is_none(),
+            "Native omitempty approval metadata may be absent"
         );
         assert!(authorize(&current, peer, &native, &policy).is_ok());
-        assert!(authorize(&current, peer, &native, &PeerPolicy::new(&[]).unwrap()).is_err());
+        assert!(authorize(&current, peer, &native, &PeerPolicy::new(&[], &[]).unwrap()).is_err());
         native.node.user = current.this_node.owner;
         native.user_profile.id = current.this_node.owner;
-        native.node.machine_authorized = true;
+        native.node.machine_authorized = Some(true);
         assert!(
-            authorize(&current, peer, &native, &PeerPolicy::new(&[]).unwrap()).is_err(),
+            authorize(&current, peer, &native, &PeerPolicy::new(&[], &[]).unwrap()).is_err(),
             "Tags never inherit same-user trust"
         );
         native.node.tags = Some(vec![]);
-        assert!(authorize(&current, peer, &native, &PeerPolicy::new(&[]).unwrap()).is_ok());
-        native.node.machine_authorized = false;
-        assert!(authorize(&current, peer, &native, &PeerPolicy::new(&[]).unwrap()).is_err());
+        assert!(authorize(&current, peer, &native, &PeerPolicy::new(&[], &[]).unwrap()).is_ok());
+        native.node.machine_authorized = Some(false);
+        assert!(authorize(&current, peer, &native, &PeerPolicy::new(&[], &[]).unwrap()).is_err());
     }
 
     #[test]
     fn explicit_trust_rejects_wrong_or_missing_nodes_even_with_matching_user_or_tags() {
         let peer: SocketAddr = "100.64.10.2:12345".parse().unwrap();
         let current = status();
-        let policy = PeerPolicy::new(&["nSyntheticTagged".into()]).unwrap();
+        let policy = PeerPolicy::new(&["nSyntheticTagged".into()], &[]).unwrap();
         let mut identity = whois();
         assert!(
             authorize(&current, peer, &identity, &policy).is_err(),
@@ -625,7 +729,7 @@ mod tests {
     #[test]
     fn explicit_node_trust_still_requires_the_exact_connected_host_address() {
         let peer: SocketAddr = "100.64.10.2:12345".parse().unwrap();
-        let policy = PeerPolicy::new(&["nSyntheticTagged".into()]).unwrap();
+        let policy = PeerPolicy::new(&["nSyntheticTagged".into()], &[]).unwrap();
         let mut identity = tagged_native_identity();
         for address in ["100.64.10.3/32", "100.64.10.2/24", "100.64.10.2", "::1/128"] {
             identity.node.addresses = vec![address.into()];
@@ -737,7 +841,7 @@ mod tests {
         // Five bounded native identity reads plus connection setup can take
         // longer than one CLI read while the local daemon is cold.
         timeout(Duration::from_secs(60), async {
-            let policy = PeerPolicy::new(&[]).unwrap();
+            let policy = PeerPolicy::new(&[], &[]).unwrap();
             let daemon = Daemon::default();
             eprintln!("native smoke: binding");
             let listener = listen(0, &daemon).await.unwrap();
