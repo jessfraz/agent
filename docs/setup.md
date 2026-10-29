@@ -84,6 +84,9 @@ Up/Down recalls sent prompts when the
 editor is empty; slash commands offer completion. Use `agent --no-tui chat`
 for plain output or `agent --json chat` for protocol events.
 
+Reopen the CLI after updating it to load presentation changes. Detaching an
+older client preserves server-owned work and saved history.
+
 `/resume` opens a saved-chat picker in this terminal. Filter by title or ID,
 press Enter to choose, or Esc to keep the current chat and draft. Browsing
 history does not start work. A new message reuses the selected conversation's

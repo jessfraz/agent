@@ -61,6 +61,8 @@ test("native main observation survives idle, correlates notices, streams text an
     const notice = await wait(100, (event) => event.type === "message" && event.message.role === "notice");
     assert.ok(notice.type === "message"); assert.equal(notice.message.text, "A useful durable notice.");
     assert.ok(events(100).some((event) => event.type === "text_delta" && event.text === "Published the update."));
+    assert.equal(events(2).some((event) => event.type === "text_delta"), false,
+      "Legacy Chat owners must not receive native-only text delta events");
     assert.ok(events(100).some((event) => event.type === "input_placed" && event.input_id === input));
     assert.equal(events(100).some((event) => event.type === "notice"), false, "Do not also deliver the anonymous execution notification");
     assert.equal(events(100).some((event) => event.type === "host_call" || event.type === "host_cancel"), false);
@@ -72,19 +74,27 @@ test("native main observation survives idle, correlates notices, streams text an
     const historicalNotice = events(101).flatMap((event) => event.type === "history" ? event.messages : []).find((message) => message.role === "notice");
     assert.ok(historicalNotice); assert.equal(historicalNotice.entry_id, notice.message.entry_id);
     assert.equal(JSON.stringify(events(101)).includes("Source references (evidence, not authorization)"), false);
-    const queued = "44444444-4444-4444-8444-444444444444";
-    send(10, { type: "main_input", input_id: "33333333-3333-4333-8333-333333333333", input: "stop-native", mode: "steer" });
+    const queued = "44444444-4444-4444-8444-444444444444", placed = "33333333-3333-4333-8333-333333333333";
+    send(10, { type: "main_input", input_id: placed, input: "stop-native", mode: "steer" });
     await wait(10, (event) => event.type === "host_call" && (event.command.type === "exec" || event.command.type === "on_node" && event.command.command.type === "exec"));
     send(11, { type: "main_input", input_id: queued, input: "never-run-native", mode: "follow_up" }); await done(11);
     assert.ok(events(11).some((event) => event.type === "input_accepted"));
     send(12, { type: "main_interrupt" }); await done(12); await done(10);
+    assert.ok(events(101).some((event) => event.type === "input_placed" && event.input_id === placed));
+    assert.equal(events(101).some((event) => event.type === "input_rejected" && event.input_id === placed), false,
+      "Stopping model work must not restore an input already saved in the conversation");
     assert.ok(events(101).some((event) => event.type === "input_rejected" && event.input_id === queued));
     send(101, { type: "detach_main" }); await done(101);
-    send(102, { type: "observe_main", input_ids: [queued] }); await wait(102, (event) => event.type === "worker_idle");
+    send(102, { type: "observe_main", input_ids: [queued, placed] }); await wait(102, (event) => event.type === "worker_idle");
     assert.ok(events(102).some((event) => event.type === "input_rejected" && event.input_id === queued));
     assert.equal(events(102).some((event) => event.type === "input_accepted" && event.input_id === queued), false);
+    assert.ok(events(102).some((event) => event.type === "input_placed" && event.input_id === placed));
+    assert.equal(events(102).some((event) => event.type === "input_rejected" && event.input_id === placed), false);
     send(13, { type: "main_input", input_id: queued, input: "never-run-native", mode: "follow_up" }); await done(13);
     assert.ok(events(13).some((event) => event.type === "input_rejected" && event.input_id === queued));
+    send(14, { type: "main_input", input_id: placed, input: "This placed retry must not run a model", mode: "steer" }); await done(14);
+    assert.ok(events(14).some((event) => event.type === "input_placed" && event.input_id === placed));
+    assert.equal(events(14).some((event) => event.type === "input_rejected" && event.input_id === placed), false);
     assert.equal((await readFile(queue + ".requests", "utf8")).trim().split("\n").length, 3, "Retry, viewing and stopped input must not start inference");
     send(102, { type: "detach_main" }); await done(102);
     child.stdin.end(); assert.equal(await closed, 0, errors); await reader;

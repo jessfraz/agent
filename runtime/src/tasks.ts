@@ -965,7 +965,7 @@ export class TaskStore {
         const settled = await submission.wait(BACKGROUND_CONTEXT).finally(() => { active.nativeActive = false; });
         if (active.fenced) { await conversation.waitForIdle(BACKGROUND_CONTEXT); break; }
         if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted" && input.interactive === true && observer !== undefined) {
-          if (next.mode !== undefined) observer.rejected?.(next.id, "The stopped turn withdrew this input; submit it again to continue.");
+          if (settled.entry === undefined && next.mode !== undefined) observer.rejected?.(next.id, "The stopped turn withdrew this input; submit it again to continue.");
           await conversation.waitForIdle(BACKGROUND_CONTEXT);
           childResultPending = false;
           continue;

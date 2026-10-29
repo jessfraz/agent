@@ -23,6 +23,9 @@ recovery; [history](history.md) describes import and retrieval.
   selected machine's browser session.
 - [ ] WhatsApp or iMessage input for the main conversation, using the same
   submission, steering and queueing path as the CLI.
+- [ ] Direct coordination between task sessions: durable messages with delivery
+  receipts, steering or queueing, and references to shared work. Reuse existing
+  task inboxes and workers.
 - [ ] Voice input through a transcription provider interface.
 - [ ] Drag/paste attachments into chat, transfer them from the originating
   machine, retain them with the conversation, and deliver supported content to

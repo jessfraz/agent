@@ -61,6 +61,96 @@ function input(conversation_id: string, input_id: string, text: string): Extract
 }
 function local(command: HostCommand): HostCommand { while (command.type === "on_node") command = command.command; return command; }
 
+test("a stopped worker keeps its placed input on retry and SQLite reopen while its unplaced input returns as a draft", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-worker-stopped-input-")); let app = await open(directory);
+  let view: ReturnType<typeof observe> | undefined;
+  try {
+    const task = await app.tasks.create({ title: "Retain stopped work", outcome: "Finish the request", model: fixtureModel });
+    const conversation = await app.tasks.conversation(task.conversation_id);
+    await conversation.configure({ model: { provider: "openai", modelId: "fixture" } }, BACKGROUND_CONTEXT);
+    view = observe(app, 1, task.conversation_id);
+    await view.until(() => view?.frames.some((event) => event.type === "conversation_ready") ?? false);
+    let started = () => {};
+    const entered = new Promise<void>((resolve) => { started = resolve; });
+    app.faux.setResponses([async (_context, options) => {
+      const signal = options?.signal; assert.ok(signal); started();
+      await new Promise<void>((resolve) => { if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true }); });
+      return fauxAssistantMessage("An interrupted result is not a completed answer");
+    }]);
+    const placed = await conversation.submit({ type: "input", content: "Already saved worker request", requestId: "placed-worker" }, BACKGROUND_CONTEXT);
+    await entered;
+    await view.until(() => view?.frames.some((event) => event.type === "message" && event.message.role === "user" && event.message.text === "Already saved worker request") ?? false);
+    const queued = await conversation.submit({ type: "input", content: "Not yet placed worker request", requestId: "queued-worker", whenBusy: "followUp" }, BACKGROUND_CONTEXT);
+    assert.equal((await queued.status(BACKGROUND_CONTEXT)).status, "queued");
+    await conversation.abort(BACKGROUND_CONTEXT);
+    const placedState = await placed.status(BACKGROUND_CONTEXT), queuedState = await queued.status(BACKGROUND_CONTEXT);
+    assert.ok(placedState.status === "unanswered" && placedState.entry !== undefined);
+    assert.ok(queuedState.status === "unanswered" && queuedState.entry === undefined);
+    assert.equal(placedState.reason, "aborted"); assert.equal(queuedState.reason, "aborted");
+    const expected: RuntimeEventKind[] = [{ type: "input_accepted", input_id: "placed-worker" },
+      { type: "input_placed", input_id: "placed-worker", entry_id: placedState.entry.toString() }];
+    const noDispatch: HostCall = async () => { throw new Error("A saved receipt cannot dispatch another worker"); };
+    const receipts: RuntimeEventKind[] = [];
+    await app.views.input(input(task.conversation_id, "placed-worker", "Already saved worker request"), noDispatch, (event) => receipts.push(event));
+    assert.deepEqual(receipts, expected, "Retry must clear an already placed input instead of restoring a duplicate draft");
+    const unplaced: RuntimeEventKind[] = [];
+    await app.views.input({ ...input(task.conversation_id, "queued-worker", "Not yet placed worker request"), mode: "follow_up" }, noDispatch, (event) => unplaced.push(event));
+    assert.equal(unplaced.length, 1); assert.equal(unplaced[0]?.type, "input_rejected");
+    const entries = (await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.map((entry) => entry.id);
+    assert.equal(app.faux.state.callCount, 1);
+    await view.detach(); view = undefined;
+    app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT);
+    app = await open(directory);
+    let writes = 0; const stop = app.harness.subscribeCommits((commit) => { writes += commit.changes.length; });
+    view = observe(app, 2, task.conversation_id, ["placed-worker", "queued-worker", "unknown-worker"]);
+    await view.until(() => view?.frames.some((event) => event.type === "input_rejected" && event.input_id === "queued-worker") ?? false);
+    assert.deepEqual(view.frames.filter((event) => event.type === "input_accepted" || event.type === "input_placed"), expected);
+    assert.equal(view.frames.filter((event) => event.type === "input_rejected").length, 1);
+    const retry: RuntimeEventKind[] = [];
+    await app.views.input(input(task.conversation_id, "placed-worker", "Already saved worker request"), noDispatch, (event) => retry.push(event));
+    assert.deepEqual(retry, expected);
+    stop(); assert.equal(writes, 0); assert.equal(app.faux.state.callCount, 0);
+    const reopened = await app.tasks.conversation(task.conversation_id);
+    assert.deepEqual((await reopened.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.map((entry) => entry.id), entries);
+  } finally { app.views.close(); await view?.running; app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a live worker stop rejects only the queued input that Pi never placed", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-worker-stop-receipt-")), app = await open(directory);
+  const controller = new AbortController(); let running: Promise<unknown> | undefined;
+  try {
+    const host = await app.environment.defaultHost(await app.environment.hosts("/example/project", binding.host_id, [])); assert.ok(host);
+    const task = await app.tasks.create({ title: "Stop worker", outcome: "Retain the request", model: fixtureModel });
+    await app.tasks.enqueue(task.id, "Saved before the stop", "placed-live", undefined, "steer");
+    await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    const saved = await app.tasks.get(task.id); assert.ok(saved.worker.state === "bound");
+    let started = () => {}, idle = () => {};
+    const entered = new Promise<void>((resolve) => { started = resolve; }), stopped = new Promise<void>((resolve) => { idle = resolve; });
+    app.faux.setResponses([async (_context, options) => {
+      const signal = options?.signal; assert.ok(signal); started();
+      await new Promise<void>((resolve) => { if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true }); });
+      return fauxAssistantMessage("An interrupted result is not a completed answer");
+    }]);
+    const rejections: string[] = [];
+    running = app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id, binding,
+      instructions: "Fixture rules", model: fixtureModel, cwd: host.cwd, interactive: true }, () => () => {}, () => {}, [], undefined, undefined,
+    { signal: controller.signal, async ready() {}, answer() {}, idle() { idle(); }, rejected(id) { rejections.push(id); } });
+    await entered;
+    await app.views.input({ ...input(task.conversation_id, "queued-live", "Not yet saved at the stop"), mode: "follow_up" },
+      async () => { throw new Error("The current worker must retain its existing pane"); }, () => {});
+    const conversation = await app.tasks.conversation(task.conversation_id);
+    assert.equal((await conversation.commit((tx) => tx.submissionByRequest(conversation.id, "queued-live"), BACKGROUND_CONTEXT))?.status, "queued");
+    await conversation.abort(BACKGROUND_CONTEXT); await stopped;
+    assert.deepEqual(rejections, ["queued-live"], "An input already in native history must not be reported as withdrawn");
+    const placed = await conversation.commit((tx) => tx.submissionByRequest(conversation.id, "placed-live"), BACKGROUND_CONTEXT);
+    const queued = await conversation.commit((tx) => tx.submissionByRequest(conversation.id, "queued-live"), BACKGROUND_CONTEXT);
+    assert.ok(placed?.status === "unanswered" && placed.entry !== undefined);
+    assert.ok(queued?.status === "unanswered" && queued.entry === undefined);
+    assert.equal(app.faux.state.callCount, 1, "Stopping cannot automatically resubmit a placed or withdrawn input");
+    assert.deepEqual((await app.tasks.get(task.id)).pending, []);
+  } finally { controller.abort(); await running?.catch(() => {}); app.views.close(); app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("imported views and settings are inert; actual input uses one normal Rex actor and preserves live identity after detach", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-in-place-view-")), app = await open(directory);
   const controller = new AbortController(); let running: Promise<unknown> | undefined;

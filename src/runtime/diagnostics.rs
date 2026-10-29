@@ -151,6 +151,15 @@ impl Trace {
             }
             | RuntimeCommand::OpenConversation {
                 conversation_id, ..
+            }
+            | RuntimeCommand::AttachConversation {
+                conversation_id, ..
+            }
+            | RuntimeCommand::ConversationInput {
+                conversation_id, ..
+            }
+            | RuntimeCommand::ConversationInterrupt {
+                conversation_id, ..
             } => {
                 trace.conversation_id = token(conversation_id);
             }
@@ -173,15 +182,21 @@ impl Trace {
                 input_id: input_id.as_deref().and_then(token),
                 mode: None,
             }),
-            RuntimeCommand::SubmitInput { input_id, mode, .. } => Some(Event::InputReceived {
-                input_id: token(input_id),
-                mode: Some(*mode),
-            }),
+            RuntimeCommand::SubmitInput { input_id, mode, .. }
+            | RuntimeCommand::MainInput { input_id, mode, .. }
+            | RuntimeCommand::ConversationInput { input_id, mode, .. } => {
+                Some(Event::InputReceived {
+                    input_id: token(input_id),
+                    mode: Some(*mode),
+                })
+            }
             RuntimeCommand::WorkerInput { input_id, .. } => Some(Event::InputReceived {
                 input_id: token(input_id),
                 mode: None,
             }),
-            RuntimeCommand::Interrupt => Some(Event::InterruptReceived),
+            RuntimeCommand::Interrupt
+            | RuntimeCommand::MainInterrupt
+            | RuntimeCommand::ConversationInterrupt { .. } => Some(Event::InterruptReceived),
             _ => None,
         }
     }
@@ -204,6 +219,11 @@ impl Trace {
                 self.task_id = settings.task_id.as_ref().map(ToString::to_string);
                 self.agent_id = settings.agent_id.as_deref().and_then(token);
             }
+            RuntimeEventKind::ConversationReady { conversation, .. } => {
+                self.conversation_id = token(&conversation.conversation_id);
+                self.task_id = conversation.task_id.as_ref().map(ToString::to_string);
+                self.agent_id = conversation.agent_id.as_deref().and_then(token);
+            }
             _ => {}
         }
         let first = if !self.active
@@ -217,9 +237,9 @@ impl Trace {
             None
         };
         let observed = match event {
-            RuntimeEventKind::MainReady { .. } | RuntimeEventKind::TaskReady { .. } => {
-                Some(Event::Ready)
-            }
+            RuntimeEventKind::MainReady { .. }
+            | RuntimeEventKind::TaskReady { .. }
+            | RuntimeEventKind::ConversationReady { .. } => Some(Event::Ready),
             RuntimeEventKind::InputAccepted { input_id } => Some(Event::InputAccepted {
                 input_id: token(input_id),
             }),
@@ -458,8 +478,8 @@ impl Writer {
 
 #[cfg(test)]
 mod tests {
-    use crate::protocol::{InputMode, RuntimeCommand};
-    use crate::runtime::diagnostics::{Diagnostics, Event, Record, Trace, Writer};
+    use crate::protocol::{InputMode, MainInputContext, RuntimeCommand, RuntimeRequest};
+    use crate::runtime::diagnostics::{Diagnostics, Event, Record, Trace, Writer, command_kind};
     use std::{
         fs,
         os::unix::fs::{PermissionsExt, symlink},
@@ -621,5 +641,130 @@ mod tests {
         retained.sort_unstable();
         assert_eq!(retained.last(), Some(&99));
         assert!(retained.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    }
+
+    #[test]
+    fn native_input_and_interrupt_diagnostics_retain_identity_mode_and_operation_only() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("diagnostics");
+        let mut writer = Writer::open(directory.clone(), 8192).unwrap();
+        let (sender, mut received) = mpsc::channel(16);
+        let mut diagnostics = Diagnostics { sender, dropped: 0 };
+        let commands = [
+            RuntimeCommand::MainInput {
+                input_id: "main-input".into(),
+                input: "A private input body".into(),
+                mode: InputMode::Steer,
+                context: Some(MainInputContext {
+                    instructions: "Private instructions".into(),
+                    origin_host_id: Some("private-origin".into()),
+                    cwd: "/private/workspace".into(),
+                    hosts: Vec::new(),
+                }),
+            },
+            RuntimeCommand::ConversationInput {
+                conversation_id: "saved-conversation".into(),
+                input_id: "saved-input".into(),
+                input: "Another private input body".into(),
+                mode: InputMode::FollowUp,
+                context: None,
+            },
+            RuntimeCommand::MainInterrupt,
+            RuntimeCommand::ConversationInterrupt {
+                conversation_id: "saved-conversation".into(),
+            },
+        ];
+        for (index, command) in commands.into_iter().enumerate() {
+            let id = u32::try_from(index + 1).unwrap();
+            let trace = Trace::new(&command);
+            diagnostics.record(
+                id,
+                &trace,
+                trace
+                    .input(&command)
+                    .expect("Typed admission and stop commands need lifecycle receipts"),
+            );
+            let bytes = serde_json::to_vec(&RuntimeRequest {
+                version: 1,
+                id,
+                command,
+            })
+            .unwrap();
+            diagnostics.record(
+                id,
+                &trace,
+                Event::CommandSent {
+                    command: command_kind(&bytes).unwrap(),
+                },
+            );
+        }
+        while let Ok(record) = received.try_recv() {
+            writer.append(&record).unwrap();
+        }
+        drop(writer);
+        let records = fs::read_to_string(directory.join("runtime.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Record>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 8);
+        let expected = [
+            (
+                None,
+                Event::InputReceived {
+                    input_id: Some("main-input".into()),
+                    mode: Some(InputMode::Steer),
+                },
+            ),
+            (
+                None,
+                Event::CommandSent {
+                    command: "main_input".into(),
+                },
+            ),
+            (
+                Some("saved-conversation"),
+                Event::InputReceived {
+                    input_id: Some("saved-input".into()),
+                    mode: Some(InputMode::FollowUp),
+                },
+            ),
+            (
+                Some("saved-conversation"),
+                Event::CommandSent {
+                    command: "conversation_input".into(),
+                },
+            ),
+            (None, Event::InterruptReceived),
+            (
+                None,
+                Event::CommandSent {
+                    command: "main_interrupt".into(),
+                },
+            ),
+            (Some("saved-conversation"), Event::InterruptReceived),
+            (
+                Some("saved-conversation"),
+                Event::CommandSent {
+                    command: "conversation_interrupt".into(),
+                },
+            ),
+        ];
+        for (record, (conversation, event)) in records.iter().zip(expected) {
+            let expected = Record {
+                timestamp_ms: record.timestamp_ms,
+                request_id: record.request_id,
+                elapsed_ms: record.elapsed_ms,
+                conversation_id: conversation.map(str::to_owned),
+                task_id: None,
+                agent_id: None,
+                dropped_before: 0,
+                event,
+            };
+            assert_eq!(
+                serde_json::to_string(record).unwrap(),
+                serde_json::to_string(&expected).unwrap()
+            );
+        }
     }
 }

@@ -36,6 +36,11 @@ Rust types generate TypeScript bindings and JSON schemas. The runtime validates
 both directions at the wire boundary. Stored resource records describe intent
 and evidence; native handles and ownership must be checked again before effects.
 
+New event streams require an explicit client subscription; upgrades preserve
+the event shapes accepted by older clients. A chat view reads one canonical
+conversation stream. Saved entry IDs identify notices, replies and tools across
+live delivery and history replay.
+
 ```text
   phone CLI in Rex       CLI / Rex terminal on any host
              \                       /

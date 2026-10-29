@@ -3,7 +3,7 @@
 use crate::{ClientContext, UiSession, connection, exchange, write_command};
 use agent_cli::{
     protocol::{RuntimeCommand, RuntimeEventKind, SavedConversation},
-    runtime::FrameReader,
+    runtime::{FrameReader, decode_coordinator_event},
     tui::TuiInfo,
 };
 use anyhow::{Context, Result, bail};
@@ -53,9 +53,10 @@ pub(crate) async fn choices(
             _ => None,
         })
         .context("The coordinator returned no saved conversations")?;
+        let found = exact(&page.0, &query).is_some();
         items.extend(page.0);
         cursor = page.1;
-        if cursor.is_none() {
+        if found || cursor.is_none() {
             break;
         }
     }
@@ -148,6 +149,7 @@ pub(crate) async fn open(
     if !initial {
         ui.handle.reset_conversation(TuiInfo {
             title: item.title.clone(),
+            model: None,
             ..previous
         })?;
     }
@@ -203,7 +205,7 @@ pub(crate) async fn open(
             .await?;
             let mut reader = FrameReader::new(BufReader::new(wire.reader));
             while let Some(frame) = reader.next_frame().await? {
-                let event: RuntimeEventKind = serde_json::from_slice(&frame)?;
+                let event = decode_coordinator_event(&frame)?;
                 if matches!(event, RuntimeEventKind::HostCall { .. }) {
                     bail!("An observing terminal cannot own execution effects");
                 }
@@ -264,7 +266,7 @@ pub(crate) async fn control(
     write_command(&mut *wire.writer, &command).await?;
     let mut reader = FrameReader::new(BufReader::new(wire.reader));
     while let Some(frame) = reader.next_frame().await? {
-        let event: RuntimeEventKind = serde_json::from_slice(&frame)?;
+        let event = decode_coordinator_event(&frame)?;
         match event {
             RuntimeEventKind::Done => return Ok(()),
             RuntimeEventKind::HostCall { .. } => {

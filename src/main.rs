@@ -31,7 +31,7 @@ use agent_cli::{
         RuntimeEventKind, SavedConversation, SearchMode, TaskId, WorkerLaunch, WorkerRef,
     },
     rex::{BlockId, RexClient, SessionId},
-    runtime::FrameReader,
+    runtime::{FrameReader, decode_coordinator_event},
     service,
     tui::{Tui, TuiHandle, TuiInfo, TuiInput},
     usage,
@@ -848,7 +848,6 @@ async fn main() -> Result<()> {
                 &script,
                 &directory,
                 arguments.json,
-                None,
             )
             .await?;
             let mut history_cursor = request(
@@ -975,13 +974,17 @@ async fn main() -> Result<()> {
                     }
                     if !line.trim().is_empty() {
                         let command = chat_command(line, model.clone(), &cwd).await?;
-                        request(
+                        request_presented(
                             &arguments,
-                            &config,
-                            coordinator.as_deref(),
-                            &script,
-                            &directory,
+                            ClientContext {
+                                config: &config,
+                                coordinator: coordinator.as_deref(),
+                                script: &script,
+                                directory: &directory,
+                            },
                             command,
+                            None,
+                            PlainNoticeRoute::Watch,
                         )
                         .await?;
                     }
@@ -1003,14 +1006,14 @@ async fn main() -> Result<()> {
             ..
         } = &command
     {
-        let owner = UiRecoveryOwner {
+        let owner = UiRecoveryOwner::Task {
             task_id: task_id.clone(),
             agent_id: agent_id.clone(),
             allocation_id: allocation_id.clone(),
         };
         let (handle, inputs, guard) = Tui::start(TuiInfo {
             title: "Connecting to task".into(),
-            model: model.clone(),
+            model: Some(model.clone()),
             cwd: cwd.clone(),
         })?;
         let mut ui = UiSession::new(handle, inputs);
@@ -1062,7 +1065,6 @@ async fn watch(
     script: &Path,
     directory: &Path,
     json: bool,
-    tui: Option<TuiHandle>,
 ) -> Result<WatchGuard> {
     let mut wire = connection(config, coordinator, script, directory, false).await?;
     write_command(&mut *wire.writer, &RuntimeCommand::Watch).await?;
@@ -1071,27 +1073,14 @@ async fn watch(
         let _child = wire.child;
         let mut reader = FrameReader::new(BufReader::new(wire.reader));
         while let Ok(Some(frame)) = reader.next_frame().await {
-            let Ok(event) = serde_json::from_slice::<RuntimeEventKind>(&frame) else {
+            let Ok(event) = decode_coordinator_event(&frame) else {
                 break;
             };
-            if matches!(event, RuntimeEventKind::Notice { .. }) {
-                if let Some(tui) = &tui {
-                    if tui.event(event).is_err() {
-                        break;
-                    }
-                } else if display(&event, json).is_err() {
-                    break;
-                }
+            if matches!(event, RuntimeEventKind::Notice { .. }) && display(&event, json).is_err() {
+                break;
             }
         }
-        if let Some(tui) = tui {
-            let _ = tui.event(RuntimeEventKind::Notice {
-                task_id: None,
-                text: "Live updates disconnected; saved work is retained.".into(),
-            });
-        } else {
-            eprintln!("Live updates disconnected; saved work is retained.");
-        }
+        eprintln!("Live updates disconnected; saved work is retained.");
     })))
 }
 
@@ -1108,10 +1097,14 @@ struct ChatStart {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct UiRecoveryOwner {
-    task_id: TaskId,
-    agent_id: Option<String>,
-    allocation_id: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum UiRecoveryOwner {
+    Main,
+    Task {
+        task_id: TaskId,
+        agent_id: Option<String>,
+        allocation_id: String,
+    },
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 struct UiRecovery {
@@ -1579,7 +1572,7 @@ fn feedback_from_ui(
         let result = async {
             let info = handle.info().await?;
             let draft = handle.draft().await?;
-            let mut context = feedback_context(info.cwd, Some(info.model), target).await?;
+            let mut context = feedback_context(info.cwd, info.model, target).await?;
             context.conversation_id = conversation_id;
             context.draft = draft;
             context.queued_inputs = queued_inputs;
@@ -1982,7 +1975,7 @@ async fn local_command_plain(
             &settings,
             &TuiInfo {
                 title: "Agent".into(),
-                model: settings.model.clone(),
+                model: Some(settings.model.clone()),
                 cwd: cwd.to_string_lossy().into_owned(),
             },
             client.coordinator,
@@ -1998,6 +1991,12 @@ async fn local_command_plain(
 struct Presentation<'a> {
     handle: TuiHandle,
     session: Option<&'a mut UiSession>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlainNoticeRoute {
+    Direct,
+    Watch,
 }
 
 async fn chat_tui(
@@ -2022,44 +2021,50 @@ async fn chat_tui(
         )
     });
     let resumed_model = if resuming { start.model.clone() } else { None };
-    let settings = conversation_settings(
-        config,
-        coordinator,
-        script,
-        directory,
-        None,
-        if resuming {
-            None
-        } else {
-            start
-                .model
-                .map(|model| ConversationChange::SetSelection { model })
-        },
-        false,
-    )
-    .await?;
-    let (handle, inputs, guard) = Tui::start(TuiInfo {
-        title: "Main agent".into(),
-        model: settings.model,
-        cwd: cwd.to_string_lossy().into_owned(),
-    })?;
+    let mut initial_prompt = start.prompt;
+    let (handle, inputs, guard) =
+        Tui::connecting("Main agent".into(), cwd.to_string_lossy().into_owned())?;
     let mut ui = UiSession::new(handle, inputs);
+    let mut startup_inputs = VecDeque::new();
     let result = async {
-        let _watch = watch(
+        let request = conversation_settings(
             config,
             coordinator,
             script,
             directory,
+            None,
+            if resuming {
+                None
+            } else {
+                start
+                    .model
+                    .map(|model| ConversationChange::SetSelection { model })
+            },
             false,
-            Some(ui.handle.clone()),
-        )
-        .await?;
-        let items = chat_view::choices(client, settings.conversation_id.clone()).await?;
-        let chief = chat_view::exact(&items, &settings.conversation_id)
-            .context("The main conversation is unavailable")?
-            .clone();
+        );
+        tokio::pin!(request);
+        let settings = loop {
+            tokio::select! {
+                result = &mut request => break result.context("Could not load the main conversation settings")?,
+                input = ui.next() => match input.unwrap_or(TuiInput::Exit) {
+                    TuiInput::Exit => { ui.exiting = true; return Ok(()); }
+                    input => startup_inputs.push_back(input),
+                }
+            }
+        };
+        let chief = SavedConversation {
+            conversation_id: settings.conversation_id.clone(),
+            title: "Main agent".into(),
+            updated_at: None,
+            task_id: None,
+            agent_id: None,
+            host: None,
+            source_thread_id: None,
+        };
+        ui.handle
+            .event(RuntimeEventKind::ConversationSettings { settings })?;
         chat_view::open(client, &mut ui, chief).await?;
-        if let Some(prompt) = start.prompt {
+        if let Some(prompt) = initial_prompt.clone() {
             if let Some(Ok(ChatCommand::Resume { query })) = ChatCommand::parse(&prompt) {
                 if chat_view::resume(client, &mut ui, query.join(" ")).await?
                     && let Some(model) = resumed_model
@@ -2086,9 +2091,14 @@ async fn chat_tui(
             } else {
                 selected_input(client, &mut ui, prompt, InputMode::Steer, cwd.to_owned())?;
             }
+            initial_prompt = None;
         }
         while !ui.exiting {
-            match ui.next().await.unwrap_or(TuiInput::Exit) {
+            let input = match startup_inputs.pop_front() {
+                Some(input) => input,
+                None => ui.next().await.unwrap_or(TuiInput::Exit),
+            };
+            match input {
                 TuiInput::Submit(text) => {
                     selected_input(client, &mut ui, text, InputMode::Steer, cwd.to_owned())?
                 }
@@ -2139,9 +2149,57 @@ async fn chat_tui(
         Ok(())
     }
     .await;
+    // Before a conversation is selected, these inputs have no native admission.
+    // Retain them locally on exit or a failed connection, without replaying them.
+    if ui.selected.is_none() {
+        while let Ok(input) = ui.inputs.try_recv() {
+            startup_inputs.push_back(input);
+        }
+    }
+    let queued_inputs = initial_prompt
+        .into_iter()
+        .chain(startup_inputs.iter().filter_map(|input| match input {
+            TuiInput::Submit(text) | TuiInput::Queue(text) => Some(text.clone()),
+            _ => None,
+        }))
+        .collect::<Vec<_>>();
+    let recovery = if ui.selected.is_none() || !queued_inputs.is_empty() {
+        Some(
+            async {
+                let draft = ui.handle.draft().await?;
+                if draft.is_empty() && queued_inputs.is_empty() {
+                    return Ok(None);
+                }
+                write_ui_recovery(
+                    directory,
+                    &UiRecovery {
+                        owner: UiRecoveryOwner::Main,
+                        draft,
+                        queued_inputs,
+                    },
+                )
+                .map(Some)
+            }
+            .await,
+        )
+    } else {
+        None
+    };
     ui.close_view().await;
     finish_controls(&mut ui.controls).await;
-    result.and(guard.stop().await)
+    let stopped = guard.stop().await;
+    let retained = match recovery {
+        Some(Ok(Some(path))) => {
+            eprintln!(
+                "Unsent input saved privately to {}. It will not be replayed automatically.",
+                path.display()
+            );
+            Ok(())
+        }
+        Some(Err(error)) => Err(error),
+        _ => Ok(()),
+    };
+    result.and(stopped).and(retained)
 }
 
 async fn exchange(
@@ -2160,7 +2218,7 @@ async fn exchange(
             .next_frame()
             .await?
             .context("Coordinator disconnected")?;
-        let event: RuntimeEventKind = serde_json::from_slice(&frame)?;
+        let event = decode_coordinator_event(&frame)?;
         match event {
             RuntimeEventKind::Done => return Ok(events),
             RuntimeEventKind::Failure { message, .. } => bail!(message),
@@ -2268,7 +2326,7 @@ async fn worker_service(
                 .context("Coordinator closed the worker registration")?;
             ensure!(
                 matches!(
-                    serde_json::from_slice::<RuntimeEventKind>(&frame)?,
+                    decode_coordinator_event(&frame)?,
                     RuntimeEventKind::WorkerReady { .. }
                 ),
                 "Coordinator did not accept this worker"
@@ -2314,7 +2372,7 @@ async fn worker_service(
                     }
                     frame = reader.next_frame() => {
                         let frame = frame?.context("Coordinator closed the worker connection")?;
-                        let event: RuntimeEventKind = serde_json::from_slice(&frame)?;
+                        let event = decode_coordinator_event(&frame)?;
                         if let RuntimeEventKind::HostCancel { call_id } = &event {
                             if let Some(cancel) = cancellations.get(call_id) { let _ = cancel.send(true); }
                             continue;
@@ -2591,12 +2649,15 @@ async fn request(
 ) -> Result<Option<String>> {
     request_presented(
         arguments,
-        config,
-        coordinator,
-        script,
-        directory,
+        ClientContext {
+            config,
+            coordinator,
+            script,
+            directory,
+        },
         command,
         None,
+        PlainNoticeRoute::Direct,
     )
     .await
 }
@@ -2613,28 +2674,35 @@ async fn request_with_ui(
     ui.failure_shown = false;
     request_presented(
         arguments,
-        config,
-        coordinator,
-        script,
-        directory,
+        ClientContext {
+            config,
+            coordinator,
+            script,
+            directory,
+        },
         command,
         Some(Presentation {
             handle: ui.handle.clone(),
             session: Some(ui),
         }),
+        PlainNoticeRoute::Direct,
     )
     .await
 }
 
 async fn request_presented(
     arguments: &Arguments,
-    config: &ClientConfig,
-    coordinator: Option<&str>,
-    script: &Path,
-    directory: &Path,
+    client: ClientContext<'_>,
     command: RuntimeCommand,
     mut presentation: Option<Presentation<'_>>,
+    notices: PlainNoticeRoute,
 ) -> Result<Option<String>> {
+    let ClientContext {
+        config,
+        coordinator,
+        script,
+        directory,
+    } = client;
     let login = matches!(command, RuntimeCommand::Login);
     let attached = matches!(command, RuntimeCommand::RunTask { .. });
     let main_view = matches!(command, RuntimeCommand::AttachMain);
@@ -2758,9 +2826,9 @@ async fn request_presented(
                         let cursor = if attached { history_cursor.take() } else { view.session.as_mut().and_then(|ui| ui.history_cursor.take()) };
                         if let Some(cursor) = cursor {
                             let (task_id, agent_id) = history_target.clone().map_or((None, None), |(task, agent)| (Some(task), agent));
-                            let next = Box::pin(request_presented(arguments, config, coordinator, script, directory,
+                            let next = Box::pin(request_presented(arguments, ClientContext { config, coordinator, script, directory },
                                 RuntimeCommand::ReadHistory { task_id, agent_id, cursor: Some(cursor) },
-                                Some(Presentation { handle: view.handle.clone(), session: None }))).await?;
+                                Some(Presentation { handle: view.handle.clone(), session: None }), PlainNoticeRoute::Direct)).await?;
                             if attached { history_cursor = next; } else if let Some(ui) = view.session.as_mut() { ui.history_cursor = next; }
                         } else { view.handle.event(RuntimeEventKind::Notice { task_id: None, text: "No older history.".into() })?; }
                     }
@@ -2850,8 +2918,7 @@ async fn request_presented(
                 continue;
             }
         };
-        let event: RuntimeEventKind =
-            serde_json::from_slice(&frame).context("Coordinator returned an invalid event")?;
+        let event = decode_coordinator_event(&frame)?;
         if let Some(ui) = presentation
             .as_mut()
             .and_then(|view| view.session.as_deref_mut()).filter(|ui|ui.selected.is_none())
@@ -2912,7 +2979,8 @@ async fn request_presented(
                 }else{false}
             }else{false}
         }else{false};
-        // The chief's Watch connection already carries notices; workers show their direct answers.
+        // Worker results render through their canonical messages and final answer.
+        // Anonymous execution notices must not repeat that result in the same view.
         if let Some(view) = &presentation
             && view.session.as_ref().is_none_or(|ui|ui.selected.is_none())
             && !replayed
@@ -3068,7 +3136,8 @@ async fn request_presented(
                 }
             }
             RuntimeEventKind::Notice { text, .. } if !arguments.json && presentation.is_none() => {
-                if !attached {
+                outcome = true;
+                if !attached && notices == PlainNoticeRoute::Direct {
                     eprintln!("{text}");
                 }
             }
@@ -3458,7 +3527,7 @@ mod tests {
         let task: agent_cli::protocol::TaskId =
             "11111111-1111-4111-8111-111111111111".parse().unwrap();
         let recovery = crate::UiRecovery {
-            owner: crate::UiRecoveryOwner {
+            owner: crate::UiRecoveryOwner::Task {
                 task_id: task.clone(),
                 agent_id: Some("review".into()),
                 allocation_id: "22222222-2222-4222-8222-222222222222".into(),
@@ -3469,9 +3538,10 @@ mod tests {
         let path = crate::write_ui_recovery(directory.path(), &recovery).unwrap();
         let saved: crate::UiRecovery =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(saved.owner.task_id, task);
-        assert_eq!(saved.owner.agent_id.as_deref(), Some("review"));
-        assert_eq!(saved.owner.allocation_id, recovery.owner.allocation_id);
+        assert!(
+            matches!(saved.owner, crate::UiRecoveryOwner::Task { task_id, agent_id: Some(agent_id), allocation_id }
+            if task_id == task && agent_id == "review" && allocation_id == "22222222-2222-4222-8222-222222222222")
+        );
         assert_eq!(saved.draft, recovery.draft);
         assert_eq!(saved.queued_inputs, recovery.queued_inputs);
         assert_eq!(

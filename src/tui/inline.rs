@@ -415,7 +415,7 @@ mod tests {
     fn state() -> State {
         let mut state = State::new(TuiInfo {
             title: "Main agent".into(),
-            model: ModelSelection::default(),
+            model: Some(ModelSelection::default()),
             cwd: "/workspace".into(),
         });
         state.output.banner.ready();
@@ -633,7 +633,7 @@ mod tests {
         terminal = crate::tui::inline::fresh_inline(terminal.backend().clone()).unwrap();
         state.reset_conversation(TuiInfo {
             title: "Selected conversation".into(),
-            model: ModelSelection::default(),
+            model: Some(ModelSelection::default()),
             cwd: "/workspace/project".into(),
         });
         let selected = handle.begin_history_replay().unwrap();
@@ -738,6 +738,19 @@ mod tests {
                 text: "Inspecting current evidence.".into(),
             },
         });
+        let mut call = message(
+            "tool-assistant",
+            HistoryRole::Tool,
+            "inspect repository",
+            false,
+            true,
+        );
+        call.tool = Some(ToolHistory {
+            call_id: "inspect".into(),
+            name: "inspect repository".into(),
+            status: ToolStatus::Running,
+        });
+        state.event(RuntimeEventKind::Message { message: call });
         state.event(RuntimeEventKind::Activity {
             activity: ModelActivity::ToolStarted {
                 call_id: "inspect".into(),
@@ -887,22 +900,43 @@ mod tests {
     fn canonical_answer_identity_merges_live_completion_with_replayed_history() {
         let mut state = state();
         let mut terminal = terminal();
+        state.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Thinking {
+                text: "Owned reasoning before final answer".into(),
+            },
+        });
         state.event(RuntimeEventKind::Answer {
             conversation_id: "main".into(),
             entry_id: Some("answer".into()),
-            text: "One completed answer".into(),
+            text: "One completed answer\nAnother distinct answer block".into(),
         });
         state.flush_output(&mut terminal, false).unwrap();
         let before = output(&terminal);
         state.event(RuntimeEventKind::History {
             conversation_id: "main".into(),
-            messages: vec![message(
-                "answer",
-                HistoryRole::Final,
-                "One completed answer",
-                false,
-                true,
-            )],
+            messages: vec![
+                message(
+                    "answer",
+                    HistoryRole::Thinking,
+                    "Owned reasoning before final answer",
+                    false,
+                    true,
+                ),
+                message(
+                    "answer",
+                    HistoryRole::Final,
+                    "One completed answer",
+                    false,
+                    true,
+                ),
+                message(
+                    "answer",
+                    HistoryRole::Final,
+                    "Another distinct answer block",
+                    false,
+                    true,
+                ),
+            ],
             next_cursor: None,
             page_complete: false,
         });
@@ -911,11 +945,12 @@ mod tests {
         state.event(RuntimeEventKind::Answer {
             conversation_id: "main".into(),
             entry_id: Some("answer".into()),
-            text: "One completed answer".into(),
+            text: "One completed answer\nAnother distinct answer block".into(),
         });
         state.flush_output(&mut terminal, false).unwrap();
         assert_eq!(output(&terminal), before);
         assert_eq!(before.matches("One completed answer").count(), 1);
+        assert_eq!(before.matches("Another distinct answer block").count(), 1);
     }
 
     #[test]
@@ -1046,6 +1081,409 @@ mod tests {
         assert_eq!(saved.matches("Completed answer").count(), 1);
         assert!(
             saved.find("First complete update").unwrap() < saved.find("Completed answer").unwrap()
+        );
+    }
+
+    #[test]
+    fn streamed_thinking_and_complete_history_share_the_assistant_entry_once() {
+        for (history_first, first, second, occurrences) in [
+            (
+                false,
+                "First reasoning block.",
+                "Second reasoning block.",
+                1,
+            ),
+            (true, "First reasoning block.", "Second reasoning block.", 1),
+            (
+                false,
+                "Identical reasoning block.",
+                "Identical reasoning block.",
+                2,
+            ),
+            (
+                true,
+                "Identical reasoning block.",
+                "Identical reasoning block.",
+                2,
+            ),
+        ] {
+            let mut state = state();
+            let mut terminal = terminal();
+            state.event(RuntimeEventKind::Activity {
+                activity: ModelActivity::Thinking {
+                    text: format!("{first}{second}"),
+                },
+            });
+            let answer = message(
+                "assistant",
+                HistoryRole::Final,
+                "Completed assistant body",
+                false,
+                true,
+            );
+            let history = RuntimeEventKind::History {
+                conversation_id: "main".into(),
+                messages: vec![
+                    message("assistant", HistoryRole::Thinking, first, false, true),
+                    message("assistant", HistoryRole::Thinking, second, false, true),
+                    answer.clone(),
+                ],
+                next_cursor: None,
+                page_complete: true,
+            };
+            if history_first {
+                state.event(RuntimeEventKind::Notice {
+                    task_id: None,
+                    text: "An unrelated update".into(),
+                });
+                draw_inline(&mut state, &mut terminal);
+                state.event(history);
+                draw_inline(&mut state, &mut terminal);
+                state.event(RuntimeEventKind::Message { message: answer });
+            } else {
+                state.event(RuntimeEventKind::Message { message: answer });
+                draw_inline(&mut state, &mut terminal);
+                state.event(history);
+            }
+            draw_inline(&mut state, &mut terminal);
+            for text in [first, second] {
+                assert_eq!(
+                    output(&terminal).matches(text).count(),
+                    occurrences,
+                    "{history_first}: {text}"
+                );
+            }
+            assert_eq!(
+                output(&terminal)
+                    .matches("Completed assistant body")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn tool_only_assistant_commit_owns_streamed_thinking_before_history_replay() {
+        let mut state = state();
+        let mut terminal = terminal();
+        state.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Thinking {
+                text: "Reasoning before the owned tool".into(),
+            },
+        });
+        state.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::ToolStarted {
+                call_id: "owned-call".into(),
+                name: "inspect".into(),
+            },
+        });
+        let mut call = message("assistant", HistoryRole::Tool, "inspect", false, true);
+        call.tool = Some(ToolHistory {
+            call_id: "owned-call".into(),
+            name: "inspect".into(),
+            status: ToolStatus::Running,
+        });
+        state.event(RuntimeEventKind::Message {
+            message: call.clone(),
+        });
+        draw_inline(&mut state, &mut terminal);
+        state.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![
+                message(
+                    "assistant",
+                    HistoryRole::Thinking,
+                    "Reasoning before the owned tool",
+                    false,
+                    true,
+                ),
+                call,
+            ],
+            next_cursor: None,
+            page_complete: true,
+        });
+        draw_inline(&mut state, &mut terminal);
+        assert_eq!(
+            output(&terminal)
+                .matches("Reasoning before the owned tool")
+                .count(),
+            1
+        );
+        state.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Thinking {
+                text: "Reasoning before the owned tool".into(),
+            },
+        });
+        let mut result = message(
+            "tool-result",
+            HistoryRole::Tool,
+            "inspect finished",
+            false,
+            true,
+        );
+        result.tool = Some(ToolHistory {
+            call_id: "owned-call".into(),
+            name: "inspect".into(),
+            status: ToolStatus::Finished,
+        });
+        state.event(RuntimeEventKind::Message { message: result });
+        assert!(
+            state.messages.iter().any(|message| matches!(
+                message.kind,
+                crate::tui::MessageKind::Thinking(_)
+            ) && message.id.is_none()),
+            "A tool result must not claim the following assistant's thinking"
+        );
+        let final_message = message(
+            "next-assistant",
+            HistoryRole::Final,
+            "The next assistant finished",
+            false,
+            true,
+        );
+        state.event(RuntimeEventKind::Message {
+            message: final_message.clone(),
+        });
+        state.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![
+                message(
+                    "next-assistant",
+                    HistoryRole::Thinking,
+                    "Reasoning before the owned tool",
+                    false,
+                    true,
+                ),
+                final_message,
+            ],
+            next_cursor: None,
+            page_complete: true,
+        });
+        draw_inline(&mut state, &mut terminal);
+        assert_eq!(
+            output(&terminal)
+                .matches("Reasoning before the owned tool")
+                .count(),
+            2,
+            "Identical thinking in distinct assistant entries must remain distinct"
+        );
+    }
+
+    #[test]
+    fn older_history_cannot_claim_the_current_generations_anonymous_thinking() {
+        let mut state = state();
+        let mut terminal = terminal();
+        state.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Thinking {
+                text: "Current generation reasoning".into(),
+            },
+        });
+        state.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![
+                message(
+                    "older-assistant",
+                    HistoryRole::Thinking,
+                    "Older retained reasoning",
+                    false,
+                    true,
+                ),
+                message(
+                    "older-assistant",
+                    HistoryRole::Final,
+                    "Older retained answer",
+                    false,
+                    true,
+                ),
+            ],
+            next_cursor: None,
+            page_complete: true,
+        });
+        draw_inline(&mut state, &mut terminal);
+        assert!(state.messages.iter().any(|message| matches!(
+            message.kind,
+            crate::tui::MessageKind::Thinking(_)
+        ) && message.id.is_none()));
+        let answer = message(
+            "current-assistant",
+            HistoryRole::Final,
+            "Current answer",
+            false,
+            true,
+        );
+        state.event(RuntimeEventKind::Message {
+            message: answer.clone(),
+        });
+        state.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![
+                message(
+                    "current-assistant",
+                    HistoryRole::Thinking,
+                    "Current generation reasoning",
+                    false,
+                    true,
+                ),
+                answer,
+            ],
+            next_cursor: None,
+            page_complete: true,
+        });
+        draw_inline(&mut state, &mut terminal);
+        for text in [
+            "Older retained reasoning",
+            "Current generation reasoning",
+            "Current answer",
+        ] {
+            assert_eq!(output(&terminal).matches(text).count(), 1, "{text}");
+        }
+    }
+
+    #[test]
+    fn complete_history_recovers_a_partial_live_block_before_its_delayed_suffix_once() {
+        let mut state = state();
+        let mut terminal = terminal();
+        state.event(RuntimeEventKind::Message {
+            message: message(
+                "overlap",
+                HistoryRole::Notice,
+                "Retained prefix ",
+                false,
+                false,
+            ),
+        });
+        draw_inline(&mut state, &mut terminal);
+        state.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![message(
+                "overlap",
+                HistoryRole::Notice,
+                "Retained prefix complete suffix",
+                false,
+                true,
+            )],
+            next_cursor: None,
+            page_complete: true,
+        });
+        state.event(RuntimeEventKind::Message {
+            message: message(
+                "overlap",
+                HistoryRole::Notice,
+                "complete suffix",
+                true,
+                true,
+            ),
+        });
+        draw_inline(&mut state, &mut terminal);
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].text, "Retained prefix complete suffix");
+        assert_eq!(
+            output(&terminal)
+                .matches("Retained prefix complete suffix")
+                .count(),
+            1
+        );
+        assert_eq!(state.messages[0].output, CellOutput::Printed);
+    }
+
+    #[test]
+    fn history_keeps_a_printed_block_and_adds_its_identical_distinct_sibling_once() {
+        let mut state = state();
+        let mut terminal = terminal();
+        let block = message(
+            "overlap",
+            HistoryRole::Commentary,
+            "Identical distinct block",
+            false,
+            true,
+        );
+        state.event(RuntimeEventKind::Message {
+            message: block.clone(),
+        });
+        draw_inline(&mut state, &mut terminal);
+        state.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![block.clone(), block.clone()],
+            next_cursor: None,
+            page_complete: true,
+        });
+        state.event(RuntimeEventKind::Message { message: block });
+        state.event(RuntimeEventKind::Message {
+            message: message(
+                "distinct-entry",
+                HistoryRole::Commentary,
+                "Identical distinct block",
+                false,
+                true,
+            ),
+        });
+        draw_inline(&mut state, &mut terminal);
+        assert_eq!(state.messages.len(), 3);
+        assert_eq!(
+            output(&terminal)
+                .matches("Identical distinct block")
+                .count(),
+            3
+        );
+        assert!(
+            state
+                .messages
+                .iter()
+                .all(|message| message.output == CellOutput::Printed)
+        );
+    }
+
+    #[test]
+    fn history_transport_chunks_replace_a_live_prefix_without_losing_late_continuations() {
+        let mut state = state();
+        let mut terminal = terminal();
+        state.event(RuntimeEventKind::Message {
+            message: message("overlap", HistoryRole::Final, "Complete ", false, false),
+        });
+        draw_inline(&mut state, &mut terminal);
+        state.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![message(
+                "overlap",
+                HistoryRole::Final,
+                "Complete native ",
+                false,
+                false,
+            )],
+            next_cursor: None,
+            page_complete: false,
+        });
+        state.event(RuntimeEventKind::Message {
+            message: message(
+                "overlap",
+                HistoryRole::Final,
+                "native continuation",
+                true,
+                true,
+            ),
+        });
+        state.flush_output(&mut terminal, false).unwrap();
+        assert!(!output(&terminal).contains("Complete native continuation"));
+        state.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![message(
+                "overlap",
+                HistoryRole::Final,
+                "continuation",
+                true,
+                true,
+            )],
+            next_cursor: None,
+            page_complete: true,
+        });
+        draw_inline(&mut state, &mut terminal);
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].text, "Complete native continuation");
+        assert_eq!(
+            output(&terminal)
+                .matches("Complete native continuation")
+                .count(),
+            1
         );
     }
 

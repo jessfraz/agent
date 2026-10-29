@@ -27,13 +27,13 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     assert.ok(validEvent(frame), "The real CLI must return typed protocol events"); return frame.event;
   });
   function start(host: number, args: string[], input?: string, extra: NodeJS.ProcessEnv = {}, nativeArguments = false, terminal = false,
-    terminalBinary = binary) {
+    clientBinary = binary) {
     const home = homes[host]; assert.ok(home);
     const arguments_ = nativeArguments ? args : ["--state-dir", join(home, "state"), "--config", join(home, "agent.toml"),
       "--runtime", runtime, "--instructions", join(home, "AGENTS.md"), ...args];
-    const command = terminal ? [terminalBinary, ...arguments_]
+    const command = terminal ? [clientBinary, ...arguments_]
       : ["--json", "--no-tui", ...arguments_];
-    const child = spawn(terminal ? terminalFixture : binary, command, { cwd: home, detached: true, stdio: ["pipe", "pipe", "pipe"], env: {
+    const child = spawn(terminal ? terminalFixture : clientBinary, command, { cwd: home, detached: true, stdio: ["pipe", "pipe", "pipe"], env: {
       PATH: bin + delimiter + process.env.PATH, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local"),
       TMPDIR: directory, TERM: "xterm-256color", AGENT_SQLITE_VEC: process.env.AGENT_SQLITE_VEC, OPENAI_API_KEY: "sk-synthetic-fixture",
       AGENT_TEST_NODE_ID: host === 0 ? coordinator : laptop, AGENT_TEST_REX_STATE: join(home, "rex.json"),
@@ -51,8 +51,8 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     }
     return owned;
   }
-  async function cli(host: number, args: string[], input = "") {
-    const process = start(host, args, input); assert.equal(await process.exited, 0, process.errors()); return events(process.output());
+  async function cli(host: number, args: string[], input = "", clientBinary = binary) {
+    const process = start(host, args, input, {}, false, false, clientBinary); assert.equal(await process.exited, 0, process.errors()); return events(process.output());
   }
   async function exchange(command: RuntimeCommand, observe?: (event: RuntimeEventKind) => void): Promise<RuntimeEventKind[]> {
     const channel = createConnection(socket); let output = "", done = false, observed = 0;
@@ -106,7 +106,7 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     await until(async () => { try { return (await stat(socket)).isSocket(); } catch { return false; } });
     let worker = start(1, ["maintain"]); await online([coordinator, laptop]);
     await script("fixture-initial-main", [exec, delegate("fixture-initial-worker", laptop), delegate("Initial desktop audit"), { text: "Sapphire main detail retained." }]);
-    const first = (await cli(1, ["chat", "fixture-initial-main: remember the sapphire connector."])).find((event) => event.type === "answer"); assert.ok(first?.type === "answer");
+    const first = (await cli(1, ["chat", "fixture-initial-main: remember the sapphire connector."], "", process.env.AGENT_TEST_LEGACY_CHAT_BINARY ?? binary)).find((event) => event.type === "answer"); assert.ok(first?.type === "answer");
     const chiefConversationId = first.conversation_id;
     const old = (await tasks()).find((task) => task.title === "fixture-initial-worker"); assert.ok(old?.worker.state === "bound");
     const original = old.worker, launch = sessions(join(homes[1]!, "rex.json")).find((session) => session.session_id === original.binding.session_id); assert.ok(launch);
@@ -328,6 +328,39 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     assert.equal(await localStatus.exited, 0, localStatus.errors()); assert.ok(localStatus.output().includes("Coordinator:"));
     assert.equal((await mainHistory()).messages.some((message) => message.role === "user" && message.text === "/status"), false);
     assert.equal(await readFile(queue + ".requests", "utf8"), requestsBeforeAttach);
+
+    const canonical = start(0, [], undefined, {}, false, true, process.env.AGENT_TEST_NOTICE_BINARY ?? binary);
+    await until(async () => canonical.output().includes("Sapphire main detail retained."));
+    const noticeOffset = canonical.output().length;
+    const noticeInput = "fixture-canonical-worker-notice", noticeBody = "One durable worker result appears in the main chat.";
+    await script(noticeInput, [{ text: noticeBody }]); actor.child.stdin.write(noticeInput + "\n");
+    await until(async () => canonical.output().slice(noticeOffset).includes(noticeBody));
+    const savedNotices = (await mainHistory()).messages.filter((message) => message.role === "notice" && message.text === noticeBody);
+    assert.equal(savedNotices.length, 1, "The worker result must have one canonical saved root entry");
+    canonical.child.stdin.write("/exit\r"); assert.equal(await canonical.exited, 0, canonical.errors());
+    const liveNotice = canonical.output().slice(noticeOffset);
+    assert.equal(liveNotice.includes(old.title + ": " + noticeBody), false, "Observer-backed chat must not also render the legacy anonymous notification");
+    assert.equal(liveNotice.split(noticeBody).length - 1, 1, "Live rendering must use the one canonical notice entry");
+    const noticeReplay = start(0, [], undefined, {}, false, true, process.env.AGENT_TEST_NOTICE_BINARY ?? binary);
+    await until(async () => noticeReplay.output().includes(noticeBody));
+    noticeReplay.child.stdin.write("/exit\r"); assert.equal(await noticeReplay.exited, 0, noticeReplay.errors());
+    assert.equal(noticeReplay.output().split(noticeBody).length - 1, 1, "Reopening must project the same saved notice once");
+    const persistedNotice = (await mainHistory()).messages.find((message) => message.role === "notice" && message.text === noticeBody);
+    assert.equal(persistedNotice?.entry_id, savedNotices[0]?.entry_id, "Live and reopened views must share the original native identity");
+
+    const plainNotice = "A useful plaintext notice appears exactly once.", plainAnswer = "The plaintext chief handled the request.";
+    await script("fixture-plain-notice", [{ tool: "notify", args: { keys: [], text: plainNotice } }, { text: plainAnswer }]);
+    const plain = start(0, ["--no-tui"], undefined, {}, false, true, process.env.AGENT_TEST_PLAIN_BINARY ?? binary);
+    await until(async () => plain.output().includes("agent> "));
+    plain.child.stdin.write("fixture-plain-notice\n");
+    await until(async () => plain.output().includes(plainAnswer));
+    plain.child.stdin.write("/exit\n"); assert.equal(await plain.exited, 0, plain.errors());
+    assert.equal(plain.output().split(plainNotice).length - 1, 1,
+      "The watched plain chief must not also render its direct duplicate notification");
+    const opened = start(0, ["--no-tui", "history", "open", old.conversation_id], undefined, {}, false, true);
+    assert.equal(await opened.exited, 0, opened.errors());
+    assert.equal(opened.output().split("Opened " + old.title).length - 1, 1,
+      "A one-off history command must retain its direct acknowledgment");
 
     const automatic = start(1, [], undefined, {}, false, true, process.env.AGENT_TEST_HISTORY_BINARY ?? binary);
     await until(async () => automatic.output().includes("Sapphire main detail retained."),

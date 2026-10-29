@@ -46,7 +46,9 @@ let activeLoginRequestId: number | undefined;
 function emit(id: number, event: RuntimeEventKind): void {
   const frame: RuntimeEvent = { version: VERSION, id, event };
   if (!validEvent(frame)) throw new Error("Invalid runtime event");
-  process.stdout.write(`${JSON.stringify(frame)}\n`);
+  // Text deltas are an ObserveMain opt-in. Existing Chat clients deserialize a
+  // closed event enum and must keep receiving their original canonical wire.
+  if (event.type !== "text_delta" || mainObservers.has(id)) process.stdout.write(`${JSON.stringify(frame)}\n`);
   if (mainTurns.has(id)) {
     for (const [observerId, observer] of mainObservers) {
       const update = event.type === "done" ? { type: "worker_idle" } satisfies RuntimeEventKind : event;
@@ -611,7 +613,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
               next += 1;
               const settled = await input.submission.wait(BACKGROUND_CONTEXT);
               if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted") {
-                if (input.input_id !== undefined) emit(id, { type: "input_rejected", input_id: input.input_id, message: "The stopped turn withdrew this input; submit it again to continue." });
+                if (input.input_id !== undefined) for (const event of await reconcileMainInput(root, input.input_id) ?? []) emit(id, event);
                 continue;
               }
               if (settled.type !== "input" || settled.status !== "done") throw new TaskError(await modelFailureMessage(root, "The model turn did not complete; its state is retained"));
@@ -626,7 +628,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
             if (turn !== undefined) {
               turn.accepting = false; await root.abort(BACKGROUND_CONTEXT);
               for (const input of turn.inputs) if (input.input_id !== undefined && (await input.submission.status(BACKGROUND_CONTEXT)).status === "unanswered") {
-                emit(id, { type: "input_rejected", input_id: input.input_id, message: "The turn failed before this input completed; its original is retained." });
+                for (const event of await reconcileMainInput(root, input.input_id) ?? []) emit(id, event);
               }
             }
             throw error;

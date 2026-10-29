@@ -186,8 +186,8 @@ before adding an approximate index or tuning the chunker.
 
 Verify idempotent reruns, fork/version preservation, interrupted import/index
 catch-up, offline asset reads, inert old tools and fenced Rex replacement.
-Preserve existing automation definitions and prompts. Migrating schedules is a
-separate next step; import neither enables schedules nor builds a cron engine.
+Preserve existing automation definitions and prompts. Import does not enable
+scheduled workflows; configure those separately through the job catalog.
 Learning and instruction changes retain their separate review boundary.
 
 ## Upstream references

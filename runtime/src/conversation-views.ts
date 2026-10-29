@@ -4,6 +4,7 @@ import { AgentDoc, ROOT_CONVERSATION_ID, type Conversation, type Harness } from 
 import type { ConversationCatalog } from "./catalog.js";
 import type { CoordinatorEnvironment } from "./environment.js";
 import type { HistoryStore } from "./history.js";
+import { reconcileMainInput } from "./main_observation.js";
 import type { ConversationModels } from "./models.js";
 import { TaskError, type HostCall, type TaskStore } from "./tasks.js";
 import { activity } from "./transcript.js";
@@ -67,14 +68,7 @@ export class ConversationViews {
         cwd: native?.cwd ?? imported?.thread.cwd ?? "/", working });
       for (const input_id of inputIds) {
         if (view.closed) return;
-        const saved = await conversation.commit((tx) => tx.submissionByRequest(conversation.id, input_id), BACKGROUND_CONTEXT);
-        if (saved === undefined) continue;
-        if (saved.status === "unanswered") emit({ type: "input_rejected", input_id,
-          message: "This saved input was stopped without an answer. Restore its text to send a new message." });
-        else {
-          emit({ type: "input_accepted", input_id });
-          if (saved.entry !== undefined) emit({ type: "input_placed", input_id, entry_id: saved.entry.toString() });
-        }
+        for (const event of await reconcileMainInput(conversation, input_id) ?? []) emit(event);
       }
       ready = true; for (const event of buffered) emit(event);
       await finished;
@@ -100,14 +94,9 @@ export class ConversationViews {
     const app = await this.services(), summary = await this.summary(app, command.conversation_id);
     if (summary.conversation_id === ROOT_CONVERSATION_ID.toString()) throw new TaskError("The main conversation uses its existing main input path");
     const conversation = await app.tasks.conversation(summary.conversation_id);
-    const saved = await conversation.commit((tx) => tx.submissionByRequest(conversation.id, command.input_id), BACKGROUND_CONTEXT);
-    if (saved !== undefined) {
-      if (saved.status === "unanswered") emit({ type: "input_rejected", input_id: command.input_id,
-        message: "This saved input was stopped without an answer. Restore its text to send a new message." });
-      else {
-        emit({ type: "input_accepted", input_id: command.input_id });
-        if (saved.entry !== undefined) emit({ type: "input_placed", input_id: command.input_id, entry_id: saved.entry.toString() });
-      }
+    const receipts = await reconcileMainInput(conversation, command.input_id);
+    if (receipts !== undefined) {
+      for (const event of receipts) emit(event);
       return;
     }
     const imported = await app.histories.byConversation(command.conversation_id);

@@ -11,10 +11,10 @@ use crate::tui::{
 };
 use crate::{
     chat_commands::{ChatCommand, Completion, command_help, completions},
-    models::ModelSelection,
+    models::{ModelProvider, ModelSelection},
     protocol::{
-        HistoryMessage, HistoryRole, InputMode, ModelActivity, RuntimeEventKind, SavedConversation,
-        ToolStatus,
+        ErrorCode, HistoryMessage, HistoryRole, InputMode, ModelActivity, RuntimeEventKind,
+        SavedConversation, ToolStatus,
     },
 };
 use anyhow::{Context, Result, anyhow, ensure};
@@ -34,7 +34,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 #[derive(Clone, Debug)]
 pub struct TuiInfo {
     pub title: String,
-    pub model: ModelSelection,
+    pub model: Option<ModelSelection>,
     pub cwd: String,
 }
 
@@ -231,6 +231,16 @@ fn join(thread: thread::JoinHandle<Result<()>>) -> Result<()> {
 
 pub struct Tui;
 impl Tui {
+    pub fn connecting(
+        title: String,
+        cwd: String,
+    ) -> Result<(TuiHandle, UnboundedReceiver<TuiInput>, TuiGuard)> {
+        Self::start(TuiInfo {
+            title,
+            model: None,
+            cwd,
+        })
+    }
     pub fn start(info: TuiInfo) -> Result<(TuiHandle, UnboundedReceiver<TuiInput>, TuiGuard)> {
         ensure!(
             std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
@@ -249,8 +259,13 @@ impl Tui {
                         return Ok(());
                     }
                 };
+                let mut state = State::new(info);
+                if let Err(error) = screen.draw(&mut state) {
+                    let _ = ready.send(Err(error));
+                    return Ok(());
+                }
                 let _ = ready.send(Ok(()));
-                run(&mut screen, updates, inputs, State::new(info))
+                run(&mut screen, updates, inputs, state)
             })
             .context("Could not start the terminal renderer")?;
         let guard = TuiGuard {
@@ -332,6 +347,7 @@ enum InputDelivery {
 }
 enum MessageKind {
     Text,
+    Answer,
     Thinking(u64),
     Tool {
         call_id: String,
@@ -342,6 +358,28 @@ enum MessageKind {
         mode: InputMode,
         delivery: InputDelivery,
     },
+}
+
+struct HistoryEntry {
+    id: String,
+    whole: bool,
+    blocks: Vec<(Role, usize)>,
+}
+impl HistoryEntry {
+    fn block(&mut self, role: Role, continuation: bool) -> usize {
+        match self.blocks.iter_mut().find(|(saved, _)| *saved == role) {
+            Some((_, count)) => {
+                if !continuation {
+                    *count += 1;
+                }
+                count.saturating_sub(1)
+            }
+            None => {
+                self.blocks.push((role, 1));
+                0
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -530,6 +568,7 @@ struct State {
     completion: Option<CompletionMenu>,
     dismissed_completion: Option<String>,
     thinking: Option<u64>,
+    unbound_thinking: Vec<u64>,
     next_thinking: u64,
     working: bool,
     compacting: bool,
@@ -537,7 +576,7 @@ struct State {
     exiting: bool,
     worker: bool,
     history_offset: Option<usize>,
-    history_entry: Option<(String, bool)>,
+    history_entry: Option<HistoryEntry>,
     loading_history: Option<HistoryLoad>,
     more_history: bool,
     history_replay: Option<uuid::Uuid>,
@@ -567,6 +606,7 @@ impl State {
             completion: None,
             dismissed_completion: None,
             thinking: None,
+            unbound_thinking: Vec::new(),
             next_thinking: 0,
             working: false,
             compacting: false,
@@ -595,6 +635,26 @@ impl State {
         self.messages.push(Message::new(None, role, text));
         self.changed = true;
     }
+    fn error_context(&self, detail: String) -> String {
+        let mut context = Vec::new();
+        if !self.info.title.is_empty() {
+            context.push(format!("Chat: {}", self.info.title));
+        }
+        if !self.info.cwd.is_empty() {
+            context.push(format!("Directory: {}", self.info.cwd));
+        }
+        if let Some(model) = &self.info.model {
+            context.push(format!(
+                "Model: {}/{}",
+                model.provider.as_str(),
+                model.model_id
+            ));
+        }
+        format!(
+            "{detail}\n\n{}\n\nRun `/feedback Investigate this error` to start a debugging task with this chat's context.",
+            context.join("\n")
+        )
+    }
     fn invalidate(&mut self, index: usize) {
         self.output.cursor = self.output.cursor.min(index);
         self.dirty_from = Some(self.dirty_from.map_or(index, |dirty| dirty.min(index)));
@@ -602,6 +662,16 @@ impl State {
     fn working(&mut self, working: bool) {
         self.working = working;
         if !working {
+            let pending = std::mem::take(&mut self.unbound_thinking);
+            for (index, message) in self.messages.iter_mut().enumerate() {
+                if matches!(message.kind, MessageKind::Thinking(id) if pending.contains(&id))
+                    && message.output == CellOutput::Mutable
+                {
+                    message.output = CellOutput::Ready;
+                    self.output.cursor = self.output.cursor.min(index);
+                }
+            }
+            self.thinking = None;
             self.settle_legacy_answer();
             self.interrupting = false;
         }
@@ -639,36 +709,80 @@ impl State {
                 self.scroll = usize::MAX;
             }
             let offset = self.history_offset.get_or_insert(0);
-            if self
-                .history_entry
-                .as_ref()
-                .is_none_or(|(id, _)| id != &message.entry_id)
+            // Live reasoning aggregates native blocks. Once its assistant entry
+            // is known, that presentation owns the entry's whole reasoning section.
+            if role == Role::Thinking
+                && let Some(index) = self.messages.iter().rposition(|saved| {
+                    saved.id.as_ref() == Some(&message.entry_id)
+                        && matches!(saved.kind, MessageKind::Thinking(_))
+                })
             {
-                // Native entries are immutable. Overlapping pages may repeat
-                // an entry with several distinct blocks and continuation frames.
-                let existing = self
-                    .messages
-                    .iter()
-                    .rposition(|saved| saved.id.as_ref() == Some(&message.entry_id));
-                if let Some(index) = existing {
-                    *offset = (*offset).max(index + 1);
-                }
-                self.history_entry = Some((message.entry_id.clone(), existing.is_some()));
-            }
-            if self.history_entry.as_ref().is_some_and(|(_, skip)| *skip) {
+                *offset = (*offset).max(index + 1);
                 self.changed = true;
                 return;
             }
-            if message.continuation
-                && *offset > 0
-                && self.messages.get(*offset - 1).is_some_and(|previous| {
-                    previous.id.as_ref() == Some(&message.entry_id) && previous.role == role
-                })
+            if self
+                .history_entry
+                .as_ref()
+                .is_none_or(|entry| entry.id != message.entry_id)
             {
-                let index = *offset - 1;
-                self.messages[index].append(&message.text);
-                self.messages[index].output = output;
-                self.invalidate(index);
+                // A legacy answer or placed input owns its whole entry. Native
+                // messages own individual blocks, and may still be in flight.
+                let existing = self
+                    .messages
+                    .iter()
+                    .position(|saved| saved.id.as_ref() == Some(&message.entry_id));
+                if let Some(index) = existing {
+                    *offset = (*offset).max(index);
+                }
+                let whole = self.messages.iter().any(|saved| {
+                    saved.id.as_ref() == Some(&message.entry_id)
+                        && matches!(saved.kind, MessageKind::Answer | MessageKind::Input { .. })
+                });
+                self.history_entry = Some(HistoryEntry {
+                    id: message.entry_id.clone(),
+                    whole,
+                    blocks: Vec::new(),
+                });
+            }
+            if self.history_entry.as_ref().is_some_and(|entry| entry.whole) {
+                if let Some(index) = self
+                    .messages
+                    .iter()
+                    .rposition(|saved| saved.id.as_ref() == Some(&message.entry_id))
+                {
+                    *offset = (*offset).max(index + 1);
+                }
+                self.changed = true;
+                return;
+            }
+            let block = self
+                .history_entry
+                .as_mut()
+                .map(|entry| entry.block(role, message.continuation))
+                .unwrap_or(0);
+            let existing = self
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|(_, saved)| {
+                    saved.id.as_ref() == Some(&message.entry_id) && saved.role == role
+                })
+                .nth(block)
+                .map(|(index, _)| index);
+            if let Some(index) = existing {
+                *offset = (*offset).max(index + 1);
+                let saved = &mut self.messages[index];
+                if saved.output != CellOutput::Printed {
+                    if message.continuation {
+                        saved.append(&message.text);
+                    } else {
+                        saved.text = message.text;
+                        saved.rendered = None;
+                    }
+                    saved.output = output;
+                    self.invalidate(index);
+                }
             } else {
                 let index = *offset;
                 self.messages.insert(
@@ -700,8 +814,55 @@ impl State {
                 .iter_mut()
                 .find(|message| matches!(message.kind, MessageKind::Thinking(saved) if saved == id))
             && message.output == CellOutput::Mutable
+            && !self.unbound_thinking.contains(&id)
         {
             message.output = CellOutput::Ready;
+        }
+    }
+    fn bind_thinking(&mut self, entry_id: &str) {
+        let pending = std::mem::take(&mut self.unbound_thinking);
+        if pending.is_empty() {
+            return;
+        }
+        self.thinking = None;
+        let historical = self.messages.iter().any(|message| {
+            message.id.as_deref() == Some(entry_id)
+                && message.role == Role::Thinking
+                && !matches!(message.kind, MessageKind::Thinking(_))
+        });
+        if historical {
+            // The other wire may have supplied canonical history first. Anonymous
+            // previews are still mutable, so retiring them cannot duplicate scrollback.
+            let mut first = None;
+            for index in (0..self.messages.len()).rev() {
+                if matches!(self.messages[index].kind, MessageKind::Thinking(id) if pending.contains(&id))
+                {
+                    self.messages.remove(index);
+                    if let Some(offset) = &mut self.history_offset
+                        && index < *offset
+                    {
+                        *offset -= 1;
+                    }
+                    first = Some(index);
+                }
+            }
+            if let Some(index) = first {
+                self.invalidate(index);
+            }
+        } else {
+            let mut first = None;
+            for (index, message) in self.messages.iter_mut().enumerate() {
+                if matches!(message.kind, MessageKind::Thinking(id) if pending.contains(&id)) {
+                    message.id = Some(entry_id.into());
+                    if message.output == CellOutput::Mutable {
+                        message.output = CellOutput::Ready;
+                    }
+                    first.get_or_insert(index);
+                }
+            }
+            if let Some(index) = first {
+                self.invalidate(index);
+            }
         }
     }
     fn pending_input(&mut self, input_id: String, text: String, mode: InputMode) {
@@ -801,7 +962,7 @@ impl State {
     fn event(&mut self, event: RuntimeEventKind) {
         match event {
             RuntimeEventKind::ConversationReady { conversation, model, cwd, working } => {
-                self.info = TuiInfo { title: conversation.title, model, cwd };
+                self.info = TuiInfo { title: conversation.title, model: Some(model), cwd };
                 self.worker = false;
                 self.output.banner.ready();
                 self.working(working);
@@ -825,6 +986,11 @@ impl State {
             }
             RuntimeEventKind::Message { message } => {
                 self.output.banner.ready();
+                if matches!(message.role, HistoryRole::Assistant | HistoryRole::Final | HistoryRole::Commentary | HistoryRole::PartialAnswer)
+                    || (matches!(message.role, HistoryRole::Tool) && message.tool.as_ref().is_some_and(|tool| tool.status == ToolStatus::Running))
+                {
+                    self.bind_thinking(&message.entry_id);
+                }
                 // A replayed page contains whole immutable native entries.
                 // Ignore a delayed live delivery of that entry, not individual
                 // role/text blocks, which may legitimately repeat within it.
@@ -842,11 +1008,14 @@ impl State {
             }
             RuntimeEventKind::Answer { text, entry_id, .. } => {
                 self.output.banner.ready();
+                if let Some(entry_id) = &entry_id { self.bind_thinking(entry_id); }
                 self.finish_thinking();
                 self.working(false);
-                if entry_id.as_ref().is_none_or(|id| !self.messages.iter().any(|message| message.id.as_ref() == Some(id))) {
+                if entry_id.as_ref().is_none_or(|id| !self.messages.iter().any(|message| message.id.as_ref() == Some(id)
+                    && matches!(message.role, Role::Agent | Role::PartialAnswer | Role::Commentary))) {
                     self.push(Role::Agent, text);
                     if let Some(message) = self.messages.last_mut() {
+                        message.kind = MessageKind::Answer;
                         message.output = if entry_id.is_some() { CellOutput::Ready } else { CellOutput::AwaitingIdle };
                         message.id = entry_id;
                     }
@@ -862,6 +1031,7 @@ impl State {
                         let id = self.next_thinking;
                         self.next_thinking = self.next_thinking.saturating_add(1);
                         self.push(Role::Thinking, text);
+                        self.unbound_thinking.push(id);
                         self.thinking = Some(id);
                         if let Some(message) = self.messages.last_mut() { message.kind = MessageKind::Thinking(id); message.output = CellOutput::Mutable; }
                     }
@@ -893,10 +1063,10 @@ impl State {
                 self.worker = true;
                 self.history_offset = Some(0);
             }
-            RuntimeEventKind::ConversationSettings { settings } => self.info.model = settings.model,
+            RuntimeEventKind::ConversationSettings { settings } => self.info.model = Some(settings.model),
             RuntimeEventKind::MainReady { model, cwd, .. } => {
                 self.output.banner.ready();
-                self.info.model = model;
+                self.info.model = Some(model);
                 self.info.cwd = cwd;
                 self.working(true);
             }
@@ -911,9 +1081,23 @@ impl State {
                 self.finish_history_page();
                 if !self.working { self.settle_legacy_answer(); }
             }
-            RuntimeEventKind::Failure { message, .. } => {
+            RuntimeEventKind::Failure { code, message } => {
                 self.compacting = false;
-                self.push(Role::Failure, message);
+                let recovery = if matches!(&code, ErrorCode::AuthenticationRequired | ErrorCode::AuthenticationFailed) {
+                    self.info.model.as_ref().map_or_else(String::new, |model| {
+                        if model.provider == ModelProvider::OpenAiCodex { "\n\nRun `agent login` to reconnect ChatGPT.".into() }
+                        else { format!("\n\nCheck the configured authentication for `{}`.", model.provider.as_str()) }
+                    })
+                } else { String::new() };
+                let code = match code {
+                    ErrorCode::InvalidRequest => "invalid_request",
+                    ErrorCode::AuthenticationRequired => "authentication_required",
+                    ErrorCode::AuthenticationFailed => "authentication_failed",
+                    ErrorCode::ProviderUnavailable => "provider_unavailable",
+                    ErrorCode::StorageUnavailable => "storage_unavailable",
+                    ErrorCode::Internal => "internal",
+                };
+                self.push(Role::Failure, self.error_context(format!("Code: {code}\n\n{message}{recovery}")));
                 self.working(false);
             }
             RuntimeEventKind::InputAccepted { input_id } => {
@@ -938,11 +1122,25 @@ impl State {
                 }
             }
             RuntimeEventKind::InputRejected { input_id, message } => {
-                if let Some(index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Input { input_id: id, delivery: InputDelivery::Submitting | InputDelivery::Waiting, .. } if id == &input_id)) {
+                let pending = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Input { input_id: id, .. } if id == &input_id));
+                let receipt = pending.map_or_else(|| "No local delivery receipt is available for this input.".into(), |index| {
+                    let saved = &self.messages[index];
+                    match &saved.kind {
+                        MessageKind::Input { delivery: InputDelivery::Placed { entry_id }, .. } =>
+                            format!("Saved entry: {entry_id}\nThe input is already present in this conversation."),
+                        MessageKind::Input { delivery, .. } => format!("Last delivery receipt: {}.\n\nPending input:\n> {}",
+                            if matches!(delivery, InputDelivery::Submitting) { "sending" } else { "accepted, awaiting placement" },
+                            saved.text.replace('\n', "\n> ")),
+                        _ => "No local delivery receipt is available for this input.".into(),
+                    }
+                });
+                let text = self.error_context(format!("Input rejected: {input_id}\n\n{message}\n\n{receipt}"));
+                if let Some(index) = pending
+                    && matches!(self.messages[index].kind, MessageKind::Input { delivery: InputDelivery::Submitting | InputDelivery::Waiting, .. }) {
                     self.messages.remove(index);
                     self.invalidate(index);
                 }
-                self.push(Role::Failure, message);
+                self.push(Role::Failure, text);
             }
             _ => {}
         }
@@ -951,6 +1149,8 @@ impl State {
     fn status(&self) -> &'static str {
         if self.exiting {
             "Closing"
+        } else if self.info.model.is_none() {
+            "Connecting"
         } else if self.interrupting {
             "Interrupting"
         } else if self.compacting {
@@ -1482,16 +1682,15 @@ impl State {
             frame.render_widget(ClearWidget, area);
             frame.render_widget(Paragraph::new(lines), area);
         }
-        let reasoning = self
-            .info
-            .model
-            .reasoning
-            .map(|value| value.as_str())
-            .unwrap_or("default");
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
+        let mut status = Vec::new();
+        if let Some(model) = &self.info.model {
+            let reasoning = model
+                .reasoning
+                .map(|value| value.as_str())
+                .unwrap_or("default");
+            status.extend([
                 Span::styled(
-                    markdown::plain(&self.info.model.model_id),
+                    markdown::plain(&model.model_id),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -1499,28 +1698,30 @@ impl State {
                 Span::styled(" · ", Style::default().fg(Color::DarkGray)),
                 Span::styled(reasoning, Style::default().fg(Color::Magenta)),
                 Span::styled(
-                    if self.info.model.fast { " · fast" } else { "" },
+                    if model.fast { " · fast" } else { "" },
                     Style::default().fg(Color::Yellow),
                 ),
                 Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    markdown::plain(&self.info.cwd),
-                    Style::default().fg(Color::Blue),
-                ),
-                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    self.status(),
-                    Style::default().fg(if self.interrupting {
-                        Color::Yellow
-                    } else if self.working || self.compacting {
-                        Color::Cyan
-                    } else {
-                        Color::Green
-                    }),
-                ),
-            ])),
-            areas[2],
-        );
+            ]);
+        }
+        status.extend([
+            Span::styled(
+                markdown::plain(&self.info.cwd),
+                Style::default().fg(Color::Blue),
+            ),
+            Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                self.status(),
+                Style::default().fg(if self.interrupting {
+                    Color::Yellow
+                } else if self.working || self.compacting || self.info.model.is_none() {
+                    Color::Cyan
+                } else {
+                    Color::Green
+                }),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(Line::from(status)), areas[2]);
         frame.render_widget(
             Paragraph::new(Line::from(
                 [Shortcut::Steer, Shortcut::Queue, Shortcut::Help]
@@ -1756,10 +1957,10 @@ mod tests {
     fn state() -> State {
         State::new(TuiInfo {
             title: "Main agent".into(),
-            model: ModelSelection {
+            model: Some(ModelSelection {
                 reasoning: Some(Reasoning::High),
                 ..ModelSelection::default()
-            },
+            }),
             cwd: "/workspace/example".into(),
         })
     }
@@ -1777,6 +1978,97 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect()
     }
+    #[test]
+    fn connecting_paints_without_a_guessed_model_and_preserves_the_draft_when_ready() {
+        let mut view = State::new(TuiInfo {
+            title: "Main agent".into(),
+            model: None,
+            cwd: "/workspace/local".into(),
+        });
+        view.input(Event::Paste("An early draft".into()));
+        let text = rendered(&mut view, 120, 24);
+        assert_eq!(view.status(), "Connecting");
+        assert!(view.info.model.is_none());
+        assert!(
+            text.contains("Connecting")
+                && text.contains("An early draft")
+                && text.contains("/workspace/local"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("gpt-") && !text.contains("default"),
+            "{text}"
+        );
+        assert_eq!(view.input(key(KeyCode::Esc, KeyModifiers::NONE)), None);
+        let model = ModelSelection {
+            provider: crate::models::ModelProvider::Anthropic,
+            model_id: "authoritative-model".into(),
+            reasoning: Some(Reasoning::Low),
+            fast: false,
+        };
+        view.event(RuntimeEventKind::ConversationReady {
+            conversation: crate::protocol::SavedConversation {
+                conversation_id: "saved-chief".into(),
+                title: "Main agent".into(),
+                updated_at: None,
+                task_id: None,
+                agent_id: None,
+                host: None,
+                source_thread_id: None,
+            },
+            model: model.clone(),
+            cwd: "/workspace/authoritative".into(),
+            working: true,
+        });
+        assert_eq!(view.info.model, Some(model));
+        assert_eq!(view.editor.lines().join("\n"), "An early draft");
+        let text = rendered(&mut view, 120, 24);
+        assert!(
+            text.contains("authoritative-model")
+                && text.contains("/workspace/authoritative")
+                && text.contains("Working"),
+            "{text}"
+        );
+        assert_eq!(
+            view.input(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(TuiInput::Interrupt)
+        );
+        view.event(RuntimeEventKind::Interrupted);
+        assert!(
+            !view
+                .messages
+                .iter()
+                .any(|message| message.role == crate::tui::Role::Failure)
+        );
+        assert_eq!(view.editor.lines().join("\n"), "An early draft");
+    }
+
+    #[test]
+    fn a_connecting_failure_keeps_known_context_without_inventing_a_provider() {
+        let mut view = State::new(TuiInfo {
+            title: "Main agent".into(),
+            model: None,
+            cwd: "/workspace/local".into(),
+        });
+        view.event(RuntimeEventKind::Failure {
+            code: crate::protocol::ErrorCode::AuthenticationRequired,
+            message: "Coordinator setup did not finish.".into(),
+        });
+        let text = rendered(&mut view, 130, 35);
+        assert!(
+            text.contains("authentication_required")
+                && text.contains("Coordinator setup did not finish.")
+                && text.contains("/workspace/local")
+                && text.contains("/feedback Investigate this error"),
+            "{text}"
+        );
+        assert!(view.info.model.is_none());
+        assert!(
+            !text.contains("Model:") && !text.contains("agent login"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn escape_cancels_a_pending_input_before_ready_and_restoring_a_view_draft_is_quiet() {
         let mut view = state();
@@ -1841,7 +2133,7 @@ mod tests {
         );
         assert!(view.working);
         assert_eq!(view.info.title, "Selected conversation");
-        assert_eq!(view.info.model, model);
+        assert_eq!(view.info.model, Some(model));
         assert_eq!(view.info.cwd, "/workspace/selected");
         let mut terminal = Terminal::with_options(
             TestBackend::new(100, 20),
@@ -2201,6 +2493,173 @@ mod tests {
         );
     }
     #[test]
+    fn typed_failures_show_the_code_chat_and_recovery_action_without_changing_the_draft() {
+        let mut view = state();
+        view.info.title = "Hardware review".into();
+        view.info.cwd = "/workspace/board".into();
+        view.editor.insert_str("An unfinished correction");
+        view.working(true);
+        view.event(RuntimeEventKind::Failure {
+            code: crate::protocol::ErrorCode::ProviderUnavailable,
+            message: "The worker connection closed before it returned a result.".into(),
+        });
+        let text = rendered(&mut view, 130, 35);
+        for expected in [
+            "provider_unavailable",
+            "The worker connection closed",
+            "Hardware review",
+            "/workspace/board",
+            "openai/gpt-6.1-sol",
+            "/feedback Investigate this error",
+        ] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+        assert_eq!(view.editor.lines().join("\n"), "An unfinished correction");
+        assert!(!view.working);
+    }
+
+    #[test]
+    fn rejected_inputs_show_only_their_known_receipts_and_preserve_the_draft_and_saved_entry() {
+        for delivery in ["sending", "waiting", "placed", "unknown"] {
+            let mut view = state();
+            view.editor.insert_str("An unrelated draft");
+            view.working(true);
+            if delivery != "unknown" {
+                view.pending_input(
+                    "input-reference".into(),
+                    "Known submitted input".into(),
+                    crate::protocol::InputMode::FollowUp,
+                );
+                if delivery != "sending" {
+                    view.event(RuntimeEventKind::InputAccepted {
+                        input_id: "input-reference".into(),
+                    });
+                }
+                if delivery == "placed" {
+                    view.event(RuntimeEventKind::InputPlaced {
+                        input_id: "input-reference".into(),
+                        entry_id: "saved-entry-reference".into(),
+                    });
+                }
+            }
+            view.event(RuntimeEventKind::InputRejected {
+                input_id: "input-reference".into(),
+                message: "The input could not continue.".into(),
+            });
+            let text = rendered(&mut view, 130, 40);
+            assert!(
+                text.contains("input-reference")
+                    && text.contains("The input could not continue.")
+                    && text.contains("/feedback Investigate this error"),
+                "{text}"
+            );
+            match delivery {
+                "sending" | "waiting" => {
+                    let receipt = if delivery == "sending" {
+                        "sending"
+                    } else {
+                        "accepted, awaiting placement"
+                    };
+                    assert!(
+                        text.contains(receipt) && text.contains("Known submitted input"),
+                        "{text}"
+                    );
+                    assert!(!view.messages.iter().any(|message| matches!(
+                        message.kind,
+                        crate::tui::MessageKind::Input { .. }
+                    )));
+                }
+                "placed" => {
+                    assert!(
+                        text.contains("Saved entry: saved-entry-reference"),
+                        "{text}"
+                    );
+                    assert_eq!(view.messages.iter().filter(|message| message.id.as_deref() == Some("saved-entry-reference")).count(), 1);
+                    assert_eq!(text.matches("Known submitted input").count(), 1);
+                }
+                _ => assert!(
+                    text.contains("No local delivery receipt is available"),
+                    "{text}"
+                ),
+            }
+            assert_eq!(view.editor.lines().join("\n"), "An unrelated draft");
+            assert!(
+                view.working,
+                "Rejecting one input must not stop unrelated active work"
+            );
+        }
+    }
+
+    #[test]
+    fn authentication_failures_offer_the_recovery_for_the_selected_provider() {
+        for (provider, recovery) in [
+            (crate::models::ModelProvider::OpenAiCodex, "agent login"),
+            (
+                crate::models::ModelProvider::Anthropic,
+                "Check the configured authentication for anthropic",
+            ),
+        ] {
+            let mut view = state();
+            view.info.model.as_mut().unwrap().provider = provider;
+            view.event(RuntimeEventKind::Failure {
+                code: crate::protocol::ErrorCode::AuthenticationRequired,
+                message: "No credentials are available.".into(),
+            });
+            let text = rendered(&mut view, 130, 35);
+            assert!(
+                text.contains("authentication_required") && text.contains(recovery),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_wire_failures_keep_safe_metadata_and_normal_interrupts_are_not_errors() {
+        #[derive(serde::Serialize)]
+        struct FutureEvent {
+            #[serde(rename = "type")]
+            tag: &'static str,
+            content: &'static str,
+        }
+        let frame = serde_json::to_vec(&FutureEvent {
+            tag: "fixture_private_event",
+            content: "fixture_private_protocol_body",
+        })
+        .unwrap();
+        let failure = crate::runtime::decode_coordinator_event(&frame).unwrap_err();
+        let mut view = state();
+        view.event(RuntimeEventKind::Failure {
+            code: crate::protocol::ErrorCode::Internal,
+            message: failure.to_string(),
+        });
+        let text = rendered(&mut view, 130, 35);
+        assert!(
+            text.contains("internal")
+                && text.contains("event schema")
+                && text.contains("bytes")
+                && text.contains("/workspace/example"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("fixture_private_event")
+                && !text.contains("fixture_private_protocol_body"),
+            "{text}"
+        );
+        let mut stopped = state();
+        stopped.editor.insert_str("Keep this draft");
+        stopped.working(true);
+        stopped.event(RuntimeEventKind::Interrupted);
+        assert!(rendered(&mut stopped, 130, 20).contains("Interrupted"));
+        assert!(
+            !stopped
+                .messages
+                .iter()
+                .any(|message| message.role == crate::tui::Role::Failure)
+        );
+        assert_eq!(stopped.editor.lines().join("\n"), "Keep this draft");
+    }
+
+    #[test]
     fn escape_keeps_an_idle_chat_and_its_draft_open() {
         let mut state = state();
         state.input(Event::Paste("An unfinished correction".into()));
@@ -2348,7 +2807,7 @@ mod tests {
             conversation_id: "worker".into(),
             title: "Review device configuration".into(),
         });
-        let mut model = view.info.model.clone();
+        let mut model = view.info.model.clone().unwrap();
         model.model_id = "updated-model".into();
         model.reasoning = Some(Reasoning::Off);
         model.fast = true;
@@ -2361,7 +2820,7 @@ mod tests {
                 catalog: vec![],
             },
         });
-        assert_eq!(view.info.model, model);
+        assert_eq!(view.info.model, Some(model));
         assert_eq!(view.info.title, "Review device configuration");
         assert_eq!(view.info.cwd, "/workspace/example");
         let mut terminal = Terminal::with_options(

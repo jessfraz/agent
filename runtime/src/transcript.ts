@@ -176,10 +176,10 @@ export async function activity(session: Harness, conversation: Conversation, emi
           });
         }
       } else if (event.type === "message_end") {
-        committed(event.entry);
         for (const message of event.entry.model ?? []) if (message.role === "assistant") message.content.forEach((part, index) => {
           if (part.type === "thinking") update(index, part.thinking);
         });
+        committed(event.entry);
         if (event.entry.model?.some((message) => message.role === "assistant")) assistantOpen = false;
       } else if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
         emit({ type: event.type === "tool_execution_start" ? "tool_started" : "tool_finished",

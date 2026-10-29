@@ -478,6 +478,22 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
     result
 }
 
+/// Decode client events without echoing value-bearing serde errors or payloads.
+pub fn decode_coordinator_event(frame: &[u8]) -> Result<RuntimeEventKind> {
+    serde_json::from_slice(frame).map_err(|error| {
+        let category = match error.classify() {
+            serde_json::error::Category::Io => "I/O",
+            serde_json::error::Category::Syntax => "JSON syntax",
+            serde_json::error::Category::Data => "event schema",
+            serde_json::error::Category::Eof => "incomplete JSON",
+        };
+        anyhow::anyhow!(
+            "Coordinator returned an invalid event ({category}; {} bytes at {}:{}). Reopen agent chat after an update; saved work is retained.",
+            frame.len(), error.line(), error.column(),
+        )
+    })
+}
+
 /// Framing state stays with the owner. Cancelling a select branch cannot
 /// discard bytes already consumed from a partial JSON line.
 pub struct FrameReader<R> {

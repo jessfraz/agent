@@ -7,7 +7,7 @@ import { transcript } from "./transcript.js";
 export async function reconcileMainInput(root: Conversation, input_id: string): Promise<RuntimeEventKind[] | undefined> {
   const saved = await root.commit((tx) => tx.submissionByRequest(root.id, input_id), BACKGROUND_CONTEXT);
   if (saved === undefined) return undefined;
-  if (saved.status === "unanswered") return [{ type: "input_rejected", input_id,
+  if (saved.status === "unanswered" && saved.entry === undefined) return [{ type: "input_rejected", input_id,
     message: "This saved input was stopped without an answer. Restore its text to send a new message." }];
   return [{ type: "input_accepted", input_id }, ...(saved.entry === undefined ? []
     : [{ type: "input_placed", input_id, entry_id: saved.entry.toString() } satisfies RuntimeEventKind])];
