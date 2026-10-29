@@ -1111,6 +1111,7 @@
         "authentication_required",
         "authentication_failed",
         "provider_unavailable",
+        "coordinator_unavailable",
         "storage_unavailable",
         "internal"
       ]

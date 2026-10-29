@@ -1191,6 +1191,7 @@ pub enum ErrorCode {
     AuthenticationRequired,
     AuthenticationFailed,
     ProviderUnavailable,
+    CoordinatorUnavailable,
     StorageUnavailable,
     Internal,
 }

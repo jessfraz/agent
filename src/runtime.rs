@@ -612,7 +612,13 @@ impl<R: AsyncBufRead + Unpin> FrameReader<R> {
         loop {
             let bytes = self.reader.fill_buf().await?;
             if bytes.is_empty() {
-                ensure!(self.frame.is_empty(), "Incomplete protocol frame");
+                if !self.frame.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "Incomplete protocol frame",
+                    )
+                    .into());
+                }
                 return Ok(None);
             }
             let count = bytes
@@ -973,11 +979,13 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
                 .await
                 .is_err()
         );
-        assert!(
-            FrameReader::new(b"incomplete".as_slice())
-                .next_frame()
-                .await
-                .is_err()
+        let incomplete = FrameReader::new(b"incomplete".as_slice())
+            .next_frame()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            incomplete.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::UnexpectedEof,
         );
         assert!(
             FrameReader::new(b"".as_slice())

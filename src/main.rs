@@ -1285,7 +1285,11 @@ impl UiSession {
         if let RuntimeEventKind::InputPlaced { input_id, .. } = &event {
             self.placed_input(input_id);
         }
-        self.handle.event(event)
+        self.handle.event(event)?;
+        if let Some(view) = &self.view {
+            self.handle.observation(view.state())?;
+        }
+        Ok(())
     }
     async fn next(&mut self) -> Option<TuiInput> {
         loop {
@@ -1390,6 +1394,13 @@ fn selected_input(
         .view
         .as_ref()
         .context("Conversation view is unavailable")?;
+    if view.state() == agent_cli::tui::ObservationState::Disconnected {
+        ui.handle.restore_input(text)?;
+        ui.handle.notice(format!(
+            "Reconnect with `/resume {conversation_id}` before sending. Saved work may still be running."
+        ))?;
+        return Ok(());
+    }
     let token = view.token;
     let mut ready = view.ready.clone();
     let interrupt = ui.interrupts.get(&conversation_id).cloned();
@@ -1406,12 +1417,14 @@ fn selected_input(
     let directory = client.directory.to_owned();
     while ui.admissions.try_join_next().is_some() {}
     ui.admissions.spawn(async move {
-        let result = async {
-            if ready.wait_for(|ready| *ready).await.is_err() {
+        let result: std::result::Result<(), chat_view::ViewError> = async {
+            if ready.wait_for(|ready| *ready != agent_cli::tui::ObservationState::Connecting).await.is_err()
+                || chat_view::observation(&ready) != agent_cli::tui::ObservationState::Connected
+            {
                 if admission.stage()? == chat_admission::Stage::Canceled {
                     return Ok(());
                 }
-                bail!("The conversation view did not attach");
+                return Err(chat_view::ViewError::Coordinator(anyhow::anyhow!("The conversation view did not attach; this input remains unsent.")));
             }
             if admission.stage()? == chat_admission::Stage::Canceled {
                 return Ok(());
@@ -1441,7 +1454,7 @@ fn selected_input(
                     cwd,
                     hosts,
                 },
-                _ => bail!("The main chat context is unavailable"),
+                _ => return Err(anyhow::anyhow!("The main chat context is unavailable").into()),
             };
             chat_view::control(
                 ClientContext {
@@ -1460,18 +1473,22 @@ fn selected_input(
                 token,
                 sender.clone(),
                 &admission,
+                &ready,
             )
             .await
         }
         .await;
         if let Err(error) = result {
-            let _ = sender.send((
-                token,
-                RuntimeEventKind::Failure {
-                    code: agent_cli::protocol::ErrorCode::Internal,
-                    message: error.to_string(),
-                },
-            ));
+            let event = error.event(&admission.conversation_id);
+            if matches!(admission.stage(), Ok(chat_admission::Stage::Waiting)) {
+                if let RuntimeEventKind::Failure { message, .. } = event {
+                    let _ = sender.send((token, RuntimeEventKind::InputRejected {
+                        input_id: admission.id.clone(), message,
+                    }));
+                }
+            } else {
+                let _ = sender.send((token, event));
+            }
         }
     });
     Ok(())
@@ -2051,6 +2068,7 @@ async fn chat_tui(
     let mut initial_prompt = start.prompt;
     let (handle, inputs, guard) =
         Tui::connecting("Main agent".into(), cwd.to_string_lossy().into_owned())?;
+    handle.observation(agent_cli::tui::ObservationState::Connecting)?;
     let mut ui = UiSession::new(handle, inputs);
     let mut startup_inputs = VecDeque::new();
     let result = async {

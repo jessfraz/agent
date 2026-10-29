@@ -55,10 +55,18 @@ enum HistoryLoad {
     Scroll,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservationState {
+    Connecting,
+    Connected,
+    Disconnected,
+}
+
 enum Update {
     Event(Box<RuntimeEventKind>),
     Status(TuiInfo),
     Working(bool),
+    Observation(ObservationState),
     Draft(tokio::sync::oneshot::Sender<String>),
     Info(tokio::sync::oneshot::Sender<TuiInfo>),
     Notice(String),
@@ -171,6 +179,9 @@ impl TuiHandle {
     }
     pub fn working(&self, working: bool) -> Result<()> {
         self.send(Update::Working(working))
+    }
+    pub fn observation(&self, state: ObservationState) -> Result<()> {
+        self.send(Update::Observation(state))
     }
     pub async fn draft(&self) -> Result<String> {
         let (sender, draft) = tokio::sync::oneshot::channel();
@@ -575,6 +586,7 @@ struct State {
     interrupting: bool,
     exiting: bool,
     worker: bool,
+    observation: Option<ObservationState>,
     history_offset: Option<usize>,
     history_entry: Option<HistoryEntry>,
     loading_history: Option<HistoryLoad>,
@@ -613,6 +625,7 @@ impl State {
             interrupting: false,
             exiting: false,
             worker: false,
+            observation: None,
             history_offset: Some(0),
             history_entry: None,
             loading_history: None,
@@ -1089,15 +1102,16 @@ impl State {
                         else { format!("\n\nCheck the configured authentication for `{}`.", model.provider.as_str()) }
                     })
                 } else { String::new() };
-                let code = match code {
-                    ErrorCode::InvalidRequest => "invalid_request",
-                    ErrorCode::AuthenticationRequired => "authentication_required",
-                    ErrorCode::AuthenticationFailed => "authentication_failed",
-                    ErrorCode::ProviderUnavailable => "provider_unavailable",
-                    ErrorCode::StorageUnavailable => "storage_unavailable",
-                    ErrorCode::Internal => "internal",
+                let label = match code {
+                    ErrorCode::CoordinatorUnavailable => "Coordinator connection lost",
+                    ErrorCode::InvalidRequest => "Code: invalid_request",
+                    ErrorCode::AuthenticationRequired => "Code: authentication_required",
+                    ErrorCode::AuthenticationFailed => "Code: authentication_failed",
+                    ErrorCode::ProviderUnavailable => "Code: provider_unavailable",
+                    ErrorCode::StorageUnavailable => "Code: storage_unavailable",
+                    ErrorCode::Internal => "Code: internal",
                 };
-                self.push(Role::Failure, self.error_context(format!("Code: {code}\n\n{message}{recovery}")));
+                self.push(Role::Failure, self.error_context(format!("{label}\n\n{message}{recovery}")));
                 self.working(false);
             }
             RuntimeEventKind::InputAccepted { input_id } => {
@@ -1149,7 +1163,11 @@ impl State {
     fn status(&self) -> &'static str {
         if self.exiting {
             "Closing"
-        } else if self.info.model.is_none() {
+        } else if self.observation == Some(ObservationState::Disconnected) {
+            "Disconnected"
+        } else if self.observation == Some(ObservationState::Connecting)
+            || self.info.model.is_none()
+        {
             "Connecting"
         } else if self.interrupting {
             "Interrupting"
@@ -1712,13 +1730,17 @@ impl State {
             Span::styled(" · ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 self.status(),
-                Style::default().fg(if self.interrupting {
-                    Color::Yellow
-                } else if self.working || self.compacting || self.info.model.is_none() {
-                    Color::Cyan
-                } else {
-                    Color::Green
-                }),
+                Style::default().fg(
+                    if self.observation == Some(ObservationState::Disconnected) {
+                        Color::Red
+                    } else if self.interrupting {
+                        Color::Yellow
+                    } else if self.working || self.compacting || self.info.model.is_none() {
+                        Color::Cyan
+                    } else {
+                        Color::Green
+                    },
+                ),
             ),
         ]);
         frame.render_widget(Paragraph::new(Line::from(status)), areas[2]);
@@ -1896,6 +1918,10 @@ fn run(
                 Ok(Update::Working(working)) => {
                     state.interrupting = false;
                     state.working(working);
+                }
+                Ok(Update::Observation(observation)) => {
+                    state.observation = Some(observation);
+                    state.changed = true;
                 }
                 Ok(Update::Draft(sender)) => {
                     let _ = sender.send(state.editor.lines().join("\n"));
@@ -2516,6 +2542,46 @@ mod tests {
         }
         assert_eq!(view.editor.lines().join("\n"), "An unfinished correction");
         assert!(!view.working);
+    }
+
+    #[test]
+    fn disconnected_observation_stays_disconnected_through_late_work_and_history_updates() {
+        use crate::{protocol::ErrorCode, tui::ObservationState};
+        use ratatui::style::Color;
+        let mut view = state();
+        view.editor.insert_str("An unfinished correction");
+        view.observation = Some(ObservationState::Disconnected);
+        view.event(RuntimeEventKind::Failure {
+            code: ErrorCode::CoordinatorUnavailable,
+            message: "Reconnect with `/resume saved-chief`. Saved work may still be running."
+                .into(),
+        });
+        view.event(RuntimeEventKind::ConversationState { working: true });
+        view.event(RuntimeEventKind::History {
+            conversation_id: "saved-chief".into(),
+            messages: vec![],
+            next_cursor: None,
+            page_complete: true,
+        });
+        assert_eq!(view.status(), "Disconnected");
+        assert_eq!(view.editor.lines(), &["An unfinished correction"]);
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let footer = (0..110)
+            .map(|x| buffer[(x, 28)].symbol())
+            .collect::<String>();
+        assert!(!footer.contains("Ready"));
+        let column = footer[..footer.find("Disconnected").unwrap()]
+            .chars()
+            .count();
+        assert_eq!(buffer[(u16::try_from(column).unwrap(), 28)].fg, Color::Red);
+        let text = rendered(&mut view, 130, 35);
+        assert!(text.contains("Coordinator connection lost"), "{text}");
+        assert!(text.contains("/resume saved-chief"), "{text}");
+        assert!(!text.contains("Code: internal"), "{text}");
+        view.observation = Some(ObservationState::Connected);
+        assert_eq!(view.status(), "Working");
     }
 
     #[test]

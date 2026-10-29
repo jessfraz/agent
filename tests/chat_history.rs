@@ -48,6 +48,274 @@ async fn chief_retains_unsent_early_inputs_when_its_initial_settings_fail() {
     chief_startup(ChiefStartup::Failure).await;
 }
 
+#[tokio::test]
+async fn disconnected_observer_retains_draft_and_reconciles_accepted_input_on_same_chat_resume() {
+    observer_disconnect(true).await;
+}
+
+#[tokio::test]
+async fn failed_attach_returns_waiting_input_to_draft_without_admitting_it() {
+    observer_disconnect(false).await;
+}
+
+async fn observer_disconnect(after_admission: bool) {
+    use agent_cli::protocol::SavedConversation;
+    let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let config = directory.path().join("config.toml");
+    fs::write(&config, "").unwrap();
+    let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();
+    let disconnect = Arc::new(tokio::sync::Semaphore::new(0));
+    let attached = Arc::new(AtomicUsize::new(0));
+    let inputs = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+    let (server_disconnect, server_attached, server_inputs) =
+        (disconnect.clone(), attached.clone(), inputs.clone());
+    let server = tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (disconnect, attached, inputs) = (
+                server_disconnect.clone(),
+                server_attached.clone(),
+                server_inputs.clone(),
+            );
+            tokio::spawn(async move {
+                let (reader, mut writer) = socket.into_split();
+                let mut reader = FrameReader::new(BufReader::new(reader));
+                let Some(bytes) = reader.next_frame().await.unwrap() else {
+                    return;
+                };
+                let command: RuntimeCommand = serde_json::from_slice(&bytes).unwrap();
+                let summary = SavedConversation {
+                    conversation_id: "saved-chief".into(),
+                    title: "Main agent".into(),
+                    updated_at: None,
+                    task_id: None,
+                    agent_id: None,
+                    host: None,
+                    source_thread_id: None,
+                };
+                let events = match command {
+                    RuntimeCommand::ConversationSettings { .. } => {
+                        vec![RuntimeEventKind::ConversationSettings {
+                            settings: ConversationSettings {
+                                conversation_id: summary.conversation_id,
+                                task_id: None,
+                                agent_id: None,
+                                model: ModelSelection::default(),
+                                catalog: vec![],
+                            },
+                        }]
+                    }
+                    RuntimeCommand::AttachConversation {
+                        conversation_id,
+                        input_ids,
+                    } => {
+                        assert_eq!(conversation_id, summary.conversation_id);
+                        let index = attached.fetch_add(1, Ordering::SeqCst);
+                        if index == 0 && !after_admission {
+                            disconnect.acquire().await.unwrap().forget();
+                            return;
+                        }
+                        let mut events = vec![RuntimeEventKind::ConversationReady {
+                            conversation: summary,
+                            model: ModelSelection::default(),
+                            cwd: "/example".into(),
+                            working: index == 0,
+                        }];
+                        if index > 0 {
+                            assert_eq!(input_ids, *inputs.lock().await);
+                            for input_id in input_ids {
+                                events.push(RuntimeEventKind::InputPlaced {
+                                    input_id,
+                                    entry_id: "saved-input".into(),
+                                });
+                            }
+                        }
+                        for event in events {
+                            let mut bytes = serde_json::to_vec(&event).unwrap();
+                            bytes.push(b'\n');
+                            writer.write_all(&bytes).await.unwrap();
+                        }
+                        if index == 0 {
+                            disconnect.acquire().await.unwrap().forget();
+                        } else {
+                            assert!(reader.next_frame().await.unwrap().is_none());
+                        }
+                        return;
+                    }
+                    RuntimeCommand::ReadConversation {
+                        conversation_id, ..
+                    } => {
+                        vec![RuntimeEventKind::History {
+                            conversation_id,
+                            messages: vec![],
+                            next_cursor: None,
+                            page_complete: true,
+                        }]
+                    }
+                    RuntimeCommand::ListConversations { query, .. } => {
+                        assert_eq!(query, summary.conversation_id);
+                        vec![RuntimeEventKind::Conversations {
+                            items: vec![summary],
+                            next_cursor: None,
+                        }]
+                    }
+                    RuntimeCommand::ConversationInput {
+                        conversation_id,
+                        input_id,
+                        input,
+                        ..
+                    } => {
+                        assert_eq!(conversation_id, summary.conversation_id);
+                        assert_eq!(input, "One owned execution");
+                        inputs.lock().await.push(input_id.clone());
+                        vec![RuntimeEventKind::InputAccepted { input_id }]
+                    }
+                    RuntimeCommand::Watch => {
+                        let _ = reader.next_frame().await;
+                        return;
+                    }
+                    other => panic!("Observer recovery unexpectedly requested {other:?}"),
+                };
+                for event in events.into_iter().chain([RuntimeEventKind::Done]) {
+                    let mut bytes = serde_json::to_vec(&event).unwrap();
+                    bytes.push(b'\n');
+                    writer.write_all(&bytes).await.unwrap();
+                }
+            });
+        }
+    });
+    let binary =
+        std::env::var_os("AGENT_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_agent").into());
+    let fixture = std::path::Path::new(env!("CARGO_BIN_EXE_agent"))
+        .parent()
+        .unwrap()
+        .join("examples/terminal-fixture");
+    let mut child = Command::new(fixture)
+        .arg(binary)
+        .arg("--state-dir")
+        .arg(directory.path())
+        .arg("--config")
+        .arg(config)
+        .arg("chat")
+        .env("TERM", "xterm-256color")
+        .env("AGENT_TEST_TERMINAL_REPLY", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
+    let mut bytes = Vec::new();
+    read_terminal_until(&mut output, &mut bytes, "Message the agent").await;
+    if after_admission {
+        read_terminal_until(&mut output, &mut bytes, "Working").await;
+        input.write_all(b"One owned execution\r").await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            while inputs.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    input
+        .write_all(b"\x1b[200~A retained draft\x1b[201~")
+        .await
+        .unwrap();
+    read_terminal_until(&mut output, &mut bytes, "A retained draft").await;
+    if !after_admission {
+        input.write_all(b"\r").await.unwrap();
+    }
+    disconnect.add_permits(1);
+    read_terminal_until(
+        &mut output,
+        &mut bytes,
+        if after_admission {
+            "Coordinator connection lost"
+        } else {
+            "The conversation view did not attach"
+        },
+    )
+    .await;
+    read_terminal_until(&mut output, &mut bytes, "Disconnected").await;
+    assert!(!terminal_text(&bytes).contains("Code: internal"));
+    if after_admission {
+        input.write_all(b"\r").await.unwrap();
+    }
+    read_terminal_until(
+        &mut output,
+        &mut bytes,
+        "Unsent input returned to the draft.",
+    )
+    .await;
+    assert_eq!(inputs.lock().await.len(), usize::from(after_admission));
+    // Replace the unsent draft with an explicit reconnect command. Reattaching
+    // must reconcile the accepted identity, never submit its text again.
+    input.write_all(&[0x7f; 16]).await.unwrap();
+    input.write_all(b"/resume saved-chief\r").await.unwrap();
+    timeout(Duration::from_secs(3), async {
+        while attached.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut resumed = Vec::new();
+    read_terminal_until(&mut output, &mut resumed, "Ready").await;
+    assert_eq!(inputs.lock().await.len(), usize::from(after_admission));
+    input.write_all(b"\x03").await.unwrap();
+    let exited = timeout(Duration::from_secs(3), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        exited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exited.stderr)
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+async fn read_terminal_until(
+    output: &mut tokio::process::ChildStdout,
+    bytes: &mut Vec<u8>,
+    expected: &str,
+) {
+    use tokio::io::AsyncReadExt;
+    timeout(Duration::from_secs(3), async {
+        let mut chunk = [0; 4096];
+        let expected = expected
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>();
+        while !terminal_text(bytes)
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>()
+            .contains(&expected)
+        {
+            let count = output.read(&mut chunk).await.unwrap();
+            assert!(
+                count > 0,
+                "Terminal closed before {expected}: {}",
+                terminal_text(bytes)
+            );
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "Terminal did not show {expected}: {error}: {}",
+            terminal_text(bytes)
+        )
+    });
+}
+
 #[derive(Clone, Copy)]
 enum ChiefStartup {
     Ready,

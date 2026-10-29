@@ -2,16 +2,16 @@
 
 use crate::{ClientContext, UiSession, connection, exchange, write_command};
 use agent_cli::{
-    protocol::{RuntimeCommand, RuntimeEventKind, SavedConversation},
+    protocol::{ErrorCode, RuntimeCommand, RuntimeEventKind, SavedConversation},
     runtime::{FrameReader, decode_coordinator_event},
-    tui::TuiInfo,
+    tui::{ObservationState, TuiInfo},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tokio::{io::BufReader, task::JoinHandle};
 
 pub(crate) struct View {
     pub(crate) token: uuid::Uuid,
-    pub(crate) ready: tokio::sync::watch::Receiver<bool>,
+    pub(crate) ready: tokio::sync::watch::Receiver<ObservationState>,
     task: JoinHandle<()>,
 }
 impl Drop for View {
@@ -20,9 +20,53 @@ impl Drop for View {
     }
 }
 impl View {
+    pub(crate) fn state(&self) -> ObservationState {
+        observation(&self.ready)
+    }
     pub(crate) async fn stop(mut self) {
         self.task.abort();
         let _ = (&mut self.task).await;
+    }
+}
+
+pub(crate) fn observation(
+    ready: &tokio::sync::watch::Receiver<ObservationState>,
+) -> ObservationState {
+    if ready.has_changed().is_err() {
+        ObservationState::Disconnected
+    } else {
+        *ready.borrow()
+    }
+}
+
+pub(crate) enum ViewError {
+    Coordinator(anyhow::Error),
+    Internal(anyhow::Error),
+}
+impl From<anyhow::Error> for ViewError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Internal(error)
+    }
+}
+impl ViewError {
+    fn read(error: anyhow::Error) -> Self {
+        if error.is::<std::io::Error>() {
+            Self::Coordinator(error)
+        } else {
+            Self::Internal(error)
+        }
+    }
+    pub(crate) fn event(self, conversation_id: &str) -> RuntimeEventKind {
+        let (code, message) = match self {
+            Self::Coordinator(error) => (
+                ErrorCode::CoordinatorUnavailable,
+                format!(
+                    "{error}\n\nReconnect with `/resume {conversation_id}`. Saved work may still be running; pending inputs will be reconciled."
+                ),
+            ),
+            Self::Internal(error) => (ErrorCode::Internal, error.to_string()),
+        };
+        RuntimeEventKind::Failure { code, message }
     }
 }
 
@@ -129,6 +173,10 @@ pub(crate) async fn open(
         .selected
         .as_ref()
         .is_some_and(|current| current.conversation_id == item.conversation_id)
+        && ui
+            .view
+            .as_ref()
+            .is_some_and(|view| view.state() != ObservationState::Disconnected)
     {
         return Ok(());
     }
@@ -153,6 +201,7 @@ pub(crate) async fn open(
             ..previous
         })?;
     }
+    ui.handle.observation(ObservationState::Connecting)?;
     if let Some(draft) = ui
         .drafts
         .get(&item.conversation_id)
@@ -175,7 +224,7 @@ pub(crate) async fn open(
     }
     let replay = ui.handle.begin_history_replay()?;
     let (ready, attached) = tokio::sync::oneshot::channel();
-    let (connected, readiness) = tokio::sync::watch::channel(false);
+    let (connected, readiness) = tokio::sync::watch::channel(ObservationState::Connecting);
     ui.history = Some(crate::chat_history::Job::start(
         client,
         item.conversation_id.clone(),
@@ -192,49 +241,50 @@ pub(crate) async fn open(
     let directory = client.directory.to_owned();
     let task = tokio::spawn(async move {
         let mut ready = Some(ready);
-        let result: Result<()> = async {
-            let mut wire =
-                connection(&config, coordinator.as_deref(), &script, &directory, false).await?;
+        let result: std::result::Result<(), ViewError> = async {
+            let mut wire = connection(&config, coordinator.as_deref(), &script, &directory, false)
+                .await
+                .map_err(ViewError::Coordinator)?;
             write_command(
                 &mut *wire.writer,
                 &RuntimeCommand::AttachConversation {
-                    conversation_id: item.conversation_id,
+                    conversation_id: item.conversation_id.clone(),
                     input_ids,
                 },
             )
-            .await?;
+            .await
+            .map_err(ViewError::read)?;
             let mut reader = FrameReader::new(BufReader::new(wire.reader));
-            while let Some(frame) = reader.next_frame().await? {
-                let event = decode_coordinator_event(&frame)?;
+            while let Some(frame) = reader.next_frame().await.map_err(ViewError::read)? {
+                let event = decode_coordinator_event(&frame).map_err(ViewError::Internal)?;
                 if matches!(event, RuntimeEventKind::HostCall { .. }) {
-                    bail!("An observing terminal cannot own execution effects");
+                    return Err(ViewError::Internal(anyhow::anyhow!(
+                        "An observing terminal cannot own execution effects"
+                    )));
                 }
                 if matches!(event, RuntimeEventKind::ConversationReady { .. })
                     && let Some(ready) = ready.take()
                 {
                     let _ = ready.send(());
-                    let _ = connected.send(true);
+                    let _ = connected.send(ObservationState::Connected);
                 }
-                let done = matches!(event, RuntimeEventKind::Done);
+                if matches!(event, RuntimeEventKind::Done) {
+                    return Ok(());
+                }
                 if sender.send((token, event)).is_err() {
                     return Ok(());
                 }
-                if done {
-                    return Ok(());
-                }
             }
-            bail!("Conversation observation disconnected; saved work is retained")
+            Err(ViewError::Coordinator(anyhow::anyhow!(
+                "The conversation observation connection closed."
+            )))
         }
         .await;
+        let _ = connected.send(ObservationState::Disconnected);
         if let Err(error) = result {
-            let _ = sender.send((
-                token,
-                RuntimeEventKind::Failure {
-                    code: agent_cli::protocol::ErrorCode::Internal,
-                    message: error.to_string(),
-                },
-            ));
+            let _ = sender.send((token, error.event(&item.conversation_id)));
         }
+        let _ = sender.send((token, RuntimeEventKind::Done));
     });
     ui.view = Some(View {
         token,
@@ -251,7 +301,8 @@ pub(crate) async fn control(
     token: uuid::Uuid,
     sender: tokio::sync::mpsc::UnboundedSender<(uuid::Uuid, RuntimeEventKind)>,
     admission: &crate::chat_admission::Admission,
-) -> Result<()> {
+    ready: &tokio::sync::watch::Receiver<ObservationState>,
+) -> std::result::Result<(), ViewError> {
     let mut wire = connection(
         client.config,
         client.coordinator,
@@ -259,18 +310,28 @@ pub(crate) async fn control(
         client.directory,
         false,
     )
-    .await?;
-    if !admission.sending()? {
+    .await
+    .map_err(ViewError::Coordinator)?;
+    if observation(ready) != ObservationState::Connected {
+        return Err(ViewError::Coordinator(anyhow::anyhow!(
+            "The conversation view is disconnected; this input remains unsent."
+        )));
+    }
+    if !admission.sending().map_err(ViewError::Internal)? {
         return Ok(());
     }
-    write_command(&mut *wire.writer, &command).await?;
+    write_command(&mut *wire.writer, &command)
+        .await
+        .map_err(ViewError::read)?;
     let mut reader = FrameReader::new(BufReader::new(wire.reader));
-    while let Some(frame) = reader.next_frame().await? {
-        let event = decode_coordinator_event(&frame)?;
+    while let Some(frame) = reader.next_frame().await.map_err(ViewError::read)? {
+        let event = decode_coordinator_event(&frame).map_err(ViewError::Internal)?;
         match event {
             RuntimeEventKind::Done => return Ok(()),
             RuntimeEventKind::HostCall { .. } => {
-                bail!("The coordinator must own admitted execution effects")
+                return Err(ViewError::Internal(anyhow::anyhow!(
+                    "The coordinator must own admitted execution effects"
+                )));
             }
             RuntimeEventKind::InputAccepted { .. }
             | RuntimeEventKind::InputPlaced { .. }
@@ -281,5 +342,7 @@ pub(crate) async fn control(
             _ => {}
         }
     }
-    bail!("Input connection ended; saved input may still be running")
+    Err(ViewError::Coordinator(anyhow::anyhow!(
+        "Input connection ended; saved input may still be running"
+    )))
 }
