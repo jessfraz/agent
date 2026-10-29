@@ -8,14 +8,14 @@ import { CoordinatorEnvironment } from "../../src/environment.js";
 import { createGuidance } from "../../src/guidance.js";
 import { ConversationModels } from "../../src/models.js";
 import { SourceJournal } from "../../src/sources.js";
-import { TaskStore } from "../../src/tasks.js";
+import { TaskStore, type HostCall } from "../../src/tasks.js";
 import { createAppTools, Executions } from "../../src/tools.js";
 import type { AgentNode } from "../../src/generated/AgentNode.js";
 import type { HostCommand } from "../../src/generated/HostCommand.js";
 import type { HostResult } from "../../src/generated/HostResult.js";
 import type { ScheduledOccurrence } from "../../src/generated/ScheduledOccurrence.js";
 import type { WorkerRef } from "../../src/generated/WorkerRef.js";
-import { exampleJob, START } from "./background-runtime.js";
+import { exampleJob, START, type FakeClock } from "./background-runtime.js";
 import { fixtureModel } from "../model.js";
 
 export const scheduledOccurrence: ScheduledOccurrence = { id: "example-occurrence", job: exampleJob(), schedule_id: "daily", scheduled_at: START };
@@ -25,13 +25,14 @@ export const node: AgentNode = { host_id: "11111111-1111-4111-8111-111111111111"
 export const binding: WorkerRef = { host_id: node.host_id, session_id: "session:22222222-2222-4222-8222-222222222222",
   window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" };
 
-export async function openScheduled(directory: string, guidanceVersion = "original") {
+export async function openScheduled(directory: string, guidanceVersion = "original", clock?: FakeClock) {
   const database = await openNodeSqliteDatabase(join(directory, "session.sqlite"));
   await database.exec("PRAGMA synchronous = FULL");
   const models = createModels(), faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 });
   models.setProvider(faux.provider);
   const registry = createRegistry();
   const session = await Harness.open(await SqliteStorage.open(database), { models, registry,
+    ...(clock === undefined ? {} : { now: clock.now, setTimer: clock.setTimer }),
     identity: { attribution: null }, settings: { retry: { enabled: false } } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(session, new ConversationModels(models));
   const environment = new CoordinatorEnvironment(session); environment.useLiveGuidance(); tasks.useEnvironment(environment);
@@ -51,13 +52,13 @@ export async function openScheduled(directory: string, guidanceVersion = "origin
     if (command.type === "exec") return { type: "process", exit_code: 0, stdout: "owned host tool output", stderr: "", truncated: false };
     return { type: "failed", message: "The fixture received an unsupported host command" };
   };
-  async function worker(taskId: string, controller = new AbortController()) {
+  async function worker(taskId: string, controller = new AbortController(), hostCall: HostCall = call) {
     const task = await tasks.get(taskId);
     if (task.worker.state !== "bound") throw new Error("The scheduled fixture has no bound worker");
     return tasks.run({ type: "run_task", task_id: task.id, allocation_id: task.worker.allocation_id, binding: task.worker.binding,
       model: fixtureModel, cwd: task.worker.host.cwd, instructions: "", interactive: false },
-    (conversation, host, model) => executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [host], role: "worker", model, call }),
-    () => {}, [guidance, tools.host, tools.worker], call, undefined,
+    (conversation, host, model) => executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [host], role: "worker", model, call: hostCall }),
+    () => {}, [guidance, tools.host, tools.worker], hostCall, undefined,
     { signal: controller.signal, async ready() {}, answer() {}, idle() {} });
   }
   return { session, tasks, sources, environment, call, commands, faux, executions, worker, registry };

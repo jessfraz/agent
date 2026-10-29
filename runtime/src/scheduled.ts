@@ -24,6 +24,12 @@ export function occurrencePrompt(occurrence: ScheduledOccurrence): string {
   ].join("\n\n");
 }
 
+async function requireReconciledTask(session: Harness, tasks: TaskStore, id: string): Promise<void> {
+  if (!await session.commit((tx) => tasks.canReleaseIn(tx, id), BACKGROUND_CONTEXT)) {
+    throw new TaskError("The scheduled turn stopped without an answer; reconcile and resolve its existing task before this occurrence can settle");
+  }
+}
+
 /** Dispatch through the existing task lifecycle, then await its exact Pi input. */
 export async function runScheduled(occurrence: ScheduledOccurrence, signal: AbortSignal,
   services: { session: Harness; tasks: TaskStore; sources: SourceJournal; environment: CoordinatorEnvironment; executions: Executions; call: HostCall }): Promise<void> {
@@ -40,7 +46,7 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
   try {
     let submission = await session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
     if (submission?.status === "done") return;
-    if (submission?.status === "unanswered") throw new TaskError("The scheduled turn stopped without an answer; inspect its existing task");
+    if (submission?.status === "unanswered") { await requireReconciledTask(session, tasks, id); return; }
     // A restored native input can progress only after its real worker binds.
     // Allocation confirmation and the worker's run_task connection are separate.
     executions.expect(conversation.id.toString());
@@ -65,6 +71,7 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
         const native = await session.submission(submission.id, BACKGROUND_CONTEXT);
         if (native === undefined) throw new TaskError("The scheduled job's admitted Pi input is unavailable");
         const result = await native.wait(withAbortSignal(signal, BACKGROUND_CONTEXT));
+        if (result.type === "input" && result.status === "unanswered") { await requireReconciledTask(session, tasks, id); return; }
         if (result.type !== "input" || result.status !== "done") throw new TaskError("The scheduled turn did not complete; inspect its existing task");
         return;
       }
