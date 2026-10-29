@@ -10,9 +10,8 @@ runtime: bindings
 build: runtime
 	cargo build
 
-check: bindings
+check: runtime
 	cargo fmt --check
 	cargo clippy --all --benches --tests --examples --all-features -- -D warnings
 	cargo test
-	npm --prefix runtime run build
 	npm --prefix runtime test
