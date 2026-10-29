@@ -59,7 +59,8 @@ background. Scroll to read it; `/resume` selects another saved chat in place.
 The terminal UI renders Markdown, including tables, and shows the model,
 reasoning, directory and live activity. Enter steers, Tab queues a separate FIFO
 turn, Shift+Enter inserts a newline, and Esc stops. Press `?` in an empty editor
-or use `/help` for commands and shortcuts. `/model`, `/reasoning` and `/fast` control this
+or use `/help` for commands and shortcuts. Ctrl+T opens activity; Enter expands
+reasoning or a tool's stored input and output. `/model`, `/reasoning` and `/fast` control this
 conversation; `/status` shows its settings, connection and available plan usage.
 Reset times use the client's local timezone and include a countdown.
 `/machines` shows connected hosts, hardware capacity and recent load samples.

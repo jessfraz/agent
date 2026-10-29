@@ -156,9 +156,18 @@ its execution lease without counting as busy work. New input reacquires
 resource guards. Child results return while their tabs remain available for
 replies. Main and task CLIs load older history automatically in the background;
 reading it does not submit it back to the model. Live
-activity exposes tool names and provider-supplied thinking text, without tool
-arguments, signatures or encrypted state.
+activity exposes tool names and provider-supplied thinking text. OpenAI requests
+ask for detailed exposed reasoning; Pi owns streaming and replay state. Clients
+retain the returned paragraphs without extracting encrypted state.
+Tool inspectors share a read-only runtime lookup anchored to the durable entry
+and call ID. It resolves the CLI's selected task or agent through the same scope
+as history; native requests remain in main. It bounds the search to 128 nearby
+entries and returns at most 32 KiB each of actual arguments and text output.
+Unavailable sections and truncation are explicit. History pages retain metadata
+without eagerly loading tool bodies.
 The Rust TUI renders Markdown with model, reasoning and directory status.
+Completed activity groups emit one compact terminal scrollback row. Ctrl+T
+opens the retained reasoning and tool details; progress commentary stays prose.
 Enter steers, Tab queues a separate turn, and Esc stops the current Pi turn and
 drains owned host operations. Tool results remain recorded; stopping cannot
 undo an external effect that already completed.

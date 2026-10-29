@@ -85,6 +85,21 @@ public enum ConnectionError: Error, LocalizedError, Sendable {
     }
     return error.localizedDescription
   }
+  static func shouldReconnect(after error: any Error) -> Bool {
+    if let error = error as? ConnectionError {
+      switch error {
+      case .closed, .timedOut, .incompleteFrame, .dnsUnavailable, .vpnUnavailable: return true
+      case .invalidAddress, .frameTooLarge: return false
+      }
+    }
+    if let error = error as? NWError {
+      switch error {
+      case .posix(.EACCES), .posix(.EPERM), .posix(.EINVAL), .tls: return false
+      default: return true
+      }
+    }
+    return false
+  }
 }
 
 /// One owner, one reader. Cancellation closes the underlying socket, not just its waiter.

@@ -69,7 +69,7 @@ final class AgentUITests: XCTestCase {
     composer.typeText("Synthetic draft kept safely offline.")
     XCTAssertFalse(app.buttons["Send message"].isEnabled)
     capture("offline-composer-keyboard", app: app)
-    app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Steer")).firstMatch.tap()
+    app.buttons["composerMenu"].tap()
     app.buttons["Follow-up"].tap()
     XCTAssertFalse(app.buttons["Queue follow-up"].isEnabled)
     XCTAssertEqual(composer.value as? String, "Synthetic draft kept safely offline.")

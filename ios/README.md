@@ -47,12 +47,19 @@ Mode if requested, then Run.
 
 - Saved history, streamed answer text, provider-exposed thinking, tool status,
   commentary, durable notices and compaction state use native views. Markdown
-  and code parsing happen outside SwiftUI bodies. Rendering and incoming pages
+  uses Foundation's parser, with native headings, quotes, lists, code blocks and
+  tables. Parsing happens outside SwiftUI bodies. Rendering and incoming pages
   are bounded; display truncation does not alter coordinator history.
 - Startup reads a bounded recent page. Older history is cursor-paged through
   **Load earlier messages**; the phone never downloads the whole conversation
   before it becomes usable. At most 500 rows and 4 MiB of display text remain
   in memory. The coordinator retains the full history.
+- Consecutive tool calls and thinking share a compact disclosure. Progress
+  messages stay visible. Expand activity to read the returned reasoning text
+  or inspect a command's arguments, output, errors and status.
+- Tool details are read on demand from Pi's stored call and result. Each text
+  section is limited to 32 KiB; missing content and truncation are shown.
+  History pages carry tool identity and status without the full output.
 - Slash parsing and execution use the shared Rust command parser and backend
   handlers. The phone menu lists only supported controls. `/resume` remains a
   TUI-only saved-conversation view; it never starts work from this app.
@@ -60,13 +67,15 @@ Mode if requested, then Run.
   per-endpoint outbox before transmission. On iOS it
   uses complete file protection and is excluded from backup. History stays in
   memory; there is no separate phone conversation database.
-- Disconnect, suspension and view removal release owned connections. Returning
-  reconnects and reconciles the original input IDs. Uncertain writes are never
-  automatically replayed. **Check / retry same message** retains the same ID;
+- Transient network loss reconnects automatically. Disconnect, suspension and
+  view removal release owned connections. Returning reconnects and reconciles
+  the original input IDs. Uncertain writes are never automatically replayed.
+  **Check / retry** retains the same ID;
   terminal rejection retains the original until **Restore to composer**.
 - Do not restore an uncertain submission as a new message to bypass checking its
   original ID. Coordinator admission may already have succeeded.
-- Attach files or photos with the paperclip, or drop files onto the chat. Up to
+- Use the **+** menu for files, photos, commands and delivery mode, or drop files
+  onto the chat. Up to
   eight files of 16 MiB each use the shared chunked attachment protocol. Photos
   are resized and encoded as JPEG. History includes file metadata; bytes are
   downloaded and verified only when opening a preview.
@@ -93,7 +102,17 @@ Rust owns the native wire types. The existing bindings exporter generates
 Rust's actual serde implementation. Swift tests consume those fixtures and
 exercise real loopback framing, outbox reconciliation, composer admission and
 owned connection cleanup. Rendering tests capture the production message rows
-in light and dark appearance using invented content. To retain these images,
+in light, dark and large-text appearance using invented content. Markdown
+regressions assert code-fence boundaries, escaped pipes, table cells, inline
+styles, link destinations, list numbering/nesting and line breaks. The gallery
+includes all heading levels, lists/tasks, wide tables, Unicode and unfinished
+code fences. PNGs support manual and Claude review; automatic assertions cover
+content, successful native rendering and Dynamic Type height growth. Full-chat
+captures cover grouped activity, opened reasoning and command details alongside
+the real header and composer. Screenshots are review artifacts, not golden-image
+comparisons.
+Nested block-container layout, remote image previews, math and diagrams remain
+outside this renderer. To retain the review images,
 pass `--attachments-path /absolute/existing/directory` to `swift test`.
 `bash ios/scripts/check.sh` runs strict Swift lint, macOS tests, the unsigned
 app build, package tests on iOS and app-hosted rendering tests. It requires an

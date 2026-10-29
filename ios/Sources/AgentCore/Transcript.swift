@@ -104,10 +104,22 @@ struct Transcript: Sendable {
     let loadedIDs = Set(loaded.rows.compactMap(\.entryID))
     historicalEntries.formUnion(loadedIDs)
     // Reuse a correlated input's stable row identity at its canonical position.
+    // Multiple user blocks can belong to one entry; only one inherits the input ID.
+    var correlatedInputs: Set<String> = []
     let incoming = loaded.rows.map { row in
-      rows.first(where: { $0.inputID != nil && $0.entryID == row.entryID }) ?? row
+      if row.role == .user,
+        let input = rows.first(where: { $0.inputID != nil && $0.entryID == row.entryID }),
+        correlatedInputs.insert(input.id).inserted
+      {
+        return input
+      }
+      // Calls and results have different entry IDs but share one tool row ID.
+      // An older call must not replace its newer result or duplicate that row.
+      if olderPage, let current = rows.first(where: { $0.id == row.id }) { return current }
+      return row
     }
-    rows.removeAll { loadedIDs.contains($0.entryID ?? "") }
+    let incomingIDs = Set(incoming.map(\.id))
+    rows.removeAll { loadedIDs.contains($0.entryID ?? "") || incomingIDs.contains($0.id) }
     if olderPage {
       rows.insert(contentsOf: incoming, at: 0)
     } else {

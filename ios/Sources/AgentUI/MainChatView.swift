@@ -8,7 +8,11 @@ import UniformTypeIdentifiers
 #endif
 
 public struct MainChatView: View {
-  @State private var model = ChatModel()
+  @State private var model: ChatModel
+  @State private var activityExpansion = ActivityExpansion()
+  private let managesConnection: Bool
+  private let detailLoader: ToolDetailsLoader?
+  private let initialScrollTarget: String?
   @State private var settings = false
   @State private var followsLatest = true
   @State private var userScrolling = false
@@ -21,12 +25,38 @@ public struct MainChatView: View {
   @AppStorage("coordinatorPort") private var port = "43187"
   @Environment(\.scenePhase) private var scenePhase
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Environment(\.colorScheme) private var colorScheme
 
-  public init() {}
+  public init() {
+    _model = State(initialValue: ChatModel())
+    managesConnection = true
+    detailLoader = nil
+    initialScrollTarget = nil
+  }
+  // Previews and hosted rendering use the real screen with a seeded model,
+  // without taking ownership of a live connection or the user's saved address.
+  init(
+    model: ChatModel, expansion: ActivityExpansion = ActivityExpansion(),
+    details: ToolDetailsLoader? = nil, initialScrollTarget: String? = nil
+  ) {
+    _model = State(initialValue: model)
+    _activityExpansion = State(initialValue: expansion)
+    managesConnection = false
+    detailLoader = details
+    self.initialScrollTarget = initialScrollTarget
+    _followsLatest = State(initialValue: initialScrollTarget == nil)
+  }
   public var body: some View {
     NavigationStack {
       VStack(spacing: 0) {
-        connectionBar
+        if model.connection == .connecting || model.connection == .reconnecting {
+          HStack(spacing: 8) {
+            ProgressView().controlSize(.mini)
+            Text(model.connection.label).font(.footnote).foregroundStyle(.secondary)
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(.horizontal, 16).padding(.vertical, 8)
+        }
         transcript
         if let error = model.error {
           Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
@@ -41,10 +71,20 @@ public struct MainChatView: View {
       .navigationTitle("Agent")
       #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(Color(uiColor: .systemBackground), for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
       #endif
       .toolbar {
+        ToolbarItem(placement: .principal) {
+          VStack(spacing: 1) {
+            Text("Agent").font(.headline)
+            Text(model.model.split(separator: "/").last.map(String.init) ?? model.model)
+              .font(.caption).foregroundStyle(.primary.opacity(0.65)).lineLimit(1)
+          }.accessibilityElement(children: .combine)
+        }
         ToolbarItem(placement: .primaryAction) {
-          Button("Connection", systemImage: "network") { settings = true }
+          Button("Connection", systemImage: "slider.horizontal.3") { settings = true }
+            .tint(.primary)
         }
       }
       .sheet(isPresented: $settings) { connectionSettings }
@@ -73,32 +113,21 @@ public struct MainChatView: View {
         }
       #endif
       .task {
+        guard managesConnection else { return }
         // Keep the SwiftUI-owned task alive. Cancellation on removal
         // tears down both the UI subscription and its network owner.
         if host.isEmpty { settings = true } else { await model.connect(host: host, port: port) }
         await model.runUntilCancelled()
       }
-      .onChange(of: scenePhase) { _, phase in Task { await model.setActive(phase == .active) } }
-    }
-  }
-  private var connectionBar: some View {
-    HStack(spacing: 8) {
-      Circle().fill(model.connection == .connected ? .green : .secondary).frame(width: 7, height: 7)
-        .accessibilityHidden(true)
-      VStack(alignment: .leading, spacing: 2) {
-        Text(model.connection.label).font(.caption).foregroundStyle(.primary)
-        Text(model.model).font(.caption).fixedSize(horizontal: false, vertical: true)
+      .onChange(of: scenePhase) { _, phase in
+        if managesConnection { Task { await model.setActive(phase == .active) } }
       }
-      Spacer()
-      if model.busy { ProgressView().controlSize(.small).accessibilityLabel("Agent is working") }
     }
-    .padding(.horizontal).padding(.vertical, 8)
-    .background(.bar)
   }
   private var transcript: some View {
     ScrollViewReader { scroll in
       ScrollView {
-        LazyVStack(alignment: .leading, spacing: 22) {
+        LazyVStack(alignment: .leading, spacing: 18) {
           if model.canLoadEarlier {
             Button {
               Task { await model.history() }
@@ -114,17 +143,37 @@ public struct MainChatView: View {
             Text("No messages yet").font(.callout).foregroundStyle(.primary)
               .frame(maxWidth: .infinity).padding(.vertical, 32)
           }
-          ForEach(model.rows) { row in
-            MessageRow(
-              model: row, retry: { id in Task { await model.retry(id) } },
-              restore: { id in Task { await model.restore(id) } },
-              preview: { file in Task { await model.preview(file) } })
+          ForEach(TranscriptItem.grouped(model.rows)) { item in
+            switch item {
+            case .message(let row):
+              MessageRow(
+                model: row, retry: { id in Task { await model.retry(id) } },
+                restore: { id in Task { await model.restore(id) } },
+                preview: { file in Task { await model.preview(file) } })
+            case .activity(let group):
+              ActivityGroupView(
+                group: group, expansion: $activityExpansion, details: loadDetails,
+                onExpand: { followsLatest = false })
+            }
+          }
+          if model.busy {
+            HStack(spacing: 8) {
+              ProgressView().controlSize(.mini)
+              Text("Working…").font(.footnote).foregroundStyle(.secondary)
+            }.frame(maxWidth: .infinity, alignment: .leading)
+              .accessibilityLabel("Agent is working")
           }
           Color.clear.frame(height: 1).id("latest")
         }
         .padding().frame(maxWidth: 720).frame(maxWidth: .infinity)
       }
-      .defaultScrollAnchor(.bottom, for: .initialOffset)
+      .defaultScrollAnchor(initialScrollTarget == nil ? .bottom : .top, for: .initialOffset)
+      .task {
+        if let initialScrollTarget {
+          await Task.yield()
+          scroll.scrollTo(initialScrollTarget, anchor: .top)
+        }
+      }
       .onScrollPhaseChange { _, phase in
         userScrolling = phase == .interacting || phase == .decelerating
       }
@@ -148,13 +197,23 @@ public struct MainChatView: View {
               withAnimation { scroll.scrollTo("latest", anchor: .bottom) }
             }
           }
-          .buttonStyle(.borderedProminent).clipShape(Capsule()).padding()
+          .buttonStyle(.borderedProminent).tint(.primary)
+          .foregroundStyle(colorScheme == .dark ? Color.black : Color.white)
+          .clipShape(Capsule()).padding()
         }
       }
     }
   }
+  private func loadDetails(_ row: ChatRow) async throws -> ToolDetails {
+    if let detailLoader { return try await detailLoader(row) }
+    return try await model.toolDetails(for: row)
+  }
+  private var showsStop: Bool {
+    model.busy && model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      && model.attachments.isEmpty
+  }
   private var composer: some View {
-    VStack(spacing: 8) {
+    VStack(spacing: 6) {
       if !model.attachments.isEmpty {
         ScrollView(.horizontal) {
           HStack(spacing: 8) {
@@ -171,79 +230,93 @@ public struct MainChatView: View {
           }
         }
       }
-      HStack(alignment: .bottom, spacing: 12) {
+      HStack(alignment: .bottom, spacing: 4) {
         Menu {
-          Button("Choose files", systemImage: "folder") { importingFiles = true }
-          #if os(iOS)
-            PhotosPicker(selection: $selectedPhoto, matching: .images) {
-              Label("Choose photo", systemImage: "photo")
-            }
-          #endif
-        } label: {
-          Image(systemName: "paperclip").frame(width: 44, height: 44)
-        }
-        .disabled(
-          model.preparingAttachments || model.attachments.count >= AttachmentLimits.maximumCount
-        )
-        .accessibilityLabel("Attach files or photos")
-        TextField("Message the coordinator", text: $model.draft, axis: .vertical)
-          .lineLimit(1...8).textFieldStyle(.plain).padding(12)
-          .background(.quaternary, in: RoundedRectangle(cornerRadius: 16))
-          .accessibilityLabel("Message the coordinator")
-        Button {
-          Task {
+          Section("Attachments") {
+            Button("Choose files", systemImage: "folder") { importingFiles = true }
             #if os(iOS)
-              await model.send(screenshot: capture.png)
-            #else
-              await model.send()
+              PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                Label("Choose photo", systemImage: "photo")
+              }
             #endif
+          }.disabled(
+            model.preparingAttachments || model.attachments.count >= AttachmentLimits.maximumCount)
+          Menu("Commands", systemImage: "command") {
+            ForEach(model.commands, id: \.usage) { command in
+              Button {
+                model.draft = String(command.usage.prefix(while: { !$0.isWhitespace })) + " "
+              } label: {
+                Text(command.usage)
+                Text(command.description)
+              }
+            }
+          }.disabled(model.commands.isEmpty)
+          Picker("Delivery", selection: $model.mode) {
+            Text("Steer").tag(InputMode.steer)
+            Text("Follow-up").tag(InputMode.followUp)
+          }.pickerStyle(.inline)
+          if model.busy {
+            Button("Stop response", systemImage: "stop.fill") { Task { await model.interrupt() } }
+          }
+        } label: {
+          Image(systemName: "plus").font(.system(size: 19, weight: .regular))
+            .frame(width: 44, height: 44).contentShape(Circle())
+        }
+        .tint(.primary).accessibilityLabel("Add attachments or commands")
+        .accessibilityIdentifier("composerMenu")
+        TextField(
+          model.mode == .steer ? "Message Agent" : "Queue a follow-up", text: $model.draft,
+          axis: .vertical
+        )
+        .lineLimit(1...6).textFieldStyle(.plain).padding(.vertical, 11).padding(.horizontal, 2)
+        .accessibilityLabel("Message the coordinator").accessibilityIdentifier(
+          "Message the coordinator")
+        Button {
+          let stop = showsStop
+          Task {
+            if stop {
+              await model.interrupt()
+            } else {
+              #if os(iOS)
+                await model.send(screenshot: capture.png)
+              #else
+                await model.send()
+              #endif
+            }
           }
         } label: {
           Group {
             if model.admitting || model.preparingAttachments {
-              ProgressView()
+              ProgressView().tint(colorScheme == .dark ? .black : .white)
             } else {
-              Image(systemName: "arrow.up").font(.headline)
-            }
-          }.frame(width: 44, height: 44)
-        }
-        .buttonStyle(.borderedProminent).clipShape(Circle())
-        .disabled(!model.canSend)
-        .accessibilityLabel(model.mode == .steer ? "Send message" : "Queue follow-up")
-      }
-      HStack {
-        Menu {
-          ForEach(model.commands, id: \.usage) { command in
-            Button {
-              model.draft = String(command.usage.prefix(while: { !$0.isWhitespace })) + " "
-            } label: {
-              Text(command.usage)
-              Text(command.description)
+              Image(systemName: showsStop ? "stop.fill" : "arrow.up")
+                .font(.system(size: 15, weight: .semibold))
             }
           }
-        } label: {
-          Label("Commands", systemImage: "command").frame(minHeight: 44)
+          .foregroundStyle(.background).frame(width: 32, height: 32)
+          .background(.primary, in: Circle()).opacity(showsStop || model.canSend ? 1 : 0.25)
+          .frame(width: 44, height: 44).contentShape(Circle())
         }
-        .tint(.primary)
-        Spacer()
-        Picker("Delivery", selection: $model.mode) {
-          Text("Steer").tag(InputMode.steer)
-          Text("Follow-up").tag(InputMode.followUp)
-        }
-        .pickerStyle(.menu).fixedSize().frame(minHeight: 44).contentShape(Rectangle())
-        if model.busy {
-          Button("Stop", systemImage: "stop.fill", role: .destructive) {
-            Task { await model.interrupt() }
-          }.frame(minHeight: 44).contentShape(Rectangle())
-        }
+        .buttonStyle(.plain)
+        .disabled(showsStop ? model.connection != .connected : !model.canSend)
+        .accessibilityLabel(
+          showsStop ? "Stop response" : model.mode == .steer ? "Send message" : "Queue follow-up")
       }
-      .font(.caption).controlSize(.small)
+      .padding(5)
+      .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 26))
+      .overlay {
+        RoundedRectangle(cornerRadius: 26).strokeBorder(.primary.opacity(0.12), lineWidth: 0.5)
+      }
     }
-    .padding().background(.bar)
+    .padding(.horizontal, 12).padding(.vertical, 8).background(.background)
   }
   private var connectionSettings: some View {
     NavigationStack {
       Form {
+        Section {
+          LabeledContent("Status", value: model.connection.label)
+          LabeledContent("Model", value: model.model)
+        }
         Section {
           VStack(alignment: .leading, spacing: 8) {
             Text("Tailscale address").font(.subheadline)
@@ -298,7 +371,6 @@ struct MessageRow: View {
   let preview: (AttachmentRef) -> Void
   @State private var expanded = false
   @Environment(\.dynamicTypeSize) private var typeSize
-  @ScaledMetric(relativeTo: .callout) private var toolIconSize = 20
 
   init(
     model: RowModel, retry: @escaping (String) -> Void, restore: @escaping (String) -> Void,
@@ -315,7 +387,7 @@ struct MessageRow: View {
       content
         .padding(isUser ? 14 : 0)
         .background(
-          isUser ? AnyShapeStyle(Color.accentColor.opacity(0.12)) : AnyShapeStyle(.clear),
+          isUser ? AnyShapeStyle(Color.primary.opacity(0.07)) : AnyShapeStyle(.clear),
           in: RoundedRectangle(cornerRadius: 18, style: .continuous)
         )
         .frame(
@@ -355,10 +427,7 @@ struct MessageRow: View {
   }
   private var isUser: Bool { model.row.role == .user }
   private var showsHeader: Bool {
-    switch model.row.role {
-    case .commentary, .partialAnswer, .notice: true
-    case .user, .assistant, .final, .thinking, .tool: false
-    }
+    model.row.role == .notice
   }
   private var content: some View {
     VStack(alignment: .leading, spacing: 8) {
@@ -366,31 +435,12 @@ struct MessageRow: View {
         Label(title, systemImage: symbol).font(.caption.weight(.semibold)).foregroundStyle(
           .secondary)
       }
-      if let tool = model.row.tool {
-        HStack {
-          Group {
-            if tool.status == .running {
-              ProgressView().controlSize(.small)
-            } else {
-              Image(systemName: tool.status == .failed ? "xmark.circle" : "checkmark.circle")
-                .foregroundStyle(tool.status == .failed ? .red : .secondary)
-            }
-          }
-          .frame(width: toolIconSize, height: toolIconSize).accessibilityHidden(true)
-          Text(tool.name).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
-          Text(tool.status.rawValue.capitalized).font(.caption.weight(.medium))
-        }
-        .accessibilityElement(children: .combine)
-      } else if model.row.role == .thinking {
-        DisclosureGroup(isExpanded: $expanded) {
-          RichMessage(blocks: model.row.blocks).foregroundStyle(.secondary)
-        } label: {
-          Label("Reasoning", systemImage: "sparkle").font(.callout)
-            .frame(minHeight: 44)
-        }
+      if model.row.tool != nil || model.row.role == .thinking {
+        ActivityItemView(
+          model: model, expanded: $expanded,
+          details: { row in .unavailable(.init(callId: row.tool?.callId ?? "")) })
       } else {
-        RichMessage(
-          blocks: model.row.blocks, textStyle: model.row.role == .commentary ? .callout : .body)
+        RichMessage(blocks: model.row.blocks)
       }
       ForEach(model.row.attachments, id: \.id) { reference in
         Button {
@@ -435,11 +485,14 @@ extension Delivery {
   }
 }
 
-private struct RichMessage: View {
+struct RichMessage: View {
   let blocks: [RichBlock]
   var textStyle: Font = .body
+  var compact = false
   @ScaledMetric(relativeTo: .body) private var leading = 3
   @ScaledMetric(relativeTo: .body) private var columnSpacing = 16
+  @ScaledMetric(relativeTo: .body) private var listIndent = 16
+  @ScaledMetric(relativeTo: .body) private var listMarkerWidth = 24
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
       ForEach(blocks.indices, id: \.self) { index in
@@ -448,7 +501,8 @@ private struct RichMessage: View {
           Text(text).font(textStyle).lineSpacing(leading).textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
         case .heading(let text, let level):
-          Text(text).font(level <= 2 ? .title3 : .headline).accessibilityAddTraits(.isHeader)
+          Text(text).font(compact ? textStyle : level <= 2 ? .title3 : .headline)
+            .accessibilityAddTraits(.isHeader)
             .textSelection(.enabled)
         case .quote(let text):
           Text(text).font(textStyle).lineSpacing(leading).textSelection(.enabled)
@@ -456,6 +510,14 @@ private struct RichMessage: View {
             .overlay(alignment: .leading) {
               RoundedRectangle(cornerRadius: 2).fill(.secondary).frame(width: 3)
             }
+        case .listItem(let text, let marker, let depth):
+          HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(marker).frame(minWidth: listMarkerWidth, alignment: .trailing)
+            Text(text).lineSpacing(leading).textSelection(.enabled)
+              .fixedSize(horizontal: false, vertical: true)
+          }
+          .font(textStyle).padding(.leading, CGFloat(depth) * listIndent)
+          .accessibilityElement(children: .combine)
         case .divider: Divider()
         case .code(let code, let language):
           VStack(alignment: .leading, spacing: 8) {
@@ -486,5 +548,6 @@ private struct RichMessage: View {
         }
       }
     }
+    .frame(maxWidth: .infinity, alignment: .leading).multilineTextAlignment(.leading)
   }
 }

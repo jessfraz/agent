@@ -93,7 +93,8 @@ and deployment are tracked separately above.
 | Steering, follow-ups, abort and compaction | In use | Native input modes, abort and compaction events drive chat. |
 | Durable sleeps and wake notifications | In use | Sources, resources and jobs share Pi's persisted sleeps and scheduler. |
 | Typed telemetry and usage totals | Partial | Pi records usage, but Agent does not expose its totals or install a telemetry adapter. Wire these into diagnostics and status. |
-| Image readers and preparation workers | Partial | Pi's Photon worker prepares attached images. Agent owns transfer, storage and host file tools; reuse image-aware reads when extending those tools. |
+| Image preparation workers | In use | Pi's Photon worker prepares attached images for native model input. Agent owns transfer and storage. |
+| Image-aware file readers | Not enabled | Agent owns its host file tools; reuse Pi's image-aware reads when extending them. |
 | Forks, child tasks and task graphs | Partial | Pi executes native model/tool task trees. Agent delegates use separate conversations; forks and graph views are not integrated. Evaluate native ownership while preserving delegates' durable lifetimes and Rex bindings. |
 | Deferred tool search and code mode | Not enabled | Benchmark upstream extensions against the current role-specific toolsets; adopt when they reduce total tokens or round trips. Tool search is separate from conversation search. |
 

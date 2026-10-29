@@ -91,6 +91,8 @@ private func withGatedPreviewCoordinator(
     Task {
       do { try await fixture.accept(socket) } catch ConnectionError.closed {
         // Cancelled lookups close their connection before sending a command.
+      } catch let error as NWError where error == .posix(.ECANCELED) {
+        // Network.framework can report the same owned cancellation directly.
       } catch { Issue.record(error) }
     }
   }

@@ -1,16 +1,20 @@
 import Foundation
 
 public enum ConnectionState: Sendable, Equatable {
-  case disconnected, connecting, connected
-  case retrying(String)
+  case disconnected, connecting, connected, reconnecting
   public var label: String {
     switch self {
     case .disconnected: "Disconnected"
     case .connecting: "Connecting"
     case .connected: "Connected via Tailscale"
-    case .retrying(let reason): reason
+    case .reconnecting: "Reconnecting…"
     }
   }
+}
+
+private struct CoordinatorRejection: LocalizedError {
+  let message: String
+  var errorDescription: String? { message }
 }
 
 public struct ChatSnapshot: Sendable {
@@ -95,6 +99,7 @@ public actor CoordinatorSession {
     // The UI supplies a per-endpoint outbox directory, not a shared queue.
     attemptedInputs.formUnion(pending.map(\.inputId))
     for request in pending { transcript.pending(request, delivery: .uncertain) }
+    snapshot.error = nil
     observation = Task { [weak self] in await self?.observe(address, generation: generation) }
   }
 
@@ -111,6 +116,7 @@ public actor CoordinatorSession {
     actionConnections = [:]
     connection = nil
     snapshot.connection = .disconnected
+    snapshot.busy = false
     snapshot.loadingHistory = false
     for request in pending { transcript.delivery(request.inputId, .uncertain) }
     publish()
@@ -231,7 +237,7 @@ public actor CoordinatorSession {
       var stream: LineConnection?
       do {
         transcript.reconnect()
-        snapshot.connection = .connecting
+        snapshot.connection = attempt == 0 ? .connecting : .reconnecting
         publish()
         let opened = try await connectTransport(address)
         guard self.generation == generation, !Task.isCancelled else {
@@ -247,6 +253,15 @@ public actor CoordinatorSession {
           let event =
             try await (snapshot.connection == .connected ? stream.next() : timedNext(stream))
           guard self.generation == generation else { return }
+          // Before readiness this rejects observation admission. Afterwards the
+          // same event can be a mirrored model-turn failure; keep observing.
+          if case .failure(let value) = event, !ready {
+            throw CoordinatorRejection(message: value.message)
+          }
+          if case .disconnect = event {
+            await disconnect()
+            return
+          }
           if case .ready = event { ready = true }
           if case .history(let frame) = event, frame.pageComplete, ready {
             attempt = 0
@@ -262,8 +277,17 @@ public actor CoordinatorSession {
         guard !Task.isCancelled, self.generation == generation else { return }
         connection = nil
         for request in pending { transcript.delivery(request.inputId, .uncertain) }
-        snapshot.connection = .retrying(ConnectionError.describe(error))
         snapshot.busy = false
+        guard ConnectionError.shouldReconnect(after: error) else {
+          let stoppedGeneration = UUID()
+          await disconnect(generation: stoppedGeneration)
+          guard self.generation == stoppedGeneration else { return }
+          snapshot.error = ConnectionError.describe(error)
+          publish()
+          return
+        }
+        snapshot.connection = .reconnecting
+        snapshot.error = nil
         publish()
         attempt = min(attempt + 1, 5)
         do { try await Task.sleep(for: .seconds(1 << attempt)) } catch { return }
@@ -317,6 +341,11 @@ public actor CoordinatorSession {
         // responses carry acknowledgements, controls and history pages.
         switch event {
         case .message, .answer, .textDelta, .activity, .ready, .idle: break
+        case .failure:
+          consume(event, historyRequestID: id)
+          if let inputID, pending.contains(where: { $0.inputId == inputID }) {
+            transcript.delivery(inputID, .uncertain)
+          }
         default: consume(event, historyRequestID: id)
         }
         schedulePublish()
@@ -329,7 +358,16 @@ public actor CoordinatorSession {
         if let inputID, pending.contains(where: { $0.inputId == inputID }) {
           transcript.delivery(inputID, attemptedInputs.contains(inputID) ? .uncertain : .rejected)
         }
-        snapshot.error = ConnectionError.describe(error)
+        if ConnectionError.shouldReconnect(after: error) {
+          snapshot.connection = .reconnecting
+          snapshot.error = nil
+          snapshot.busy = false
+          // The observer reconciles all pending IDs after a lost action reply.
+          // Closing it never resends the action or its uncertain input.
+          await connection?.close()
+        } else {
+          snapshot.error = ConnectionError.describe(error)
+        }
       }
     }
     await actionConnections.removeValue(forKey: id)?.close()
@@ -386,6 +424,51 @@ public actor CoordinatorSession {
         return
       }
     } while true
+  }
+
+  /// Tool input and output are loaded only when their durable row is opened.
+  public func toolDetails(entryID: String, callID: String) async throws -> ToolDetails {
+    guard actions.count + previewRequests.count < 32, let address,
+      snapshot.connection == .connected
+    else { throw ConnectionError.closed }
+    let id = UUID()
+    previewRequests.insert(id)
+    defer { previewRequests.remove(id) }
+    let generation = generation
+    let stream = try await connectTransport(address)
+    guard self.generation == generation, !Task.isCancelled else {
+      await stream.close()
+      throw CancellationError()
+    }
+    actionConnections[id] = stream
+    do {
+      try await timedSend(stream, .toolDetails(.init(callId: callID, entryId: entryID)))
+      var details: ToolDetails?
+      while true {
+        let event = try await timedNext(stream)
+        guard self.generation == generation, !Task.isCancelled else { throw CancellationError() }
+        switch event {
+        case .toolDetails(let value):
+          guard details == nil else { throw ConnectionError.incompleteFrame }
+          switch value.details {
+          case .available(let detail):
+            guard detail.callId == callID else { throw ConnectionError.incompleteFrame }
+          case .unavailable(let detail):
+            guard detail.callId == callID else { throw ConnectionError.incompleteFrame }
+          }
+          details = value.details
+        case .done:
+          guard let details else { throw ConnectionError.incompleteFrame }
+          await actionConnections.removeValue(forKey: id)?.close()
+          return details
+        case .failure(let value): throw CoordinatorRejection(message: value.message)
+        default: throw ConnectionError.incompleteFrame
+        }
+      }
+    } catch {
+      await actionConnections.removeValue(forKey: id)?.close()
+      throw error
+    }
   }
 
   /// Fetch only on an explicit preview request; history carries metadata, never image bytes.
@@ -499,7 +582,6 @@ public actor CoordinatorSession {
     case .notice(let value): transcript.notice(value.text)
     case .failure(let value):
       snapshot.error = value.message
-      transcript.notice(value.message, failure: true)
     case .idle:
       snapshot.busy = false
       transcript.idle()

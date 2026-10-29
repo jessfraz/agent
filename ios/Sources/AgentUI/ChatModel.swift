@@ -240,10 +240,17 @@ final class ChatModel {
     }
   }
   func retry(_ id: String) async { await session?.retry(id) }
+  func toolDetails(for row: ChatRow) async throws -> ToolDetails {
+    guard let entryID = row.entryID, let tool = row.tool, let session else {
+      throw ConnectionError.closed
+    }
+    return try await session.toolDetails(entryID: entryID, callID: tool.callId)
+  }
   func history() async { await session?.loadEarlier() }
   func interrupt() async { await session?.interrupt() }
   private func apply(_ update: ChatSnapshot) {
-    let existing = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
+    let existing = Dictionary(
+      rows.map { ($0.id, $0) }, uniquingKeysWith: { original, _ in original })
     let next = update.rows.map { row -> RowModel in
       if let model = existing[row.id] {
         if model.row != row { model.row = row }

@@ -208,14 +208,23 @@ private func send(_ data: Data, on connection: NWConnection) async throws {
 
 actor FixtureCoordinator {
   nonisolated let closedObservations: AsyncStream<Void>
+  nonisolated let closedToolLookups: AsyncStream<Void>
   private let closedContinuation: AsyncStream<Void>.Continuation
+  private let closedToolContinuation: AsyncStream<Void>.Continuation
+  private var toolRequests: [NativeRequestToolDetails] = []
+  private var toolReply: [NativeEvent] = []
   private var delaySnapshot = false
   private var release: CheckedContinuation<Void, Never>?
   init() {
     let pair = AsyncStream<Void>.makeStream()
     closedObservations = pair.stream
     closedContinuation = pair.continuation
+    let details = AsyncStream<Void>.makeStream()
+    closedToolLookups = details.stream
+    closedToolContinuation = details.continuation
   }
+  func replyToToolLookups(with events: [NativeEvent]) { toolReply = events }
+  func toolLookups() -> [NativeRequestToolDetails] { toolRequests }
   func holdSnapshot() { delaySnapshot = true }
   func releaseSnapshot() {
     delaySnapshot = false
@@ -261,6 +270,24 @@ actor FixtureCoordinator {
       bytes.removeSubrange(...end)
       guard case .native(let value) = command else { return }
       switch value.request {
+      case .toolDetails(let request):
+        toolRequests.append(request)
+        var reply = Data()
+        for event in toolReply {
+          reply.append(try JSONEncoder().encode(event))
+          reply.append(10)
+        }
+        if !reply.isEmpty { try? await send(reply, on: socket) }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+          socket.receive(minimumIncompleteLength: 1, maximumLength: 1) {
+            data, _, complete, error in
+            #expect(data?.isEmpty ?? true)
+            #expect(complete || error != nil)
+            continuation.resume()
+          }
+        }
+        closedToolContinuation.yield(())
+        return
       case .observe(let request):
         try await emit(
           .ready(.init(conversationId: "fixture-root", model: "fixture/model")), on: socket)
@@ -372,6 +399,8 @@ actor FixtureCoordinator {
     let pendingFile = outbox.deletingLastPathComponent().appending(
       path: "Attachments/\(file.id)/Notes.txt")
     #expect(try Data(contentsOf: pendingFile) == bytes)
+    // Uncached previews require the lost-reply connection to recover first.
+    _ = try await until(session) { $0.connection == .connected }
     let preview = try await session.preview(file.reference)
     #expect(try Data(contentsOf: preview) == bytes)
     #expect(try await session.preview(file.reference) == preview)
