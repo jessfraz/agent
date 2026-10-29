@@ -11,7 +11,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
-import { createRegistry, Harness } from "@earendil-works/pi-durable";
+import { createRegistry, GenerationTask, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
@@ -380,6 +380,142 @@ test("child outcomes retain tool provenance and settle atomically with delivery 
     assert.equal(await app.sources.hasWork(), false);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
+
+test("a successful native child final completes its assignment without a reporting tool call", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-child-final-")); const app = await open(directory);
+  try {
+    const command = await childCommand(app);
+    const answer = "The bounded source review is complete; the original evidence supports the result.";
+    app.faux.setResponses([fauxAssistantMessage(answer)]);
+    const result = await app.run(command);
+    const saved = await app.tasks.get(command.task_id); const child = saved.agents[0]; assert.ok(child);
+    assert.equal(child.state.state, "done"); assert.equal(child.summary, answer); assert.equal(saved.state.state, "open");
+    assert.ok(saved.pending.some((input) => input.id.startsWith("agent-result:") && input.content.includes(answer)));
+    const outcomes = await app.sources.events({ provider: "task_outcomes" });
+    assert.ok(outcomes.some((record) => record.outcome?.conversation_id === child.conversation_id && record.outcome.entry_id === result.entry_id && record.outcome.tool_call_id === null));
+    const delivered = saved.pending.filter((input) => input.id.startsWith("agent-result:"));
+    await app.run(command);
+    assert.deepEqual((await app.tasks.get(command.task_id)).pending.filter((input) => input.id.startsWith("agent-result:")), delivered);
+    assert.equal(app.faux.state.callCount, 1, "Publishing an already completed result must not repeat source/model work");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a continuation admitted at the child completion boundary keeps its own final result", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-child-completion-race-")); const app = await open(directory);
+  const commit = app.session.commit.bind(app.session);
+  let release = () => {}, running: Promise<unknown> | undefined;
+  try {
+    const command = await childCommand(app);
+    let reached = () => {}; const checked = new Promise<void>((resolve) => { reached = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; }); let first = true;
+    // Stop after the real native receipt transaction releases its line. A
+    // continuation can commit here without replacing the model or task store.
+    app.session.commit = async (change, context) => {
+      let inspected = false;
+      const result = await commit(async (tx) => {
+        const scan = tx.scanTasks.bind(tx);
+        tx.scanTasks = async (query, limit, cursor) => {
+          const page = await scan(query, limit, cursor);
+          if (query.kind === GenerationTask.definition.name) inspected = true;
+          return page;
+        };
+        return change(tx);
+      }, context);
+      if (inspected && first) { first = false; reached(); await gate; }
+      return result;
+    };
+    const firstAnswer = "The first bounded assignment is complete.", secondAnswer = "The second assignment has a different verified result.";
+    app.faux.setResponses([fauxAssistantMessage(firstAnswer), fauxAssistantMessage(secondAnswer)]);
+    running = app.run(command); await checked;
+    await app.tasks.continueAgent(command.task_id, command.agent_id, "Review the second assignment.", "second-child-assignment");
+    release(); await running; running = undefined;
+    const saved = await app.tasks.get(command.task_id); const child = saved.agents[0]; assert.ok(child);
+    assert.equal(child.state.state, "done"); assert.equal(child.summary, secondAnswer); assert.equal(child.pending.length, 0);
+    assert.equal(saved.state.state, "open"); assert.equal(app.faux.state.callCount, 2);
+    const delivered = saved.pending.filter((input) => input.id.startsWith("agent-result:"));
+    assert.ok(delivered.at(-1)?.content.includes(secondAnswer));
+    const conversation = await app.tasks.conversation(child.conversation_id);
+    const receipt = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, "second-child-assignment"), BACKGROUND_CONTEXT);
+    assert.ok(receipt?.type === "input" && receipt.status === "done");
+    const outcomes = await app.sources.events({ provider: "task_outcomes" });
+    assert.ok(outcomes.some((record) => record.outcome?.entry_id === receipt.answer.toString() && record.outcome.summary === secondAnswer));
+  } finally { release(); await running; app.session.commit = commit; await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("empty, failed and aborted native child answers remain failures", async (t) => {
+  for (const stopReason of ["stop", "error", "aborted"]) await t.test(stopReason, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-child-no-answer-")); const app = await open(directory);
+    try {
+      const command = await childCommand(app);
+      const response = stopReason === "error" ? fauxAssistantMessage("Partial evidence", { stopReason: "error", errorMessage: "Synthetic native failure" })
+        : stopReason === "aborted" ? fauxAssistantMessage("Partial evidence", { stopReason: "aborted" }) : fauxAssistantMessage("");
+      app.faux.setResponses([response]);
+      if (stopReason === "stop") await app.run(command); else await assert.rejects(app.run(command));
+      const saved = await app.tasks.get(command.task_id);
+      assert.equal(saved.state.state, "open"); assert.equal(saved.agents[0]?.state.state, "failed");
+      if (saved.agents[0]?.state.state === "failed") assert.match(saved.agents[0].state.reason,
+        stopReason === "stop" ? /without a successful final answer/ : /execution did not complete/);
+    } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+});
+
+test("reopening after a native child final uses its durable receipt and rejects a newer unanswered generation", { timeout: 15_000 }, async (t) => {
+  for (const newerFailure of [false, true]) await t.test(newerFailure ? "newer native failure" : "completed final", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-child-recovery-")); let app = await open(directory);
+    const controller = new AbortController(); let resume = () => {}, releaseExecution = () => {};
+    let running: Promise<unknown> | undefined;
+    try {
+      const command = await childCommand(app), answer = "The native bounded review finished before parent delivery.";
+      let pause = () => {}; const paused = new Promise<void>((resolve) => { pause = resolve; });
+      const gate = new Promise<void>((resolve) => { resume = resolve; }); let boundaries = 0;
+      app.faux.setResponses([fauxAssistantMessage(answer)]);
+      running = app.tasks.run(command, (conversation) => {
+        releaseExecution = app.executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [host], role: "worker", call: async () => ({ type: "written" }) });
+        return releaseExecution;
+      }, () => {}, [app.tools.agent], undefined, undefined, {
+        signal: controller.signal, async ready() {}, answer() {}, idle() {},
+        async beforeTurn() { if (++boundaries === 3) { pause(); await gate; } },
+      }).catch((error: unknown) => error);
+      await paused;
+      const before = await app.tasks.get(command.task_id); const child = before.agents[0]; assert.ok(child);
+      assert.equal(child.state.state, "open"); assert.equal(child.pending.length, 0);
+      assert.equal(before.pending.some((input) => input.id.startsWith("agent-result:")), false);
+      const conversation = await app.tasks.conversation(child.conversation_id);
+      const native = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, "child-assignment"), BACKGROUND_CONTEXT);
+      assert.ok(native?.type === "input" && native.status === "done");
+      await app.session.close(BACKGROUND_CONTEXT); controller.abort(); resume(); await running; running = undefined; releaseExecution();
+      app = await open(directory);
+      if (newerFailure) {
+        const reopened = await app.tasks.conversation(child.conversation_id);
+        await reopened.configure({ model: { provider: "unavailable-fixture", modelId: "missing" } }, BACKGROUND_CONTEXT);
+        const failed = await (await reopened.submit({ type: "input", content: "A newer assignment has no usable model.", requestId: "newer-unanswered" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+        assert.ok(failed.type === "input" && failed.status === "unanswered");
+        await app.tasks.inference.configure(reopened, fixtureModel, {});
+        await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+      }
+      const result = await app.run(command);
+      const saved = await app.tasks.get(command.task_id); const completed = saved.agents[0]; assert.ok(completed);
+      assert.equal(completed.state.state, newerFailure ? "failed" : "done"); assert.equal(saved.state.state, "open");
+      assert.equal(app.faux.state.callCount, 0, "Recovery must publish stored evidence without another model/source read");
+      if (!newerFailure) {
+        assert.equal(completed.summary, answer); assert.equal(result.entry_id, native.answer.toString());
+        const delivered = saved.pending.filter((input) => input.id.startsWith("agent-result:")); assert.equal(delivered.length, 1);
+        await app.run(command);
+        assert.deepEqual((await app.tasks.get(command.task_id)).pending.filter((input) => input.id.startsWith("agent-result:")), delivered);
+      }
+    } finally { controller.abort(); resume(); await running; releaseExecution(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+});
+
+async function childCommand(app: Awaited<ReturnType<typeof open>>) {
+  const command = await app.prepare();
+  const child = await app.tasks.createAgent(command.task_id, { id: "bounded-review", title: "Review", outcome: "Review the original evidence",
+    input: "Complete the bounded review", inputId: "child-assignment" });
+  const childBinding = { ...binding, block_id: "block:66666666-6666-4666-8666-666666666666" };
+  await app.tasks.dispatchAgent(command.task_id, child.id, async () => ({ type: "spawned", binding: childBinding }));
+  const saved = (await app.tasks.get(command.task_id)).agents[0]; assert.ok(saved?.worker.state === "bound");
+  return { ...command, agent_id: child.id, allocation_id: saved.worker.allocation_id, binding: childBinding };
+}
 
 test("the real bridge admits a safe failed outcome when authentication fails before a model turn", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-outcomes-")); let app = await open(directory);
