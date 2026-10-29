@@ -34,7 +34,42 @@ pub enum NativeRequest {
     History {
         cursor: Option<String>,
     },
+    ToolDetails {
+        entry_id: String,
+        call_id: String,
+    },
     Interrupt,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolDetails {
+    Available {
+        call_id: String,
+        name: String,
+        status: crate::protocol::ToolStatus,
+        input: ToolDetailContent,
+        output: ToolDetailContent,
+    },
+    Unavailable {
+        call_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolDetailContent {
+    Text { text: String, truncated: bool },
+    Unavailable { reason: ToolDetailUnavailable },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolDetailUnavailable {
+    NotRecorded,
+    Pending,
+    LookupLimit,
+    Unsupported,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -64,6 +99,9 @@ pub enum NativeEvent {
         messages: Vec<HistoryMessage>,
         next_cursor: Option<String>,
         page_complete: bool,
+    },
+    ToolDetails {
+        details: ToolDetails,
     },
     Message {
         message: HistoryMessage,
@@ -128,6 +166,23 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
             agent_id: None,
             cursor,
         },
+        NativeRequest::ToolDetails { entry_id, call_id } => {
+            let id = entry_id.parse::<u64>()?;
+            ensure!(
+                id > 0 && id <= 9_007_199_254_740_991 && id.to_string() == entry_id,
+                "Invalid native entry ID"
+            );
+            ensure!(
+                !call_id.is_empty() && call_id.len() <= 1024,
+                "Invalid tool call ID"
+            );
+            RuntimeCommand::ReadToolDetails {
+                entry_id,
+                call_id,
+                task_id: None,
+                agent_id: None,
+            }
+        }
         NativeRequest::Interrupt => RuntimeCommand::MainInterrupt,
         NativeRequest::Submit {
             input_id,
@@ -253,6 +308,9 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             messages: messages.clone(),
             next_cursor: next_cursor.clone(),
             page_complete: *page_complete,
+        },
+        RuntimeEventKind::ToolDetails { details } => NativeEvent::ToolDetails {
+            details: details.clone(),
         },
         RuntimeEventKind::Message { message } => NativeEvent::Message {
             message: message.clone(),
@@ -484,6 +542,49 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn tool_details_keep_the_durable_anchor_and_never_become_model_input() {
+        let Operation::Runtime(command) = prepare(NativeRequest::ToolDetails {
+            entry_id: "42".into(),
+            call_id: "provider-call".into(),
+        })
+        .unwrap() else {
+            panic!("Expected a read-only runtime lookup");
+        };
+        assert!(
+            matches!(*command, RuntimeCommand::ReadToolDetails { entry_id, call_id, task_id: None, agent_id: None }
+            if entry_id == "42" && call_id == "provider-call")
+        );
+        for entry_id in ["", "0", "-1", "01", "1.0", "9007199254740992"] {
+            assert!(
+                prepare(NativeRequest::ToolDetails {
+                    entry_id: entry_id.into(),
+                    call_id: "provider-call".into(),
+                })
+                .is_err()
+            );
+        }
+        for call_id in [String::new(), "🦀".repeat(257)] {
+            assert!(
+                prepare(NativeRequest::ToolDetails {
+                    entry_id: "42".into(),
+                    call_id,
+                })
+                .is_err()
+            );
+        }
+        let projected = crate::native::project(&crate::protocol::RuntimeEventKind::ToolDetails {
+            details: crate::native::ToolDetails::Unavailable {
+                call_id: "provider-call".into(),
+            },
+        });
+        assert!(
+            matches!(projected, Some(crate::native::NativeEvent::ToolDetails {
+            details: crate::native::ToolDetails::Unavailable { call_id }
+        }) if call_id == "provider-call")
+        );
     }
 
     #[test]

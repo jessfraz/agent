@@ -8,4 +8,5 @@
 {"type":"native","request":{"type":"submit","input_id":"example","text":"example","mode":"follow_up","attachments":[{"id":"example","name":"example","media_type":"example","size_bytes":1,"sha256":"example"}]}}
 {"type":"native","request":{"type":"history","cursor":"example"}}
 {"type":"native","request":{"type":"history","cursor":null}}
+{"type":"native","request":{"type":"tool_details","entry_id":"example","call_id":"example"}}
 {"type":"native","request":{"type":"interrupt"}}

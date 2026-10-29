@@ -27,7 +27,7 @@ import { createToolsets, type Toolsets } from "./toolsets.js";
 import { createSourceTools, SourceJournal } from "./sources.js";
 import { createResourceTools, ResourceStore } from "./resources.js";
 import { BrowserStore, createBrowserTools } from "./browser.js";
-import { activity, history } from "./transcript.js";
+import { activity, history, toolDetails } from "./transcript.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { conversationSettings } from "./settings.js";
@@ -451,13 +451,17 @@ async function handle(request: RuntimeRequest): Promise<void> {
         emit(id, { type: "task", task: await tasks.get(command.task_id), history: await tasks.history(command.task_id) });
         break;
       }
-      case "read_history": {
+      case "read_history":
+      case "read_tool_details": {
         const { harness, tasks } = await app();
-        if (command.task_id === null && command.agent_id !== null) throw new TaskError("Choose a task for agent history");
-        const conversation = command.task_id === null ? await harness.root(BACKGROUND_CONTEXT)
-          : await tasks.conversation(command.agent_id === null ? (await tasks.get(command.task_id)).conversation_id
-            : (await tasks.get(command.task_id)).agents.find((agent) => agent.id === command.agent_id)?.conversation_id ?? "");
-        for (const frame of await history(conversation, command.cursor)) emit(id, frame);
+        const taskId = command.task_id ?? null, agentId = command.agent_id ?? null;
+        if (taskId === null && agentId !== null) throw new TaskError("Choose a task for agent history");
+        const task = taskId === null ? undefined : await tasks.get(taskId);
+        const conversation = task === undefined ? await harness.root(BACKGROUND_CONTEXT)
+          : await tasks.conversation(agentId === null ? task.conversation_id
+            : task.agents.find((agent) => agent.id === agentId)?.conversation_id ?? "");
+        if (command.type === "read_history") for (const frame of await history(conversation, command.cursor)) emit(id, frame);
+        else emit(id, { type: "tool_details", details: await toolDetails(conversation, command.entry_id, command.call_id) });
         break;
       }
       case "revoke_allocation": {

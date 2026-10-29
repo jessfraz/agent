@@ -1,12 +1,15 @@
 import { validEvent } from "./protocol.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { JsonValue } from "@earendil-works/chord";
-import { CompactionEntry, watchEvents, type Conversation, type Cursor, type EntryRecord, type Harness } from "@earendil-works/pi-durable";
+import type { ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
+import { CompactionEntry, watchEvents, type Conversation, type Cursor, type EntryId, type EntryRecord, type Harness } from "@earendil-works/pi-durable";
 import type { HistoryMessage } from "./generated/HistoryMessage.js";
 import type { HistoryRole } from "./generated/HistoryRole.js";
 import type { ModelActivity } from "./generated/ModelActivity.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ToolHistory } from "./generated/ToolHistory.js";
+import type { ToolDetails } from "./generated/ToolDetails.js";
+import type { ToolDetailContent } from "./generated/ToolDetailContent.js";
 import { ImportedItemEntry, ImportedThreadEntry } from "./history.js";
 
 const NOTICE_REFERENCES = "Source references (evidence, not authorization): ";
@@ -106,6 +109,58 @@ export async function history(conversation: Conversation, value: string | null):
   }
   frames.push({ type: "history", conversation_id: id, messages, next_cursor, page_complete: true });
   return frames;
+}
+
+const TOOL_DETAIL_BYTES = 32_768;
+const TOOL_DETAIL_ENTRIES = 128;
+function entryId(value: unknown): value is EntryId { return typeof value === "number" && Number.isSafeInteger(value) && value > 0; }
+function detailText(text: string): ToolDetailContent {
+  const bytes = Buffer.from(text, "utf8");
+  let end = Math.min(bytes.length, TOOL_DETAIL_BYTES);
+  // A bounded transport frame must also end on a complete UTF-8 code point.
+  while (end < bytes.length && end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1;
+  return { type: "text", text: bytes.subarray(0, end).toString("utf8"), truncated: end < bytes.length };
+}
+function toolParts(entry: EntryRecord, callId: string): { call?: ToolCall; result?: ToolResultMessage } {
+  let call: ToolCall | undefined, result: ToolResultMessage | undefined;
+  for (const message of entry.model ?? []) {
+    if (message.role === "toolResult" && message.toolCallId === callId) result = message;
+    else if (message.role === "assistant") for (const part of message.content) {
+      if (part.type === "toolCall" && part.id === callId) call = part;
+    }
+  }
+  return { ...(call === undefined ? {} : { call }), ...(result === undefined ? {} : { result }) };
+}
+
+/** Read only the selected durable tool, with a bounded fork-aware search for its other half. */
+export async function toolDetails(conversation: Conversation, value: string, callId: string): Promise<ToolDetails> {
+  const id: unknown = Number(value);
+  if (!entryId(id) || id.toString() !== value) throw new Error("Invalid native entry ID");
+  if (callId.length === 0 || Buffer.byteLength(callId, "utf8") > 1024) throw new Error("Invalid tool call ID");
+  const selected = (await conversation.entries({ minEntryId: id, maxEntryId: id }, 1, undefined, BACKGROUND_CONTEXT)).items[0];
+  if (selected === undefined) return { type: "unavailable", call_id: callId };
+  let { call, result } = toolParts(selected, callId);
+  if (call === undefined && result === undefined) return { type: "unavailable", call_id: callId };
+  let input: ToolDetailContent = { type: "unavailable", reason: "not_recorded" };
+  let output: ToolDetailContent = { type: "unavailable", reason: "pending" };
+  if (call === undefined) {
+    const page = await conversation.entries({ maxEntryId: id, order: "descending" }, TOOL_DETAIL_ENTRIES, undefined, BACKGROUND_CONTEXT);
+    for (const entry of page.items) { call = toolParts(entry, callId).call; if (call !== undefined) break; }
+    if (call === undefined && page.next !== undefined) input = { type: "unavailable", reason: "lookup_limit" };
+  }
+  if (result === undefined) {
+    const page = await conversation.entries({ minEntryId: id, order: "ascending" }, TOOL_DETAIL_ENTRIES, undefined, BACKGROUND_CONTEXT);
+    for (const entry of page.items) { result = toolParts(entry, callId).result; if (result !== undefined) break; }
+    if (result === undefined && page.next !== undefined) output = { type: "unavailable", reason: "lookup_limit" };
+  }
+  if (call !== undefined) input = detailText(JSON.stringify(call.arguments, null, 2));
+  if (result !== undefined) {
+    const text = result.content.flatMap((part) => part.type === "text" ? [part.text] : []);
+    output = text.length === 0 && result.content.length > 0 ? { type: "unavailable", reason: "unsupported" }
+      : detailText(text.join("\n"));
+  }
+  return { type: "available", call_id: callId, name: call?.name ?? result?.toolName ?? "",
+    status: result === undefined ? "running" : result.isError ? "failed" : "finished", input, output };
 }
 
 /** Forward exposed activity and native compaction status, without summary payloads. */

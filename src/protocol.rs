@@ -385,6 +385,16 @@ pub enum RuntimeCommand {
         agent_id: Option<String>,
         cursor: Option<String>,
     },
+    ReadToolDetails {
+        entry_id: String,
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        task_id: Option<TaskId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        agent_id: Option<String>,
+    },
     Feedback {
         description: String,
         context: FeedbackContext,
@@ -1041,6 +1051,9 @@ pub enum RuntimeEventKind {
         // The final frame in this page, even when the worker stays open.
         #[serde(default)]
         page_complete: bool,
+    },
+    ToolDetails {
+        details: crate::native::ToolDetails,
     },
     TaskReady {
         conversation_id: String,

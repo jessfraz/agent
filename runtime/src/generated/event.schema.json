@@ -3778,6 +3778,22 @@
         {
           "type": "object",
           "properties": {
+            "details": {
+              "$ref": "#/$defs/ToolDetails"
+            },
+            "type": {
+              "type": "string",
+              "const": "tool_details"
+            }
+          },
+          "required": [
+            "type",
+            "details"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "conversation_id": {
               "type": "string"
             },
@@ -4746,6 +4762,107 @@
     },
     "TimezoneId": {
       "type": "string"
+    },
+    "ToolDetailContent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "type": {
+              "type": "string",
+              "const": "text"
+            }
+          },
+          "required": [
+            "type",
+            "text",
+            "truncated"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/ToolDetailUnavailable"
+            },
+            "type": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "type",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "ToolDetailUnavailable": {
+      "type": "string",
+      "enum": [
+        "not_recorded",
+        "pending",
+        "lookup_limit",
+        "unsupported"
+      ]
+    },
+    "ToolDetails": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "input": {
+              "$ref": "#/$defs/ToolDetailContent"
+            },
+            "name": {
+              "type": "string"
+            },
+            "output": {
+              "$ref": "#/$defs/ToolDetailContent"
+            },
+            "status": {
+              "$ref": "#/$defs/ToolStatus"
+            },
+            "type": {
+              "type": "string",
+              "const": "available"
+            }
+          },
+          "required": [
+            "type",
+            "call_id",
+            "name",
+            "status",
+            "input",
+            "output"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "type",
+            "call_id"
+          ]
+        }
+      ]
     },
     "ToolHistory": {
       "type": "object",

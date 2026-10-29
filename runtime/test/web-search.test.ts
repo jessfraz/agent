@@ -29,6 +29,7 @@ function tools(value: unknown): Record<string, unknown>[] {
 function send(response: ServerResponse, event: object): void { response.write("data: " + JSON.stringify(event) + "\n\n"); }
 const marker = "\uE200cite\uE202turn0search0\uE201";
 const raw = "A verified component. " + marker;
+const exposedReasoning = "**Checking the source**\n\nThe component specification needs to match the installed version. The published source provides that version.\n\nThe next check compares its reported dimensions before accepting the result.";
 interface CitationPart { text: string; annotations: { type: "url_citation"; start_index: number; end_index: number; url: string; title: string }[] }
 const defaultParts: CitationPart[] = [{ text: raw, annotations: [{ type: "url_citation", start_index: raw.indexOf(marker), end_index: raw.length,
   url: "https://example.com/component", title: "Component specification" }] }];
@@ -38,7 +39,7 @@ const binding: WorkerRef = { host_id: "11111111-1111-4111-8111-111111111111", se
 function complete(response: ServerResponse, id: number, parts: CitationPart[] = defaultParts, preface?: CitationPart[]): void {
   response.writeHead(200, { "content-type": "text/event-stream" });
   const search = { id: "search_" + id, type: "web_search_call", status: "completed", action: { type: "search", queries: ["synthetic component specification"] } };
-  const thinking = { id: "reasoning_" + id, type: "reasoning", summary: [{ type: "summary_text", text: "Checking the source." }], encrypted_content: "synthetic-encrypted-replay" };
+  const thinking = { id: "reasoning_" + id, type: "reasoning", summary: [{ type: "summary_text", text: exposedReasoning }], encrypted_content: "synthetic-encrypted-replay" };
   const message = { type: "message", id: "message_" + id, role: "assistant", phase: "final_answer", status: "completed",
     content: parts.map((part) => ({ type: "output_text", ...part })) };
   const leading = { ...message, id: "preface_" + id, phase: "commentary", content: (preface ?? []).map((part) => ({ type: "output_text", ...part })) };
@@ -55,6 +56,10 @@ function complete(response: ServerResponse, id: number, parts: CitationPart[] = 
   let index = 1;
   if (preface !== undefined) writeMessage(leading, index++);
   send(response, { type: "response.output_item.added", output_index: index, item: { ...thinking, summary: [] } });
+  send(response, { type: "response.reasoning_summary_part.added", item_id: thinking.id, output_index: index, summary_index: 0, part: { type: "summary_text", text: "" } });
+  for (const delta of [exposedReasoning.slice(0, 30), exposedReasoning.slice(30)]) send(response, { type: "response.reasoning_summary_text.delta", item_id: thinking.id, output_index: index, summary_index: 0, delta });
+  send(response, { type: "response.reasoning_summary_text.done", item_id: thinking.id, output_index: index, summary_index: 0, text: exposedReasoning });
+  send(response, { type: "response.reasoning_summary_part.done", item_id: thinking.id, output_index: index, summary_index: 0, part: { type: "summary_text", text: exposedReasoning } });
   send(response, { type: "response.output_item.done", output_index: index++, item: thinking });
   writeMessage(message, index);
   send(response, { type: "response.completed", response: { id: "response_" + id, object: "response", status: "completed", output: [search, ...(preface === undefined ? [] : [leading]), thinking, message],
@@ -135,6 +140,21 @@ test("legacy Codex Responses uses its native transport and the same durable cita
     assert.equal((await (await app.root.submit({ type: "input", content: "Check the published source." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
     assert.match((await answer(app)).content.find((part) => part.type === "text")?.text ?? "", /\[1\]\(<https:\/\/example.com\/component>\)/);
     assert.ok(tools(wire.requests).some((tool) => tool.type === "web_search")); assert.equal(wire.requests.length, 1);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await wire.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("enabled reasoning requests detailed explanations and preserves every paragraph through Pi and native history", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-reasoning-")), wire = await server((response, _body, id) => complete(response, id));
+  const app = await open(directory, wire.url);
+  try {
+    await app.inference.configure(app.root, { ...app.selection, reasoning: "high" }, {});
+    assert.equal((await (await app.root.submit({ type: "input", content: "Check the specification." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+    assert.ok(wire.requests.some((request) => object(request.reasoning) && request.reasoning.summary === "detailed"));
+    const thinking = (await answer(app)).content.find((part) => part.type === "thinking");
+    assert.equal(thinking?.thinking, exposedReasoning);
+    const rendered = (await history(app.root, null)).flatMap((frame) => frame.messages).filter((message) => message.role === "thinking");
+    assert.equal(rendered.map((message) => message.text).join(""), exposedReasoning);
+    assert.equal(JSON.stringify(rendered).includes("synthetic-encrypted-replay"), false);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await wire.close(); await rm(directory, { recursive: true, force: true }); }
 });
 

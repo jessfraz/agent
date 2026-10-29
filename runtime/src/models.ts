@@ -1,5 +1,5 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { getSupportedThinkingLevels, type Api, type AuthResult, type Model, type MutableModels } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Api, type AuthResult, type Model, type MutableModels, type ProviderStreams } from "@earendil-works/pi-ai";
 import { builtinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { MODEL_THINKING_LEVELS } from "@earendil-works/pi-ai/providers/model-schema";
 import { AgentDoc, configure, defineDoc, ProviderDoc, type AgentChange, type Conversation, type Harness, type Tx } from "@earendil-works/pi-durable";
@@ -42,6 +42,18 @@ function provider(value: unknown): value is ModelProvider { return PROVIDERS.som
 function reasoning(value: unknown): value is Reasoning { return MODEL_THINKING_LEVELS.some((level) => level === value); }
 function supportsFast(model: Model<Api>): boolean { return model.provider === "openai" && model.api === "openai-responses"; }
 
+/** Request the complete exposed explanation once, before every client receives Pi's output. */
+function withDetailedReasoning(native: ProviderStreams["streamSimple"]): ProviderStreams["streamSimple"] {
+  return (model, context, options) => native(model, context, { ...options,
+    onPayload: async (payload, actual) => {
+      const previous = await options?.onPayload?.(payload, actual);
+      const selected = previous === undefined ? payload : previous;
+      if (!object(selected) || !object(selected.reasoning) || typeof selected.reasoning.summary !== "string") return selected;
+      return { ...selected, reasoning: { ...selected.reasoning, summary: "detailed" } };
+    },
+  });
+}
+
 /** Old worker launch records held an OpenAI model ID. Configuration itself is strict. */
 export function savedModel(value: unknown): ModelSelection | null {
   if (value === undefined || value === null) return null;
@@ -70,7 +82,7 @@ export class ConversationModels {
   constructor(readonly models: MutableModels = builtinModels(), auth?: ChatGptAuth) {
     for (const id of ["openai", "openai-codex"]) {
       const provider = models.getProvider(id);
-      if (provider !== undefined) models.setProvider({ ...provider, streamSimple: withWebSearch(provider.streamSimple) });
+      if (provider !== undefined) models.setProvider({ ...provider, streamSimple: withDetailedReasoning(withWebSearch(provider.streamSimple)) });
     }
     const openai = models.getProvider("openai");
     if (openai !== undefined) {

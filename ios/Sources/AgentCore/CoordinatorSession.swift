@@ -503,7 +503,7 @@ public actor CoordinatorSession {
     case .idle:
       snapshot.busy = false
       transcript.idle()
-    case .attachment, .disconnect, .done: break
+    case .attachment, .toolDetails, .disconnect, .done: break
     }
   }
   private func schedulePublish() {

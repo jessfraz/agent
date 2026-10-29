@@ -401,6 +401,16 @@ public struct NativeEventHistory: Codable, Sendable, Equatable {
     }
 }
 
+public struct NativeEventToolDetails: Codable, Sendable, Equatable {
+    public var `details`: ToolDetails
+    public init(`details`: ToolDetails) {
+        self.`details` = `details`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `details` = "details"
+    }
+}
+
 public struct NativeEventMessage: Codable, Sendable, Equatable {
     public var `message`: HistoryMessage
     public init(`message`: HistoryMessage) {
@@ -506,6 +516,7 @@ public enum NativeEvent: Codable, Sendable, Equatable {
     case `commands`(NativeEventCommands)
     case `ready`(NativeEventReady)
     case `history`(NativeEventHistory)
+    case `toolDetails`(NativeEventToolDetails)
     case `message`(NativeEventMessage)
     case `answer`(NativeEventAnswer)
     case `textDelta`(NativeEventTextDelta)
@@ -527,6 +538,7 @@ public enum NativeEvent: Codable, Sendable, Equatable {
         case "commands": self = .`commands`(try NativeEventCommands(from: decoder))
         case "ready": self = .`ready`(try NativeEventReady(from: decoder))
         case "history": self = .`history`(try NativeEventHistory(from: decoder))
+        case "tool_details": self = .`toolDetails`(try NativeEventToolDetails(from: decoder))
         case "message": self = .`message`(try NativeEventMessage(from: decoder))
         case "answer": self = .`answer`(try NativeEventAnswer(from: decoder))
         case "text_delta": self = .`textDelta`(try NativeEventTextDelta(from: decoder))
@@ -559,6 +571,9 @@ public enum NativeEvent: Codable, Sendable, Equatable {
             try value.encode(to: encoder)
         case .`history`(let value):
             try tag.encode("history", forKey: .type)
+            try value.encode(to: encoder)
+        case .`toolDetails`(let value):
+            try tag.encode("tool_details", forKey: .type)
             try value.encode(to: encoder)
         case .`message`(let value):
             try tag.encode("message", forKey: .type)
@@ -646,11 +661,25 @@ public struct NativeRequestHistory: Codable, Sendable, Equatable {
     }
 }
 
+public struct NativeRequestToolDetails: Codable, Sendable, Equatable {
+    public var `callId`: String
+    public var `entryId`: String
+    public init(`callId`: String, `entryId`: String) {
+        self.`callId` = `callId`
+        self.`entryId` = `entryId`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `callId` = "call_id"
+        case `entryId` = "entry_id"
+    }
+}
+
 public enum NativeRequest: Codable, Sendable, Equatable {
     case `attachment`(NativeRequestAttachment)
     case `observe`(NativeRequestObserve)
     case `submit`(NativeRequestSubmit)
     case `history`(NativeRequestHistory)
+    case `toolDetails`(NativeRequestToolDetails)
     case `interrupt`
     enum CodingKeys: String, CodingKey { case type }
     public init(from decoder: any Decoder) throws {
@@ -660,6 +689,7 @@ public enum NativeRequest: Codable, Sendable, Equatable {
         case "observe": self = .`observe`(try NativeRequestObserve(from: decoder))
         case "submit": self = .`submit`(try NativeRequestSubmit(from: decoder))
         case "history": self = .`history`(try NativeRequestHistory(from: decoder))
+        case "tool_details": self = .`toolDetails`(try NativeRequestToolDetails(from: decoder))
         case "interrupt": self = .`interrupt`
         default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported protocol event: \(tag)"))
         }
@@ -678,6 +708,9 @@ public enum NativeRequest: Codable, Sendable, Equatable {
             try value.encode(to: encoder)
         case .`history`(let value):
             try tag.encode("history", forKey: .type)
+            try value.encode(to: encoder)
+        case .`toolDetails`(let value):
+            try tag.encode("tool_details", forKey: .type)
             try value.encode(to: encoder)
         case .`interrupt`:
             try tag.encode("interrupt", forKey: .type)
@@ -699,6 +732,118 @@ public struct SlashCommand: Codable, Sendable, Equatable {
 }
 
 public typealias TaskId = String
+
+public struct ToolDetailContentText: Codable, Sendable, Equatable {
+    public var `text`: String
+    public var `truncated`: Bool
+    public init(`text`: String, `truncated`: Bool) {
+        self.`text` = `text`
+        self.`truncated` = `truncated`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `text` = "text"
+        case `truncated` = "truncated"
+    }
+}
+
+public struct ToolDetailContentUnavailable: Codable, Sendable, Equatable {
+    public var `reason`: ToolDetailUnavailable
+    public init(`reason`: ToolDetailUnavailable) {
+        self.`reason` = `reason`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `reason` = "reason"
+    }
+}
+
+public enum ToolDetailContent: Codable, Sendable, Equatable {
+    case `text`(ToolDetailContentText)
+    case `unavailable`(ToolDetailContentUnavailable)
+    enum CodingKeys: String, CodingKey { case type }
+    public init(from decoder: any Decoder) throws {
+        let tag = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .type)
+        switch tag {
+        case "text": self = .`text`(try ToolDetailContentText(from: decoder))
+        case "unavailable": self = .`unavailable`(try ToolDetailContentUnavailable(from: decoder))
+        default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported protocol event: \(tag)"))
+        }
+    }
+    public func encode(to encoder: any Encoder) throws {
+        var tag = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .`text`(let value):
+            try tag.encode("text", forKey: .type)
+            try value.encode(to: encoder)
+        case .`unavailable`(let value):
+            try tag.encode("unavailable", forKey: .type)
+            try value.encode(to: encoder)
+        }
+    }
+}
+
+public enum ToolDetailUnavailable: String, Codable, Sendable, Equatable {
+    case `notRecorded` = "not_recorded"
+    case `pending` = "pending"
+    case `lookupLimit` = "lookup_limit"
+    case `unsupported` = "unsupported"
+}
+
+public struct ToolDetailsAvailable: Codable, Sendable, Equatable {
+    public var `callId`: String
+    public var `input`: ToolDetailContent
+    public var `name`: String
+    public var `output`: ToolDetailContent
+    public var `status`: ToolStatus
+    public init(`callId`: String, `input`: ToolDetailContent, `name`: String, `output`: ToolDetailContent, `status`: ToolStatus) {
+        self.`callId` = `callId`
+        self.`input` = `input`
+        self.`name` = `name`
+        self.`output` = `output`
+        self.`status` = `status`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `callId` = "call_id"
+        case `input` = "input"
+        case `name` = "name"
+        case `output` = "output"
+        case `status` = "status"
+    }
+}
+
+public struct ToolDetailsUnavailable: Codable, Sendable, Equatable {
+    public var `callId`: String
+    public init(`callId`: String) {
+        self.`callId` = `callId`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `callId` = "call_id"
+    }
+}
+
+public enum ToolDetails: Codable, Sendable, Equatable {
+    case `available`(ToolDetailsAvailable)
+    case `unavailable`(ToolDetailsUnavailable)
+    enum CodingKeys: String, CodingKey { case type }
+    public init(from decoder: any Decoder) throws {
+        let tag = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .type)
+        switch tag {
+        case "available": self = .`available`(try ToolDetailsAvailable(from: decoder))
+        case "unavailable": self = .`unavailable`(try ToolDetailsUnavailable(from: decoder))
+        default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported protocol event: \(tag)"))
+        }
+    }
+    public func encode(to encoder: any Encoder) throws {
+        var tag = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .`available`(let value):
+            try tag.encode("available", forKey: .type)
+            try value.encode(to: encoder)
+        case .`unavailable`(let value):
+            try tag.encode("unavailable", forKey: .type)
+            try value.encode(to: encoder)
+        }
+    }
+}
 
 public struct ToolHistory: Codable, Sendable, Equatable {
     public var `callId`: String
