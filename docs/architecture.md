@@ -41,7 +41,7 @@ and evidence; native handles and ownership must be checked again before effects.
              \                       /
               +----- agent chat ----+
                           |
-                desktop coordinator (macOS)
+                coordinator (macOS or Linux)
                 + main conversation
                 + Pi Durable / SQLite
                 + settings / context repositories

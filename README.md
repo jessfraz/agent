@@ -22,7 +22,7 @@ owns the hosts, sessions and terminals. Reuse them.
              \                       /
               +----- agent chat ----+
                           |
-               desktop coordinator (macOS)
+               coordinator (macOS or Linux)
                main conversation / Pi Durable / SQLite
                settings / context / incoming events
                           |
@@ -42,7 +42,7 @@ owns the hosts, sessions and terminals. Reuse them.
 
 Every chat uses the coordinator. Each task gets one named Rex session on its
 execution machine; its subagents get named terminals inside that session.
-Hosts can run macOS or Linux; the three hosts above are one example.
+The coordinator and workers can run macOS or Linux; these hosts are one example.
 Results return to the main chat, so visiting task sessions is optional. Worker
 connections share metadata, not duplicate executions. Offline workers retain
 their tasks; automatic transfer to another machine comes later.
