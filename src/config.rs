@@ -272,20 +272,6 @@ fn validate(config: &mut ClientConfig) -> Result<()> {
             "Browser credential command requires an executable and valid arguments"
         );
     }
-    if let Some(browser) = &config.browser {
-        ensure!(
-            browser.secret_environment.iter().all(|name| {
-                !name.is_empty()
-                    && name != "OP_SERVICE_ACCOUNT_TOKEN"
-                    && name.bytes().enumerate().all(|(index, byte)| {
-                        byte == b'_'
-                            || byte.is_ascii_alphabetic()
-                            || (index > 0 && byte.is_ascii_digit())
-                    })
-            }),
-            "Browser secret_environment requires credential field names, excluding provider bootstrap tokens"
-        );
-    }
     for repository in &mut config.context_repositories {
         *repository = context_repository_path(repository, home.as_deref())?;
     }

@@ -5,7 +5,7 @@ import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import { format, promisify } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { runInNewContext } from "node:vm";
+import { constants, runInNewContext } from "node:vm";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { McpClient, StdioTransport } from "@earendil-works/pi-mcp";
 import { chromium, type Browser, type BrowserContext, type Dialog, type Frame, type Page } from "playwright-core";
@@ -243,7 +243,7 @@ export class BrowserHost {
   private redaction: { token: string | undefined; pattern: RegExp } | undefined;
 
   constructor(private readonly config: Pick<BrowserConfig, "user_data_dir" | "profile_dir_name">
-    & Partial<Pick<BrowserConfig, "debugging_port" | "secret_environment">>,
+    & Partial<Pick<BrowserConfig, "debugging_port">>,
     private readonly options: BrowserHostOptions = {}) {}
 
   execute(request: BrowserRequest): Promise<BrowserReply> {
@@ -589,21 +589,13 @@ export class BrowserHost {
       Buffer, URL, URLSearchParams, TextEncoder, TextDecoder, setTimeout, clearTimeout,
       setInterval, clearInterval, AbortController, AbortSignal, fetch, Headers,
       Request, Response, FormData, Blob, crypto, atob, btoa, structuredClone,
-    });
+    }, { importModuleDynamically: constants.USE_MAIN_CONTEXT_DEFAULT_LOADER });
     if (typeof invoke !== "function") throw new Error("Playwright code must be an async function receiving page");
     tab.script = script;
     // Normal Playwright scripts await their operations and handle dialogs with
     // Page event handlers. Keep the host's native-input lease until completion.
     await tab.page.bringToFront();
-    const secret = (name: unknown): string => {
-      if (typeof name !== "string" || name === "OP_SERVICE_ACCOUNT_TOKEN"
-          || this.config.secret_environment?.includes(name) !== true) throw new Error("This browser credential is not configured");
-      const value = process.env[name];
-      if (value === undefined || value.length === 0) throw new Error("The configured browser credential is unavailable");
-      this.rememberPassword(value);
-      return value;
-    };
-    script.result = await invoke(tab.page, secret);
+    script.result = await invoke(tab.page);
     await this.capturePasswords(tab);
   }
 
@@ -642,7 +634,7 @@ export class BrowserHost {
       await this.refresh();
       this.liveBrowser();
       if (action.type === "status") return { type: "ready", session_id, tabs: this.tabs(),
-        output: output("Current owned Chrome tabs.", { available_secrets: this.config.secret_environment ?? [] }), is_error: false };
+        output: output("Current owned Chrome tabs."), is_error: false };
       let tab: OwnedTab;
       if (action.type === "open" || action.type === "new_tab") {
         const context = browser.contexts()[0];
@@ -780,12 +772,9 @@ async function main(): Promise<void> {
       || rawConfig.profile_dir_name !== null && typeof rawConfig.profile_dir_name !== "string"
       || rawConfig.debugging_port !== undefined && rawConfig.debugging_port !== null
         && (typeof rawConfig.debugging_port !== "number" || !Number.isInteger(rawConfig.debugging_port)
-          || rawConfig.debugging_port < 1 || rawConfig.debugging_port > 65535)
-      || rawConfig.secret_environment !== undefined && (!Array.isArray(rawConfig.secret_environment)
-        || !rawConfig.secret_environment.every((name: unknown) => typeof name === "string"
-          && /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && name !== "OP_SERVICE_ACCOUNT_TOKEN"))) throw new Error("Invalid browser configuration");
+          || rawConfig.debugging_port < 1 || rawConfig.debugging_port > 65535)) throw new Error("Invalid browser configuration");
   const host = new BrowserHost({ user_data_dir: rawConfig.user_data_dir, profile_dir_name: rawConfig.profile_dir_name,
-    debugging_port: rawConfig.debugging_port ?? null, secret_environment: rawConfig.secret_environment ?? [] });
+    debugging_port: rawConfig.debugging_port ?? null });
   const ajv = new Ajv2020({ strict: true });
   ajv.addFormat("uuid", /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
   ajv.addFormat("uint32", { type: "number", validate: (value: number) => Number.isInteger(value) && value >= 0 && value <= 0xffff_ffff });

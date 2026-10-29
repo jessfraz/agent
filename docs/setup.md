@@ -190,36 +190,13 @@ must belong to that exact profile. Confirm the website's account before an
 account-specific action. Browser state remains local. Script scope is not a
 process security sandbox; the existing task authorization applies to code.
 
-Scheduled sign-ins can use the existing machine credential launcher, even
-while the password-manager UI is locked. Configure a profile that resolves the
-selected login fields into the browser helper's child environment, then name
-only those fields in `secret_environment`:
-
-```toml
-[browser]
-debugging_port = 9222
-credential_command = ["with-credentials", "browser-login", "--"]
-secret_environment = ["BROWSER_LOGIN_USERNAME", "BROWSER_LOGIN_PASSWORD"]
-```
-
-`browser_status` lists the configured names. Browser scripts can use them
-without embedding values in their source:
-
-```js
-async (page, secret) => {
-  await page.getByLabel("Email").fill(secret("BROWSER_LOGIN_USERNAME"));
-  await page.getByLabel("Password").fill(secret("BROWSER_LOGIN_PASSWORD"));
-  await page.getByRole("button", { name: "Sign in" }).click();
-}
-```
-
-The credential profile stays fixed for the connection. Resolved values are
-registered for output redaction before browser input. Lookup failure stops
-the credential-bearing helper; it never opens a desktop approval prompt or
-falls back to a broader account. Provider bootstrap tokens stay in the
-credential provider. For extension mode, its pairing launcher can wrap the
-login launcher in `credential_command`. Existing one-argument scripts still
-work with the full Playwright Page API.
+Scheduled sign-ins use the 1Password CLI from the running agent. Browser
+scripts support standard Node imports, so a script can run the configured
+machine-authenticated CLI, select the saved login for the task, and pass its
+values directly to Playwright. Keep credential output inside that function;
+return only the task result. No website-specific Nix entries or browser
+credential mappings are needed. Machine authentication stays with the
+credential provider and does not depend on unlocking the desktop extension.
 
 Ask Agent to use Chrome on a named machine when necessary. `browser_open`
 creates an owned tab. `browser_status` inspects the live connection;

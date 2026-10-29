@@ -36,9 +36,6 @@ pub struct BrowserConfig {
     // It wraps only the browser helper, so unavailable browser credentials do
     // not prevent the rest of Agent from starting.
     pub credential_command: Option<Vec<String>>,
-    // Only these child-environment fields are available to browser scripts.
-    #[serde(default)]
-    pub secret_environment: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -202,11 +199,6 @@ impl Process {
         } else {
             Command::new("node")
         };
-        if config.credential_command.is_some() {
-            for name in &config.secret_environment {
-                command.env_remove(name);
-            }
-        }
         let mut child = command
             .arg(helper)
             .arg(serde_json::to_string(config)?)
@@ -489,7 +481,6 @@ input.on('close', () => { writeFileSync(join(directory, 'closed'), 'closed'); })
                 profile_dir_name: None,
                 debugging_port: None,
                 credential_command: None,
-                secret_environment: Vec::new(),
             }),
         )
     }

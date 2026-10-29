@@ -4,4 +4,4 @@
  * Selects an existing Chrome connection. Pairing credentials arrive through the
  * helper environment and never enter these serialized helper arguments.
  */
-export type BrowserConfig = { user_data_dir: string | null, profile_dir_name: string | null, debugging_port: number | null, credential_command: Array<string> | null, secret_environment: Array<string>, };
+export type BrowserConfig = { user_data_dir: string | null, profile_dir_name: string | null, debugging_port: number | null, credential_command: Array<string> | null, };

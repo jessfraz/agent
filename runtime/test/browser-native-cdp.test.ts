@@ -37,11 +37,10 @@ class NativeHelper {
   private readonly child;
   private readonly exited: Promise<void>;
   private readonly lines;
-  constructor(port: number, credentials: Record<string, string> = {}) {
+  constructor(port: number) {
     this.child = spawn(process.execPath, [fileURLToPath(new URL("../src/browser-host.js", import.meta.url)),
-      JSON.stringify({ user_data_dir: null, profile_dir_name: null, debugging_port: port,
-        credential_command: null, secret_environment: Object.keys(credentials) })],
-      { stdio: ["pipe", "pipe", "ignore"], env: { ...process.env, ...credentials, PLAYWRIGHT_MCP_EXTENSION_TOKEN: "" } });
+      JSON.stringify({ user_data_dir: null, profile_dir_name: null, debugging_port: port })],
+      { stdio: ["pipe", "pipe", "ignore"], env: { ...process.env, PLAYWRIGHT_MCP_EXTENSION_TOKEN: "" } });
     this.exited = new Promise(resolve => this.child.once("close", () => resolve()));
     this.lines = createInterface({ input: this.child.stdout, crlfDelay: Infinity })[Symbol.asyncIterator]();
   }
@@ -88,6 +87,12 @@ document.addEventListener('focusin', event => {
   host.attachShadow({mode:'closed'}).append(frame); document.documentElement.append(host);
 });`);
   const inventedPassword = "Invented-native-password-42";
+  const credentialCli = join(directory, "credential-cli.mjs");
+  await writeFile(credentialCli, "import assert from 'node:assert/strict';\n"
+    + "assert.deepEqual(process.argv.slice(2), ['item','get','invented-login','--format','json']);\n"
+    + "process.stdout.write(" + JSON.stringify(JSON.stringify({ fields: [
+      { id: "username", value: "Native form value" }, { id: "password", value: inventedPassword }
+    ] })) + ");");
   let submissions = 0;
   const server = createServer((request, response) => {
     response.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -153,7 +158,7 @@ document.addEventListener('focusin', event => {
   const initialPages = context.pages().length;
   // Separate helpers reconnect to the same browser without extension pairing.
   for (let helper = 0; helper < 2; helper++) {
-    const host = new NativeHelper(port, { SITE_USERNAME: "Native form value", SITE_PASSWORD: inventedPassword });
+    const host = new NativeHelper(port);
     hosts.push(host);
     const owner_id = randomUUID(), session_id = randomUUID();
     const execute = async (action: BrowserAction) => (await host.execute({ owner_id, session_id, operation_id: randomUUID(), action })).response;
@@ -162,26 +167,29 @@ document.addEventListener('focusin', event => {
     assert.equal(opened.tabs.length, 1); const tab = opened.tabs[0]; assert.ok(tab);
     const status = await execute({ type: "status" });
     assert.ok(status.type === "ready", JSON.stringify(status));
-    assert.ok(status.output.includes("SITE_PASSWORD"));
     assert.equal(status.output.includes(inventedPassword), false);
-    const denied = await execute({ type: "run_code", tab_id: tab.id, code: 'async (page, secret) => secret("UNCONFIGURED_CREDENTIAL")' });
-    assert.ok(denied.type === "uncertain");
-    assert.match(denied.message, /credential is not configured/);
-    const filled = await execute({ type: "run_code", tab_id: tab.id, code: `async (page, secret) => {
+    const filled = await execute({ type: "run_code", tab_id: tab.id, code: `async page => {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { execPath } = await import('node:process');
+      const { stdout } = await promisify(execFile)(execPath,
+        [${JSON.stringify(credentialCli)},'item','get','invented-login','--format','json'], {timeout:5000});
+      const { fields } = JSON.parse(stdout);
+      const username = fields.find(field => field.id === 'username').value;
+      const password = fields.find(field => field.id === 'password').value;
       const attached = page.waitForEvent('framenavigated', {predicate: frame => frame.url().startsWith('chrome-extension://'), timeout:5000});
-      await page.getByLabel('Name', {exact:true}).fill(secret('SITE_USERNAME'));
+      await page.getByLabel('Name', {exact:true}).fill(username);
       const foreign = await attached;
       if (!foreign || foreign.isDetached()) throw new Error('Foreign extension frame must remain attached');
       await page.getByLabel('Name', {exact:true}).focus();
       const ordinary = page.frameLocator('iframe[title="Result"]');
       await ordinary.getByLabel('Frame note').fill('Ordinary frame works');
-      const password = secret('SITE_PASSWORD'); console.log(password);
       await page.getByLabel('Password', {exact:true}).fill(password);
+      console.log(password);
       return { foreignFramePresent: !foreign.isDetached(), ordinaryFrameValue: await ordinary.getByLabel('Frame note').inputValue(), password };
     }` });
     assert.ok(filled.type === "ready", JSON.stringify(filled));
     assert.equal(filled.output.includes(inventedPassword), false, "A filled password must not enter tool output");
-    assert.equal(filled.output.includes("Native form value"), false, "Resolved credentials are redacted before browser input");
     assert.ok(filled.output.includes('"foreignFramePresent":true'));
     assert.ok(filled.output.includes("Ordinary frame works"));
     const submitted = await execute({ type: "run_code", tab_id: tab.id, code: `async page => {
