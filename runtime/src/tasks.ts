@@ -810,7 +810,8 @@ export class TaskStore {
     await this.session.commit(async (tx) => {
       await this.updateIn(tx, id, (task) => {
         this.assertSource(conversationId);
-        task.summary = answer.slice(-4000);
+        // A silent final answer must not erase recorded progress or a handoff.
+        if (answer.trim().length > 0) task.summary = answer.slice(-4000);
         outcome = this.outcome(task, conversationId, entryId, null);
       });
       if (outcome !== undefined) await this.outcomes?.recordIn(tx, outcome, false);
@@ -931,7 +932,7 @@ export class TaskStore {
               }
               cursor = page.next;
             } while (cursor !== undefined);
-            if (answer.length > 0 && actor.summary !== answer.slice(-4000)) {
+            if (answer.trim().length > 0 && actor.summary !== answer.slice(-4000)) {
               task = await this.update(task.id, (current) => {
                 this.assertSource(conversation.id.toString()); this.actor(current, input.agent_id).summary = answer.slice(-4000);
               });
@@ -999,7 +1000,7 @@ export class TaskStore {
         task = await this.update(task.id, (current) => {
           this.assertSource(conversation.id.toString());
           const currentActor = this.actor(current, input.agent_id);
-          if (input.agent_id === undefined || currentActor.state.state === "open") currentActor.summary = answer.slice(-4000);
+          if (answer.trim().length > 0 && (input.agent_id === undefined || currentActor.state.state === "open")) currentActor.summary = answer.slice(-4000);
         });
         if (input.agent_id === undefined) notice(task, answer);
         observer?.answer(conversation.id.toString(), answer, entry?.id.toString());

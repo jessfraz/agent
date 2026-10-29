@@ -14,6 +14,7 @@ import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
+import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { WorkerHost } from "../src/generated/WorkerHost.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
 import { validEvent } from "../src/protocol.js";
@@ -95,6 +96,117 @@ test("published task resolution and waiting outcomes preserve provenance and rem
     await assert.rejects(app.sources.admit({ source: { provider: "task_outcomes", account: "local" }, events: [], checkpoint: null,
       coverage: { status: "complete" } }, null), /owned task lifecycle/);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("an empty final answer preserves the recorded waiting brief for durable due follow-up", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-outcomes-")); let app = await open(directory);
+  try {
+    const command = await app.prepare("Collect remote diagnostics");
+    const summary = "Coordinator: collect the last day's service logs from the remote worker, then continue this task with the evidence.";
+    const state = { state: "waiting", actor: "coordinator", next_check: new Date(Date.now() - 1000).toISOString() };
+    app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("record_task", { summary, state }), { stopReason: "toolUse" }),
+      fauxAssistantMessage(""),
+    ]);
+    await app.run(command);
+    assert.equal((await app.tasks.get(command.task_id)).summary, summary);
+    assert.deepEqual((await app.tasks.get(command.task_id)).state, state);
+    const outcomes = await app.sources.events({ provider: "task_outcomes", thread_id: command.task_id });
+    assert.equal(outcomes.at(-1)?.outcome?.summary, summary);
+    assert.equal(outcomes.every((record) => record.decision !== null), true);
+    assert.equal(await app.sources.hasWork(), true);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    assert.equal((await app.tasks.get(command.task_id)).summary, summary);
+    assert.equal(await app.sources.hasWork(), true);
+    await app.run(command);
+    assert.equal((await app.tasks.get(command.task_id)).summary, summary);
+    assert.equal(app.faux.state.callCount, 0, "Recovered history must retain the brief without another model turn");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a due coordinator handoff collects remote evidence and continues the same worker task", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-outcomes-")); const app = await open(directory);
+  let release = () => {};
+  try {
+    const command = await app.prepare("Review fleet diagnostics");
+    const summary = "Coordinator: collect the remote worker's service log for the last day, then continue this task with the evidence.";
+    const state = { state: "waiting", actor: "coordinator", next_check: new Date(Date.now() - 1000).toISOString() };
+    let recorded = () => {};
+    const ready = new Promise<void>((resolve) => { recorded = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("record_task", { summary, state }), { stopReason: "toolUse" }),
+      async () => { recorded(); await gate; return fauxAssistantMessage(summary); },
+    ]);
+    const running = app.run(command); await ready;
+    assert.equal(await app.sources.hasWork(), false, "A busy worker retains ownership of its due handoff");
+    release(); await running;
+    const before = await app.tasks.get(command.task_id);
+    assert.equal((await app.sources.events({ provider: "task_outcomes", pending: true })).length, 0);
+    assert.equal(await app.sources.hasWork(), true, "The durable wait remains due after outcome publication");
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    assert.ok((await root.context(BACKGROUND_CONTEXT)).messages.some((message) => message.role === "assistant" &&
+      message.content.some((part) => part.type === "text" && part.text === summary)));
+    const remote: WorkerHost = { ...host, host_id: "55555555-5555-4555-8555-555555555555", name: "remote-fixture" };
+    const evidence = "Remote service log: one startup failure, followed by successful recovery.";
+    const followUp = "Continue the existing review with coordinator-collected evidence: " + evidence;
+    const calls: HostCommand[] = [];
+    app.faux.setResponses([
+      (input) => {
+        assert.ok(input.messages.some((message) => message.role === "user" && (typeof message.content === "string"
+          ? message.content.includes('"due_followups"') && message.content.includes(summary)
+          : message.content.some((part) => part.type === "text" && part.text.includes('"due_followups"') && part.text.includes(summary)))));
+        return fauxAssistantMessage(fauxToolCall("exec", { host: remote.name, program: "journalctl",
+          args: ["--user", "--unit=fixture-agent.service", "--since=1 day ago", "--no-pager"], timeout_seconds: 30 }), { stopReason: "toolUse" });
+      },
+      (input) => {
+        assert.ok(input.messages.some((message) => message.role === "toolResult" &&
+          message.content.some((part) => part.type === "text" && part.text.includes(evidence))));
+        return fauxAssistantMessage(fauxToolCall("delegate_task", { task_id: command.task_id,
+          input: followUp, mode: "follow_up" }), { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage("Evidence delivered to the existing review task."),
+    ]);
+    await app.sources.triage({ ...triage, hosts: [host, remote] }, (conversation) => app.executions.bind(conversation.id.toString(), {
+      cwd: host.cwd, hosts: [host, remote], role: "triage", call: async (operation) => {
+        calls.push(operation);
+        if (operation.type === "on_node") {
+          assert.equal(operation.host_id, remote.host_id);
+          assert.deepEqual(operation.command, { type: "exec", program: "journalctl",
+            args: ["--user", "--unit=fixture-agent.service", "--since=1 day ago", "--no-pager"], cwd: remote.cwd, timeout_seconds: 30 });
+          return { type: "process", exit_code: 0, stdout: evidence, stderr: "", truncated: false };
+        }
+        assert.equal(operation.type, "resume_worker");
+        if (operation.type !== "resume_worker") throw new Error("The existing task worker must be resumed");
+        assert.equal(operation.task_id, command.task_id); assert.deepEqual(operation.binding, binding);
+        return { type: "written" };
+      },
+    }), [app.tools.host, app.tools.main, app.sourceTools]);
+    const continued = await app.tasks.get(command.task_id);
+    assert.deepEqual(calls.map((operation) => operation.type), ["on_node", "resume_worker"]);
+    assert.equal((await app.tasks.list()).length, 1);
+    assert.equal(continued.conversation_id, before.conversation_id);
+    assert.deepEqual(continued.worker, before.worker);
+    assert.equal(continued.state.state, "open");
+    assert.deepEqual(continued.pending.map((input) => ({ content: input.content, mode: input.mode })), [{ content: followUp, mode: "follow_up" }]);
+    assert.equal(await app.sources.hasWork(), false);
+    app.faux.setResponses([
+      (input) => {
+        assert.ok(input.messages.some((message) => message.role === "user" && (typeof message.content === "string"
+          ? message.content === followUp : message.content.some((part) => part.type === "text" && part.text === followUp))));
+        return fauxAssistantMessage(fauxToolCall("record_task", { summary: "Checked the returned evidence.",
+          state: { state: "resolved", evidence: "The coordinator's bounded remote logs confirm recovery." } }), { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage("Review complete: the remote startup failure recovered."),
+    ]);
+    await app.run(command);
+    const finished = await app.tasks.get(command.task_id);
+    assert.equal(finished.conversation_id, before.conversation_id);
+    assert.deepEqual(finished.worker, before.worker);
+    assert.equal(finished.state.state, "resolved"); assert.equal(finished.pending.length, 0);
+    assert.equal(finished.summary, "Review complete: the remote startup failure recovered.");
+    assert.equal(await app.sources.hasWork(), false);
+  } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("active progress defers source triage and linking the finished event does not reopen or requeue its task", async () => {
