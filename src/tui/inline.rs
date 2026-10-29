@@ -23,6 +23,7 @@ use ratatui::{
 use std::{collections::HashSet, io::Stdout};
 
 const BANNER_ROWS: u16 = 2;
+const OUTPUT_CELLS_PER_FRAME: usize = 32;
 
 struct OutputRows {
     ready: usize,
@@ -139,6 +140,15 @@ impl Screen {
             self.title = title;
         }
         self.terminal.draw(|frame| state.draw(frame))?;
+        state.changed |= state.has_native_output();
+        Ok(())
+    }
+
+    pub(super) fn reset(&mut self) -> Result<()> {
+        self.terminal = fresh_inline(CrosstermBackend::new(std::io::stdout()))?;
+        self.height = 6;
+        self.size = self.terminal.size()?;
+        self.title.clear();
         Ok(())
     }
 
@@ -152,8 +162,8 @@ impl Screen {
     }
 
     pub(super) fn finish(&mut self, state: &mut State) -> Result<()> {
-        // Detaching makes the final local snapshot immutable, including a
-        // still-running tool. It does not claim that background work finished.
+        // A bounded final snapshot keeps exit responsive during a large replay.
+        // Unprinted history and ongoing work remain in their durable owner.
         self.reframe(self.terminal.size()?, 1)?;
         state.flush_output(&mut self.terminal, true)?;
         let top = self.terminal.get_frame().area().y;
@@ -219,7 +229,7 @@ impl Drop for TerminalModes {
 
 impl State {
     fn viewport_height(&mut self, size: Size, top: u16) -> u16 {
-        if self.output.view == View::History || self.help_open {
+        if self.output.view == View::History || self.help_open || self.picker.is_some() {
             return size.height;
         }
         self.prepare_editor();
@@ -246,6 +256,9 @@ impl State {
         terminal: &mut Terminal<B>,
         ending: bool,
     ) -> std::result::Result<(), B::Error> {
+        if self.picker.is_some() && !ending {
+            return Ok(());
+        }
         if matches!(self.output.banner, Banner::Waiting) && !ending {
             return Ok(());
         }
@@ -264,14 +277,18 @@ impl State {
             })?;
             self.output.banner = Banner::Printed;
         }
-        if self.output.collecting_history && !ending {
+        if (self.output.collecting_history || self.history_replay.is_some()) && !ending {
             return Ok(());
         }
         let width = terminal.size()?.width;
+        let mut emitted = 0;
         while let Some(message) = self.messages.get_mut(self.output.cursor) {
             match message.output {
                 CellOutput::Mutable | CellOutput::AwaitingIdle if !ending => break,
                 CellOutput::Ready | CellOutput::Mutable | CellOutput::AwaitingIdle => {
+                    if emitted == OUTPUT_CELLS_PER_FRAME {
+                        break;
+                    }
                     let cached = message.cached();
                     let rows = cached.layout(width);
                     for top in (0..rows).step_by(256) {
@@ -283,12 +300,26 @@ impl State {
                         })?;
                     }
                     message.output = CellOutput::Printed;
+                    emitted += 1;
                 }
                 CellOutput::Printed | CellOutput::Retained => {}
             }
             self.output.cursor += 1;
         }
         Ok(())
+    }
+
+    fn has_native_output(&self) -> bool {
+        !self.output.collecting_history
+            && self.picker.is_none()
+            && self.history_replay.is_none()
+            && !matches!(self.output.banner, Banner::Waiting)
+            && self.messages[self.output.cursor..]
+                .iter()
+                .find(|message| {
+                    !matches!(message.output, CellOutput::Printed | CellOutput::Retained)
+                })
+                .is_some_and(|message| message.output == CellOutput::Ready)
     }
 
     pub(super) fn live_base(&self) -> usize {
@@ -317,7 +348,11 @@ impl State {
             0
         };
         let mut frontier = self.output.cursor;
-        if !self.output.collecting_history && !matches!(self.output.banner, Banner::Waiting) {
+        let mut cells = 0;
+        if !self.output.collecting_history
+            && self.history_replay.is_none()
+            && !matches!(self.output.banner, Banner::Waiting)
+        {
             while self.messages.get(frontier).is_some_and(|message| {
                 !matches!(
                     message.output,
@@ -325,12 +360,16 @@ impl State {
                 )
             }) {
                 if self.messages[frontier].output == CellOutput::Ready {
+                    if cells == OUTPUT_CELLS_PER_FRAME {
+                        break;
+                    }
                     let before = frontier
                         .checked_sub(1)
                         .and_then(|index| self.row_ends.get(index))
                         .copied()
                         .unwrap_or(0);
                     ready = ready.saturating_add(self.row_ends[frontier].saturating_sub(before));
+                    cells += 1;
                 }
                 frontier += 1;
             }
@@ -434,6 +473,191 @@ mod tests {
         );
         assert_eq!(terminal.get_frame().area().bottom(), size.height);
         visible
+    }
+
+    fn replay_updates(state: &mut State, receiver: &std::sync::mpsc::Receiver<crate::tui::Update>) {
+        for update in receiver.try_iter() {
+            match update {
+                crate::tui::Update::HistoryReplay(update) => state.history_update(update),
+                _ => panic!("Unexpected non-history update"),
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_backfill_keeps_input_live_and_replays_large_history_once_in_bounded_frames() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = crate::tui::TuiHandle { sender };
+        let replay = handle.begin_history_replay().unwrap();
+        let mut state = state();
+        let mut terminal = crate::tui::inline::fresh_inline(TestBackend::new(80, 24)).unwrap();
+        for first in (0..1_000).step_by(20).rev() {
+            replay
+                .page(vec![RuntimeEventKind::History {
+                    conversation_id: "main".into(),
+                    messages: (first..first + 20)
+                        .map(|index| {
+                            message(
+                                &format!("saved-{index}"),
+                                HistoryRole::Final,
+                                &format!("Saved reply {index:04}"),
+                                false,
+                                true,
+                            )
+                        })
+                        .collect(),
+                    next_cursor: (first > 0).then(|| format!("before-{first}")),
+                    page_complete: true,
+                }])
+                .unwrap();
+            replay_updates(&mut state, &receiver);
+            assert!(draw_inline(&mut state, &mut terminal).contains("Saved reply 0999"));
+            assert!(!text(terminal.backend().scrollback()).contains("Saved reply"));
+        }
+        state.input(Event::Paste("Steer while history is loading".into()));
+        assert_eq!(
+            state.input(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ))),
+            Some(crate::tui::TuiInput::Submit(
+                "Steer while history is loading".into()
+            ))
+        );
+        assert_eq!(state.layout_work.parsed_messages, 1_000);
+        replay.finish().unwrap();
+        replay_updates(&mut state, &receiver);
+        let mut frames = 0;
+        while state.has_native_output() {
+            let before = state
+                .messages
+                .iter()
+                .filter(|message| message.output == CellOutput::Printed)
+                .count();
+            draw_inline(&mut state, &mut terminal);
+            let after = state
+                .messages
+                .iter()
+                .filter(|message| message.output == CellOutput::Printed)
+                .count();
+            assert!((1..=super::OUTPUT_CELLS_PER_FRAME).contains(&(after - before)));
+            frames += 1;
+        }
+        assert_eq!(frames, 1_000usize.div_ceil(super::OUTPUT_CELLS_PER_FRAME));
+        assert_eq!(state.layout_work.parsed_messages, 1_000);
+        let rendered = output(&terminal);
+        let mut previous = 0;
+        for index in 0..1_000 {
+            let text = format!("Saved reply {index:04}");
+            assert_eq!(rendered.matches(&text).count(), 1);
+            let position = rendered.find(&text).unwrap();
+            assert!(position >= previous);
+            previous = position;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_and_superseded_replay_jobs_cannot_hold_or_pollute_the_current_view() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = crate::tui::TuiHandle { sender };
+        let old = handle.begin_history_replay().unwrap();
+        let current = handle.begin_history_replay().unwrap();
+        let page = |id: &str, text: &str| {
+            vec![RuntimeEventKind::History {
+                conversation_id: id.into(),
+                messages: vec![message(id, HistoryRole::Final, text, false, true)],
+                next_cursor: Some("older".into()),
+                page_complete: true,
+            }]
+        };
+        old.page(page("old", "Stale replay must not appear"))
+            .unwrap();
+        drop(old);
+        current
+            .page(page("current", "Current saved history"))
+            .unwrap();
+        let (started, began) = tokio::sync::oneshot::channel();
+        let job = tokio::spawn(async move {
+            let _replay = current;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        began.await.unwrap();
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+        let mut state = state();
+        replay_updates(&mut state, &receiver);
+        assert!(state.history_replay.is_none());
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|message| message.text.contains("partial"))
+                .count(),
+            1
+        );
+        assert!(
+            !state
+                .messages
+                .iter()
+                .any(|message| message.text.contains("Stale replay"))
+        );
+        let mut terminal = terminal();
+        state.flush_output(&mut terminal, false).unwrap();
+        let rendered = output(&terminal);
+        assert!(rendered.contains("Current saved history"));
+        assert!(rendered.contains("displayed history is partial"));
+    }
+
+    #[test]
+    fn switching_views_preserves_native_scrollback_and_rejects_the_previous_backfill() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = crate::tui::TuiHandle { sender };
+        let previous = handle.begin_history_replay().unwrap();
+        let page = |id: &str, text: &str| {
+            vec![RuntimeEventKind::History {
+                conversation_id: id.into(),
+                messages: vec![message(id, HistoryRole::Final, text, false, true)],
+                next_cursor: None,
+                page_complete: true,
+            }]
+        };
+        let mut state = state();
+        let mut terminal = crate::tui::inline::fresh_inline(TestBackend::new(80, 24)).unwrap();
+        previous
+            .page(page("main", "Previous conversation remains copyable"))
+            .unwrap();
+        replay_updates(&mut state, &receiver);
+        draw_inline(&mut state, &mut terminal);
+        terminal = crate::tui::inline::fresh_inline(terminal.backend().clone()).unwrap();
+        state.reset_conversation(TuiInfo {
+            title: "Selected conversation".into(),
+            model: ModelSelection::default(),
+            cwd: "/workspace/project".into(),
+        });
+        let selected = handle.begin_history_replay().unwrap();
+        previous
+            .page(page("stale", "Late old backfill must not appear"))
+            .unwrap();
+        drop(previous);
+        selected
+            .page(page("selected", "Selected conversation body"))
+            .unwrap();
+        selected.finish().unwrap();
+        replay_updates(&mut state, &receiver);
+        draw_inline(&mut state, &mut terminal);
+        let rendered = output(&terminal);
+        assert_eq!(
+            rendered
+                .matches("Previous conversation remains copyable")
+                .count(),
+            1
+        );
+        assert_eq!(rendered.matches("Selected conversation body").count(), 1);
+        assert!(!rendered.contains("Late old backfill"));
+        assert!(!rendered.contains("displayed history is partial"));
+        assert_eq!(state.messages.len(), 1);
     }
 
     fn message(
@@ -1078,6 +1302,9 @@ mod tests {
         let visible = draw_inline(&mut state, &mut terminal);
         assert!(visible.contains("Saved history item 199"));
         assert!(text(terminal.backend().scrollback()).contains("Saved history item 000"));
+        while state.has_native_output() {
+            draw_inline(&mut state, &mut terminal);
+        }
         let saved = output(&terminal);
         // Native wheel/trackpad reads scrollback without sending an app event.
         let _older = text(terminal.backend().scrollback());

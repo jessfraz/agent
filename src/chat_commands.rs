@@ -123,7 +123,13 @@ pub enum ChatCommand {
         #[arg(value_enum)]
         level: Option<Reasoning>,
     },
+    /// Resume a saved chat, optionally finding its title or exact ID.
+    Resume {
+        #[arg(value_name = "QUERY_OR_ID", num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
+        query: Vec<String>,
+    },
     /// Load earlier saved messages.
+    #[command(hide = true)]
     History,
     /// Start a background repair with private diagnostic context.
     Feedback {
@@ -190,13 +196,12 @@ impl ChatCommand {
         Some(RuntimeCommand::ConversationSettings {
             task_id,
             agent_id,
+            conversation_id: None,
             change,
             catalog,
         })
     }
-}
 
-impl ChatCommand {
     pub fn jobs(&self) -> Option<RuntimeCommand> {
         match self {
             Self::Jobs { id: None } => Some(RuntimeCommand::ListJobs),
@@ -327,6 +332,23 @@ mod tests {
             ["/machines"]
         );
         assert!(ChatCommand::Machines.settings(None).is_none());
+        assert_eq!(
+            ChatCommand::parse("/resume").unwrap().unwrap(),
+            ChatCommand::Resume { query: Vec::new() }
+        );
+        assert_eq!(
+            ChatCommand::parse("/resume hardware board")
+                .unwrap()
+                .unwrap(),
+            ChatCommand::Resume {
+                query: vec!["hardware".into(), "board".into()]
+            }
+        );
+        assert!(
+            ChatCommand::Resume { query: Vec::new() }
+                .settings(None)
+                .is_none()
+        );
     }
 
     #[test]

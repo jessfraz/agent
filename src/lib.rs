@@ -25,3 +25,5 @@ pub mod sources;
 pub mod tailnet;
 pub mod tui;
 pub mod usage;
+
+pub mod native;

@@ -1,9 +1,11 @@
 //! Terminal presentation only. Request ownership, model calls and durable input stay outside this module.
+mod conversations;
 mod inline;
 mod markdown;
 mod transcript;
 
 use crate::tui::{
+    conversations::ConversationPicker,
     inline::{CellOutput, Output, Screen, View},
     transcript::CachedText,
 };
@@ -11,7 +13,8 @@ use crate::{
     chat_commands::{ChatCommand, Completion, command_help, completions},
     models::ModelSelection,
     protocol::{
-        HistoryMessage, HistoryRole, InputMode, ModelActivity, RuntimeEventKind, ToolStatus,
+        HistoryMessage, HistoryRole, InputMode, ModelActivity, RuntimeEventKind, SavedConversation,
+        ToolStatus,
     },
 };
 use anyhow::{Context, Result, anyhow, ensure};
@@ -60,12 +63,69 @@ enum Update {
     Info(tokio::sync::oneshot::Sender<TuiInfo>),
     Notice(String),
     RestoreInput(String),
+    SetDraft(String),
     PendingInput {
         input_id: String,
         text: String,
         mode: InputMode,
     },
+    HistoryReplay(HistoryUpdate),
+    ChooseConversation {
+        choices: Vec<SavedConversation>,
+        query: String,
+        reply: tokio::sync::oneshot::Sender<Option<String>>,
+    },
+    ResetConversation(TuiInfo),
     Stop,
+}
+
+enum HistoryUpdate {
+    Begin(uuid::Uuid),
+    Page {
+        id: uuid::Uuid,
+        events: Vec<RuntimeEventKind>,
+    },
+    End {
+        id: uuid::Uuid,
+        complete: bool,
+    },
+}
+
+/// Owns one initial replay. Cancelled reads cannot append to a replacement view.
+pub struct HistoryReplay {
+    sender: mpsc::Sender<Update>,
+    id: uuid::Uuid,
+    finished: bool,
+}
+impl HistoryReplay {
+    pub fn page(&self, events: Vec<RuntimeEventKind>) -> Result<()> {
+        self.sender
+            .send(Update::HistoryReplay(HistoryUpdate::Page {
+                id: self.id,
+                events,
+            }))
+            .context("The terminal history view is closed")
+    }
+    pub fn finish(mut self) -> Result<()> {
+        self.sender
+            .send(Update::HistoryReplay(HistoryUpdate::End {
+                id: self.id,
+                complete: true,
+            }))
+            .context("The terminal history view is closed")?;
+        self.finished = true;
+        Ok(())
+    }
+}
+impl Drop for HistoryReplay {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.sender.send(Update::HistoryReplay(HistoryUpdate::End {
+                id: self.id,
+                complete: false,
+            }));
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -80,6 +140,31 @@ impl TuiHandle {
     }
     pub fn event(&self, event: RuntimeEventKind) -> Result<()> {
         self.send(Update::Event(Box::new(event)))
+    }
+    pub fn begin_history_replay(&self) -> Result<HistoryReplay> {
+        let id = uuid::Uuid::new_v4();
+        self.send(Update::HistoryReplay(HistoryUpdate::Begin(id)))?;
+        Ok(HistoryReplay {
+            sender: self.sender.clone(),
+            id,
+            finished: false,
+        })
+    }
+    pub async fn choose_conversation(
+        &self,
+        choices: Vec<SavedConversation>,
+        initial_query: String,
+    ) -> Result<Option<String>> {
+        let (reply, selection) = tokio::sync::oneshot::channel();
+        self.send(Update::ChooseConversation {
+            choices,
+            query: initial_query,
+            reply,
+        })?;
+        selection.await.context("The conversation picker closed")
+    }
+    pub fn reset_conversation(&self, info: TuiInfo) -> Result<()> {
+        self.send(Update::ResetConversation(info))
     }
     pub fn set_status(&self, info: TuiInfo) -> Result<()> {
         self.send(Update::Status(info))
@@ -102,6 +187,9 @@ impl TuiHandle {
     }
     pub fn restore_input(&self, text: String) -> Result<()> {
         self.send(Update::RestoreInput(text))
+    }
+    pub fn set_draft(&self, text: String) -> Result<()> {
+        self.send(Update::SetDraft(text))
     }
     pub fn pending_input(&self, input_id: String, text: String, mode: InputMode) -> Result<()> {
         self.send(Update::PendingInput {
@@ -452,6 +540,8 @@ struct State {
     history_entry: Option<(String, bool)>,
     loading_history: Option<HistoryLoad>,
     more_history: bool,
+    history_replay: Option<uuid::Uuid>,
+    picker: Option<ConversationPicker>,
     help_open: bool,
     help_scroll: usize,
     history_changed: bool,
@@ -487,6 +577,8 @@ impl State {
             history_entry: None,
             loading_history: None,
             more_history: false,
+            history_replay: None,
+            picker: None,
             help_open: false,
             help_scroll: 0,
             history_changed: false,
@@ -708,6 +800,13 @@ impl State {
     }
     fn event(&mut self, event: RuntimeEventKind) {
         match event {
+            RuntimeEventKind::ConversationReady { conversation, model, cwd, working } => {
+                self.info = TuiInfo { title: conversation.title, model, cwd };
+                self.worker = false;
+                self.output.banner.ready();
+                self.working(working);
+            }
+            RuntimeEventKind::ConversationState { working } => self.working(working),
             RuntimeEventKind::History {
                 messages,
                 next_cursor,
@@ -858,6 +957,8 @@ impl State {
             "Compacting context"
         } else if self.working {
             "Working"
+        } else if self.history_replay.is_some() {
+            "Loading history"
         } else {
             "Ready"
         }
@@ -867,16 +968,73 @@ impl State {
         self.loading_history = None;
         self.history_entry = None;
     }
+    fn history_update(&mut self, update: HistoryUpdate) {
+        match update {
+            HistoryUpdate::Begin(id) => self.begin_history_replay(id),
+            HistoryUpdate::Page { id, events } => self.history_replay_page(id, events),
+            HistoryUpdate::End { id, complete } => self.end_history_replay(id, complete),
+        }
+    }
+    fn begin_history_replay(&mut self, id: uuid::Uuid) {
+        self.history_replay = Some(id);
+        self.changed = true;
+    }
+    fn choose_conversation(
+        &mut self,
+        choices: Vec<SavedConversation>,
+        query: String,
+        reply: tokio::sync::oneshot::Sender<Option<String>>,
+    ) {
+        self.picker = Some(ConversationPicker::new(choices, query, reply));
+        self.changed = true;
+    }
+    fn reset_conversation(&mut self, info: TuiInfo) {
+        *self = Self::new(info);
+    }
+    fn history_replay_page(&mut self, id: uuid::Uuid, events: Vec<RuntimeEventKind>) {
+        if self.history_replay != Some(id) {
+            return;
+        }
+        self.history_offset = Some(0);
+        self.history_entry = None;
+        for event in events {
+            if matches!(event, RuntimeEventKind::History { .. }) {
+                self.event(event);
+            }
+        }
+    }
+    fn end_history_replay(&mut self, id: uuid::Uuid, complete: bool) {
+        if self.history_replay != Some(id) {
+            return;
+        }
+        self.history_replay = None;
+        self.finish_history_page();
+        if !complete {
+            self.push(
+                Role::Notice,
+                "History loading stopped; displayed history is partial.".into(),
+            );
+        }
+        self.changed = true;
+    }
     fn input(&mut self, event: Event) -> Option<TuiInput> {
         self.sync_completion();
         let input = self.input_event(event);
         self.sync_completion();
         input
     }
+    fn set_draft(&mut self, text: String) {
+        self.editor = editor();
+        self.editor.insert_str(markdown::plain(&text));
+        self.changed = true;
+    }
     fn load_history(&mut self, mode: HistoryLoad) -> Option<TuiInput> {
         self.output.view = View::History;
         self.changed = true;
         if self.loading_history.is_some() {
+            return None;
+        }
+        if self.history_replay.is_some() {
             return None;
         }
         if !self.more_history {
@@ -896,6 +1054,7 @@ impl State {
             || (row + 1 == self.editor.lines().len()
                 && column == self.editor.lines()[row].chars().count());
         if self.help_open
+            || self.picker.is_some()
             || self.exiting
             || row != 0
             || self.input_history.can_recall(&text, boundary)
@@ -953,6 +1112,13 @@ impl State {
         self.dismissed_completion = Some(lines[0][..item.range.start + replacement.len()].into());
     }
     fn input_event(&mut self, event: Event) -> Option<TuiInput> {
+        if let Some(picker) = self.picker.as_mut() {
+            if picker.input(event) {
+                self.picker = None;
+            }
+            self.changed = true;
+            return None;
+        }
         self.changed = true;
         if self.exiting {
             return None;
@@ -1002,7 +1168,18 @@ impl State {
                         self.scroll = 0;
                     }
                     KeyCode::Esc => {
-                        if self.working {
+                        if self.working
+                            || self.messages.iter().any(|message| {
+                                matches!(
+                                    &message.kind,
+                                    MessageKind::Input {
+                                        delivery: InputDelivery::Submitting
+                                            | InputDelivery::Waiting,
+                                        ..
+                                    }
+                                )
+                            })
+                        {
                             self.interrupting = true;
                             return Some(TuiInput::Interrupt);
                         }
@@ -1188,6 +1365,11 @@ impl State {
     fn draw(&mut self, frame: &mut Frame<'_>) {
         if frame.area().width < 16 || frame.area().height < 6 {
             frame.render_widget(Paragraph::new("Enlarge the terminal"), frame.area());
+            self.changed = false;
+            return;
+        }
+        if let Some(picker) = self.picker.as_mut() {
+            picker.draw(frame, frame.area());
             self.changed = false;
             return;
         }
@@ -1528,11 +1710,24 @@ fn run(
                     state.editor.insert_str(text);
                     state.push(Role::Notice, "Unsent input returned to the draft.".into());
                 }
+                Ok(Update::SetDraft(text)) => state.set_draft(text),
                 Ok(Update::PendingInput {
                     input_id,
                     text,
                     mode,
                 }) => state.pending_input(input_id, text, mode),
+                Ok(Update::HistoryReplay(update)) => state.history_update(update),
+                Ok(Update::ChooseConversation {
+                    choices,
+                    query,
+                    reply,
+                }) => {
+                    state.choose_conversation(choices, query, reply);
+                }
+                Ok(Update::ResetConversation(info)) => {
+                    screen.reset()?;
+                    state.reset_conversation(info);
+                }
             }
         }
         if state.changed {
@@ -1582,6 +1777,115 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect()
     }
+    #[test]
+    fn escape_cancels_a_pending_input_before_ready_and_restoring_a_view_draft_is_quiet() {
+        let mut view = state();
+        view.pending_input(
+            "not-admitted".into(),
+            "Keep this request".into(),
+            crate::protocol::InputMode::Steer,
+        );
+        assert!(!view.working);
+        assert_eq!(
+            view.input(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(TuiInput::Interrupt)
+        );
+        view.set_draft("Saved draft\nsecond line".into());
+        assert_eq!(view.editor.lines().join("\n"), "Saved draft\nsecond line");
+        assert!(
+            !view
+                .messages
+                .iter()
+                .any(|message| message.text.contains("returned to the draft"))
+        );
+    }
+
+    #[test]
+    fn resumed_conversation_metadata_is_authoritative_and_run_state_keeps_model_changes() {
+        let mut view = state();
+        view.worker = true;
+        view.event(RuntimeEventKind::History {
+            conversation_id: "selected".into(),
+            messages: vec![HistoryMessage {
+                entry_id: "saved".into(),
+                role: HistoryRole::Final,
+                text: "Saved reply loaded before attachment".into(),
+                continuation: false,
+                final_chunk: true,
+                tool: None,
+            }],
+            next_cursor: None,
+            page_complete: true,
+        });
+        let model = ModelSelection {
+            model_id: "saved-model".into(),
+            ..ModelSelection::default()
+        };
+        view.event(RuntimeEventKind::ConversationReady {
+            conversation: crate::protocol::SavedConversation {
+                conversation_id: "selected".into(),
+                title: "Selected conversation".into(),
+                updated_at: None,
+                task_id: None,
+                agent_id: None,
+                host: Some("desktop".into()),
+                source_thread_id: None,
+            },
+            model: model.clone(),
+            cwd: "/workspace/selected".into(),
+            working: true,
+        });
+        assert!(
+            !view.worker,
+            "An observing CLI detaches on Ctrl+C even for a Rex-owned task"
+        );
+        assert!(view.working);
+        assert_eq!(view.info.title, "Selected conversation");
+        assert_eq!(view.info.model, model);
+        assert_eq!(view.info.cwd, "/workspace/selected");
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(100, 20),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(6),
+            },
+        )
+        .unwrap();
+        view.flush_output(&mut terminal, false).unwrap();
+        let output = terminal
+            .backend()
+            .scrollback()
+            .content
+            .iter()
+            .chain(&terminal.backend().buffer().content)
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_eq!(
+            output
+                .matches("Saved reply loaded before attachment")
+                .count(),
+            1
+        );
+        view.event(RuntimeEventKind::ConversationState { working: false });
+        let text = rendered(&mut view, 100, 20);
+        assert!(text.contains("saved-model"));
+        assert!(text.contains("/workspace/selected"));
+        assert!(text.contains("Ready"));
+    }
+
+    #[test]
+    fn resume_picker_preserves_the_composer_and_cannot_steer_or_stop_the_model() {
+        let mut view = state();
+        view.input(Event::Paste("Keep this unsent draft".into()));
+        view.working(true);
+        let (reply, mut selected) = tokio::sync::oneshot::channel();
+        view.choose_conversation(Vec::new(), String::new(), reply);
+        assert_eq!(view.input(key(KeyCode::Esc, KeyModifiers::NONE)), None);
+        assert!(view.picker.is_none());
+        assert!(view.working);
+        assert_eq!(view.editor.lines().join("\n"), "Keep this unsent draft");
+        assert_eq!(selected.try_recv().unwrap(), None);
+    }
+
     #[test]
     fn live_and_reopened_tables_share_cached_width_aware_layout() {
         let text = "| Item | Detail |\n| :--- | ---: |\n| **Board** | ready now |\n| 界界 | pending work |";

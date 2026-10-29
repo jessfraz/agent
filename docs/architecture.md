@@ -133,8 +133,8 @@ serializes replies typed in the terminal and inputs queued by the main agent;
 queued work wakes an idle terminal automatically. An idle attachment retains
 its execution lease without counting as busy work. New input reacquires
 resource guards. Child results return while their tabs remain available for
-replies. Main and task CLIs render stored history with older pages available
-through `/history`; reading it does not submit it back to the model. Live
+replies. Main and task CLIs load older history automatically in the background;
+reading it does not submit it back to the model. Live
 activity exposes tool names and provider-supplied thinking text, without tool
 arguments, signatures or encrypted state.
 The Rust TUI renders Markdown with model, reasoning and directory status.

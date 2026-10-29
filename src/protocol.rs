@@ -28,6 +28,12 @@ pub struct CoordinatorSettings {
     pub sources: Vec<SourceConfig>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, Default)]
+pub struct WorkerCapabilities {
+    #[serde(default)]
+    pub resume_agent: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct AgentNode {
     pub host_id: String,
@@ -37,6 +43,9 @@ pub struct AgentNode {
     pub home_directory: String,
     pub coordinator: Option<String>,
     pub launch: WorkerLaunch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub capabilities: Option<WorkerCapabilities>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<MachineSnapshot>,
 }
@@ -185,6 +194,28 @@ pub struct ConversationSettings {
     pub catalog: Vec<ModelOption>,
 }
 
+/// Saved conversation identity and metadata; listing never starts execution.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct SavedConversation {
+    pub conversation_id: String,
+    pub title: String,
+    #[ts(type = "number | null")]
+    pub updated_at: Option<i64>,
+    pub task_id: Option<TaskId>,
+    pub agent_id: Option<String>,
+    pub host: Option<String>,
+    pub source_thread_id: Option<String>,
+}
+
+/// Used only when an idle chief starts a new turn; active work keeps its context.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct MainInputContext {
+    pub instructions: String,
+    pub origin_host_id: Option<String>,
+    pub cwd: String,
+    pub hosts: Vec<WorkerHost>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct RuntimeRequest {
     pub version: u32,
@@ -244,10 +275,34 @@ pub enum RuntimeCommand {
         provider: crate::models::ModelProvider,
     },
     AttachMain,
+    /// Long-lived, read-only observation of the existing root conversation.
+    ObserveMain {
+        input_ids: Vec<String>,
+    },
+    /// Owner-independent admission using Pi's durable request identity.
+    MainInput {
+        input_id: String,
+        input: String,
+        mode: InputMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        context: Option<MainInputContext>,
+    },
+    MainInterrupt,
+    MainFeedback {
+        description: String,
+    },
+    /// Native clients share the authenticated local/tailnet transport.
+    Native {
+        request: crate::native::NativeRequest,
+    },
     DetachMain,
     ConversationSettings {
         task_id: Option<TaskId>,
         agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        conversation_id: Option<String>,
         change: Option<ConversationChange>,
         #[serde(default)]
         catalog: bool,
@@ -268,6 +323,31 @@ pub enum RuntimeCommand {
         query: String,
     },
     ListTasks,
+    ListConversations {
+        query: String,
+        cursor: Option<String>,
+        limit: u32,
+    },
+    /// Observe a saved conversation without claiming its execution.
+    AttachConversation {
+        conversation_id: String,
+        #[serde(default)]
+        input_ids: Vec<String>,
+    },
+    DetachConversation,
+    /// Admit input independently of any observing terminal's lifetime.
+    ConversationInput {
+        conversation_id: String,
+        input_id: String,
+        input: String,
+        mode: InputMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        context: Option<MainInputContext>,
+    },
+    ConversationInterrupt {
+        conversation_id: String,
+    },
     ListResources,
     CollectResources {
         host_id: String,
@@ -682,6 +762,13 @@ pub enum HostCommand {
         task_id: TaskId,
         allocation_id: String,
     },
+    ResumeAgentWorker {
+        host: WorkerHost,
+        binding: WorkerRef,
+        task_id: TaskId,
+        agent_id: String,
+        allocation_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -788,6 +875,10 @@ pub enum RuntimeEventKind {
         matches: Vec<SavedMatch>,
         gaps: Vec<String>,
     },
+    Conversations {
+        items: Vec<SavedConversation>,
+        next_cursor: Option<String>,
+    },
     Configured,
     NodeRegistered {
         host_id: String,
@@ -842,6 +933,15 @@ pub enum RuntimeEventKind {
         model: ModelSelection,
         cwd: String,
     },
+    ConversationReady {
+        conversation: SavedConversation,
+        model: ModelSelection,
+        cwd: String,
+        working: bool,
+    },
+    ConversationState {
+        working: bool,
+    },
     Answer {
         conversation_id: String,
         text: String,
@@ -873,6 +973,9 @@ pub enum RuntimeEventKind {
     InputPlaced {
         input_id: String,
         entry_id: String,
+    },
+    TextDelta {
+        text: String,
     },
     Activity {
         activity: ModelActivity,

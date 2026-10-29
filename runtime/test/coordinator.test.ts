@@ -26,11 +26,12 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     const event: unknown = JSON.parse(line), frame = { version: 1, id: 1, event };
     assert.ok(validEvent(frame), "The real CLI must return typed protocol events"); return frame.event;
   });
-  function start(host: number, args: string[], input?: string, extra: NodeJS.ProcessEnv = {}, nativeArguments = false, terminal = false) {
+  function start(host: number, args: string[], input?: string, extra: NodeJS.ProcessEnv = {}, nativeArguments = false, terminal = false,
+    terminalBinary = binary) {
     const home = homes[host]; assert.ok(home);
     const arguments_ = nativeArguments ? args : ["--state-dir", join(home, "state"), "--config", join(home, "agent.toml"),
       "--runtime", runtime, "--instructions", join(home, "AGENTS.md"), ...args];
-    const command = terminal ? [binary, ...arguments_]
+    const command = terminal ? [terminalBinary, ...arguments_]
       : ["--json", "--no-tui", ...arguments_];
     const child = spawn(terminal ? terminalFixture : binary, command, { cwd: home, detached: true, stdio: ["pipe", "pipe", "pipe"], env: {
       PATH: bin + delimiter + process.env.PATH, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local"),
@@ -44,7 +45,10 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     child.stderr.setEncoding("utf8").on("data", (text: string) => { stderr += text; });
     const exited = new Promise<number | null>((resolve, reject) => { child.once("close", resolve); child.once("error", reject); });
     const owned = { child, exited, output: () => stdout, errors: () => stderr }; children.push(owned);
-    if (input !== undefined) child.stdin.end(input);
+    if (input !== undefined) {
+      if (input.length === 0) child.stdin.end();
+      else child.stdin.end(input);
+    }
     return owned;
   }
   async function cli(host: number, args: string[], input = "") {
@@ -65,9 +69,9 @@ test("real CLI, coordinator and worker retain main history across an offline lap
       });
     } finally { channel.destroy(); }
   }
-  async function until(check: () => Promise<boolean>, message = ""): Promise<void> {
+  async function until(check: () => Promise<boolean>, message = "", diagnostic: () => string = () => ""): Promise<void> {
     const deadline = Date.now() + 10_000;
-    while (!await check()) { assert.ok(Date.now() < deadline, message + "\n" + children.map((process) => process.errors()).join("\n") +
+    while (!await check()) { assert.ok(Date.now() < deadline, message + "\n" + diagnostic() + "\n" + children.map((process) => process.errors()).join("\n") +
       children.slice(-3).map((process) => process.output().slice(-2400)).join("\n")); await new Promise((resolve) => setTimeout(resolve, 20)); }
   }
   async function online(ids: string[]): Promise<void> {
@@ -324,6 +328,110 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     assert.equal(await localStatus.exited, 0, localStatus.errors()); assert.ok(localStatus.output().includes("Coordinator:"));
     assert.equal((await mainHistory()).messages.some((message) => message.role === "user" && message.text === "/status"), false);
     assert.equal(await readFile(queue + ".requests", "utf8"), requestsBeforeAttach);
+
+    const automatic = start(1, [], undefined, {}, false, true, process.env.AGENT_TEST_HISTORY_BINARY ?? binary);
+    await until(async () => automatic.output().includes("Sapphire main detail retained."),
+      "The native terminal must expose history older than its first20-entry page without /history");
+    automatic.child.stdin.write("/exit\r"); assert.equal(await automatic.exited, 0, automatic.errors());
+    const historyGate = join(directory, "history-replay");
+    const replayed = start(1, [], undefined, { AGENT_TEST_HISTORY_GATE: historyGate }, false, true);
+    await until(async () => stat(historyGate + ".entered").then(() => true, () => false),
+      "A selected conversation must automatically request older native pages");
+    const duringReplay = "fixture-steer-during-history", replayAnswer = "Input remains responsive while older pages wait.";
+    await script(duringReplay, [{ text: replayAnswer }]);
+    replayed.child.stdin.write(duringReplay + "\r");
+    await until(async () => (await mainHistory()).messages.some((message) => message.text === replayAnswer),
+      "Historical replay must not block independent input admission or inference");
+    await writeFile(historyGate + ".release", "Release only this view's older page.");
+    await until(async () => replayed.output().includes("Sapphire main detail retained."),
+      "The native terminal must expose history older than its first20-entry page without /history");
+    const requestsBeforeResume = await readFile(queue + ".requests", "utf8");
+    const sessionsBeforeResume = sessions(join(homes[1]!, "rex.json"));
+    replayed.child.stdin.write("/resume\r");
+    await until(async () => replayed.output().includes("Resume conversation"));
+    replayed.child.stdin.write("\u001b[27u");
+    const resumeOffset = replayed.output().length;
+    replayed.child.stdin.write("/resume " + old.id + "\r");
+    await until(async () => replayed.output().slice(resumeOffset).includes("Sapphire laptop measurement retained."),
+      "An exact task ID must switch this terminal to its existing saved worker conversation");
+    assert.equal(await readFile(queue + ".requests", "utf8"), requestsBeforeResume,
+      "Browsing and attaching must not submit model input");
+    assert.deepEqual(sessions(join(homes[1]!, "rex.json")), sessionsBeforeResume,
+      "An in-place view must not allocate or focus another Rex folder or terminal");
+    const resumedInput = "fixture-resumed-worker", resumedAnswer = "The same Rex-owned worker answers the selected view.";
+    await script(resumedInput, [{ text: resumedAnswer }]);
+    replayed.child.stdin.write(resumedInput + "\r");
+    await until(async () => events(actor.output()).some((event) => event.type === "answer" && event.text === resumedAnswer),
+      "The selected view input must reach its already-running worker", () => replayed.output().slice(-8000) + "\nActor:\n" + actor.output().slice(-3000));
+    await until(async () => replayed.output().includes(resumedAnswer));
+    assert.deepEqual((await tasks()).find((task) => task.id === old.id)?.worker, originalAfterFeedback.worker);
+    replayed.child.stdin.write("/exit\r"); assert.equal(await replayed.exited, 0, replayed.errors());
+    assert.equal(actor.child.exitCode, null, "Closing a view must not stop its independently owned worker");
+
+    for (const navigation of ["resume", "interrupt"]) {
+      const attachGate = join(directory, "attach-" + navigation);
+      const waiting = start(1, [], undefined, { AGENT_TEST_ATTACH_GATE: attachGate }, false, true,
+        process.env.AGENT_TEST_ADMISSION_BINARY ?? binary);
+      await until(async () => stat(attachGate + ".entered").then(() => true, () => false));
+      const unsent = "fixture-not-admitted-" + navigation;
+      const before = await readFile(queue + ".requests", "utf8");
+      waiting.child.stdin.write(unsent + "\r");
+      await until(async () => waiting.output().includes(unsent));
+      let restoredAt = waiting.output().length;
+      if (navigation === "resume") {
+        waiting.child.stdin.write("/resume " + old.id + "\r");
+        await until(async () => waiting.output().includes("Sapphire laptop measurement retained."));
+        restoredAt = waiting.output().length;
+        waiting.child.stdin.write("/resume " + chiefConversationId + "\r");
+      } else waiting.child.stdin.write("\u001b[27u");
+      await writeFile(attachGate + ".release", "Complete observation after canceling the proven-unsent input.");
+      await until(async () => waiting.output().includes("Sapphire main detail retained."));
+      await until(async () => waiting.output().slice(restoredAt).includes(unsent),
+        "A proven-unsent message must return to its own conversation's visible draft");
+      const admitted = "fixture-after-canceled-" + navigation, answer = "The restored draft was sent deliberately after " + navigation + ".";
+      await script(admitted, [{ text: answer }]);
+      // Replace the restored draft explicitly. It must not have been silently
+      // redirected to the selected task or sent when the old view became ready.
+      waiting.child.stdin.write("\u0001\u000b" + admitted + "\r");
+      await until(async () => (await mainHistory()).messages.some((message) => message.text === answer));
+      const newRequests = (await readFile(queue + ".requests", "utf8")).slice(before.length);
+      assert.equal(newRequests.includes(unsent), false, "A canceled pre-Ready input must never be admitted later");
+      assert.equal((await mainHistory()).messages.some((message) => message.text === unsent), false);
+      waiting.child.stdin.write("/exit\r"); assert.equal(await waiting.exited, 0, waiting.errors());
+    }
+
+    const earlyGate = join(directory, "attach-before-exit"), earlyAction = join(directory, "early-exit-action");
+    const earlyInput = "fixture-exit-before-ready", earlyAnswer = "A quickly detached input still finishes once.";
+    await script(earlyInput, [held(earlyAction), { text: earlyAnswer }]);
+    const earlyExit = start(1, [], undefined, { AGENT_TEST_ATTACH_GATE: earlyGate }, false, true);
+    await until(async () => stat(earlyGate + ".entered").then(() => true, () => false));
+    earlyExit.child.stdin.write(earlyInput + "\r/exit\r");
+    await until(async () => earlyExit.output().includes(earlyInput));
+    assert.equal(earlyExit.child.exitCode, null, "Exit must hand off an unsent input before closing its observer");
+    await writeFile(earlyGate + ".release", "Allow observation and independent input admission.");
+    await until(async () => earlyExit.child.exitCode !== null || earlyExit.child.signalCode !== null,
+      "Exit must wait only for admission, not the held model action");
+    assert.equal(await earlyExit.exited, 0, earlyExit.errors());
+    await until(async () => stat(earlyAction + ".started").then(() => true, () => false));
+    assert.equal(await stat(earlyAction + ".finished").then(() => true, () => false), false);
+    await writeFile(earlyAction + ".release", "Finish independently after the terminal exited.");
+    await until(async () => (await mainHistory()).messages.some((message) => message.text === earlyAnswer));
+    assert.equal(await readFile(earlyAction + ".finished", "utf8"), "once\n");
+
+    const chiefModel = (await exchange({ type: "conversation_settings", task_id: null, agent_id: null, change: null, catalog: false }))
+      .find((event) => event.type === "conversation_settings");
+    assert.ok(chiefModel?.type === "conversation_settings");
+    const selectedModel = start(1, ["chat", "/resume " + old.id, "--reasoning", "medium"], undefined, {}, false, true);
+    await until(async () => selectedModel.output().includes("Sapphire laptop measurement retained."));
+    selectedModel.child.stdin.write("/exit\r"); assert.equal(await selectedModel.exited, 0, selectedModel.errors());
+    const afterModel = (await exchange({ type: "conversation_settings", task_id: null, agent_id: null, change: null, catalog: false }))
+      .find((event) => event.type === "conversation_settings");
+    assert.ok(afterModel?.type === "conversation_settings");
+    assert.deepEqual(afterModel.settings.model, chiefModel.settings.model,
+      "Model overrides on an initial /resume must configure the chosen chat, never the chief");
+    const resumedModel = (await exchange({ type: "conversation_settings", task_id: old.id, agent_id: null, change: null, catalog: false }))
+      .find((event) => event.type === "conversation_settings");
+    assert.ok(resumedModel?.type === "conversation_settings"); assert.equal(resumedModel.settings.model.reasoning, "medium");
 
     actor.child.stdin.write("/reasoning medium\n");
     await until(async () => events(actor.output()).some((event) => event.type === "conversation_settings" && event.settings.model.reasoning === "medium"));

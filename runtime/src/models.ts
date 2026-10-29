@@ -201,4 +201,16 @@ export class ConversationModels {
     const session = await this.session;
     return session.commit((tx) => this.currentIn(tx, conversation, fallback), BACKGROUND_CONTEXT);
   }
+  /** Presentation must not create native provider or configuration documents. */
+  async peek(conversation: Conversation, fallback: ModelSelection): Promise<ModelSelection> {
+    const session = await this.session;
+    const native = await session.snapshot(AgentDoc, conversation.id, BACKGROUND_CONTEXT);
+    if (native?.model === undefined) return { ...fallback };
+    if (!provider(native.model.provider)) throw new ModelError("The saved provider is unavailable; its conversation was retained.");
+    const connection = await session.snapshot(ProviderDoc, conversation.id, BACKGROUND_CONTEXT);
+    const policy = connection === undefined ? undefined
+      : (await session.snapshot(Policies, BACKGROUND_CONTEXT))?.sessions[connection.sessionId];
+    return { provider: native.model.provider, model_id: native.model.modelId, reasoning: native.thinkingLevel ?? null,
+      fast: policy?.provider === native.model.provider && policy.model_id === native.model.modelId && policy.fast };
+  }
 }

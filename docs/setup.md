@@ -62,8 +62,8 @@ shows registered machines and which are online.
 
 In the TUI, `agent` opens that same saved main conversation and attaches to
 ongoing work. `/exit` or Ctrl+C detaches main chat while the work continues.
-Reopen it to see live progress, steer or queue more context. Recent saved
-messages appear on startup; `/history` reads older pages.
+Reopen it to see live progress, steer or queue more context. Saved messages load
+automatically in the background while the composer remains usable.
 
 Task sessions open directly into an interactive `Chat` tab. Reply there or
 through the main agent; both use the same task conversation. Named child tabs
@@ -79,10 +79,15 @@ Pi's compaction shows as **Compacting context**; current instructions reload
 before the next model round.
 Select transcript text with the terminal's normal copy/paste controls;
 the wheel and trackpad use native terminal scrollback. PgUp/PgDn scroll the
-loaded conversation or shortcut help. On a Mac, use Fn+Up/Fn+Down. `/history`
-or Ctrl+R loads older saved messages. Up/Down recalls sent prompts when the
+loaded conversation or shortcut help. On a Mac, use Fn+Up/Fn+Down.
+Up/Down recalls sent prompts when the
 editor is empty; slash commands offer completion. Use `agent --no-tui chat`
 for plain output or `agent --json chat` for protocol events.
+
+`/resume` opens a saved-chat picker in this terminal. Filter by title or ID,
+press Enter to choose, or Esc to keep the current chat and draft. Browsing
+history does not start work. A new message reuses the selected conversation's
+worker, reopening its Rex session in the background when needed.
 
 Use `/model`, `/reasoning` or `/fast` to change the current conversation, and
 `/status` to inspect its effective settings, connection and available plan usage.
@@ -153,7 +158,9 @@ each with its own stable `id` and anchored DTSTART/RRULE `recurrence`. See the
 across jobs and within each job's schedules; renames retain their IDs. Optional
 schedule `focus` and `prompt` narrow a pass while retaining the main rules.
 
-After editing or pulling the files:
+Run check and sync in the coordinator's checkout after editing or pulling the
+files. Sync rejects remote clients so their local paths cannot select a
+different working directory on the coordinator:
 
 ```sh
 agent jobs check --next 5

@@ -24,6 +24,7 @@ struct Peer {
     generation: Uuid,
     calls: mpsc::Sender<Effect>,
     stop: watch::Sender<bool>,
+    resume_agent: bool,
 }
 struct Effect {
     command: HostCommand,
@@ -113,6 +114,10 @@ impl Broker {
                 generation,
                 calls,
                 stop,
+                resume_agent: node
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.resume_agent),
             },
         );
         if let Err(error) = control(
@@ -167,10 +172,15 @@ impl Broker {
             .lock()
             .await
             .get(id)
-            .map(|peer| peer.calls.clone());
-        let Some(sender) = sender else {
+            .map(|peer| (peer.calls.clone(), peer.resume_agent));
+        let Some((sender, resume_agent)) = sender else {
             return unavailable();
         };
+        if matches!(command, HostCommand::ResumeAgentWorker { .. }) && !resume_agent {
+            return HostResult::Failed {
+                message: "Update agent on this host before resuming a saved child agent".into(),
+            };
+        }
         let deadline = match &command {
             HostCommand::Exec {
                 timeout_seconds, ..
@@ -357,9 +367,9 @@ fn target(command: &HostCommand) -> Option<&str> {
         | HostCommand::ResourceCollect { record, .. } => Some(&record.host_id),
         HostCommand::SpawnWorker { host, .. } => host.host_id.as_deref(),
         HostCommand::SpawnSubagent { parent, .. } => Some(&parent.host_id),
-        HostCommand::ResumeWorker { binding, .. } | HostCommand::InspectWorker { binding } => {
-            Some(&binding.host_id)
-        }
+        HostCommand::ResumeWorker { binding, .. }
+        | HostCommand::ResumeAgentWorker { binding, .. }
+        | HostCommand::InspectWorker { binding } => Some(&binding.host_id),
         _ => None,
     }
 }
@@ -476,6 +486,7 @@ mod tests {
                     model: Some(ModelSelection::default()),
                 },
                 machine: None,
+                capabilities: Default::default(),
             };
             let task = tokio::spawn(async move {
                 broker
@@ -537,6 +548,78 @@ mod tests {
             .close()
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_worker_rejects_child_resume_before_forwarding_and_still_handles_parent_resume()
+    {
+        let (_directory, runtime) = runtime().await;
+        let broker = Arc::new(Broker::new(None, std::path::Path::new("/tmp")).unwrap());
+        let id = "11111111-1111-4111-8111-111111111111";
+        let mut worker = Worker::connect(broker.clone(), runtime.clone(), id).await;
+        let host = crate::protocol::WorkerHost {
+            host_id: Some(id.into()),
+            name: "legacy".into(),
+            rex_server: None,
+            coordinator: None,
+            cwd: "/example".into(),
+            agent_program: "/example/agent".into(),
+            launch: None,
+        };
+        let binding = crate::protocol::WorkerRef {
+            host_id: id.into(),
+            session_id: "session:22222222-2222-4222-8222-222222222222".into(),
+            window_id: "window:33333333-3333-4333-8333-333333333333".into(),
+            block_id: "block:44444444-4444-4444-8444-444444444444".into(),
+        };
+        let task_id = crate::protocol::TaskId::new();
+        let child = broker
+            .execute(HostCommand::ResumeAgentWorker {
+                host: host.clone(),
+                binding: binding.clone(),
+                task_id: task_id.clone(),
+                agent_id: "child".into(),
+                allocation_id: "child-allocation".into(),
+            })
+            .await;
+        assert!(matches!(child,HostResult::Failed{message} if message.contains("Update agent")));
+        assert!(
+            timeout(Duration::from_millis(25), worker.reader.next_frame())
+                .await
+                .is_err(),
+            "An unsupported command must never enter the legacy worker's effect stream"
+        );
+        let operation = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker
+                    .execute(HostCommand::ResumeWorker {
+                        host,
+                        binding,
+                        task_id,
+                        allocation_id: "parent-allocation".into(),
+                    })
+                    .await
+            })
+        };
+        let RuntimeEventKind::HostCall { call_id, command } = event(&mut worker.reader).await
+        else {
+            panic!("Expected the unchanged parent command")
+        };
+        assert!(matches!(*command, HostCommand::ResumeWorker { .. }));
+        write_frame(
+            &mut worker.writer,
+            &RuntimeCommand::HostReply {
+                call_id,
+                result: HostResult::Written,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(operation.await.unwrap(), HostResult::Written));
+        worker.close().await;
+        drop(broker);
+        close(runtime).await;
     }
 
     #[tokio::test]

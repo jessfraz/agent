@@ -431,16 +431,14 @@ export class TaskStore {
     if (active?.attached !== true || active.input !== input) throw new TaskError("This worker is no longer attached");
     return this.enqueueActor(input.task_id, content, inputId, input.agent_id, undefined, mode);
   }
-  async continueAgent(id: string, agentId: string, content: string, inputId: string, call?: HostCall, mode?: InputMode): Promise<TaskRecord> {
-    if (this.running.get(this.actorKey(id, agentId))?.attached !== true) {
-      const task = await this.get(id);
-      if (call !== undefined && this.actor(task, agentId).worker.state === "unassigned" && task.worker.state === "bound") {
-        await this.enqueueActor(id, content, inputId, agentId, undefined, mode);
-        return this.dispatchAgent(id, agentId, call);
-      }
-      throw new TaskError("This agent is no longer attached; its conversation is retained");
-    }
-    return this.enqueueActor(id, content, inputId, agentId, undefined, mode);
+  async continueAgent(id: string, agentId: string, content: string, inputId: string, call?: HostCall, mode?: InputMode, admitted?: () => void): Promise<TaskRecord> {
+    const active = this.running.get(this.actorKey(id, agentId));
+    const attached = active?.attached === true && active.observer?.signal.aborted !== true;
+    if (!attached && call === undefined) throw new TaskError("This agent is no longer attached; its conversation is retained");
+    const task = await this.enqueueActor(id, content, inputId, agentId, undefined, mode);
+    admitted?.();
+    const current = this.running.get(this.actorKey(id, agentId));
+    return (current?.attached === true && current.observer?.signal.aborted !== true) || call === undefined ? task : this.dispatchAgent(id, agentId, call);
   }
   private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome, mode?: InputMode): Promise<TaskRecord> {
     if (content.trim().length === 0 || Buffer.byteLength(content, "utf8") > 65_536) throw new TaskError("Task input must contain 1 to 65536 UTF-8 bytes");
@@ -509,9 +507,76 @@ export class TaskStore {
     return agent;
   }
   async dispatchAgent(taskId: string, agentId: string, call: HostCall): Promise<TaskRecord> {
-    const task = await this.get(taskId);
-    const existing = this.actor(task, agentId);
-    if (existing.worker.state === "bound") return task;
+    let task = await this.get(taskId);
+    const key = this.actorKey(taskId, agentId), active = this.running.get(key);
+    if (active?.attached === true && active.observer?.signal.aborted !== true) return task;
+    let existing = this.actor(task, agentId);
+    if ("binding" in existing.worker) {
+      if (this.resuming.has(key)) throw new TaskError("An agent resume is already in progress; its pending input is retained");
+      this.resuming.add(key);
+      try {
+        const previous = { ...existing.worker, host: await this.workerHost(taskId, agentId) };
+        let presence = await this.inspect(previous.binding, call), reopened = false;
+        if (presence?.state === "missing_session") {
+          // A child read cannot own its parent's folder transition. Claim the
+          // same guard as parent recovery, then verify the parent itself afresh.
+          if (this.resuming.has(taskId)) throw new TaskError("The task session is recovering; this agent's pending input is retained");
+          this.resuming.add(taskId);
+          try {
+            task = await this.get(taskId);
+            if (this.actor(task, agentId).worker.state === "unassigned" && task.worker.state === "bound") reopened = true;
+            else {
+              if (!("binding" in task.worker) || task.worker.binding.session_id !== previous.binding.session_id ||
+                task.worker.binding.host_id !== previous.binding.host_id) throw new TaskError("The task session changed; its pending input is retained");
+              const parentPresence = await this.inspect(task.worker.binding, call);
+              if (parentPresence?.state === "missing_session") {
+                task = await this.reopen(taskId, task.worker, call); reopened = true;
+              } else if (parentPresence?.state === "pending" || parentPresence?.state === "present") {
+                presence = await this.inspect(previous.binding, call);
+                if (presence === undefined || presence.state === "missing_session") throw new TaskError("Agent presence is still unconfirmed; its task folder and input are retained");
+              } else throw new TaskError("Task folder inspection is unavailable; its binding and input are retained");
+            }
+          } finally { this.resuming.delete(taskId); }
+        }
+        if (!reopened && previous.state !== "bound") {
+          task = await this.allocation(taskId, "reconcile", (saved) => {
+            const actor = this.actor(saved, agentId); this.requireResume(actor.worker, previous);
+            actor.worker = { ...previous, state: presence?.state === "pending" || (presence?.state === "present" && presence.running) ? "bound" : "resume_uncertain" };
+            return { result: presence === undefined ? { type: "failed", message: "Agent inspection was unavailable" } : { type: "presence", presence },
+              reason: "Reconciled the retained agent terminal without repeating an uncertain write" };
+          }, agentId);
+          if (this.actor(task, agentId).worker.state !== "bound") throw new TaskError("Agent resume is still unconfirmed; its binding and input are retained");
+          return task;
+        } else if (!reopened && (presence?.state === "pending" || (presence?.state === "present" && presence.running))) return task;
+        else if (!reopened) {
+          if (presence === undefined) throw new TaskError("Agent inspection is unavailable; its binding and input are retained");
+          await this.fenceActor(key);
+          await this.allocation(taskId, "resume", (saved) => {
+            const actor = this.actor(saved, agentId);
+            if (actor.worker.state !== "bound" || actor.worker.allocation_id !== previous.allocation_id ||
+              !sameBinding(actor.worker.binding, previous.binding)) throw new TaskError("Another transition owns this agent");
+            actor.worker = { ...previous, state: "resuming" };
+            return { result: { type: "pending" }, reason: "Resuming the confirmed exited agent in its existing task session" };
+          }, agentId);
+          let result: HostResult;
+          try { result = await call({ type: "resume_agent_worker", host: previous.host, binding: previous.binding,
+            task_id: taskId, agent_id: agentId, allocation_id: previous.allocation_id }); }
+          catch { result = { type: "creation_uncertain", session_id: previous.binding.session_id }; }
+          task = await this.allocation(taskId, "resume", (saved) => {
+            const actor = this.actor(saved, agentId); this.requireResume(actor.worker, previous);
+            actor.worker = result.type === "spawned" && result.binding.host_id === previous.binding.host_id && result.binding.session_id === previous.binding.session_id
+              ? { ...previous, state: "bound", binding: result.binding }
+              : result.type === "written" || result.type === "failed" || (result.type === "worker_presence" && result.presence.state === "pending")
+                ? previous : { ...previous, state: "resume_uncertain" };
+            return { result: allocationResult(result), reason: "Retained the agent identity and task folder while reconciling its terminal" };
+          }, agentId);
+          if (result.type === "failed" || this.actor(task, agentId).worker.state !== "bound") throw new TaskError("Agent resume was not confirmed; its binding and input are retained");
+          return task;
+        }
+      } finally { this.resuming.delete(key); }
+      existing = this.actor(task, agentId);
+    }
+    if (existing.worker.state !== "unassigned") throw new TaskError("Agent allocation needs reconciliation; its pending input is retained");
     if (task.worker.state !== "bound") throw new TaskError("A bound task worker must own the agent's Rex session");
     const parent = { ...task.worker, host: await this.workerHost(taskId) };
     const allocation_id = randomUUID();
@@ -594,10 +659,14 @@ export class TaskStore {
     const active = this.running.get(id);
     if (active !== undefined) {
       if (active.observer?.signal.aborted !== true || current.worker.state !== "bound") return current;
-      const presence = await this.inspect(current.worker.binding, call);
-      if (presence?.state === "missing_session") return this.reopen(id, current.worker, call);
-      if (presence?.state === "missing_terminal" || (presence?.state === "present" && !presence.running)) await this.fenceActor(id);
-      else throw new TaskError("The previous execution is detaching; pending input is retained");
+      if (this.resuming.has(id)) throw new TaskError("A task recovery already owns this session; its pending input is retained");
+      this.resuming.add(id);
+      try {
+        const presence = await this.inspect(current.worker.binding, call);
+        if (presence?.state === "missing_session") return await this.reopen(id, current.worker, call);
+        if (presence?.state === "missing_terminal" || (presence?.state === "present" && !presence.running)) await this.fenceActor(id);
+        else throw new TaskError("The previous execution is detaching; pending input is retained");
+      } finally { this.resuming.delete(id); }
     }
     if (current.worker.state === "allocating" || current.worker.state === "uncertain") {
       throw new TaskError("Worker allocation needs reconciliation; no duplicate session was created");

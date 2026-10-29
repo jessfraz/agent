@@ -169,8 +169,9 @@ an explicit session-not-found response permits a replacement folder, after
 fencing the old allocation. A transport or permission failure retains ownership.
 
 Reopening restores saved messages, pending inputs and task settings. Recent
-history loads first; older pages remain available through `/history`. It does
-not create a duplicate conversation or submit old messages to the model.
+history loads first; older pages load automatically while chat stays usable.
+`/resume` selects a saved conversation in place. Browsing does not create a
+duplicate conversation, execute work or submit old messages to the model.
 Imported history gets its first task/session only on adoption. Cross-host
 transfer remains separate. Reconcile uncertain effects before retrying.
 

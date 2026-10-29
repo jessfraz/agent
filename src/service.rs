@@ -293,12 +293,31 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         .context("Client sent no command")?;
     let command: RuntimeCommand =
         serde_json::from_slice(&initial).context("Client sent an invalid command")?;
+    let native = matches!(command, RuntimeCommand::Native { .. });
+    let command = match command {
+        RuntimeCommand::Native { request } => {
+            match crate::native::prepare(request).unwrap_or_else(|error| {
+                crate::native::Operation::Local(crate::native::NativeEvent::Failure {
+                    message: error.to_string(),
+                })
+            }) {
+                crate::native::Operation::Runtime(command) => *command,
+                crate::native::Operation::Local(event) => {
+                    write_frame(&mut writer, &event).await?;
+                    write_frame(&mut writer, &crate::native::NativeEvent::Done).await?;
+                    return Ok(());
+                }
+            }
+        }
+        command => command,
+    };
     let login = matches!(command, RuntimeCommand::Login);
     ensure!(
         !matches!(
             command,
             RuntimeCommand::Interrupt
                 | RuntimeCommand::DetachMain
+                | RuntimeCommand::DetachConversation
                 | RuntimeCommand::SubmitInput { .. }
                 | RuntimeCommand::WorkerInput { .. }
                 | RuntimeCommand::DetachWorker
@@ -337,7 +356,12 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     let attached = matches!(command, RuntimeCommand::RunTask { .. });
-    let main_view = matches!(command, RuntimeCommand::AttachMain);
+    let main_view = matches!(
+        command,
+        RuntimeCommand::AttachMain
+            | RuntimeCommand::ObserveMain { .. }
+            | RuntimeCommand::AttachConversation { .. }
+    );
     let interruptible = attached || main_view || matches!(command, RuntimeCommand::Chat { .. });
     let interactive = matches!(
         command,
@@ -346,6 +370,15 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             ..
         }
     );
+    if native && main_view {
+        write_frame(
+            &mut writer,
+            &crate::native::NativeEvent::Commands {
+                commands: crate::native::commands(),
+            },
+        )
+        .await?;
+    }
     let mut call = runtime.request(command).await?;
     let mut input_closed = false;
     let mut output_closed = false;
@@ -382,7 +415,13 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                         continue;
                     }
                     let done = matches!(event, RuntimeEventKind::Done);
-                    if !output_closed && let Err(error) = write_frame(&mut writer, &event).await {
+                    let written = if native {
+                        match crate::native::project(&event) {
+                            Some(event) if !output_closed => write_frame(&mut writer, &event).await,
+                            _ => Ok(()),
+                        }
+                    } else if !output_closed { write_frame(&mut writer, &event).await } else { Ok(()) };
+                    if let Err(error) = written {
                         if attached || main_view { return Err(error); }
                         input_closed = true;
                         output_closed = true;

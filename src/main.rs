@@ -1,3 +1,6 @@
+mod chat_admission;
+mod chat_history;
+mod chat_view;
 mod mail;
 mod state;
 
@@ -24,8 +27,8 @@ use agent_cli::{
     models::{ModelProvider, ModelSelection, Reasoning},
     protocol::{
         AuthStatus, ConversationChange, ConversationSettings, CoordinatorBootstrap,
-        CoordinatorSettings, ImportPhase, InputMode, RuntimeCommand, RuntimeEventKind, SearchMode,
-        TaskId, WorkerLaunch, WorkerRef,
+        CoordinatorSettings, ImportPhase, InputMode, MainInputContext, RuntimeCommand,
+        RuntimeEventKind, SavedConversation, SearchMode, TaskId, WorkerLaunch, WorkerRef,
     },
     rex::{BlockId, RexClient, SessionId},
     runtime::FrameReader,
@@ -617,9 +620,15 @@ async fn main() -> Result<()> {
         Action::Logout => RuntimeCommand::Logout,
         Action::Sources => RuntimeCommand::SourceStates,
         Action::Jobs { command } => match command {
-            JobsAction::Sync { directories } => RuntimeCommand::SyncJobs {
-                jobs: jobs::load(&job_directories(&config, directories)?)?,
-            },
+            JobsAction::Sync { directories } => {
+                ensure!(
+                    coordinator.is_none(),
+                    "Run jobs sync on the coordinator in the checkout that owns the job files; client paths cannot select the coordinator's working directory"
+                );
+                RuntimeCommand::SyncJobs {
+                    jobs: jobs::load(&job_directories(&config, directories)?)?,
+                }
+            }
             JobsAction::List => RuntimeCommand::ListJobs,
             JobsAction::Get { id } => RuntimeCommand::ReadJob {
                 job_id: jobs::JobId::try_from(id)?,
@@ -715,6 +724,21 @@ async fn main() -> Result<()> {
                         return Ok(());
                     }
                     ChatCommand::Exit => return Ok(()),
+                    ChatCommand::Resume { query } if use_tui(&arguments) => {
+                        return chat_tui(
+                            &arguments,
+                            &config,
+                            coordinator.as_deref(),
+                            &script,
+                            &directory,
+                            &cwd,
+                            ChatStart {
+                                model,
+                                prompt: Some(format!("/resume {}", query.join(" "))),
+                            },
+                        )
+                        .await;
+                    }
                     ChatCommand::History => {
                         return request(
                             &arguments,
@@ -990,6 +1014,7 @@ async fn main() -> Result<()> {
             cwd: cwd.clone(),
         })?;
         let mut ui = UiSession::new(handle, inputs);
+        ui.initial_replay = Some(ui.handle.begin_history_replay()?);
         let result = request_with_ui(
             &arguments,
             &config,
@@ -1006,6 +1031,7 @@ async fn main() -> Result<()> {
         } else {
             None
         };
+        ui.close_view().await;
         finish_controls(&mut ui.controls).await;
         let stopped = guard.stop().await;
         match recovery {
@@ -1163,9 +1189,20 @@ struct UiSession {
     submitted: VecDeque<(String, String, InputMode)>,
     errors: VecDeque<String>,
     controls: tokio::task::JoinSet<()>,
+    selected: Option<SavedConversation>,
+    admissions: tokio::task::JoinSet<()>,
+    pending_admissions: Vec<Arc<chat_admission::Admission>>,
+    drafts: HashMap<String, String>,
+    view: Option<chat_view::View>,
+    history: Option<chat_history::Job>,
+    initial_replay: Option<agent_cli::tui::HistoryReplay>,
+    initial_history: Vec<RuntimeEventKind>,
+    view_sender: tokio::sync::mpsc::UnboundedSender<(uuid::Uuid, RuntimeEventKind)>,
+    view_events: tokio::sync::mpsc::UnboundedReceiver<(uuid::Uuid, RuntimeEventKind)>,
 }
 impl UiSession {
     fn new(handle: TuiHandle, inputs: tokio::sync::mpsc::UnboundedReceiver<TuiInput>) -> Self {
+        let (view_sender, view_events) = tokio::sync::mpsc::unbounded_channel();
         Self {
             handle,
             inputs,
@@ -1177,7 +1214,149 @@ impl UiSession {
             submitted: VecDeque::new(),
             errors: VecDeque::new(),
             controls: tokio::task::JoinSet::new(),
+            selected: None,
+            admissions: tokio::task::JoinSet::new(),
+            pending_admissions: Vec::new(),
+            drafts: HashMap::new(),
+            view: None,
+            history: None,
+            initial_replay: None,
+            initial_history: Vec::new(),
+            view_sender,
+            view_events,
         }
+    }
+    fn view_event(&mut self, token: uuid::Uuid, event: RuntimeEventKind) -> Result<()> {
+        let id = match &event {
+            RuntimeEventKind::InputAccepted { input_id }
+            | RuntimeEventKind::InputPlaced { input_id, .. }
+            | RuntimeEventKind::InputRejected { input_id, .. } => Some(input_id),
+            _ => None,
+        };
+        let admission = id
+            .and_then(|id| self.pending_admissions.iter().find(|input| &input.id == id))
+            .cloned();
+        let previous = admission.as_ref().map(|input| input.stage()).transpose()?;
+        if let Some(input) = &admission {
+            input.observe(&event)?;
+        }
+        // An admission belongs to its conversation even if it outlived an old
+        // view token. Other events remain isolated to their exact observer.
+        let current = admission.as_ref().map_or_else(
+            || self.view.as_ref().is_some_and(|view| view.token == token),
+            |input| {
+                self.selected
+                    .as_ref()
+                    .is_some_and(|selected| selected.conversation_id == input.conversation_id)
+            },
+        );
+        if matches!(event, RuntimeEventKind::InputRejected { .. }) {
+            if let Some(input) = &admission {
+                if !matches!(
+                    previous,
+                    Some(
+                        chat_admission::Stage::Placed
+                            | chat_admission::Stage::Rejected
+                            | chat_admission::Stage::Canceled
+                    )
+                ) {
+                    if current {
+                        self.handle.restore_input(input.text.clone())?;
+                    } else {
+                        let draft = self
+                            .drafts
+                            .entry(input.conversation_id.clone())
+                            .or_default();
+                        if !draft.is_empty() {
+                            draft.push('\n');
+                        }
+                        draft.push_str(&input.text);
+                    }
+                }
+            } else if current
+                && let RuntimeEventKind::InputRejected { input_id, .. } = &event
+                && let Some(index) = self.submitted.iter().position(|(id, _, _)| id == input_id)
+                && let Some((_, text, _)) = self.submitted.remove(index)
+            {
+                self.handle.restore_input(text)?;
+            }
+        }
+        if !current {
+            return Ok(());
+        }
+        if let RuntimeEventKind::InputPlaced { input_id, .. } = &event {
+            self.placed_input(input_id);
+        }
+        self.handle.event(event)
+    }
+    async fn next(&mut self) -> Option<TuiInput> {
+        loop {
+            tokio::select! {
+                input=self.inputs.recv()=>return input,
+                frame=self.view_events.recv(),if self.view.is_some()=>{
+                    if let Some((token,event))=frame && let Err(error)=self.view_event(token,event) {
+                        let _=self.handle.notice(error.to_string());
+                    }
+                }
+            }
+        }
+    }
+    async fn finish_admissions(&mut self) -> Result<()> {
+        // Detaching cannot discard an input still waiting for observation or
+        // its write receipt. The coordinator owns work after durable admission;
+        // its model generation may continue after this terminal closes.
+        loop {
+            let mut waiting = false;
+            for input in &self.pending_admissions {
+                waiting |= matches!(
+                    input.stage()?,
+                    chat_admission::Stage::Waiting | chat_admission::Stage::Sending
+                );
+            }
+            if !waiting {
+                return Ok(());
+            }
+            let (token, event) = self
+                .view_events
+                .recv()
+                .await
+                .context("Input admission disconnected before it could be confirmed")?;
+            let failure = match &event {
+                RuntimeEventKind::Failure { message, .. } => Some(message.clone()),
+                _ => None,
+            };
+            self.view_event(token, event)?;
+            if let Some(message) = failure {
+                bail!("Input admission could not be confirmed: {message}");
+            }
+        }
+    }
+    fn cancel_waiting(&mut self, conversation_id: &str) -> Result<Vec<String>> {
+        let mut canceled = Vec::new();
+        for input in &self.pending_admissions {
+            if input.conversation_id == conversation_id && input.cancel_waiting()? {
+                let draft = self.drafts.entry(conversation_id.to_owned()).or_default();
+                if !draft.is_empty() {
+                    draft.push('\n');
+                }
+                draft.push_str(&input.text);
+                canceled.push(input.id.clone());
+            }
+        }
+        Ok(canceled)
+    }
+    async fn close_view(&mut self) {
+        if let Some(view) = self.view.take() {
+            view.stop().await;
+        }
+        if let Some(history) = self.history.take() {
+            history.cancel().await;
+        }
+        self.initial_replay.take();
+        self.admissions.abort_all();
+        while self.admissions.join_next().await.is_some() {}
+        self.controls.abort_all();
+        while self.controls.join_next().await.is_some() {}
     }
     fn enqueue(&mut self, input: String, mode: InputMode) -> Result<()> {
         let id = uuid::Uuid::new_v4().to_string();
@@ -1194,6 +1373,155 @@ impl UiSession {
             self.submitted.remove(index);
         }
     }
+}
+
+fn selected_input(
+    client: ClientContext<'_>,
+    ui: &mut UiSession,
+    text: String,
+    mode: InputMode,
+    cwd: PathBuf,
+) -> Result<()> {
+    let conversation_id = ui
+        .selected
+        .as_ref()
+        .context("Choose a saved conversation")?
+        .conversation_id
+        .clone();
+    let view = ui
+        .view
+        .as_ref()
+        .context("Conversation view is unavailable")?;
+    let token = view.token;
+    let mut ready = view.ready.clone();
+    let admission = Arc::new(chat_admission::Admission::new(conversation_id, text, mode));
+    ui.pending_admissions
+        .retain(|input| !matches!(input.retained(), Ok(false)));
+    ui.handle
+        .pending_input(admission.id.clone(), admission.text.clone(), admission.mode)?;
+    ui.pending_admissions.push(admission.clone());
+    let sender = ui.view_sender.clone();
+    let config = client.config.clone();
+    let coordinator = client.coordinator.map(str::to_owned);
+    let script = client.script.to_owned();
+    let directory = client.directory.to_owned();
+    while ui.admissions.try_join_next().is_some() {}
+    ui.admissions.spawn(async move {
+        let result = async {
+            if ready.wait_for(|ready| *ready).await.is_err() {
+                if admission.stage()? == chat_admission::Stage::Canceled {
+                    return Ok(());
+                }
+                bail!("The conversation view did not attach");
+            }
+            if admission.stage()? == chat_admission::Stage::Canceled {
+                return Ok(());
+            }
+            let context = match chat_command(String::new(), None, &cwd).await? {
+                RuntimeCommand::Chat {
+                    instructions,
+                    origin_host_id,
+                    cwd,
+                    hosts,
+                    ..
+                } => MainInputContext {
+                    instructions,
+                    origin_host_id,
+                    cwd,
+                    hosts,
+                },
+                _ => bail!("The main chat context is unavailable"),
+            };
+            chat_view::control(
+                ClientContext {
+                    config: &config,
+                    coordinator: coordinator.as_deref(),
+                    script: &script,
+                    directory: &directory,
+                },
+                RuntimeCommand::ConversationInput {
+                    conversation_id: admission.conversation_id.clone(),
+                    input_id: admission.id.clone(),
+                    input: admission.text.clone(),
+                    mode: admission.mode,
+                    context: Some(context),
+                },
+                token,
+                sender.clone(),
+                &admission,
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = sender.send((
+                token,
+                RuntimeEventKind::Failure {
+                    code: agent_cli::protocol::ErrorCode::Internal,
+                    message: error.to_string(),
+                },
+            ));
+        }
+    });
+    Ok(())
+}
+
+async fn selected_interrupt(client: ClientContext<'_>, ui: &mut UiSession) -> Result<()> {
+    let Some(selected) = &ui.selected else {
+        return Ok(());
+    };
+    let conversation_id = selected.conversation_id.clone();
+    ui.drafts
+        .insert(conversation_id.clone(), ui.handle.draft().await?);
+    let canceled = ui.cancel_waiting(&conversation_id)?;
+    for input_id in &canceled {
+        ui.handle.event(RuntimeEventKind::InputRejected {
+            input_id: input_id.clone(),
+            message: "Input canceled before admission.".into(),
+        })?;
+    }
+    if !canceled.is_empty() {
+        ui.handle
+            .set_draft(ui.drafts.get(&conversation_id).cloned().unwrap_or_default())?;
+    }
+    let command = RuntimeCommand::ConversationInterrupt { conversation_id };
+    let config = client.config.clone();
+    let coordinator = client.coordinator.map(str::to_owned);
+    let script = client.script.to_owned();
+    let directory = client.directory.to_owned();
+    let sender = ui.view_sender.clone();
+    let token = ui.view.as_ref().map(|view| view.token);
+    ui.controls.spawn(async move {
+        match exchange(
+            &config,
+            coordinator.as_deref(),
+            &script,
+            &directory,
+            command,
+        )
+        .await
+        {
+            Ok(events) => {
+                if let Some(token) = token {
+                    for event in events {
+                        let _ = sender.send((token, event));
+                    }
+                }
+            }
+            Err(error) => {
+                if let Some(token) = token {
+                    let _ = sender.send((
+                        token,
+                        RuntimeEventKind::Failure {
+                            code: agent_cli::protocol::ErrorCode::Internal,
+                            message: error.to_string(),
+                        },
+                    ));
+                }
+            }
+        }
+    });
+    Ok(())
 }
 
 async fn feedback_context(
@@ -1311,6 +1639,7 @@ async fn conversation_settings(
         RuntimeCommand::ConversationSettings {
             task_id,
             agent_id,
+            conversation_id: None,
             change,
             catalog,
         },
@@ -1437,6 +1766,10 @@ fn local_command_from_ui(
     let script = script.to_owned();
     let directory = directory.to_owned();
     let handle = ui.handle.clone();
+    let selected = ui
+        .selected
+        .as_ref()
+        .map(|item| item.conversation_id.clone());
     while ui.controls.try_join_next().is_some() {}
     ui.controls.spawn(async move {
         let changed = async {
@@ -1467,15 +1800,42 @@ fn local_command_from_ui(
                 return handle.notice(inventory.format(SystemTime::now()));
             }
             let info = handle.info().await?;
-            let settings = local_settings(
-                &config,
-                coordinator.as_deref(),
-                &script,
-                &directory,
-                &command,
-                target,
-            )
-            .await?;
+            let settings = if let Some(conversation_id) = selected {
+                let mut request = command
+                    .settings(target)
+                    .context("This command does not change conversation settings")?;
+                if let RuntimeCommand::ConversationSettings {
+                    conversation_id: selected,
+                    ..
+                } = &mut request
+                {
+                    *selected = Some(conversation_id);
+                }
+                exchange(
+                    &config,
+                    coordinator.as_deref(),
+                    &script,
+                    &directory,
+                    request,
+                )
+                .await?
+                .into_iter()
+                .find_map(|event| match event {
+                    RuntimeEventKind::ConversationSettings { settings } => Some(settings),
+                    _ => None,
+                })
+                .context("The coordinator returned no conversation settings")?
+            } else {
+                local_settings(
+                    &config,
+                    coordinator.as_deref(),
+                    &script,
+                    &directory,
+                    &command,
+                    target,
+                )
+                .await?
+            };
             let mut text = settings_text(&command, &settings, &info, coordinator.as_deref());
             let provider = settings.model.provider;
             handle.event(RuntimeEventKind::ConversationSettings { settings })?;
@@ -1545,6 +1905,24 @@ async fn local_command_plain(
     cwd: &Path,
     json: bool,
 ) -> Result<()> {
+    if let ChatCommand::Resume { query } = command {
+        let items = chat_view::choices(client, query.join(" ")).await?;
+        if json {
+            display(
+                &RuntimeEventKind::Conversations {
+                    items,
+                    next_cursor: None,
+                },
+                true,
+            )?;
+        } else {
+            for item in items {
+                println!("{}  {}", item.conversation_id, item.title);
+            }
+            println!("Open an interactive agent chat to select a saved conversation.");
+        }
+        return Ok(());
+    }
     if let Some(request) = command.jobs() {
         for event in exchange(
             client.config,
@@ -1623,7 +2001,7 @@ struct Presentation<'a> {
 }
 
 async fn chat_tui(
-    arguments: &Arguments,
+    _arguments: &Arguments,
     config: &ClientConfig,
     coordinator: Option<&str>,
     script: &Path,
@@ -1631,94 +2009,139 @@ async fn chat_tui(
     cwd: &Path,
     start: ChatStart,
 ) -> Result<()> {
-    let effective = conversation_settings(
+    let client = ClientContext {
+        config,
+        coordinator,
+        script,
+        directory,
+    };
+    let resuming = start.prompt.as_ref().is_some_and(|prompt| {
+        matches!(
+            ChatCommand::parse(prompt),
+            Some(Ok(ChatCommand::Resume { .. }))
+        )
+    });
+    let resumed_model = if resuming { start.model.clone() } else { None };
+    let settings = conversation_settings(
         config,
         coordinator,
         script,
         directory,
         None,
-        start
-            .model
-            .clone()
-            .map(|model| ConversationChange::SetSelection { model }),
+        if resuming {
+            None
+        } else {
+            start
+                .model
+                .map(|model| ConversationChange::SetSelection { model })
+        },
         false,
     )
-    .await?
-    .model;
+    .await?;
     let (handle, inputs, guard) = Tui::start(TuiInfo {
         title: "Main agent".into(),
-        model: effective,
+        model: settings.model,
         cwd: cwd.to_string_lossy().into_owned(),
     })?;
     let mut ui = UiSession::new(handle, inputs);
     let result = async {
-        let _watch = watch(config, coordinator, script, directory, false, Some(ui.handle.clone())).await?;
-        ui.history_cursor = request_presented(arguments, config, coordinator, script, directory,
-            RuntimeCommand::ReadHistory { task_id: None, agent_id: None, cursor: None },
-            Some(Presentation { handle: ui.handle.clone(), session: None })).await?;
-        if let Some(prompt) = start.prompt { ui.enqueue(prompt, InputMode::Steer)?; }
-        request_with_ui(arguments, config, coordinator, script, directory, RuntimeCommand::AttachMain, &mut ui).await?;
-        let mut paused = false;
-        while !ui.exiting {
-            if paused || ui.queued.is_empty() {
-                match ui.inputs.recv().await.unwrap_or(TuiInput::Exit) {
-                    TuiInput::Submit(input) => { ui.enqueue(input, InputMode::Steer)?; paused = false; }
-                    TuiInput::Queue(input) => { ui.enqueue(input, InputMode::FollowUp)?; paused = false; }
-                    TuiInput::Feedback(description) => {
-                        feedback_from_ui(config, coordinator, script, directory, &mut ui, None, description);
-                        continue;
+        let _watch = watch(
+            config,
+            coordinator,
+            script,
+            directory,
+            false,
+            Some(ui.handle.clone()),
+        )
+        .await?;
+        let items = chat_view::choices(client, settings.conversation_id.clone()).await?;
+        let chief = chat_view::exact(&items, &settings.conversation_id)
+            .context("The main conversation is unavailable")?
+            .clone();
+        chat_view::open(client, &mut ui, chief).await?;
+        if let Some(prompt) = start.prompt {
+            if let Some(Ok(ChatCommand::Resume { query })) = ChatCommand::parse(&prompt) {
+                if chat_view::resume(client, &mut ui, query.join(" ")).await?
+                    && let Some(model) = resumed_model
+                    && let Some(selected) = &ui.selected
+                {
+                    for event in exchange(
+                        config,
+                        coordinator,
+                        script,
+                        directory,
+                        RuntimeCommand::ConversationSettings {
+                            task_id: selected.task_id.clone(),
+                            agent_id: selected.agent_id.clone(),
+                            conversation_id: Some(selected.conversation_id.clone()),
+                            change: Some(ConversationChange::SetSelection { model }),
+                            catalog: false,
+                        },
+                    )
+                    .await?
+                    {
+                        ui.handle.event(event)?;
                     }
-                    TuiInput::Command(command) => {
-                        local_command_from_ui(config, coordinator, script, directory, &mut ui, None, command);
-                        continue;
-                    }
-                    TuiInput::History => {
-                        if let Some(cursor) = ui.history_cursor.take() {
-                            ui.history_cursor = request_presented(arguments, config, coordinator, script, directory,
-                                RuntimeCommand::ReadHistory { task_id: None, agent_id: None, cursor: Some(cursor) },
-                                Some(Presentation { handle: ui.handle.clone(), session: None })).await?;
-                        } else { ui.handle.event(RuntimeEventKind::Notice { task_id: None, text: "No older history.".into() })?; }
-                        continue;
-                    }
-                    TuiInput::Interrupt => { ui.handle.working(false)?; continue; }
-                    TuiInput::Exit => break,
                 }
+            } else {
+                selected_input(client, &mut ui, prompt, InputMode::Steer, cwd.to_owned())?;
             }
-            let Some(input) = ui.queued.front().cloned() else { continue; };
-            let prepared = async {
-                let model = conversation_settings(config, coordinator, script, directory, None, None, false).await?.model;
-                ui.handle.set_status(TuiInfo { title: "Main agent".into(), model, cwd: cwd.to_string_lossy().into_owned() })?;
-                let mut command = chat_command(input.text.clone(), None, cwd).await?;
-                if let RuntimeCommand::Chat { input_id, .. } = &mut command { *input_id = Some(input.id.clone()); }
-                Ok::<_, anyhow::Error>(command)
-            }.await;
-            let command = match prepared {
-                Ok(command) => command,
-                Err(error) => {
-                    ui.handle.working(false)?;
-                    ui.handle.event(RuntimeEventKind::Failure { code: agent_cli::protocol::ErrorCode::Internal, message: error.to_string() })?;
-                    paused = true;
-                    continue;
+        }
+        while !ui.exiting {
+            match ui.next().await.unwrap_or(TuiInput::Exit) {
+                TuiInput::Submit(text) => {
+                    selected_input(client, &mut ui, text, InputMode::Steer, cwd.to_owned())?
                 }
-            };
-            ui.queued.pop_front();
-            ui.submitted.push_back((input.id, input.text, input.mode));
-            ui.handle.working(true)?;
-            if let Err(error) = request_with_ui(arguments, config, coordinator, script, directory, command, &mut ui).await {
-                ui.handle.working(false)?;
-                if !ui.failure_shown { ui.handle.event(RuntimeEventKind::Failure { code: agent_cli::protocol::ErrorCode::Internal, message: error.to_string() })?; }
-                if !ui.queued.is_empty() { ui.handle.event(RuntimeEventKind::Notice { task_id: None, text: format!("{} messages remain queued, unsent. The next submission resumes the queue.", ui.queued.len()) })?; }
-                paused = true;
+                TuiInput::Queue(text) => {
+                    selected_input(client, &mut ui, text, InputMode::FollowUp, cwd.to_owned())?
+                }
+                TuiInput::Command(ChatCommand::Resume { query }) => {
+                    if let Err(error) = chat_view::resume(client, &mut ui, query.join(" ")).await {
+                        ui.handle.notice(error.to_string())?;
+                    }
+                }
+                TuiInput::Command(command) => {
+                    let target = ui.selected.as_ref().and_then(|item| {
+                        item.task_id.clone().map(|id| (id, item.agent_id.clone()))
+                    });
+                    local_command_from_ui(
+                        config,
+                        coordinator,
+                        script,
+                        directory,
+                        &mut ui,
+                        target,
+                        command,
+                    );
+                }
+                TuiInput::Feedback(description) => {
+                    let target = ui.selected.as_ref().and_then(|item| {
+                        item.task_id.clone().map(|id| (id, item.agent_id.clone()))
+                    });
+                    feedback_from_ui(
+                        config,
+                        coordinator,
+                        script,
+                        directory,
+                        &mut ui,
+                        target,
+                        description,
+                    );
+                }
+                TuiInput::Interrupt => selected_interrupt(client, &mut ui).await?,
+                TuiInput::History => {} // All native pages are already being replayed in the background.
+                TuiInput::Exit => {
+                    ui.finish_admissions().await?;
+                    ui.exiting = true;
+                }
             }
         }
         Ok(())
-    }.await;
-    finish_controls(&mut ui.controls).await;
-    let stopped = guard.stop().await;
-    if !ui.queued.is_empty() {
-        eprintln!("{} queued messages were not sent.", ui.queued.len());
     }
-    result.and(stopped)
+    .await;
+    ui.close_view().await;
+    finish_controls(&mut ui.controls).await;
+    result.and(guard.stop().await)
 }
 
 async fn exchange(
@@ -2287,7 +2710,7 @@ async fn request_presented(
             }
             action = async {
                 match presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
-                    Some(ui) => ui.inputs.recv().await,
+                    Some(ui) => ui.next().await,
                     None => std::future::pending().await,
                 }
             }, if ui_controls => {
@@ -2296,7 +2719,10 @@ async fn request_presented(
                 match action {
                     TuiInput::Submit(text) | TuiInput::Queue(text) => {
                         let ui = presentation.as_mut().and_then(|view| view.session.as_deref_mut()).context("Missing terminal input owner")?;
-                        if (chat && (!main_view || ready)) || (attached && ready) {
+                        if ui.selected.is_some() {
+                            let cwd=feedback_settings.as_ref().map(|(_,cwd)|PathBuf::from(cwd)).unwrap_or(env::current_dir()?);
+                            selected_input(ClientContext{config,coordinator,script,directory},ui,text,mode,cwd)?;
+                        } else if (chat && (!main_view || ready)) || (attached && ready) {
                             active_turn = true;
                             let input_id = uuid::Uuid::new_v4().to_string();
                             ui.handle.pending_input(input_id.clone(), text.clone(), mode)?;
@@ -2306,19 +2732,28 @@ async fn request_presented(
                     }
                     TuiInput::Feedback(description) => {
                         if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
-                            feedback_from_ui(config, coordinator, script, directory, ui, history_target.clone(), description);
+                            let target=ui.selected.as_ref().map_or_else(||history_target.clone(),|item|item.task_id.clone().map(|id|(id,item.agent_id.clone())));
+                            feedback_from_ui(config, coordinator, script, directory, ui, target, description);
                         }
                     }
                     TuiInput::Command(command) => {
                         if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
-                            local_command_from_ui(config, coordinator, script, directory, ui, history_target.clone(), command);
+                            if let ChatCommand::Resume{query}=command {
+                                if let Err(error)=chat_view::resume(ClientContext{config,coordinator,script,directory},ui,query.join(" ")).await {ui.handle.notice(error.to_string())?;}
+                            } else {
+                                let target=ui.selected.as_ref().map_or_else(||history_target.clone(),|item|item.task_id.clone().map(|id|(id,item.agent_id.clone())));
+                                local_command_from_ui(config, coordinator, script, directory, ui, target, command);
+                            }
                         }
                     }
                     TuiInput::Interrupt => {
-                        if active_turn { write_command(&mut *wire.writer, &RuntimeCommand::Interrupt).await?; }
+                        if let Some(ui)=presentation.as_mut().and_then(|view|view.session.as_deref_mut()).filter(|ui|ui.selected.is_some()) {
+                            selected_interrupt(ClientContext{config,coordinator,script,directory},ui).await?;
+                        } else if active_turn { write_command(&mut *wire.writer, &RuntimeCommand::Interrupt).await?; }
                         else if let Some(view) = &presentation { view.handle.working(false)?; }
                     }
                     TuiInput::History => {
+                        if presentation.as_ref().and_then(|view|view.session.as_ref()).is_some_and(|ui|ui.selected.is_some()) {continue;}
                         let view = presentation.as_mut().context("Missing terminal presentation")?;
                         let cursor = if attached { history_cursor.take() } else { view.session.as_mut().and_then(|ui| ui.history_cursor.take()) };
                         if let Some(cursor) = cursor {
@@ -2330,7 +2765,10 @@ async fn request_presented(
                         } else { view.handle.event(RuntimeEventKind::Notice { task_id: None, text: "No older history.".into() })?; }
                     }
                     TuiInput::Exit => {
-                        if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) { ui.exiting = true; }
+                        if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
+                            ui.finish_admissions().await?;
+                            ui.exiting = true;
+                        }
                         if chat { return Ok(history_cursor); }
                         if active_turn { write_command(&mut *wire.writer, &RuntimeCommand::Interrupt).await?; }
                         if attached { write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?; }
@@ -2416,7 +2854,7 @@ async fn request_presented(
             serde_json::from_slice(&frame).context("Coordinator returned an invalid event")?;
         if let Some(ui) = presentation
             .as_mut()
-            .and_then(|view| view.session.as_deref_mut())
+            .and_then(|view| view.session.as_deref_mut()).filter(|ui|ui.selected.is_none())
         {
             match &event {
                 RuntimeEventKind::InputRejected { input_id, .. } => {
@@ -2460,8 +2898,24 @@ async fn request_presented(
             | RuntimeEventKind::WorkerIdle => active_turn = false,
             _ => {}
         }
+        let replayed = if let Some(ui)=presentation.as_mut().and_then(|view|view.session.as_deref_mut()).filter(|ui|ui.selected.is_none()) {
+            if let RuntimeEventKind::History{conversation_id,next_cursor,page_complete,..}=&event {
+                if ui.initial_replay.is_some() {
+                    ui.initial_history.push(event.clone());
+                    if *page_complete && let Some(replay)=ui.initial_replay.take() {
+                        replay.page(std::mem::take(&mut ui.initial_history))?;
+                        if let Some(cursor)=next_cursor {
+                            ui.history=Some(chat_history::Job::start(ClientContext{config,coordinator,script,directory},conversation_id.clone(),chat_history::Start::Older(cursor.clone()),replay));
+                        }else{replay.finish()?;}
+                    }
+                    true
+                }else{false}
+            }else{false}
+        }else{false};
         // The chief's Watch connection already carries notices; workers show their direct answers.
         if let Some(view) = &presentation
+            && view.session.as_ref().is_none_or(|ui|ui.selected.is_none())
+            && !replayed
             && !matches!(event, RuntimeEventKind::Notice { .. })
         {
             view.handle.event(event.clone())?;
@@ -2518,7 +2972,7 @@ async fn request_presented(
                 failure = Some(message);
             }
             RuntimeEventKind::Done => {
-                if chat && let Some(view) = &presentation { view.handle.working(false)?; }
+                if chat && let Some(view) = &presentation && view.session.as_ref().is_none_or(|ui|ui.selected.is_none()) { view.handle.working(false)?; }
                 break;
             }
             RuntimeEventKind::MainReady { .. } => {
@@ -2557,7 +3011,7 @@ async fn request_presented(
             } => {
                 if let Some(ui) = presentation
                     .as_mut()
-                    .and_then(|view| view.session.as_deref_mut())
+                    .and_then(|view| view.session.as_deref_mut()).filter(|ui|ui.selected.is_none())
                 {
                     ui.conversation_id = Some(conversation_id.clone());
                 }
@@ -3078,6 +3532,7 @@ mod tests {
                     model: None,
                 },
                 machine: Some(snapshot),
+                capabilities: Default::default(),
             };
             let event = RuntimeEventKind::Environment {
                 settings: CoordinatorSettings {

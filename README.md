@@ -50,7 +50,8 @@ their tasks; automatic transfer to another machine comes later.
 Rex task tabs open directly into chat and accept replies after a turn finishes.
 The TUI reopens the saved main conversation with `agent` and reconnects to
 ongoing work. `/exit` or Ctrl+C detaches main chat while that work continues;
-reopen it to follow or steer the same execution. `/history` reads older pages.
+reopen it to follow or steer the same execution. Saved history loads in the
+background. Scroll to read it; `/resume` selects another saved chat in place.
 
 The terminal UI renders Markdown, including tables, and shows the model,
 reasoning, directory and live activity. Enter steers, Tab queues a separate FIFO

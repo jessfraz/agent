@@ -50,6 +50,16 @@
         "agent_program": {
           "type": "string"
         },
+        "capabilities": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "coordinator": {
           "type": [
             "string",
@@ -1820,6 +1830,38 @@
             "task_id",
             "allocation_id"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agent_id": {
+              "type": "string"
+            },
+            "allocation_id": {
+              "type": "string"
+            },
+            "binding": {
+              "$ref": "#/$defs/WorkerRef"
+            },
+            "host": {
+              "$ref": "#/$defs/WorkerHost"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            },
+            "type": {
+              "type": "string",
+              "const": "resume_agent_worker"
+            }
+          },
+          "required": [
+            "type",
+            "host",
+            "binding",
+            "task_id",
+            "agent_id",
+            "allocation_id"
+          ]
         }
       ]
     },
@@ -2751,6 +2793,31 @@
         {
           "type": "object",
           "properties": {
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SavedConversation"
+              }
+            },
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "conversations"
+            }
+          },
+          "required": [
+            "type",
+            "items"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "type": {
               "type": "string",
               "const": "configured"
@@ -3055,6 +3122,50 @@
         {
           "type": "object",
           "properties": {
+            "conversation": {
+              "$ref": "#/$defs/SavedConversation"
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "model": {
+              "$ref": "#/$defs/ModelSelection"
+            },
+            "type": {
+              "type": "string",
+              "const": "conversation_ready"
+            },
+            "working": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "type",
+            "conversation",
+            "model",
+            "cwd",
+            "working"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "conversation_state"
+            },
+            "working": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "type",
+            "working"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "conversation_id": {
               "type": "string"
             },
@@ -3203,6 +3314,22 @@
         {
           "type": "object",
           "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "text_delta"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "activity": {
               "$ref": "#/$defs/ModelActivity"
             },
@@ -3292,6 +3419,57 @@
             "type"
           ]
         }
+      ]
+    },
+    "SavedConversation": {
+      "description": "Saved conversation identity and metadata; listing never starts execution.",
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conversation_id": {
+          "type": "string"
+        },
+        "host": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "title"
       ]
     },
     "SavedMatch": {
@@ -4088,6 +4266,15 @@
       "description": "An absolute instant that has the same exact representation in Rust and JS.",
       "type": "integer",
       "format": "int64"
+    },
+    "WorkerCapabilities": {
+      "type": "object",
+      "properties": {
+        "resume_agent": {
+          "type": "boolean",
+          "default": false
+        }
+      }
     },
     "WorkerHost": {
       "type": "object",

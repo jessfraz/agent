@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { setTimeout } from "node:timers/promises";
+import { createInterface } from "node:readline";
 
 export type NativeSession = { session_id: string; window_id: string; block_id: string; label: string; command: string[]; cwd: string };
 function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
@@ -21,7 +22,27 @@ if (process.env.AGENT_TEST_NATIVE === "ssh") {
   const path = process.env.AGENT_TEST_COORDINATOR_SOCKET; assert.ok(path);
   const socket = createConnection(path);
   socket.on("error", () => process.exitCode = 1);
-  process.stdin.pipe(socket); socket.pipe(process.stdout);
+  socket.pipe(process.stdout);
+  const gate = process.env.AGENT_TEST_HISTORY_GATE;
+  const attachGate = process.env.AGENT_TEST_ATTACH_GATE;
+  if (gate === undefined && attachGate === undefined) process.stdin.pipe(socket);
+  else {
+    let first = true;
+    for await (const line of createInterface({ input: process.stdin })) {
+      const command: unknown = JSON.parse(line);
+      if (gate !== undefined && first && object(command) && command.type === "read_conversation" && command.cursor !== null) {
+        writeFileSync(gate + ".entered", "An older native page is waiting at its transport boundary.");
+        while (!existsSync(gate + ".release")) await setTimeout(10);
+      }
+      if (attachGate !== undefined && first && object(command) && command.type === "attach_conversation" && !existsSync(attachGate + ".entered")) {
+        writeFileSync(attachGate + ".entered", "Observation has not yet been admitted.");
+        while (!existsSync(attachGate + ".release")) await setTimeout(10);
+      }
+      first = false;
+      socket.write(line + "\n");
+    }
+    socket.end();
+  }
 } else if (process.env.AGENT_TEST_NATIVE === "rex") {
   const host = process.env.AGENT_TEST_NODE_ID, path = process.env.AGENT_TEST_REX_STATE; assert.ok(host && path);
   const args = process.argv.slice(2); const call = args.indexOf("call");

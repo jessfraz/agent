@@ -259,6 +259,7 @@ mod tests {
                 model: None,
             },
             machine,
+            capabilities: Default::default(),
         };
         let now = UNIX_EPOCH + Duration::from_millis(sample.observed_at_ms + 65_000);
         let inventory = MachineInventory {

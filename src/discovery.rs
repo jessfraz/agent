@@ -85,6 +85,7 @@ pub async fn local_node(
             .into_owned(),
         coordinator: coordinator.map(str::to_owned),
         launch,
+        capabilities: Some(crate::protocol::WorkerCapabilities { resume_agent: true }),
         machine: crate::machines::observe(daemon).await.ok(),
     };
     validate_node(&node)?;

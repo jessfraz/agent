@@ -100,9 +100,11 @@ export async function history(conversation: Conversation, value: string | null):
 
 /** Forward exposed activity and native compaction status, without summary payloads. */
 export async function activity(session: Harness, conversation: Conversation, emit: (event: ModelActivity) => void,
-  message?: (message: HistoryMessage) => void): Promise<() => Promise<void>> {
+  message?: (message: HistoryMessage) => void, text?: (delta: string) => void,
+  observer?: { includeFinal: true; working(value: boolean): void }): Promise<() => Promise<void>> {
   const stream = await watchEvents(session, conversation.id, BACKGROUND_CONTEXT);
   const thinking = new Map<number, string>();
+  const responding = new Map<number, string>();
   const compactions = new Set<string>();
   let compacting = false, compactionFailure = stream.snapshot.compactionFailure?.taskId.toString();
   const reportCompaction = (failed = false) => {
@@ -111,21 +113,43 @@ export async function activity(session: Harness, conversation: Conversation, emi
   };
   for (const status of stream.snapshot.compactions) compactions.add(status.taskId.toString());
   reportCompaction();
-  let assistantOpen = false;
+  observer?.working(stream.snapshot.run !== undefined);
+  const seen = observer?.includeFinal ? new Set(stream.snapshot.entries.map((entry) => entry.id.toString())) : undefined;
+  const committed = (entry: EntryRecord) => {
+    if (seen?.has(entry.id.toString())) return;
+    seen?.add(entry.id.toString());
+    for (const item of transcript(entry)) if (item.role === "user" || item.role === "commentary" || item.tool !== undefined
+      || (observer?.includeFinal && item.role !== "thinking")) message?.(item);
+  };
+  let assistantOpen = stream.snapshot.generation?.message !== undefined;
   const update = (index: number, text: string) => {
     const previous = thinking.get(index) ?? "";
     const append = text.startsWith(previous) ? text.slice(previous.length) : "\n" + text;
     thinking.set(index, text);
     for (const chunk of chunks(append)) emit({ type: "thinking", text: chunk });
   };
+  const updateText = (index: number, value: string) => {
+    const previous = responding.get(index) ?? "";
+    const append = value.startsWith(previous) ? value.slice(previous.length) : "\n" + value;
+    responding.set(index, value);
+    for (const chunk of chunks(append)) text?.(chunk);
+  };
+  for (const [index, part] of (stream.snapshot.generation?.message?.content ?? []).entries()) {
+    if (part.type === "thinking") update(index, part.thinking);
+    else if (part.type === "text") updateText(index, part.text);
+  }
   stream.start(async (events) => {
     for (const event of events) {
       if (event.type === "snapshot") {
+        observer?.working(event.run !== undefined);
+        if (observer?.includeFinal) for (const entry of event.entries) committed(entry);
         compactions.clear();
         for (const status of event.compactions) compactions.add(status.taskId.toString());
         const failure = event.compactionFailure?.taskId.toString();
         reportCompaction(failure !== undefined && failure !== compactionFailure);
         compactionFailure = failure;
+      } else if (event.type === "run_start" || event.type === "run_end") {
+        observer?.working(event.type === "run_start");
       } else if (event.type === "compaction_start") {
         compactions.add(event.taskId.toString()); reportCompaction();
       } else if (event.type === "compaction_end") {
@@ -134,21 +158,25 @@ export async function activity(session: Harness, conversation: Conversation, emi
         reportCompaction(event.error !== undefined);
       } else if (event.type === "message_start") {
         if (event.message.role === "assistant") {
-          if (!assistantOpen) thinking.clear();
+          if (!assistantOpen) { thinking.clear(); responding.clear(); }
           assistantOpen = true;
-          event.message.content.forEach((part, index) => { if (part.type === "thinking") update(index, part.thinking); });
+          event.message.content.forEach((part, index) => { if (part.type === "thinking") update(index, part.thinking); else if (part.type === "text") updateText(index, part.text); });
         }
       } else if (event.type === "message_update") {
         const whole = new Set(event.changes.flatMap((change) => (change.type === "thinking_start" || change.type === "block") && change.block.type === "thinking" ? [change.contentIndex] : []));
+        const wholeText = new Set(event.changes.flatMap((change) => (change.type === "text_start" || change.type === "block") && change.block.type === "text" ? [change.contentIndex] : []));
         for (const change of event.changes) {
+          if (change.type === "text_delta" && !wholeText.has(change.contentIndex)) updateText(change.contentIndex, (responding.get(change.contentIndex) ?? "") + change.delta);
+          else if ((change.type === "text_start" || change.type === "block") && change.block.type === "text") updateText(change.contentIndex, change.block.text);
           if (change.type === "thinking_delta" && !whole.has(change.contentIndex)) update(change.contentIndex, (thinking.get(change.contentIndex) ?? "") + change.delta);
           else if ((change.type === "thinking_start" || change.type === "block") && change.block.type === "thinking") update(change.contentIndex, change.block.thinking);
           else if (change.type === "message") change.message.content.forEach((part, index) => {
             if (part.type === "thinking") update(index, part.thinking);
+            else if (part.type === "text") updateText(index, part.text);
           });
         }
       } else if (event.type === "message_end") {
-        for (const item of transcript(event.entry)) if (item.role === "user" || item.role === "commentary" || item.tool !== undefined) message?.(item);
+        committed(event.entry);
         for (const message of event.entry.model ?? []) if (message.role === "assistant") message.content.forEach((part, index) => {
           if (part.type === "thinking") update(index, part.thinking);
         });

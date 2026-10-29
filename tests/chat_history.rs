@@ -61,6 +61,7 @@ async fn main_history(older: bool) {
                         agent_id: None,
                         change: None,
                         catalog: false,
+                        conversation_id: None,
                     } => {
                         observed_settings.fetch_add(1, Ordering::SeqCst);
                         let event = RuntimeEventKind::ConversationSettings {

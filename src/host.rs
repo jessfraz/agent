@@ -323,8 +323,7 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
                 .inspect_session(&native.session_id)
                 .await?
                 .verify_binding(&native, &identity.host_id)?;
-            let mut args = worker_args(&host, &task_id, &allocation_id);
-            args.extend(["--agent-id".into(), agent_id]);
+            let args = worker_args(&host, &task_id, &allocation_id, Some(&agent_id));
             match client
                 .create_worker_window(
                     &native.session_id,
@@ -364,60 +363,79 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             binding,
             task_id,
             allocation_id,
-        } => {
-            let client = RexClient::new(None);
-            let native = native_binding(&binding)?;
-            let identity = client.whoami().await?;
-            ensure!(
-                identity.host_id == HostId::parse(&binding.host_id)?,
-                "Worker host identity changed"
-            );
-            let presence = client.worker_presence(&native, &identity.host_id).await?;
-            if matches!(presence, crate::protocol::WorkerPresence::MissingSession) {
-                anyhow::bail!(
-                    "The task session was closed; reconcile its allocation before reopening"
-                );
-            }
-            if matches!(presence, crate::protocol::WorkerPresence::MissingTerminal) {
-                return match client
-                    .create_worker_window(
-                        &native.session_id,
-                        "Chat",
-                        &host.agent_program,
-                        &worker_args(&host, &task_id, &allocation_id),
-                        Path::new(&host.cwd),
-                    )
-                    .await
-                {
-                    Ok(restored)
-                        if confirmed_binding(&client, &restored, &identity.host_id).await =>
-                    {
-                        promote(&client, &restored.session_id).await;
-                        Ok(HostResult::Spawned {
-                            binding: WorkerRef {
-                                host_id: binding.host_id,
-                                session_id: restored.session_id.to_string(),
-                                window_id: restored.window_id.to_string(),
-                                block_id: restored.block_id.to_string(),
-                            },
-                        })
-                    }
-                    Ok(_) => Ok(HostResult::CreationUncertain {
-                        session_id: Some(binding.session_id),
-                    }),
-                    Err(RexError::CreationUncertain { session_id }) => {
-                        Ok(HostResult::CreationUncertain {
-                            session_id: session_id.map(|id| id.to_string()),
-                        })
-                    }
-                    Err(error) => Err(error.into()),
-                };
-            }
-            // A running client drains new pending inputs itself. An exited pane
-            // needs a new execution in this same session, handled by Rex below.
-            resume_worker(&client, &host, &task_id, &allocation_id, &binding).await
-        }
+        } => resume_bound_worker(host, binding, task_id, allocation_id, None).await,
+        HostCommand::ResumeAgentWorker {
+            host,
+            binding,
+            task_id,
+            agent_id,
+            allocation_id,
+        } => resume_bound_worker(host, binding, task_id, allocation_id, Some(agent_id)).await,
     }
+}
+
+// Child identity is a distinct wire command: older nodes must reject it before
+// effects instead of silently starting a parent with a child's allocation.
+async fn resume_bound_worker(
+    host: WorkerHost,
+    binding: WorkerRef,
+    task_id: TaskId,
+    allocation_id: String,
+    agent_id: Option<String>,
+) -> Result<HostResult> {
+    let client = RexClient::new(None);
+    let native = native_binding(&binding)?;
+    let identity = client.whoami().await?;
+    ensure!(
+        identity.host_id == HostId::parse(&binding.host_id)?,
+        "Worker host identity changed"
+    );
+    let presence = client.worker_presence(&native, &identity.host_id).await?;
+    if matches!(presence, crate::protocol::WorkerPresence::MissingSession) {
+        anyhow::bail!("The task session was closed; reconcile its allocation before reopening");
+    }
+    if matches!(presence, crate::protocol::WorkerPresence::MissingTerminal) {
+        return match client
+            .create_worker_window(
+                &native.session_id,
+                "Chat",
+                &host.agent_program,
+                &worker_args(&host, &task_id, &allocation_id, agent_id.as_deref()),
+                Path::new(&host.cwd),
+            )
+            .await
+        {
+            Ok(restored) if confirmed_binding(&client, &restored, &identity.host_id).await => {
+                promote(&client, &restored.session_id).await;
+                Ok(HostResult::Spawned {
+                    binding: WorkerRef {
+                        host_id: binding.host_id,
+                        session_id: restored.session_id.to_string(),
+                        window_id: restored.window_id.to_string(),
+                        block_id: restored.block_id.to_string(),
+                    },
+                })
+            }
+            Ok(_) => Ok(HostResult::CreationUncertain {
+                session_id: Some(binding.session_id),
+            }),
+            Err(RexError::CreationUncertain { session_id }) => Ok(HostResult::CreationUncertain {
+                session_id: session_id.map(|id| id.to_string()),
+            }),
+            Err(error) => Err(error.into()),
+        };
+    }
+    // A running client drains new pending inputs itself. An exited pane
+    // needs a new execution in this same session, handled by Rex below.
+    resume_worker(
+        &client,
+        &host,
+        &task_id,
+        &allocation_id,
+        &binding,
+        agent_id.as_deref(),
+    )
+    .await
 }
 
 async fn require_local_host(expected: &str) -> Result<()> {
@@ -438,7 +456,12 @@ fn native_binding(binding: &WorkerRef) -> Result<WorkerBinding> {
     })
 }
 
-fn worker_args(host: &WorkerHost, task_id: &TaskId, allocation_id: &str) -> Vec<String> {
+fn worker_args(
+    host: &WorkerHost,
+    task_id: &TaskId,
+    allocation_id: &str,
+    agent_id: Option<&str>,
+) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(launch) = &host.launch {
         for (flag, value) in [
@@ -461,6 +484,9 @@ fn worker_args(host: &WorkerHost, task_id: &TaskId, allocation_id: &str) -> Vec<
         "--allocation-id".into(),
         allocation_id.into(),
     ]);
+    if let Some(agent_id) = agent_id {
+        args.extend(["--agent-id".into(), agent_id.into()]);
+    }
     if let Some(model) = host
         .launch
         .as_ref()
@@ -501,7 +527,7 @@ async fn spawn_worker(
                 &native.session_id,
                 title,
                 &host.agent_program,
-                &worker_args(host, task_id, allocation_id),
+                &worker_args(host, task_id, allocation_id, None),
                 Path::new(&host.cwd),
             )
             .await
@@ -510,7 +536,7 @@ async fn spawn_worker(
             .create_session(
                 title,
                 &host.agent_program,
-                &worker_args(host, task_id, allocation_id),
+                &worker_args(host, task_id, allocation_id, None),
                 Path::new(&host.cwd),
             )
             .await
@@ -558,13 +584,14 @@ async fn resume_worker(
     task_id: &TaskId,
     allocation_id: &str,
     binding: &WorkerRef,
+    agent_id: Option<&str>,
 ) -> Result<HostResult> {
     promote(client, &SessionId::parse(&binding.session_id)?).await;
     match client
         .resume_worker(
             &native_binding(binding)?,
             &host.agent_program,
-            &worker_args(host, task_id, allocation_id),
+            &worker_args(host, task_id, allocation_id, agent_id),
             Path::new(&host.cwd),
         )
         .await

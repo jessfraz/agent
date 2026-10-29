@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
-import { AssistantEntry, createRegistry, Harness, type Conversation, type Submission } from "@earendil-works/pi-durable";
+import { AssistantEntry, createRegistry, Harness, ROOT_CONVERSATION_ID, type Conversation, type Submission } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
@@ -15,6 +15,8 @@ import { validRequest, validEvent, errorEvent, invalidHostReply, protocolLines }
 import { TaskError, TaskStore, type HostCall } from "./tasks.js";
 import { HistoryStore } from "./history.js";
 import { CodexImporter } from "./importer.js";
+import { ConversationCatalog } from "./catalog.js";
+import { ConversationViews } from "./conversation-views.js";
 import { Retrieval } from "./retrieval.js";
 import { FeedbackStore } from "./feedback.js";
 import { FeedbackDispatcher } from "./feedback-dispatch.js";
@@ -27,6 +29,7 @@ import type { SearchMode } from "./generated/SearchMode.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { conversationSettings } from "./settings.js";
 import { watchInputPlacements } from "./input_delivery.js";
+import { reconcileMainInput, watchMainNotices } from "./main_observation.js";
 import { BackgroundScheduler } from "./background.js";
 import { runScheduled } from "./scheduled.js";
 import type { SourcePollCursor } from "./generated/SourcePollCursor.js";
@@ -44,6 +47,14 @@ function emit(id: number, event: RuntimeEventKind): void {
   const frame: RuntimeEvent = { version: VERSION, id, event };
   if (!validEvent(frame)) throw new Error("Invalid runtime event");
   process.stdout.write(`${JSON.stringify(frame)}\n`);
+  if (mainTurns.has(id)) {
+    for (const [observerId, observer] of mainObservers) {
+      const update = event.type === "done" ? { type: "worker_idle" } satisfies RuntimeEventKind : event;
+      if (["main_ready", "text_delta", "activity", "message", "answer", "input_accepted", "input_placed", "input_rejected", "interrupted", "failure", "conversation_settings", "worker_idle"].includes(update.type)) {
+        queueMainObserver(observerId, observer, update);
+      }
+    }
+  }
   for (const [viewId, view] of mainViews) {
     if (view.owner !== id) continue;
     if (event.type === "done") view.finish();
@@ -79,6 +90,7 @@ async function openApplication() {
   const environment = new CoordinatorEnvironment(harness); environment.useLiveGuidance(); tasks.useEnvironment(environment);
   const assets = join(state, "history", "assets");
   const histories = new HistoryStore(harness, assets); tasks.useHistory(histories);
+  const catalog = new ConversationCatalog(harness, histories, tasks);
   const importer = new CodexImporter(harness, histories, assets);
   const retrieval = new Retrieval(harness, histories, tasks, join(state, "search.sqlite"));
   const feedback = new FeedbackStore(state, tasks);
@@ -102,7 +114,7 @@ async function openApplication() {
       if (conversation.id.toString() === conversationId && !ending.has(id)) emit(id, { type: "input_placed", input_id, entry_id });
     }
   });
-  const core = { stopPlacements, harness, tasks, environment, executions, tools, sources, sourceTools, resources, resourceTools, histories, importer, retrieval, guidance, feedback, repairs };
+  const core = { stopPlacements, harness, tasks, environment, executions, tools, sources, sourceTools, resources, resourceTools, histories, catalog, importer, retrieval, guidance, feedback, repairs };
   const background = new BackgroundScheduler(harness, registry, {
     async plan(cadence, after, now) {
       const result = await backgroundCall({ type: "background", request: { type: "plan", cadence, after, now } });
@@ -136,6 +148,8 @@ let application: ReturnType<typeof openApplication> | undefined;
 function app(): ReturnType<typeof openApplication> { return application ??= openApplication(); }
 let mainQueue = Promise.resolve();
 const activeConversations = new Map<number, import("@earendil-works/pi-durable").Conversation>();
+const conversationViews = new ConversationViews(async () => ({ ...await app(), inference }),
+  (request, conversation) => activeConversations.set(request, conversation));
 const activeCommands = new Set<number>();
 const interrupted = new Set<number>();
 const interrupts = new Map<number, Promise<void>>();
@@ -150,6 +164,17 @@ function mainTurn(): MainTurn {
 }
 const mainTurns = new Map<number, MainTurn>();
 const mainViews = new Map<number, { owner: number; live: boolean; finish(): void }>();
+type MainObserver = { buffer?: RuntimeEventKind[]; bytes: number; overflow: boolean; finish(): void };
+const mainObservers = new Map<number, MainObserver>();
+function queueMainObserver(id: number, observer: MainObserver, event: RuntimeEventKind): void {
+  if (observer.overflow) return;
+  if (observer.buffer === undefined) { emit(id, event); return; }
+  observer.bytes += Buffer.byteLength(JSON.stringify(event), "utf8");
+  if (observer.buffer.length >= 512 || observer.bytes > 4 * 1024 * 1024) {
+    observer.overflow = true; observer.finish(); return;
+  }
+  observer.buffer.push(event);
+}
 const inputControls = new Map<number, Set<Promise<void>>>();
 const ending = new Set<number>();
 
@@ -181,8 +206,11 @@ async function interrupt(id: number): Promise<void> {
   const operation = (async () => { await conversation.abort(BACKGROUND_CONTEXT); emit(id, { type: "interrupted" }); })();
   interrupts.set(id, operation); await operation;
 }
-function submitInput(id: number, command: Extract<RuntimeCommand, { type: "submit_input" }>): void {
-  if (!activeCommands.has(id) || ending.has(id)) return;
+function submitInput(id: number, command: Extract<RuntimeCommand, { type: "submit_input" }>, responseId = id): Promise<void> {
+  if (!activeCommands.has(id) || ending.has(id)) {
+    emit(responseId, { type: "input_rejected", input_id: command.input_id, message: "The turn ended before admission; retry this input." });
+    return Promise.resolve();
+  }
   const worker = workers.get(id), main = mainTurns.get(id);
   if (main !== undefined) main.admissions += 1;
   const operations = inputControls.get(id) ?? new Set<Promise<void>>(); inputControls.set(id, operations);
@@ -206,24 +234,56 @@ function submitInput(id: number, command: Extract<RuntimeCommand, { type: "submi
       }
       main.inputs.push({ input_id: command.input_id, submission });
     }
-    emit(id, { type: "input_accepted", input_id: command.input_id });
+    if (responseId !== id) emit(id, { type: "input_accepted", input_id: command.input_id });
+    emit(responseId, { type: "input_accepted", input_id: command.input_id });
   })().catch((error: unknown) => {
-    emit(id, { type: "input_rejected", input_id: command.input_id,
+    emit(responseId, { type: "input_rejected", input_id: command.input_id,
       message: error instanceof TaskError ? error.message : "Input could not be saved; its draft is retained" });
   }).finally(() => {
     if (main !== undefined) { main.admissions -= 1; main.wake?.(); }
     operations.delete(operation);
   });
   operations.add(operation);
+  return operation;
 }
 async function handle(request: RuntimeRequest): Promise<void> {
-  const { id, command } = request;
-  if (command.type === "chat" || command.type === "run_task" || command.type === "attach_main") activeCommands.add(id);
-  if (command.type === "chat") mainTurns.set(id, mainTurn());
-  if (command.type === "run_task" && command.interactive === true) {
-    workers.set(id, { command, controller: new AbortController() });
+  const { id } = request;
+  let effective = request.command;
+  const initial = request.command;
+  if (initial.type === "chat" || initial.type === "run_task" || initial.type === "attach_main" || initial.type === "attach_conversation") activeCommands.add(id);
+  if (initial.type === "chat") mainTurns.set(id, mainTurn());
+  if (initial.type === "run_task" && initial.interactive === true) {
+    workers.set(id, { command: initial, controller: new AbortController() });
   }
   try {
+    if (effective.type === "conversation_input" && effective.conversation_id === ROOT_CONVERSATION_ID.toString()) {
+      effective = { type: "main_input", input_id: effective.input_id, input: effective.input, mode: effective.mode,
+        ...(effective.context === undefined ? {} : { context: effective.context }) };
+    }
+    if (effective.type === "main_input") {
+      const application = await app();
+      const root = await application.harness.root(BACKGROUND_CONTEXT);
+      const reconciled = await reconcileMainInput(root, effective.input_id);
+      if (reconciled !== undefined) { for (const event of reconciled) emit(id, event); return; }
+      const owner = [...mainTurns].find(([owner, turn]) => turn.accepting && !ending.has(owner))?.[0];
+      if (owner !== undefined) {
+        await submitInput(owner, { type: "submit_input", input_id: effective.input_id, input: effective.input, mode: effective.mode }, id);
+        return;
+      }
+      const context = effective.context;
+      const hosts = await application.environment.hosts(context?.cwd ?? "/", context?.origin_host_id ?? null, context?.hosts ?? []);
+      const host = await application.environment.defaultHost(hosts);
+      if (host === null) throw new TaskError("The coordinator execution host is offline");
+      const admittedOwner = [...mainTurns].find(([owner, turn]) => turn.accepting && !ending.has(owner))?.[0];
+      if (admittedOwner !== undefined) {
+        await submitInput(admittedOwner, { type: "submit_input", input_id: effective.input_id, input: effective.input, mode: effective.mode }, id);
+        return;
+      }
+      effective = { type: "chat", input: effective.input, input_id: effective.input_id, instructions: context?.instructions ?? "", model: null,
+        origin_host_id: context?.origin_host_id ?? host.host_id ?? null, cwd: context?.cwd ?? host.cwd, hosts };
+      activeCommands.add(id); mainTurns.set(id, mainTurn());
+    }
+    const command = effective;
     switch (command.type) {
       case "run_background": {
         if (backgroundOwner !== undefined) throw new TaskError("The coordinator already owns background execution");
@@ -318,6 +378,23 @@ async function handle(request: RuntimeRequest): Promise<void> {
       case "read_conversation": {
         for (const frame of await history(await (await app()).tasks.conversation(command.conversation_id), command.cursor)) emit(id, frame);
         break;
+      }
+      case "list_conversations": {
+        emit(id, { type: "conversations", ...await (await app()).catalog.list(command.query, command.cursor, command.limit) }); break;
+      }
+      case "attach_conversation": {
+        await conversationViews.attach(id, command.conversation_id, (event) => emit(id, event), command.input_ids ?? []); break;
+      }
+      case "conversation_input": {
+        await conversationViews.input(command, (operation) => hostRequests.call(id, operation), (event) => emit(id, event)); break;
+      }
+      case "conversation_interrupt": {
+        const conversation = await (await app()).tasks.conversation(command.conversation_id);
+        const owner = [...activeConversations].find(([request, active]) => !ending.has(request) &&
+          active.id === conversation.id && (workers.has(request) || mainTurns.has(request)))?.[0];
+        if (owner === undefined) await conversation.abort(BACKGROUND_CONTEXT);
+        else await interrupt(owner);
+        emit(id, { type: "interrupted" }); break;
       }
       case "open_conversation": {
         const application = await app(); const { tasks, environment } = application;
@@ -414,6 +491,46 @@ async function handle(request: RuntimeRequest): Promise<void> {
         } finally { await stop?.(); }
         break;
       }
+      case "main_interrupt": {
+        const owner = [...mainTurns].find(([owner]) => !ending.has(owner))?.[0];
+        if (owner !== undefined) await interrupt(owner);
+        break;
+      }
+      case "main_feedback": {
+        const application = await app();
+        const root = await application.harness.root(BACKGROUND_CONTEXT);
+        const host = await application.environment.defaultHost(await application.environment.hosts("/", null, []));
+        if (host?.host_id === undefined || host.host_id === null) throw new TaskError("The coordinator execution host is offline");
+        const bundle = await application.feedback.capture(command.description, { origin_host_id: host.host_id,
+          cwd: host.cwd, conversation_id: root.id.toString(), task_id: null, agent_id: null,
+          model: application.executions.model(root.id.toString()) ?? await application.environment.model(null),
+          binding: null, draft: "", queued_inputs: [], client_errors: [] });
+        const receipt = await application.repairs.dispatch(bundle, (operation) => hostRequests.call(id, operation));
+        emit(id, { type: "feedback_ready", receipt }); break;
+      }
+      case "observe_main": {
+        const application = await app();
+        const root = await application.harness.root(BACKGROUND_CONTEXT);
+        let finish = () => {};
+        const finished = new Promise<void>((resolve) => { finish = resolve; });
+        const observer: MainObserver = { buffer: [], bytes: 0, overflow: false, finish };
+        mainObservers.set(id, observer);
+        const stopNotices = watchMainNotices(application.harness, root, (event) => queueMainObserver(id, observer, event));
+        try {
+          emit(id, { type: "main_ready", conversation_id: root.id.toString(),
+            model: await inference.legacy(root, await application.environment.model(null)), cwd: "" });
+          for (const frame of await history(root, null)) emit(id, frame);
+          for (const input_id of command.input_ids) {
+            for (const event of await reconcileMainInput(root, input_id) ?? []) emit(id, event);
+          }
+          if (observer.overflow) { failure(id, "internal", "Observation fell behind during history load. Reconnect to recover saved history."); break; }
+          for (const frame of observer.buffer ?? []) emit(id, frame);
+          delete observer.buffer;
+          if (mainTurns.size === 0) emit(id, { type: "worker_idle" });
+          await finished;
+        } finally { stopNotices(); mainObservers.delete(id); }
+        break;
+      }
       case "attach_main": {
         const application = await app();
         const snapshot = async () => {
@@ -461,7 +578,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
             notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
           });
           const stop = await activity(harness, root, (activity) => emit(id, { type: "activity", activity }),
-            (message) => emit(id, { type: "message", message }));
+            (message) => emit(id, { type: "message", message }), (text) => emit(id, { type: "text_delta", text }));
           const turn = mainTurns.get(id);
           try {
             const related = await tasks.find(command.input, [], 8,
@@ -479,6 +596,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
             submissionAttempted = true;
             const submission = await root.submit({ type: "input", content: command.input,
               ...(command.input_id === undefined ? {} : { requestId: command.input_id }) }, BACKGROUND_CONTEXT);
+            if (command.input_id !== undefined) emit(id, { type: "input_accepted", input_id: command.input_id });
             if (turn === undefined) throw new TaskError("The main execution owner is unavailable");
             turn.conversation = root; turn.info = { type: "main_ready", conversation_id: root.id.toString(), model: selected, cwd: command.cwd };
             turn.inputs.push({ submission, ...(command.input_id === undefined ? {} : { input_id: command.input_id }) }); turn.start(true);
@@ -544,12 +662,12 @@ async function handle(request: RuntimeRequest): Promise<void> {
     ending.add(id);
     const turn = mainTurns.get(id); if (turn !== undefined) { turn.accepting = false; turn.start(false); }
     await Promise.allSettled([...(inputControls.get(id) ?? [])]); inputControls.delete(id);
-    mainTurns.delete(id);
     await interrupts.get(id)?.catch(() => {});
     activeCommands.delete(id); activeConversations.delete(id); interrupted.delete(id); interrupts.delete(id);
     workers.delete(id);
     hostRequests.finish(id);
     emit(id, { type: "done" });
+    mainTurns.delete(id);
     ending.delete(id);
   }
 }
@@ -574,8 +692,10 @@ try {
     }
     if (request.command.type === "detach_main") {
       mainViews.get(request.id)?.finish();
+      mainObservers.get(request.id)?.finish();
       continue;
     }
+    if (request.command.type === "detach_conversation") { conversationViews.detach(request.id); continue; }
     if (request.command.type === "interrupt") {
       // Done may already be buffered while Rust still owns the request and sends its last control.
       if (!activeCommands.has(request.id)) continue;
@@ -616,6 +736,7 @@ try {
     pending.add(operation);
   }
   stopBackground?.();
+  conversationViews.close();
   for (const worker of workers.values()) worker.controller.abort();
   await Promise.allSettled(pending);
 } finally {

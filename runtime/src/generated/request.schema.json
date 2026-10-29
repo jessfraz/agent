@@ -29,6 +29,16 @@
         "agent_program": {
           "type": "string"
         },
+        "capabilities": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "coordinator": {
           "type": [
             "string",
@@ -1315,6 +1325,35 @@
         "architecture"
       ]
     },
+    "MainInputContext": {
+      "description": "Used only when an idle chief starts a new turn; active work keeps its context.",
+      "type": "object",
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerHost"
+          }
+        },
+        "instructions": {
+          "type": "string"
+        },
+        "origin_host_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "instructions",
+        "cwd",
+        "hosts"
+      ]
+    },
     "ModelProvider": {
       "type": "string",
       "enum": [
@@ -1392,6 +1431,87 @@
         "provider",
         "model_id",
         "fast"
+      ]
+    },
+    "NativeRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "input_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "observe"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "input_ids"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "input_id": {
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/InputMode"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "submit"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "input_id",
+            "text",
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "history"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "interrupt"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        }
       ]
     },
     "NativeWorktreeIdentity": {
@@ -2086,6 +2206,106 @@
           ]
         },
         {
+          "description": "Long-lived, read-only observation of the existing root conversation.",
+          "type": "object",
+          "properties": {
+            "input_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "observe_main"
+            }
+          },
+          "required": [
+            "type",
+            "input_ids"
+          ]
+        },
+        {
+          "description": "Owner-independent admission using Pi's durable request identity.",
+          "type": "object",
+          "properties": {
+            "context": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MainInputContext"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "input": {
+              "type": "string"
+            },
+            "input_id": {
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/InputMode"
+            },
+            "type": {
+              "type": "string",
+              "const": "main_input"
+            }
+          },
+          "required": [
+            "type",
+            "input_id",
+            "input",
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "main_interrupt"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "description": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "main_feedback"
+            }
+          },
+          "required": [
+            "type",
+            "description"
+          ]
+        },
+        {
+          "description": "Native clients share the authenticated local/tailnet transport.",
+          "type": "object",
+          "properties": {
+            "request": {
+              "$ref": "#/$defs/NativeRequest"
+            },
+            "type": {
+              "type": "string",
+              "const": "native"
+            }
+          },
+          "required": [
+            "type",
+            "request"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "type": {
@@ -2118,6 +2338,12 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "conversation_id": {
+              "type": [
+                "string",
+                "null"
               ]
             },
             "task_id": {
@@ -2230,6 +2456,125 @@
           },
           "required": [
             "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "limit": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "query": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "list_conversations"
+            }
+          },
+          "required": [
+            "type",
+            "query",
+            "limit"
+          ]
+        },
+        {
+          "description": "Observe a saved conversation without claiming its execution.",
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "input_ids": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "attach_conversation"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "detach_conversation"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Admit input independently of any observing terminal's lifetime.",
+          "type": "object",
+          "properties": {
+            "context": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MainInputContext"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "conversation_id": {
+              "type": "string"
+            },
+            "input": {
+              "type": "string"
+            },
+            "input_id": {
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/InputMode"
+            },
+            "type": {
+              "type": "string",
+              "const": "conversation_input"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id",
+            "input_id",
+            "input",
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "conversation_interrupt"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id"
           ]
         },
         {
@@ -3112,6 +3457,15 @@
       "description": "An absolute instant that has the same exact representation in Rust and JS.",
       "type": "integer",
       "format": "int64"
+    },
+    "WorkerCapabilities": {
+      "type": "object",
+      "properties": {
+        "resume_agent": {
+          "type": "boolean",
+          "default": false
+        }
+      }
     },
     "WorkerHost": {
       "type": "object",

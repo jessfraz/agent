@@ -432,3 +432,28 @@ fn real_cli_reconciles_files_preserves_builtins_and_reopens_durable_deadlines() 
     );
     server.stop();
 }
+
+#[test]
+fn remote_sync_rejects_client_paths_before_connecting() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.jobs.join("review.toml"),
+        definition("Review the current evidence.", 9),
+    )
+    .unwrap();
+    executable(
+        &fixture.bin.join("ssh"),
+        "#!/bin/sh\nprintf '%s\\n' unexpected >> \"$AGENT_TEST_EXTERNAL_CALLS\"\nexit 1\n",
+    );
+    let output = fixture.cli(&["--coordinator", "fixture-coordinator", "jobs", "sync"]);
+    assert!(!output.status.success());
+    assert!(
+        !fixture.directory.path().join("external-calls").exists(),
+        "Remote sync must reject client paths before contacting the coordinator"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Run jobs sync on the coordinator"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -65,13 +65,27 @@ enum CommandMessage {
     Shutdown,
 }
 
+#[derive(Clone, Copy)]
+enum RuntimeView {
+    Main,
+    Conversation,
+}
+impl RuntimeView {
+    fn command(self) -> RuntimeCommand {
+        match self {
+            Self::Main => RuntimeCommand::DetachMain,
+            Self::Conversation => RuntimeCommand::DetachConversation,
+        }
+    }
+}
+
 struct Pending {
     events: Option<mpsc::Sender<RuntimeEventKind>>,
     host_calls: HashMap<String, HostTiming>,
     trace: Trace,
     login: bool,
     worker: bool,
-    main_view: bool,
+    view: Option<RuntimeView>,
     interruptible: bool,
 }
 
@@ -159,6 +173,7 @@ impl Runtime {
                     | RuntimeCommand::SubmitInput { .. }
                     | RuntimeCommand::DetachWorker
                     | RuntimeCommand::DetachMain
+                    | RuntimeCommand::DetachConversation
             ),
             "Transport control commands do not create Pi requests"
         );
@@ -288,14 +303,13 @@ async fn reject_host_calls(
         )
         .await?;
     }
-    if pending.main_view {
-        pending.main_view = false;
+    if let Some(view) = pending.view.take() {
         send(
             stdin,
             RuntimeRequest {
                 version: PROTOCOL_VERSION,
                 id,
-                command: RuntimeCommand::DetachMain,
+                command: view.command(),
             },
         )
         .await?;
@@ -342,8 +356,12 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                         let command = *command;
                         let login = matches!(command, RuntimeCommand::Login);
                         let worker = matches!(command, RuntimeCommand::RunTask { interactive: Some(true), .. });
-                        let main_view = matches!(command, RuntimeCommand::AttachMain);
-                        let interruptible = worker || main_view || matches!(command, RuntimeCommand::Chat { .. });
+                        let view = match command {
+                            RuntimeCommand::AttachMain | RuntimeCommand::ObserveMain { .. } => Some(RuntimeView::Main),
+                            RuntimeCommand::AttachConversation { .. } => Some(RuntimeView::Conversation),
+                            _ => None,
+                        };
+                        let interruptible = worker || view.is_some() || matches!(command, RuntimeCommand::Chat { .. });
                         let id = next_id;
                         next_id = id.checked_add(1).context("Runtime request IDs exhausted")?;
                         let (sender, events) = mpsc::channel(64);
@@ -353,7 +371,7 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                         if let Some(command) = send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id, command }).await? {
                             diagnostics.record(id, &trace, DiagnosticEvent::CommandSent { command });
                         }
-                        pending.insert(id, Pending { events: Some(sender), host_calls: HashMap::new(), trace, login, worker, main_view, interruptible });
+                        pending.insert(id, Pending { events: Some(sender), host_calls: HashMap::new(), trace, login, worker, view, interruptible });
                         if admitted.send(Ok(RuntimeCall { request_id: id, events })).is_err()
                             && let Some(call) = pending.get_mut(&id) {
                             reject_host_calls(&mut stdin, id, call, &mut diagnostics).await?;
