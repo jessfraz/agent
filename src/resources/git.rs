@@ -325,8 +325,14 @@ async fn unused(record: &ResourceRecord, identity: &NativeWorktreeIdentity) -> R
     );
     // Scope the native query: an entire-machine listing can exceed bounded
     // process capture, while +D includes cwd and open files beneath this tree.
+    // Package builds of lsof can stall enumerating macOS processes.
+    let lsof = if cfg!(target_os = "macos") {
+        "/usr/sbin/lsof"
+    } else {
+        "lsof"
+    };
     let output = run(
-        "lsof",
+        lsof,
         vec![
             "-nP".into(),
             "-Fpn".into(),
