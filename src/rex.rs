@@ -988,50 +988,75 @@ mod tests {
             );
             return;
         }
-        let node = std::process::Command::new("node")
-            .args(["-p", "process.execPath"])
-            .output()
-            .unwrap();
-        assert!(node.status.success());
-        let node = String::from_utf8(node.stdout).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("rex");
-        let fixture = r#"
-import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-const root = process.env.AGENT_TEST_REX_PROCESS_FIXTURE;
-const mode = process.env.AGENT_TEST_REX_PROCESS_CASE;
-const method = process.argv.includes('whoami') ? 'whoami' : process.argv[process.argv.indexOf('call') + 1];
-appendFileSync(join(root, 'calls'), method + '\n');
-const session = 'session:11111111-1111-4111-8111-111111111111';
-const window = 'window:22222222-2222-4222-8222-222222222222';
-const block = 'block:33333333-3333-4333-8333-333333333333';
-const host = '44444444-4444-4444-8444-444444444444';
-const replacement = 'block:55555555-5555-4555-8555-555555555555';
-let value;
-if (method === 'session.list') value = { sessions: mode.startsWith('unlisted-') ? [] : [{ session_id: session, label: 'Synthetic work' }] };
-else if (method === 'session.view') {
-  if (mode === 'unlisted-missing' || mode === 'unlisted-read-failure') {
-    console.error(mode === 'unlisted-missing'
-      ? `Error: stream response "control-1" failed: session ${session} not found (status=404 code=session_not_found)`
-      : 'Error: session inspection denied (status=403 code=session_not_found)');
-    process.exit(3);
-  }
-  const blocks = existsSync(join(root, 'closed')) ? [] : [block];
-  if (existsSync(join(root, 'created'))) blocks.push(replacement);
-  value = { session_id: session, revision: 2, windows: [{ window_id: window, layers: [{ blocks: blocks.map(id => ({ block_id: id, host_id: host, flavor: 'com.superlogical.terminal.shell' })) }] }] };
-} else if (method === 'com.superlogical.terminal.process') {
-  const live = { pid: 123, user_id: 501, name: 'agent' };
-  value = { child: mode === 'child' || mode === 'unlisted-running' ? live : null, foreground: mode === 'foreground' ? live : null,
-    last_exit: mode === 'invalid-exit' ? {} : mode === 'starting' || mode === 'child' ? null : { exit_code: 0 } };
-} else if (method === 'session.new_window') {
-  writeFileSync(join(root, 'created'), ''); value = { window_id: window, block_ids: [replacement], revision: 2 };
-} else if (method === 'whoami') value = { host_id: host, instance_id: '66666666-6666-4666-8666-666666666666', rex_version: 'fixture' };
-else if (method === 'block.close') { writeFileSync(join(root, 'closed'), ''); value = {}; }
-else throw new Error('Unexpected native method ' + method);
-process.stdout.write(JSON.stringify(value));
+        // Keep each native RPC as a process, without booting a JS runtime for
+        // every poll. The fixture only needs shell builtins and owned markers.
+        let fixture = r#"#!/bin/sh
+set -eu
+root=${AGENT_TEST_REX_PROCESS_FIXTURE:?}
+mode=${AGENT_TEST_REX_PROCESS_CASE:?}
+previous=
+method=
+for argument do
+  if [ "$previous" = call ]; then method=$argument; break; fi
+  if [ "$argument" = whoami ]; then method=whoami; break; fi
+  previous=$argument
+done
+printf '%s\n' "$method" >> "$root/calls"
+trap 'code=$?; printf "%s status=%s pid=%s\n" "$method" "$code" "$$" >> "$root/results"' 0
+fail() {
+  printf '%s\n' "$1" >&2
+  printf '%s\n' "$1" >> "$root/errors"
+  exit "$2"
+}
+session=session:11111111-1111-4111-8111-111111111111
+window=window:22222222-2222-4222-8222-222222222222
+block=block:33333333-3333-4333-8333-333333333333
+host=44444444-4444-4444-8444-444444444444
+replacement=block:55555555-5555-4555-8555-555555555555
+case "$method" in
+  session.list)
+    case "$mode" in
+      unlisted-*) value='{"sessions":[]}' ;;
+      *) value="{\"sessions\":[{\"session_id\":\"$session\",\"label\":\"Synthetic work\"}]}" ;;
+    esac ;;
+  session.view)
+    case "$mode" in
+      unlisted-missing) fail "Error: stream response \"control-1\" failed: session $session not found (status=404 code=session_not_found)" 3 ;;
+      unlisted-read-failure) fail 'Error: session inspection denied (status=403 code=session_not_found)' 3 ;;
+    esac
+    blocks=
+    for id in "$block" "$replacement"; do
+      if [ "$id" = "$block" ] && [ -e "$root/closed" ]; then continue; fi
+      if [ "$id" = "$replacement" ] && [ ! -e "$root/created" ]; then continue; fi
+      item="{\"block_id\":\"$id\",\"host_id\":\"$host\",\"flavor\":\"com.superlogical.terminal.shell\"}"
+      blocks="${blocks:+$blocks,}$item"
+    done
+    value="{\"session_id\":\"$session\",\"revision\":2,\"windows\":[{\"window_id\":\"$window\",\"layers\":[{\"blocks\":[$blocks]}]}]}" ;;
+  com.superlogical.terminal.process)
+    child=null
+    foreground=null
+    last_exit='{"exit_code":0}'
+    live='{"pid":123,"user_id":501,"name":"agent"}'
+    case "$mode" in child|unlisted-running) child=$live ;; esac
+    if [ "$mode" = foreground ]; then foreground=$live; fi
+    case "$mode" in
+      invalid-exit) last_exit='{}' ;;
+      starting|child) last_exit=null ;;
+    esac
+    value="{\"child\":$child,\"foreground\":$foreground,\"last_exit\":$last_exit}" ;;
+  session.new_window)
+    : > "$root/created"
+    value="{\"window_id\":\"$window\",\"block_ids\":[\"$replacement\"],\"revision\":2}" ;;
+  whoami)
+    value="{\"host_id\":\"$host\",\"instance_id\":\"66666666-6666-4666-8666-666666666666\",\"rex_version\":\"fixture\"}" ;;
+  block.close) : > "$root/closed"; value='{}' ;;
+  *) fail "Unexpected native method $method" 1 ;;
+esac
+printf '%s\n' "$value"
 "#;
-        std::fs::write(&program, format!("#!{}\n{fixture}", node.trim())).unwrap();
+        std::fs::write(&program, fixture).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         let paths = std::env::join_paths(
@@ -1050,7 +1075,9 @@ process.stdout.write(JSON.stringify(value));
             "exited",
             "invalid-exit",
         ] {
-            std::fs::write(directory.path().join("calls"), "").unwrap();
+            for log in ["calls", "results", "errors"] {
+                std::fs::write(directory.path().join(log), "").unwrap();
+            }
             for marker in ["created", "closed"] {
                 let _ = std::fs::remove_file(directory.path().join(marker));
             }
@@ -1063,9 +1090,12 @@ process.stdout.write(JSON.stringify(value));
                 .unwrap();
             assert!(
                 result.status.success(),
-                "Native fixture {case}:\n{}\n{}",
+                "Native fixture {case}:\n{}\n{}\nCalls:\n{}\nProcess results:\n{}\nDriver errors:\n{}",
                 String::from_utf8_lossy(&result.stdout),
-                String::from_utf8_lossy(&result.stderr)
+                String::from_utf8_lossy(&result.stderr),
+                std::fs::read_to_string(directory.path().join("calls")).unwrap(),
+                std::fs::read_to_string(directory.path().join("results")).unwrap(),
+                std::fs::read_to_string(directory.path().join("errors")).unwrap(),
             );
         }
     }
