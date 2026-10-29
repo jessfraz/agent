@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,6 +25,7 @@ import { SearchIndex } from "../src/search.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
 import { HostRequests } from "../src/tools.js";
 import { transcript } from "../src/transcript.js";
+import { fixtureModel } from "./model.js";
 
 function node(host_id: string): AgentNode {
   return { host_id, name: host_id, rex_server: null, agent_program: "/example/agent", home_directory: "/example/home", coordinator: null,
@@ -67,8 +68,67 @@ async function originals(app: Awaited<ReturnType<typeof open>>, id: string) {
   const record = await app.histories.get(id); assert.ok(record);
   const conversation = await app.histories.conversation(record.conversation_id); assert.ok(conversation);
   const entries = await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT);
-  return { conversation, entries: entries.items.filter(ImportedItemEntry.is) };
+  return { conversation, entries: entries.items.filter(ImportedItemEntry.is), all: entries.items };
 }
+
+test("same-version imports repair native lineage before completed skips and affected-page retries without reindexing", async (t) => {
+  for (const complete of [true, false]) await t.test(complete ? "completed checkpoint" : "partial media checkpoint", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-import-lineage-")); let app = await open(directory);
+    let retrieval: Retrieval | undefined;
+    try {
+      const listing = thread("native-child"), source = { ...listing, version: "read-parent-v2" }, entry = item("saved-context");
+      const gaps = complete ? [] : [{ code: "missing", item_id: entry.id, message: "A referenced media asset is unavailable" } satisfies HistoryGap];
+      let corrected = false, reads = 0, embeddings = 0;
+      const producer: Producer = async (_host, request) => {
+        if (request.type === "list") return { type: "list", threads: request.archived ? [] : [corrected
+          ? { ...source, parent_thread_id: "native-parent", forked_from_id: "native-fork" } : listing], next_cursor: null };
+        assert.equal(request.type, "read"); if (request.type !== "read") throw new Error("No asset transfer is needed");
+        reads += 1; assert.equal(request.cursor, null);
+        if (corrected) assert.equal((await app.histories.get(source.id))?.thread.parent_thread_id, "native-parent",
+          "Lineage must be repaired before retrying the affected page");
+        return { ...page(source, [entry]), complete, gaps };
+      };
+      await app.run(producer);
+      const seeded = await app.histories.get(source.id); assert.ok(seeded);
+      assert.equal(seeded.thread.version, source.version); assert.equal(seeded.thread.parent_thread_id, null);
+      await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+      const tasks = new TaskStore(app.session, new ConversationModels(app.models)); tasks.useHistory(app.histories);
+      const adopted = await tasks.adopt(seeded.conversation_id, { id: randomUUID(), outcome: "Continue the retained discussion",
+        evidence: "Synthetic existing context", model: fixtureModel });
+      const index = new Retrieval(app.session, app.histories, tasks, join(directory, "search.sqlite")); retrieval = index;
+      const embedding: HostCall = async (command) => {
+        if (command.type !== "embed") throw new Error("A lineage repair must not start model or worker effects");
+        embeddings += command.texts.length;
+        return { type: "embeddings", batch: { space: { id: "synthetic-lineage", model_revision: "fixture", model_digest: "fixture",
+          dimensions: 3, pooling: "last", normalization: "l2", instruction_version: 1 }, vectors: command.texts.map(() => [1, 0, 0]) } };
+      };
+      await index.sync(embedding, true); assert.ok(embeddings > 0);
+      const before = await app.histories.get(source.id), checkpoint = await app.histories.checkpoint(source.id, coordinator.host_id);
+      assert.ok(before);
+      const retained = await originals(app, source.id), indexed = embeddings;
+      const search = new SearchIndex(join(directory, "search.sqlite"));
+      const published = search.checkpoint(seeded.conversation_id); search.close();
+      corrected = true; reads = 0;
+      const result = await app.importer.run([coordinator], [coordinator.host_id], [], native(producer), () => {}, () => index.sync(embedding, true));
+      assert.equal(result.items_added, 0); assert.equal(reads, complete ? 0 : 1);
+      assert.deepEqual(await app.histories.get(source.id), { ...before, thread: { ...before.thread,
+        parent_thread_id: "native-parent", forked_from_id: "native-fork" } });
+      assert.deepEqual((await originals(app, source.id)).entries, retained.entries);
+      assert.deepEqual((await originals(app, source.id)).all, retained.all);
+      assert.equal(embeddings, indexed, "Repairing lineage must leave the native search watermark and embeddings unchanged");
+      const afterSearch = new SearchIndex(join(directory, "search.sqlite"));
+      try { assert.deepEqual(afterSearch.checkpoint(seeded.conversation_id), published); } finally { afterSearch.close(); }
+      assert.equal((await tasks.get(adopted.id)).conversation_id, seeded.conversation_id);
+      assert.equal(await app.histories.evidence(seeded.conversation_id), "Synthetic existing context");
+      if (complete) assert.deepEqual(await app.histories.checkpoint(source.id, coordinator.host_id), checkpoint);
+      assert.equal(app.faux.state.callCount, 0);
+      retrieval.close(); retrieval = undefined;
+      await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+      assert.equal((await app.histories.get(source.id))?.thread.parent_thread_id, "native-parent");
+      assert.equal((await app.histories.get(source.id))?.adopted_task_id, adopted.id);
+    } finally { retrieval?.close(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+});
 
 test("unchanged partial imports retry only affected source pages across reopen and opaque page boundary changes", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-import-page-retry-")); let app = await open(directory);

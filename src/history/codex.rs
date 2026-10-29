@@ -102,6 +102,7 @@ impl CodexHistory {
                     sort_key: "created_at",
                     sort_direction: "asc",
                     source_kinds: SOURCES,
+                    model_providers: &[],
                 },
             )
             .await?;
@@ -760,6 +761,24 @@ impl Drop for TemporaryAsset {
     }
 }
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum NativeSource {
+    Spawn {
+        #[serde(rename = "subAgent")]
+        subagent: NativeSpawn,
+    },
+    Other(serde::de::IgnoredAny),
+}
+#[derive(Deserialize)]
+struct NativeSpawn {
+    thread_spawn: NativeParent,
+}
+#[derive(Deserialize)]
+struct NativeParent {
+    parent_thread_id: String,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeThread {
     id: String,
@@ -776,6 +795,8 @@ struct NativeThread {
     forked_from_id: Option<String>,
     #[serde(default)]
     parent_thread_id: Option<String>,
+    #[serde(default)]
+    source: Option<NativeSource>,
     #[serde(default)]
     history_mode: String,
     #[serde(default)]
@@ -802,13 +823,23 @@ impl NativeThread {
             title.trim_end().to_owned()
         };
         let fingerprint = self.path.as_deref().and_then(locator_fingerprint);
+        let parent_thread_id = self
+            .parent_thread_id
+            .as_deref()
+            .or(match &self.source {
+                Some(NativeSource::Spawn { subagent }) => {
+                    Some(subagent.thread_spawn.parent_thread_id.as_str())
+                }
+                _ => None,
+            })
+            .map(str::to_owned);
         let version = digest(&serde_json::to_vec(&(
             &self.id,
             native_title,
             &self.cwd,
             self.updated_at,
             &self.forked_from_id,
-            &self.parent_thread_id,
+            &parent_thread_id,
             &self.path,
             &fingerprint,
         ))?);
@@ -819,7 +850,7 @@ impl NativeThread {
             created_at: self.created_at,
             updated_at: self.updated_at,
             forked_from_id: self.forked_from_id.clone(),
-            parent_thread_id: self.parent_thread_id.clone(),
+            parent_thread_id,
             version,
             version_reliable: fingerprint.is_some(),
             archived,
@@ -1145,6 +1176,7 @@ struct ListParams {
     sort_key: &'static str,
     sort_direction: &'static str,
     source_kinds: &'static [&'static str],
+    model_providers: &'static [&'static str],
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1431,7 +1463,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   process.stdout.write(JSON.stringify({method:'history/fixture',params:{}})+'\n');
   if(r.method==='initialize') return send(r.id,{codexHome:dir});
   if(r.method==='thread/list') {
-    if(p.sourceKinds.length!==10||!p.sourceKinds.includes('subAgentThreadSpawn')||p.sortKey!=='created_at')return fail(r.id,-32602,'incomplete enumeration');
+    if(p.sourceKinds.length!==10||!p.sourceKinds.includes('subAgentThreadSpawn')||p.sortKey!=='created_at'||!Array.isArray(p.modelProviders)||p.modelProviders.length!==0)return fail(r.id,-32602,'incomplete enumeration');
     const start=data.paginateThreads?Number(p.cursor||0):0;
     const end=data.paginateThreads?Math.min(start+p.limit,data.threads.length):data.threads.length;
     const done=()=>send(r.id,{data:data.threads.slice(start,end),nextCursor:end<data.threads.length?String(end):null});
@@ -2626,6 +2658,97 @@ try{
         assert!(matches!(gaps[0].code, HistoryGapCode::Changed));
     }
 
+    #[test]
+    fn native_spawn_parent_survives_db_list_metadata_and_matches_the_read_version() {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Metadata<S> {
+            id: &'static str,
+            cwd: &'static str,
+            created_at: u64,
+            updated_at: u64,
+            forked_from_id: &'static str,
+            parent_thread_id: Option<&'static str>,
+            source: S,
+        }
+        #[derive(serde::Serialize)]
+        struct Parent {
+            parent_thread_id: &'static str,
+            depth: u32,
+        }
+        #[derive(serde::Serialize)]
+        struct Spawn {
+            thread_spawn: Parent,
+        }
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Source {
+            sub_agent: Spawn,
+        }
+        fn native(source: impl serde::Serialize, parent: Option<&'static str>) -> NativeThread {
+            serde_json::from_slice(
+                &serde_json::to_vec(&Metadata {
+                    id: "thread-a",
+                    cwd: "/",
+                    created_at: 1,
+                    updated_at: 2,
+                    forked_from_id: "fork-parent",
+                    parent_thread_id: parent,
+                    source,
+                })
+                .unwrap(),
+            )
+            .unwrap()
+        }
+        let source = Source {
+            sub_agent: Spawn {
+                thread_spawn: Parent {
+                    parent_thread_id: "spawn-parent",
+                    depth: 1,
+                },
+            },
+        };
+        let listed = native(&source, None).metadata(false).unwrap();
+        let read = native(&source, Some("spawn-parent"))
+            .metadata(false)
+            .unwrap();
+        assert_eq!(listed.parent_thread_id.as_deref(), Some("spawn-parent"));
+        assert_eq!(listed.forked_from_id.as_deref(), Some("fork-parent"));
+        assert_eq!(
+            listed.version, read.version,
+            "DB-list and read metadata must describe the same native source version"
+        );
+        let explicit = native(&source, Some("explicit-parent"))
+            .metadata(false)
+            .unwrap();
+        assert_eq!(
+            explicit.parent_thread_id.as_deref(),
+            Some("explicit-parent")
+        );
+        assert_eq!(explicit.forked_from_id.as_deref(), Some("fork-parent"));
+        #[derive(serde::Serialize)]
+        struct Future {
+            future_source: Parent,
+        }
+        for unknown in [
+            native("cli", None),
+            native(
+                Future {
+                    future_source: Parent {
+                        parent_thread_id: "unknown-parent",
+                        depth: 1,
+                    },
+                },
+                None,
+            ),
+        ] {
+            let metadata = unknown.metadata(false).unwrap();
+            assert_eq!(metadata.id, "thread-a");
+            assert_eq!(metadata.parent_thread_id, None);
+            assert_eq!(metadata.forked_from_id.as_deref(), Some("fork-parent"));
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires the installed Codex CLI; uses only an isolated synthetic CODEX_HOME, no model or conversation actions"]
     async fn installed_codex_reads_active_archived_subagent_history_by_native_id() {
@@ -2659,16 +2782,37 @@ try{
             text_elements: Vec<Value>,
         }
         let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .unwrap();
         let first = uuid::Uuid::new_v4().to_string();
-        let second = uuid::Uuid::new_v4().to_string();
-        for (id, archived) in [(&first, false), (&second, true)] {
+        let threads = [
+            (first.clone(), false, "openai", false),
+            (uuid::Uuid::new_v4().to_string(), true, "openai", true),
+            (
+                uuid::Uuid::new_v4().to_string(),
+                false,
+                "fixture-other",
+                false,
+            ),
+            (
+                uuid::Uuid::new_v4().to_string(),
+                true,
+                "fixture-other",
+                false,
+            ),
+        ];
+        for (id, archived, provider, subagent) in &threads {
+            let archived = *archived;
             let folder = directory.path().join(if archived {
                 "archived_sessions"
             } else {
                 "sessions/2026/01/02"
             });
             std::fs::create_dir_all(&folder).unwrap();
-            let source = if archived {
+            let source = if *subagent {
                 serde_json::from_str(&format!(r#"{{"subagent":{{"thread_spawn":{{"parent_thread_id":"{first}","depth":1}}}}}}"#)).unwrap()
             } else {
                 Value::String("cli".into())
@@ -2676,14 +2820,14 @@ try{
             let meta = Meta {
                 id,
                 session_id: &first,
-                forked_from_id: archived.then_some(first.as_str()),
-                parent_thread_id: archived.then_some(first.as_str()),
+                forked_from_id: subagent.then_some(first.as_str()),
+                parent_thread_id: subagent.then_some(first.as_str()),
                 timestamp: "2026-01-02T12:00:00Z",
                 cwd: "/",
                 originator: "synthetic-history-test",
                 cli_version: "0.0.0",
                 source,
-                model_provider: "openai",
+                model_provider: provider,
             };
             let mut text = serde_json::to_string(&Line {
                 timestamp: "2026-01-02T12:00:00Z",
@@ -2715,7 +2859,8 @@ try{
         }
         let mut source = history(directory.path(), "codex".into());
         source.codex_home = Some(directory.path().to_owned());
-        for (id, archived) in [(&first, false), (&second, true)] {
+        for (id, archived, provider, subagent) in threads.iter().rev() {
+            let archived = *archived;
             let mut cursor = None;
             let mut found = false;
             loop {
@@ -2731,7 +2876,7 @@ try{
                 };
                 if let Some(thread) = threads.iter().find(|thread| thread.id == *id) {
                     found = true;
-                    if archived {
+                    if *subagent {
                         assert_eq!(thread.parent_thread_id.as_deref(), Some(first.as_str()));
                     }
                 }
@@ -2742,7 +2887,7 @@ try{
             }
             assert!(
                 found,
-                "Native thread list must include the requested source/archive kind"
+                "Native thread list must include source/archive kinds for provider {provider}"
             );
             let HistoryResponse::Read {
                 thread_id,

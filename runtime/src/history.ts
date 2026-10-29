@@ -91,6 +91,22 @@ export class HistoryStore {
     const state = await this.session.snapshot(Checkpoints, identity(threadId, hostId), BACKGROUND_CONTEXT);
     return state?.checkpoint === null || state?.checkpoint === undefined ? undefined : structuredClone(state.checkpoint);
   }
+  /** Older native listings omitted lineage even when a read supplied the current version. */
+  async reconcileLineage(thread: HistoryThread): Promise<void> {
+    if (!thread.version_reliable) return;
+    const key = identity(thread.id), before = await this.session.snapshot(Threads, key, BACKGROUND_CONTEXT);
+    const previous = before?.record?.thread;
+    if (before?.native_id === null || before?.native_id === undefined || previous === undefined ||
+      !previous.version_reliable || previous.version !== thread.version || previous.updated_at > thread.updated_at ||
+      (previous.parent_thread_id === thread.parent_thread_id && previous.forked_from_id === thread.forked_from_id)) return;
+    await this.session.commit(async (tx) => {
+      const current = await tx.doc(Threads, key, null), saved = current.record?.thread;
+      if (current.native_id !== before.native_id || saved === undefined || !saved.version_reliable ||
+        saved.version !== thread.version || saved.updated_at > thread.updated_at) return;
+      // Keep the current record's coverage and adoption; lineage does not change indexed text.
+      saved.parent_thread_id = thread.parent_thread_id; saved.forked_from_id = thread.forked_from_id;
+    }, BACKGROUND_CONTEXT);
+  }
   async conversation(id: string): Promise<Conversation | undefined> {
     const link = await this.session.snapshot(Reverse, id, BACKGROUND_CONTEXT);
     if (link?.thread_id === null || link?.thread_id === undefined) return undefined;

@@ -133,7 +133,10 @@ export class CodexImporter {
   }
   private async thread(host: string, thread: HistoryThread, progress: ImportProgress, call: HostCall): Promise<void> {
     const saved = await this.history.checkpoint(thread.id, host);
-    if (thread.version_reliable && saved?.version === thread.version && saved.complete) { progress.threads_unchanged += 1; return; }
+    if (thread.version_reliable && saved?.version === thread.version) {
+      await this.history.reconcileLineage(thread);
+      if (saved.complete) { progress.threads_unchanged += 1; return; }
+    }
     let gaps: HistoryGap[] | undefined;
     if (thread.version_reliable && saved?.version === thread.version && saved.source_exhausted && saved.retry_pages !== undefined) {
       const planned = new Set(saved.retry_pages.flatMap((page) => page.gaps.map((gap) => JSON.stringify(gap))));

@@ -17,7 +17,9 @@ Run import again to catch up. Completed reliable source versions are skipped;
 partial reads resume their committed cursor. Once a transcript scan reaches its
 end, missing attachments retry only their affected source pages. Changed or
 unreliable sources are scanned again; older partial checkpoints reconcile once
-before using targeted retries. Retained text is indexed alongside source
+before using targeted retries. Unchanged transcripts still reconcile corrected
+lineage without duplicating messages or regenerating vectors. Retained text is
+indexed alongside source
 scanning and catches up again afterward, so neither a large vector backlog nor
 attachment retries block the other work. Interrupted or failed final indexing
 resumes from the retained corpus before the next fresh import. Explicit
@@ -55,8 +57,9 @@ The `agent import codex` command gathers history from registered,
 online hosts through their existing worker connections. It reports checkpointed
 progress and unavailable hosts; no copied host inventory or model run is needed.
 Use the installed Codex app-server's read-only APIs. Page `thread/list` for
-active and archived threads with every native `sourceKinds` value explicitly
-selected; omission includes only interactive sources. Read metadata with
+active and archived threads with `modelProviders: []` and every native
+`sourceKinds` value explicitly selected. Omitted filters select the configured
+provider and interactive sources. Read metadata with
 `thread/read`, then use full turn/item pagination where supported, or the
 installed full-history read. Thread IDs establish identity; filenames and
 directories are locators, not thread IDs or assumptions about which threads
@@ -67,6 +70,8 @@ asset reads. Codex is its first implementation. Rust also owns import records
 and provenance types, generating TypeScript bindings for the Pi adapter.
 Cloud-only or Dot history needs a separately verified export path; local Codex
 access does not establish access to those conversations.
+Persistent attached-thread sessions require separate enumeration; the ordinary
+native list excludes them.
 
 The same Codex ID imports idempotently across machines. Retain source versions,
 item IDs and real fork relationships. Divergent versions remain distinguishable;

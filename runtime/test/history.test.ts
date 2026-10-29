@@ -46,6 +46,64 @@ async function open(directory: string) {
   return { session, storage, imported, tasks, faux, executions, tools, registry };
 }
 
+test("lineage reconciliation changes only a current reliable record and leaves unchanged observations read-only", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-history-lineage-")); const app = await open(directory);
+  try {
+    const source = batch([item("item1", "Retain the original discussion")]);
+    const saved = await app.imported.import(source);
+    const conversation = await app.imported.conversation(saved.conversation.conversation_id); assert.ok(conversation);
+    const before = await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT);
+    const commit = app.session.commit.bind(app.session); let commits = 0;
+    app.session.commit = (change, context) => { commits += 1; return commit(change, context); };
+    const observed = { ...source.thread, parent_thread_id: "native-parent", forked_from_id: "native-fork" };
+    await app.imported.reconcileLineage({ ...observed, id: "unknown-source" });
+    await app.imported.reconcileLineage({ ...observed, version_reliable: false });
+    await app.imported.reconcileLineage({ ...observed, version: "different-version" });
+    await app.imported.reconcileLineage({ ...observed, updated_at: source.thread.updated_at - 1 });
+    await app.imported.reconcileLineage(source.thread);
+    assert.equal(commits, 0, "Unchanged and ineligible observations must not rebuild receipts or start a native commit");
+    await app.imported.reconcileLineage({ ...observed, title: "A listing preview", cwd: "/another/listing", archived: false });
+    assert.equal(commits, 1);
+    assert.deepEqual(await app.imported.get(source.thread.id), { ...saved.conversation, thread: { ...source.thread,
+      parent_thread_id: observed.parent_thread_id, forked_from_id: observed.forked_from_id } });
+    await app.imported.reconcileLineage(observed); assert.equal(commits, 1);
+    assert.deepEqual(await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT), before);
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a delayed lineage repair preserves concurrent adoption and cannot overwrite newer native observations", async (t) => {
+  for (const change of ["adoption", "version", "timestamp"]) await t.test(change, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-history-lineage-race-")); const app = await open(directory);
+    let entered = () => {}, release = () => {};
+    const began = new Promise<void>((resolve) => { entered = resolve; }), gate = new Promise<void>((resolve) => { release = resolve; });
+    let repair: Promise<void> | undefined;
+    try {
+      const source = batch([item("item1", "Retain the original discussion")]);
+      const imported = await app.imported.import(source), commit = app.session.commit.bind(app.session); let held = false;
+      app.session.commit = async (body, context) => {
+        if (!held) { held = true; entered(); await gate; }
+        return commit(body, context);
+      };
+      repair = app.imported.reconcileLineage({ ...source.thread, parent_thread_id: "listing-parent", forked_from_id: "listing-fork" });
+      await began;
+      if (change === "adoption") await app.tasks.adopt(imported.conversation.conversation_id, { id: randomUUID(),
+        outcome: "Continue the existing discussion", evidence: "Current adoption context", model: fixtureModel });
+      else await app.imported.import({ ...source, thread: { ...source.thread, version: change === "version" ? "newer-v2" : source.thread.version,
+        updated_at: source.thread.updated_at + 1, parent_thread_id: "newer-parent", forked_from_id: "newer-fork" } });
+      const current = await app.imported.get(source.thread.id); assert.ok(current);
+      const conversation = await app.imported.conversation(imported.conversation.conversation_id); assert.ok(conversation);
+      const before = await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT);
+      release(); await repair;
+      assert.deepEqual(await app.imported.get(source.thread.id), change === "adoption" ? { ...current, thread: { ...current.thread,
+        parent_thread_id: "listing-parent", forked_from_id: "listing-fork" } } : current);
+      assert.deepEqual(await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT), before);
+      if (change === "adoption") assert.equal(await app.imported.evidence(imported.conversation.conversation_id), "Current adoption context");
+      assert.equal(app.faux.state.callCount, 0);
+    } finally { release(); await repair; await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+});
+
 test("legacy oversized previews stay intact as evidence and become bounded titles on reads and adoption", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-import-")); const app = await open(directory);
   try {
