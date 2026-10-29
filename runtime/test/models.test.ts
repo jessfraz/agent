@@ -139,7 +139,7 @@ test("tasks and children retain their selected model across reopen and changes t
       instructions: "", cwd: host.cwd, model: fixtureModel } satisfies Extract<import("../src/generated/RuntimeCommand.js").RuntimeCommand, { type: "run_task" }>;
     await app.session.close(BACKGROUND_CONTEXT); native = fauxModels(); app = await open(directory, native.models);
     native.second.setResponses([fauxAssistantMessage("The original backend handled the turn.")]);
-    await app.tasks.run(command, (_conversation, _host, model) => { assert.deepEqual(model, selected); return () => {}; }, () => {}, [], undefined,
+    await app.tasks.run(command, (_conversation, _host, model) => { assert.deepEqual(model, selected); return () => {}; }, [], undefined,
       (model) => app.inference.preflight(model));
     assert.equal(native.second.state.callCount, 1); assert.equal(native.first.state.callCount, 0);
     const child = await app.tasks.createAgent(task.id, { id: "fixture-review", title: "Review", outcome: "Check the concrete result",
@@ -173,7 +173,7 @@ test("legacy native conversation state wins over old string launch defaults with
     assert.ok(validEvent({ version: 1, id: 1, event: { type: "tasks", tasks: [canonical] } }));
     native.second.setResponses([fauxAssistantMessage("Continued with the original provider and evidence.")]);
     await app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: current.worker.allocation_id, binding,
-      instructions: "", cwd: host.cwd, model: fixtureModel }, () => () => {}, () => {});
+      instructions: "", cwd: host.cwd, model: fixtureModel }, () => () => {});
     assert.deepEqual((await app.tasks.get(task.id)).model, { ...fixtureModel, provider: "anthropic" });
     assert.match(await app.tasks.history(task.id), /Original violet connector evidence/);
     assert.equal(native.second.state.callCount, 1); assert.equal(native.first.state.callCount, 0);

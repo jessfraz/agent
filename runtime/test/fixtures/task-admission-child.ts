@@ -31,4 +31,4 @@ await tasks.dispatch(id, host, async () => ({ type: "spawned", binding }));
 const task = await tasks.get(id);
 if (task.worker.state !== "bound") throw new Error("Fixture binding missing");
 await tasks.run({ type: "run_task", task_id: id, allocation_id: task.worker.allocation_id,
-  binding, instructions: "Use the original request.", model: fixtureModel, cwd: host.cwd }, () => () => {}, () => {});
+  binding, instructions: "Use the original request.", model: fixtureModel, cwd: host.cwd }, () => () => {});

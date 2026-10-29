@@ -54,7 +54,7 @@ test("interrupt drains the current native turn before admitting queued steering 
     const conversation = await app.tasks.conversation(task.conversation_id); const answers: string[] = [];
     let idle = () => {}; const idleTurn = new Promise<void>((resolve) => { idle = resolve; });
     let interrupt: Promise<void> | undefined;
-    running = app.tasks.run(command, () => () => {}, () => {}, [], undefined, undefined, {
+    running = app.tasks.run(command, () => () => {}, [], undefined, undefined, {
       signal: controller.signal, async ready() {}, answer(_id, value) { answers.push(value); }, idle() { idle(); },
       beforeTurn() { return interrupt ?? Promise.resolve(); },
     });
@@ -110,7 +110,7 @@ test("confirmed session loss fences the old actor before reopening the same hist
       cancelled(); await drain; return fauxAssistantMessage("A late stale result");
     }, fauxAssistantMessage("Continued after the closed tab")]);
     let fenced = false;
-    running = app.tasks.run(old, () => () => {}, () => {}, [], undefined, undefined, {
+    running = app.tasks.run(old, () => () => {}, [], undefined, undefined, {
       signal: controller.signal, async ready() {}, answer() {}, idle() {}, async fence() { fenced = true; await conversation.abort(BACKGROUND_CONTEXT); },
     });
     await startedTurn; controller.abort();
@@ -128,8 +128,8 @@ test("confirmed session loss fences the old actor before reopening the same hist
     assert.equal(reopened.agents[0]?.worker.state, "unassigned"); assert.equal(reopened.agents[0]?.pending[0]?.content, "Keep the assignment");
     assert.equal(reopened.pending[0]?.id, "after-close"); assert.equal(reopened.summary, ""); assert.ok(reopened.worker.state === "bound");
     assert.notEqual(reopened.worker.allocation_id, old.allocation_id);
-    await assert.rejects(app.tasks.run(old, () => () => {}, () => {}), /binding is not confirmed/);
-    const result = await app.tasks.run({ ...old, allocation_id: reopened.worker.allocation_id, binding: replacement, interactive: false }, () => () => {}, () => {});
+    await assert.rejects(app.tasks.run(old, () => () => {}), /binding is not confirmed/);
+    const result = await app.tasks.run({ ...old, allocation_id: reopened.worker.allocation_id, binding: replacement, interactive: false }, () => () => {});
     assert.equal(result.text, "Continued after the closed tab"); assert.equal(app.faux.state.callCount, 2);
     const visible = (await history(conversation, null)).flatMap((frame) => frame.messages);
     assert.equal(visible.some((message) => message.text === "A late stale result"), false);
@@ -180,7 +180,7 @@ test("an interactive task serializes local and chief inputs, wakes while idle an
     const idle = async (count: number) => { while (idleCount < count) await new Promise<void>((resolve) => { wake = resolve; }); };
     app.faux.setResponses([fauxAssistantMessage([fauxThinking("Published reasoning summary."), { type: "text", text: "Initial answer" }]),
       fauxAssistantMessage("Chief follow-up answer")]);
-    running = app.tasks.run(command, () => () => {}, () => {}, [], undefined, undefined, {
+    running = app.tasks.run(command, () => () => {}, [], undefined, undefined, {
       signal: controller.signal,
       async ready(conversation) { assert.equal(conversation.id.toString(), task.conversation_id); stop = await activity(app.session, conversation, (event) => live.push(event),
         (message) => { if (message.role === "user") inputs.push(message.text); }); },
@@ -188,7 +188,7 @@ test("an interactive task serializes local and chief inputs, wakes while idle an
     });
     assert.equal(await Promise.race([idle(1).then(() => "idle"), running.then(() => "exited")]), "idle", "The task tab must remain attached after its first answer");
     assert.equal(app.tasks.isRunning(task.id), false, "An idle UI is a lease, not unfinished work");
-    await assert.rejects(app.tasks.run(command, () => () => {}, () => {}), /attached worker/);
+    await assert.rejects(app.tasks.run(command, () => () => {}), /attached worker/);
     await app.tasks.enqueue(task.id, "Chief follow-up while the tab is idle");
     await app.tasks.dispatch(task.id, host, async () => { throw new Error("An attached worker must wake without another Rex session"); });
     await idle(2);
@@ -253,7 +253,7 @@ test("an idle interactive child delivers its result and accepts another assignme
     const idle = async (count: number) => { while (idleCount < count) await new Promise<void>((resolve) => { wake = resolve; }); };
     running = app.tasks.run(command, (conversation) => app.executions.bind(conversation.id.toString(), {
       cwd: host.cwd, hosts: [host], call: async () => { throw new Error("No Rex effects expected"); },
-    }), () => {}, [app.tools.agent], undefined, undefined, {
+    }), [app.tools.agent], undefined, undefined, {
       signal: controller.signal, async ready() {}, answer() {}, idle() { idleCount += 1; wake(); },
     });
     await idle(1);
@@ -283,7 +283,7 @@ test("detaching before a child's first turn preserves its pending assignment wit
     const controller = new AbortController(); controller.abort();
     await app.tasks.run({ type: "run_task", task_id: task.id, agent_id: child.id,
       allocation_id: saved.worker.allocation_id, binding: childBinding, instructions: "", model: fixtureModel, cwd: host.cwd, interactive: true },
-    () => () => {}, () => {}, [], undefined, undefined, { signal: controller.signal, async ready() {}, answer() {}, idle() {} });
+    () => () => {}, [], undefined, undefined, { signal: controller.signal, async ready() {}, answer() {}, idle() {} });
     const retained = await app.tasks.get(task.id);
     assert.equal(retained.pending.length, 0); assert.equal(retained.agents[0]?.pending.length, 1);
     assert.equal(retained.agents[0]?.state.state, "open"); assert.equal(app.faux.state.callCount, 0);
@@ -319,7 +319,7 @@ test("task agents own conversations and named terminals in one Rex session, then
           assert.notEqual(agent.conversation_id, task.conversation_id);
           return { type: "spawned", binding: childBinding };
         },
-      }), () => {}, [app.tools.host, app.tools.worker]);
+      }), [app.tools.host, app.tools.worker]);
     assert.equal(nativeCreates, 1); parent = await app.tasks.get(task.id); assert.equal(parent.state.state, "open");
     const child = parent.agents[0]; assert.ok(child); assert.equal(child.worker.state, "bound");
     if (child.worker.state !== "bound") throw new Error("Missing child binding");
@@ -333,7 +333,7 @@ test("task agents own conversations and named terminals in one Rex session, then
     await app.tasks.run({ type: "run_task", task_id: task.id, agent_id: child.id, allocation_id: child.worker.allocation_id,
       binding: childBinding, instructions: "", model: fixtureModel, cwd: host.cwd }, (conversation) => app.executions.bind(conversation.id.toString(), {
         cwd: host.cwd, hosts: [host], call: async () => { throw new Error("No direct child host effects expected"); },
-      }), () => { throw new Error("Child results belong to the parent"); }, [app.tools.host, app.tools.agent], async (command) => {
+      }), [app.tools.host, app.tools.agent], async (command) => {
         assert.equal(command.type, "resume_worker"); resumed += 1;
         assert.equal((await app.tasks.get(task.id)).pending.length, 1);
         return { type: "spawned", binding: replacement };
@@ -358,7 +358,7 @@ test("task agents own conversations and named terminals in one Rex session, then
     await app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: parent.worker.allocation_id,
       binding: replacement, instructions: "", model: fixtureModel, cwd: host.cwd }, (conversation) => app.executions.bind(conversation.id.toString(), {
         cwd: host.cwd, hosts: [host], call: async () => { throw new Error("Parent result should reuse the conversation"); },
-      }), () => {}, [app.tools.host, app.tools.worker]);
+      }), [app.tools.host, app.tools.worker]);
     assert.equal((await app.tasks.get(task.id)).state.state, "resolved");
     assert.match(await app.tasks.history(task.id), /concrete checks passed/);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
@@ -440,7 +440,7 @@ test("input arriving during recovered history finalization is drained by the att
     const command = { type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id,
       binding, instructions: "", model: fixtureModel, cwd: host.cwd };
     app.faux.setResponses([fauxAssistantMessage("Initial result")]);
-    await app.tasks.run({ ...command, type: "run_task" }, () => () => {}, () => {});
+    await app.tasks.run({ ...command, type: "run_task" }, () => () => {});
     let historyStarted: () => void = () => {};
     const started = new Promise<void>((resolve) => { historyStarted = resolve; });
     const gate = new Promise<void>((resolve) => { releaseHistory = resolve; });
@@ -459,7 +459,7 @@ test("input arriving during recovered history finalization is drained by the att
       return conversation;
     };
     app.faux.setResponses([fauxAssistantMessage("Follow-up drained without another dispatch.")]);
-    const running = app.tasks.run({ ...command, type: "run_task" }, () => () => {}, () => {});
+    const running = app.tasks.run({ ...command, type: "run_task" }, () => () => {});
     await started;
     await app.tasks.enqueue(task.id, "Follow-up during finalization");
     await app.tasks.dispatch(task.id, host, async () => { throw new Error("The attached actor must drain this input"); });
@@ -517,7 +517,7 @@ test("delegation persists the chosen repository cwd and bound tasks reuse it", a
           assert.equal(command.type, "exec"); if (command.type !== "exec") throw new Error("Expected repository operation");
           assert.equal(command.cwd, cwd); return { type: "process", exit_code: 0, stdout: "Verified", stderr: "", truncated: false };
         } });
-      }, () => {}, [app.tools.host, app.tools.worker]);
+      }, [app.tools.host, app.tools.worker]);
       assert.equal((await app.tasks.get(task.id)).pending.length, 0);
     } finally { release(); }
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
@@ -570,7 +570,7 @@ test("exact allocation revocation preserves pending work and rejects stale worke
     assert.deepEqual(retained.worker, { state: "unassigned" }); assert.equal(retained.conversation_id, task.conversation_id);
     assert.deepEqual(retained.pending, uncertain.pending); assert.deepEqual(retained.model, fixtureModel); assert.deepEqual(retained.sources, [source]);
     await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: uncertain.worker.allocation_id,
-      binding, instructions: "", cwd: host.cwd, model: fixtureModel }, () => { throw new Error("A stale worker must never attach"); }, () => {}), /binding is not confirmed/);
+      binding, instructions: "", cwd: host.cwd, model: fixtureModel }, () => { throw new Error("A stale worker must never attach"); }), /binding is not confirmed/);
     assert.equal(app.faux.state.callCount, 0); assert.deepEqual((await app.tasks.get(task.id)).pending, uncertain.pending);
     await assert.rejects(app.tasks.revokeAllocation(task.id, uncertain.worker.allocation_id), /exact unresolved allocation/);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
@@ -601,7 +601,7 @@ for (const transition of ["spawn", "spawn-error"]) {
       const current = await app.tasks.get(task.id);
       assert.deepEqual(current.worker, replacement.worker); assert.equal(current.pending.length, 1);
       await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: allocating.worker.allocation_id,
-        binding, instructions: "", cwd: host.cwd, model: fixtureModel }, () => { throw new Error("No old attachment"); }, () => {}), /binding is not confirmed/);
+        binding, instructions: "", cwd: host.cwd, model: fixtureModel }, () => { throw new Error("No old attachment"); }), /binding is not confirmed/);
       assert.equal(app.faux.state.callCount, 0);
     } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
   });
@@ -644,7 +644,7 @@ test("allocation recovery rejects an attached run before changing its worker or 
     const gate = new Promise<void>((resolve) => { release = resolve; });
     app.faux.setResponses([fauxAssistantMessage("The attached assignment completed.")]);
     running = app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id,
-      binding, instructions: "", cwd: host.cwd, model: fixtureModel }, () => () => {}, () => {}, [], undefined,
+      binding, instructions: "", cwd: host.cwd, model: fixtureModel }, () => () => {}, [], undefined,
       async () => { attached(); await gate; });
     await started;
     await assert.rejects(app.tasks.revokeAllocation(task.id, saved.worker.allocation_id), /attached worker must finish/);
@@ -671,10 +671,10 @@ test("resuming a task keeps its session and conversation while replacing an exit
     assert.equal(resumed.worker.binding.session_id, binding.session_id);
     app.faux.setResponses([fauxAssistantMessage("Continued the existing inspection.")]);
     await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: resumed.worker.allocation_id,
-      binding, instructions: "", model: fixtureModel, cwd: host.cwd }, () => () => {}, () => {}), /binding is not confirmed/);
+      binding, instructions: "", model: fixtureModel, cwd: host.cwd }, () => () => {}), /binding is not confirmed/);
     assert.equal(app.faux.state.callCount, 0);
     assert.match((await app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: resumed.worker.allocation_id,
-      binding: replacement, instructions: "", model: fixtureModel, cwd: host.cwd }, () => () => {}, () => {})).text, /Continued/);
+      binding: replacement, instructions: "", model: fixtureModel, cwd: host.cwd }, () => () => {})).text, /Continued/);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -732,31 +732,32 @@ test("worker host tools execute through the attached client while the main conve
       fauxAssistantMessage("Main stays available."), fauxAssistantMessage("Worker verified the source."),
       fauxAssistantMessage("The follow-up was verified too."),
     ]);
-    const notices: string[] = [];
     const running = app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id,
       binding, instructions: "Use verified source.", model: fixtureModel, cwd: host.cwd },
     (conversation) => app.executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [], call: async (command) => {
       assert.deepEqual(command, { type: "exec", program: "inspect", args: ["literal value"], cwd: host.cwd, timeout_seconds: 900 });
       started(); return hostResult;
-    } }), (_task, answer) => notices.push(answer), [app.tools.host, app.tools.worker]);
+    } }), [app.tools.host, app.tools.worker]);
     await hostStarted;
     await app.tasks.enqueue(task.id, "Also inspect the follow-up.");
     await app.tasks.dispatch(task.id, host, async () => { throw new Error("An active worker must be reused"); });
     await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id,
-      binding, instructions: "", model: fixtureModel, cwd: host.cwd }, () => () => {}, () => {}), /already has/);
+      binding, instructions: "", model: fixtureModel, cwd: host.cwd }, () => () => {}), /already has/);
     const root = await app.session.root(BACKGROUND_CONTEXT);
     await root.configure({ model: { provider: "openai", modelId: "fixture" } }, BACKGROUND_CONTEXT);
     const main = await root.submit({ type: "input", content: "Are you available?" }, BACKGROUND_CONTEXT);
     assert.equal((await main.wait(BACKGROUND_CONTEXT)).status, "done");
     releaseHost({ type: "process", exit_code: 0, stdout: "verified", stderr: "", truncated: false });
     assert.match((await running).text, /follow-up was verified/);
-    assert.equal(notices.length, 2);
+    const workerHistory = (await history(await app.tasks.conversation(task.conversation_id), null)).flatMap((frame) => frame.messages);
+    assert.deepEqual(workerHistory.filter((message) => message.role === "final").map((message) => message.text),
+      ["Worker verified the source.", "The follow-up was verified too."]);
     assert.equal((await app.tasks.get(task.id)).pending.length, 0);
     assert.equal((await app.tasks.get(task.id)).state.state, "open", "A worker answer alone does not resolve the user's outcome");
     const rootContext = await root.context(BACKGROUND_CONTEXT);
-    assert.ok(rootContext.messages.some((message) => message.role === "assistant" &&
+    assert.equal(rootContext.messages.some((message) => message.role === "assistant" &&
       message.content.some((part) => part.type === "text" && part.text.includes("follow-up was verified"))),
-    "The main model sees the actual worker notice when the user responds");
+    false, "Worker finals stay in their own conversation until coordinator judgment");
   } finally {
     releaseHost({ type: "failed", message: "test cleanup" });
     await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
@@ -783,7 +784,7 @@ test("a killed coordinator recovers an admitted Pi submission even after app pen
     app.faux.setResponses([fauxAssistantMessage("Recovered the original requested work.")]);
     const recovered = await app.tasks.run({ type: "run_task", task_id: id, allocation_id: task.worker.allocation_id,
       binding: task.worker.binding, instructions: "Use verified source.", model: fixtureModel, cwd: host.cwd },
-    () => () => {}, () => {});
+    () => () => {});
     assert.match(recovered.text, /Recovered the original/);
     const conversation = await app.tasks.conversation(task.conversation_id);
     const page = await conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT);
@@ -816,7 +817,7 @@ test("worker tools reject unrelated task writes and oversized reads while main m
       binding, instructions: "Work on the own source.", model: fixtureModel, cwd: host.cwd },
     (conversation) => app.executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [], call: async () => {
       calls += 1; return { type: "written" };
-    } }), () => {}, [app.tools.host, app.tools.worker]);
+    } }), [app.tools.host, app.tools.worker]);
     assert.equal(calls, 0);
     assert.equal((await app.tasks.get(other.id)).state.state, "open");
     assert.equal((await app.tasks.get(other.id)).summary, "");

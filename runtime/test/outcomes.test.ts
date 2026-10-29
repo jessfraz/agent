@@ -22,6 +22,8 @@ import { validEvent } from "../src/protocol.js";
 import { TaskStore } from "../src/tasks.js";
 import { createSourceTools, SourceJournal } from "../src/sources.js";
 import { createAppTools, Executions } from "../src/tools.js";
+import { watchMainNotices } from "../src/main_observation.js";
+import { isUserNotice, transcript } from "../src/transcript.js";
 
 const host: WorkerHost = { host_id: null, name: "fixture", rex_server: null, coordinator: null,
   cwd: "/workspace/example", agent_program: "/example/agent" };
@@ -40,7 +42,6 @@ async function open(directory: string) {
   const session = await Harness.open(await SqliteStorage.open(database), { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(session, new ConversationModels(models)); const executions = new Executions(); const sources = new SourceJournal(session, tasks);
   const tools = createAppTools(tasks, executions); const sourceTools = createSourceTools(sources, executions);
-  const notices: string[] = [];
   registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker); registry.install(tools.agent); registry.install(tools.legacy);
   registry.install(sourceTools.main); registry.install(sourceTools.worker);
   async function prepare(title = "Example task") {
@@ -56,16 +57,77 @@ async function open(directory: string) {
   async function run(command: Extract<RuntimeCommand, { type: "run_task" }>) {
     return tasks.run(command, (conversation) => executions.bind(conversation.id.toString(), {
       cwd: host.cwd, hosts: [host], role: "worker", call: async () => ({ type: "written" }),
-    }), (_task, text) => notices.push(text), [tools.host, command.agent_id === undefined ? tools.worker : tools.agent, sourceTools.worker]);
+    }), [tools.host, command.agent_id === undefined ? tools.worker : tools.agent, sourceTools.worker]);
   }
-  return { session, tasks, executions, sources, tools, sourceTools, faux, notices, prepare, run };
+  return { session, tasks, executions, sources, tools, sourceTools, faux, prepare, run };
 }
 
-test("published task resolution and waiting outcomes preserve provenance and remain quiet after reopening", async () => {
+test("bookkeeping finals stay internal until outcome triage selects one useful notification", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-outcome-publication-")); let app = await open(directory);
+  let stop = () => {};
+  const live: string[] = [];
+  const observe = async () => {
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    stop = watchMainNotices(app.session, root, (event) => {
+      if (event.type === "message") live.push(event.message.text);
+    });
+    return root;
+  };
+  try {
+    let root = await observe();
+    const command = await app.prepare("Verify a requested result");
+    const bookkeeping = "Task state recorded.\n" + JSON.stringify({ tool: "record_task", task_id: command.task_id, saved: true });
+    app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("record_task", { summary: "The requested behavior passed its native check.",
+        state: { state: "resolved", evidence: "The native check returned the expected result." } }), { stopReason: "toolUse" }),
+      fauxAssistantMessage(bookkeeping),
+    ]);
+    const result = await app.run(command);
+    assert.equal(result.text, bookkeeping, "The task terminal still receives its own final answer");
+    assert.deepEqual(live, [], "Internal final text must not become a main-chat update");
+    assert.equal((await root.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.some((entry) =>
+      isUserNotice(entry) || entry.kind === "agent.notice"), false);
+    const conversation = await app.tasks.conversation(result.conversation_id);
+    const originals = (await conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items;
+    assert.equal(originals.flatMap(transcript).filter((message) => message.role === "final" && message.text === bookkeeping).length, 1);
+    assert.equal((await app.sources.events({ provider: "task_outcomes", pending: true })).length, 1);
+    stop(); await app.session.close(BACKGROUND_CONTEXT); app = await open(directory); root = await observe();
+    await app.run(command);
+    assert.equal(app.faux.state.callCount, 0, "Reopening a completed worker must not generate or promote another final");
+    assert.deepEqual(live, []);
+    const pending = await app.sources.events({ provider: "task_outcomes", pending: true });
+    assert.equal(pending.length, 1); assert.equal(pending[0]?.outcome?.entry_id, result.entry_id);
+    assert.equal(await app.sources.hasWork(), true);
+    const useful = "The requested behavior passed its native check.";
+    const keys = pending.map((record) => record.key);
+    app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("link_source_events", { keys, task_id: command.task_id }), { stopReason: "toolUse" }),
+      fauxAssistantMessage(fauxToolCall("notify", { keys, task_id: command.task_id, text: useful }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("The outcome and publication are recorded."),
+    ]);
+    const delivered: string[] = [];
+    await app.sources.triage(triage, (selected) => app.executions.bind(selected.id.toString(), {
+      cwd: host.cwd, hosts: [host], role: "triage", call: async () => { throw new Error("Publication must not start a worker"); },
+      notify: (_task, text) => delivered.push(text),
+    }), [app.tools.main, app.sourceTools.main]);
+    assert.deepEqual(delivered, [useful]); assert.deepEqual(live, [useful]);
+    let notices = (await root.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.filter(isUserNotice);
+    assert.equal(notices.length, 1); assert.deepEqual(notices.flatMap(transcript).map((message) => message.text), [useful]);
+    assert.equal(await app.sources.hasWork(), false);
+    stop(); await app.session.close(BACKGROUND_CONTEXT); app = await open(directory); root = await observe();
+    await app.sources.triage(triage, () => { throw new Error("Handled outcomes must not restart triage"); }, []);
+    assert.equal(app.faux.state.callCount, 0); assert.deepEqual(live, [useful]);
+    notices = (await root.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.filter(isUserNotice);
+    assert.equal(notices.length, 1);
+    const reopened = await app.tasks.conversation(result.conversation_id);
+    assert.equal((await reopened.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.flatMap(transcript)
+      .filter((message) => message.role === "final" && message.text === bookkeeping).length, 1);
+  } finally { stop(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("legacy published task outcomes preserve provenance and remain quiet after reopening", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-outcomes-")); let app = await open(directory);
   try {
-    // Simulate a process disappearing after publication, before recording its receipt.
-    app.sources.published = async () => {};
     for (const state of [{ state: "resolved", evidence: "Native check returned the requested result" },
       { state: "waiting", actor: "supplier", next_check: "2099-01-01T00:00:00.000Z" }]) {
       const command = await app.prepare();
@@ -81,6 +143,14 @@ test("published task resolution and waiting outcomes preserve provenance and rem
       assert.equal(toolOutcome.outcome.task_id, command.task_id);
       assert.equal(toolOutcome.outcome.conversation_id, (await app.tasks.get(command.task_id)).conversation_id);
       assert.deepEqual(toolOutcome.outcome.sources, [{ provider: "mail", account: "alpha", thread_id: "example-thread" }]);
+      // An older worker could stop after publication but before its receipt.
+      const finalOutcome = outcomes.find((record) => record.outcome?.tool_call_id === null)?.outcome;
+      assert.ok(finalOutcome?.entry_id);
+      const root = await app.session.root(BACKGROUND_CONTEXT);
+      await root.submit({ type: "write", requestId: "notice:" + finalOutcome.entry_id,
+        entry: { kind: "agent.notice", data: { task_id: command.task_id,
+          source_conversation_id: finalOutcome.conversation_id, source_entry_id: finalOutcome.entry_id },
+          model: [fauxAssistantMessage("Verified and recorded the next step.")] } }, BACKGROUND_CONTEXT);
       await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
       assert.equal(await app.sources.hasWork(), false);
       assert.equal((await app.sources.events({ provider: "task_outcomes", thread_id: command.task_id })).every((record) => record.decision !== null), true);
@@ -112,21 +182,20 @@ test("an empty final stays silent live and after reopening while preserving its 
       fauxAssistantMessage(""),
     ]);
     await app.run(command);
-    assert.deepEqual(app.notices, []);
     const root = await app.session.root(BACKGROUND_CONTEXT);
     assert.equal((await root.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.filter((entry) => entry.kind === "agent.notice").length, 0);
     assert.equal((await app.tasks.get(command.task_id)).summary, summary);
     assert.deepEqual((await app.tasks.get(command.task_id)).state, state);
     const outcomes = await app.sources.events({ provider: "task_outcomes", thread_id: command.task_id });
     assert.equal(outcomes.at(-1)?.outcome?.summary, summary);
-    assert.equal(outcomes.every((record) => record.decision !== null), true);
+    assert.equal(outcomes.find((record) => record.outcome?.tool_call_id === null)?.decision, null,
+      "A quiet final still needs coordinator outcome judgment");
     assert.equal(await app.sources.hasWork(), true);
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
     assert.equal((await app.tasks.get(command.task_id)).summary, summary);
     assert.equal(await app.sources.hasWork(), true);
     await app.run(command);
     assert.equal((await app.tasks.get(command.task_id)).summary, summary);
-    assert.deepEqual(app.notices, []);
     const reopenedRoot = await app.session.root(BACKGROUND_CONTEXT);
     assert.equal((await reopenedRoot.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.filter((entry) => entry.kind === "agent.notice").length, 0);
     assert.equal(app.faux.state.callCount, 0, "Recovered history must retain the brief without another model turn");
@@ -151,16 +220,18 @@ test("a due coordinator handoff collects remote evidence and continues the same 
     assert.equal(await app.sources.hasWork(), false, "A busy worker retains ownership of its due handoff");
     release(); await running;
     const before = await app.tasks.get(command.task_id);
-    assert.equal((await app.sources.events({ provider: "task_outcomes", pending: true })).length, 0);
-    assert.equal(await app.sources.hasWork(), true, "The durable wait remains due after outcome publication");
+    const handoff = await app.sources.events({ provider: "task_outcomes", pending: true });
+    assert.equal(handoff.length, 1);
+    assert.equal(await app.sources.hasWork(), true, "The durable handoff remains pending for coordinator judgment");
     const root = await app.session.root(BACKGROUND_CONTEXT);
-    assert.ok((await root.context(BACKGROUND_CONTEXT)).messages.some((message) => message.role === "assistant" &&
-      message.content.some((part) => part.type === "text" && part.text === summary)));
+    assert.equal((await root.context(BACKGROUND_CONTEXT)).messages.some((message) => message.role === "assistant" &&
+      message.content.some((part) => part.type === "text" && part.text === summary)), false);
     const remote: WorkerHost = { ...host, host_id: "55555555-5555-4555-8555-555555555555", name: "remote-fixture" };
     const evidence = "Remote service log: one startup failure, followed by successful recovery.";
     const followUp = "Continue the existing review with coordinator-collected evidence: " + evidence;
     const calls: HostCommand[] = [];
     app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("link_source_events", { keys: handoff.map((record) => record.key), task_id: command.task_id }), { stopReason: "toolUse" }),
       (input) => {
         assert.ok(input.messages.some((message) => message.role === "user" && (typeof message.content === "string"
           ? message.content.includes('"due_followups"') && message.content.includes(summary)
@@ -214,6 +285,9 @@ test("a due coordinator handoff collects remote evidence and continues the same 
     assert.deepEqual(finished.worker, before.worker);
     assert.equal(finished.state.state, "resolved"); assert.equal(finished.pending.length, 0);
     assert.equal(finished.summary, "Review complete: the remote startup failure recovered.");
+    const completed = await app.sources.events({ provider: "task_outcomes", pending: true });
+    assert.equal(completed.length, 1);
+    await app.sources.decide(completed.map((record) => record.key), { type: "task", task_id: command.task_id });
     assert.equal(await app.sources.hasWork(), false);
   } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -304,7 +378,7 @@ test("workers are offered source reads without coordinator decisions and stale s
     let notices = 0;
     await app.tasks.run(command, (conversation) => app.executions.bind(conversation.id.toString(), {
       cwd: host.cwd, hosts: [host], role: "worker", call: async () => ({ type: "written" }), notify: () => { notices += 1; },
-    }), () => {}, [app.tools.host, app.tools.worker, app.sourceTools.main]);
+    }), [app.tools.host, app.tools.worker, app.sourceTools.main]);
     const conversation = await app.tasks.conversation((await app.tasks.get(command.task_id)).conversation_id);
     const entries = await conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT);
     const denied = entries.items.flatMap((entry) => entry.model?.flatMap((message) => message.role === "toolResult" &&
@@ -479,7 +553,7 @@ test("reopening after a native child final uses its durable receipt and rejects 
       running = app.tasks.run(command, (conversation) => {
         releaseExecution = app.executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [host], role: "worker", call: async () => ({ type: "written" }) });
         return releaseExecution;
-      }, () => {}, [app.tools.agent], undefined, undefined, {
+      }, [app.tools.agent], undefined, undefined, {
         signal: controller.signal, async ready() {}, answer() {}, idle() {},
         async beforeTurn() { if (++boundaries === 3) { pause(); await gate; } },
       }).catch((error: unknown) => error);
@@ -547,14 +621,14 @@ test("the real bridge admits a safe failed outcome when authentication fails bef
     assert.equal(failed[0]?.outcome?.state.state, "failed"); assert.equal(failed[0]?.outcome?.entry_id, null);
     assert.equal(await app.sources.hasWork(), true);
     await app.tasks.update(command.task_id, (task) => { task.model = fixtureModel; });
-    await assert.rejects(app.tasks.run(command, () => () => {}, () => {}, [], undefined,
+    await assert.rejects(app.tasks.run(command, () => () => {}, [], undefined,
       async () => { throw new Error("Secret-bearing auth diagnostic must not enter the outcome"); }));
     const repeated = await app.sources.events({ provider: "task_outcomes", pending: true });
     assert.equal(repeated.length, 1); assert.notEqual(repeated[0]?.key, failed[0]?.key);
     assert.doesNotMatch(repeated[0]?.event.text ?? "", /Secret-bearing/);
     let checked = false;
     await assert.rejects(app.tasks.run({ ...command, binding: { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" } },
-      () => () => {}, () => {}, [], undefined, async () => { checked = true; }), /binding is not confirmed/);
+      () => () => {}, [], undefined, async () => { checked = true; }), /binding is not confirmed/);
     assert.equal(checked, false); assert.equal((await app.sources.events({ provider: "task_outcomes" })).length, 2);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

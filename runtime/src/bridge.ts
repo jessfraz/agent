@@ -513,7 +513,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
           model, cwd: host.cwd, hosts: [host], default_host: host, origin_host_id: host.host_id ?? null,
           connectedHosts: () => environment.hosts(host.cwd, host.host_id ?? null, [host]),
           role: "worker", search: searchFor(application, id), call: (operation) => hostRequests.call(id, operation),
-        }), (task, text) => emit(id, { type: "notice", task_id: task.id, text: `${task.title}: ${text}` }),
+        }),
         command.agent_id === undefined ? toolsets.worker : toolsets.agent, (operation) => hostRequests.call(id, operation), (selected) => inference.preflight(selected),
         worker === undefined ? undefined : {
           signal: worker.controller.signal,

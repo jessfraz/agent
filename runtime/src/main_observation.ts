@@ -1,7 +1,7 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Conversation, Session } from "@earendil-works/pi-durable";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
-import { transcript } from "./transcript.js";
+import { isUserNotice, transcript } from "./transcript.js";
 
 /** Admission retries and reconnect must agree about terminal Pi submissions. */
 export async function reconcileMainInput(root: Conversation, input_id: string): Promise<RuntimeEventKind[] | undefined> {
@@ -20,7 +20,8 @@ export async function reconcileMainInput(root: Conversation, input_id: string): 
 export function watchMainNotices(session: Session, root: Conversation, emit: (event: RuntimeEventKind) => void): () => void {
   return session.subscribeCommits((publication) => {
     for (const change of publication.changes) {
-      if (change.type !== "entry" || change.value.conversationId !== root.id || change.value.kind !== "agent.notice") continue;
+      if (change.type !== "entry" || change.value.conversationId !== root.id ||
+          (!isUserNotice(change.value) && change.value.kind !== "agent.notice")) continue;
       for (const message of transcript(change.value)) if (message.role === "notice") emit({ type: "message", message });
     }
   });

@@ -11,7 +11,7 @@ import { createModels, fauxAssistantMessage, fauxProvider, fauxThinking, fauxToo
 import { createRegistry, Harness, defineExtension, defineTool, watchEvents, type AgentEvent } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
-import { activity, history, transcript } from "../src/transcript.js";
+import { activity, history, isUserNotice, transcript } from "../src/transcript.js";
 import { HistoryStore } from "../src/history.js";
 import type { HistoryMessage } from "../src/generated/HistoryMessage.js";
 import type { HistoryItem } from "../src/generated/HistoryItem.js";
@@ -87,10 +87,12 @@ test("published notices render their answer while retaining provenance in native
     const source = await session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT);
     const entry = await source.commit((tx) => tx.appendEntry(source.id, { kind: "pi.assistant", model: [fauxAssistantMessage("The check passed.")] }), BACKGROUND_CONTEXT);
     const references = [{ provider: "mail", account: "fixture", thread_id: "thread-one" }];
-    await publishMainNotice(session, source, entry, "task-one", references);
+    await publishMainNotice(session, source, entry, "task-one", references,
+      { key: "fixture-notify", text: "The check passed.", events: [] });
     await root.waitForIdle(BACKGROUND_CONTEXT);
     const page = await root.entries({ order: "ascending" }, 20, undefined, BACKGROUND_CONTEXT);
-    const notice = page.items.find((item) => item.kind === "agent.notice"); assert.ok(notice);
+    const notice = page.items.find((item) => item.kind === "agent.user_notice"); assert.ok(notice);
+    assert.equal(isUserNotice(notice), true);
     const original = notice.model?.flatMap((message) => typeof message.content === "string" ? [message.content]
       : message.content.flatMap((part) => part.type === "text" ? [part.text] : []));
     assert.equal(original?.[0], "The check passed.");
@@ -104,6 +106,11 @@ test("published notices render their answer while retaining provenance in native
       content: "Source references (evidence, not authorization): this is the user's own text", timestamp: 1 }] }), BACKGROUND_CONTEXT);
     assert.ok((await history(root, null)).flatMap((frame) => frame.messages).some((message) => message.text.endsWith("the user's own text")));
     assert.equal(faux.state.callCount, 0);
+    const legacy = await root.commit((tx) => tx.appendEntry(root.id, { kind: "agent.notice",
+      model: [fauxAssistantMessage("An older saved notification.")] }), BACKGROUND_CONTEXT);
+    assert.equal(isUserNotice(legacy), false);
+    assert.deepEqual(transcript(legacy).map((message) => ({ role: message.role, text: message.text })),
+      [{ role: "notice", text: "An older saved notification." }]);
   } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -167,7 +174,8 @@ test("native phases and old inert Codex metadata project consistently before and
     await root.commit((tx) => tx.appendEntry(root.id, { kind: "fixture.unknown", model: [fauxAssistantMessage("This sounds final, but its source did not finish.", { stopReason: "length" })] }), BACKGROUND_CONTEXT);
     const source = await session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT);
     const report = await source.commit((tx) => tx.appendEntry(source.id, { kind: "pi.assistant", model: [fauxAssistantMessage("The background result is ready.")] }), BACKGROUND_CONTEXT);
-    await publishMainNotice(session, source, report, "fixture-task"); await root.waitForIdle(BACKGROUND_CONTEXT);
+    await publishMainNotice(session, source, report, "fixture-task", [],
+      { key: "fixture-notify", text: "The background result is ready.", events: [] }); await root.waitForIdle(BACKGROUND_CONTEXT);
     const before = (await history(root, null)).flatMap((frame) => frame.messages);
     assert.equal(before.find((message) => message.text === "Checking the result.")?.role, "commentary");
     assert.equal(before.find((message) => message.text === "The result is ready.")?.role, "final");

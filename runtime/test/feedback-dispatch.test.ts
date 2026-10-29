@@ -19,6 +19,7 @@ import { ConversationModels } from "../src/models.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
 import { fixtureModel } from "./model.js";
 import { AttachmentStore } from "../src/attachments.js";
+import { SourceJournal } from "../src/sources.js";
 
 const coordinator: AgentNode = { host_id: "11111111-1111-4111-8111-111111111111", name: "coordinator", rex_server: null,
   coordinator: null, home_directory: "/home/coordinator", agent_program: "/example/bin/agent",
@@ -42,7 +43,8 @@ async function open(directory: string) {
   await environment.configure({ settings: { model: fixtureModel, instructions: "Use the existing checkout.", context_repositories: [], sources: [] }, node: coordinator });
   await environment.register(linux); environment.setConnected([coordinator.host_id, linux.host_id]);
   const store = new FeedbackStore(directory, tasks);
-  return { session, tasks, environment, store, attachments, dispatcher: new FeedbackDispatcher(store, tasks, environment), faux };
+  const sources = new SourceJournal(session, tasks);
+  return { session, tasks, environment, store, sources, attachments, dispatcher: new FeedbackDispatcher(store, tasks, environment), faux };
 }
 
 test("feedback retries keep one durable report and attachment assignment before and after repair admission", async () => {
@@ -69,7 +71,7 @@ test("feedback retries keep one durable report and attachment assignment before 
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("feedback starts a Linux repair in its current Rex folder, reuses it, and publishes its answer in main", async () => {
+test("feedback reuses its Linux repair folder and retains the outcome for coordinator publication", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-feedback-dispatch-")); let app = await open(directory);
   const effects: HostCommand[] = [];
   const call: HostCall = async (command) => {
@@ -91,12 +93,14 @@ test("feedback starts a Linux repair in its current Rex folder, reuses it, and p
     assert.ok(task.pending[0]?.content.includes(`agent --json feedback show ${bundle.id}`));
     assert.equal((await app.tasks.list()).length, 1);
     app.faux.setResponses([fauxAssistantMessage("The reported routing issue is fixed and the regression passes.")]);
-    await app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: task.worker.allocation_id,
-      binding, instructions: "Repair the reported behavior.", model: fixtureModel, cwd: context.cwd }, () => () => {}, () => {});
+    const result = await app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: task.worker.allocation_id,
+      binding, instructions: "Repair the reported behavior.", model: fixtureModel, cwd: context.cwd }, () => () => {});
     const main = await app.session.root(BACKGROUND_CONTEXT);
     const entries = (await main.entries({ order: "ascending" }, 50, undefined, BACKGROUND_CONTEXT)).items;
-    assert.ok(entries.some((entry) => entry.kind === "agent.notice" && entry.model?.some((message) =>
-      message.role === "assistant" && message.content.some((part) => part.type === "text" && part.text.includes("regression passes")))));
+    assert.equal(entries.some((entry) => entry.kind === "agent.notice" || entry.kind === "agent.user_notice"), false);
+    const outcomes = await app.sources.events({ provider: "task_outcomes", pending: true });
+    assert.equal(outcomes.length, 1); assert.equal(outcomes[0]?.outcome?.entry_id, result.entry_id);
+    assert.equal(outcomes[0]?.outcome?.summary, "The reported routing issue is fixed and the regression passes.");
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
     const next = await app.store.capture("Also preserve the queued correction.", context);
     const continued = await app.dispatcher.dispatch(next, call);

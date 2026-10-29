@@ -94,8 +94,7 @@ async function open(directory: string, guidanceText = "CURRENT_PROFILE_GUIDANCE"
     const saved = await tasks.get(task.id); assert.equal(saved.worker.state, "bound"); if (saved.worker.state !== "bound") throw new Error("Missing parent binding");
     return { type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id, binding, instructions: "", model: fixtureModel, cwd: host.cwd };
   }
-  const run = (command: Extract<RuntimeCommand, { type: "run_task" }>) => tasks.run(command, (conversation) => bind(conversation, "worker"),
-    () => {}, command.agent_id === undefined ? toolsets.worker : toolsets.agent);
+  const run = (command: Extract<RuntimeCommand, { type: "run_task" }>) => tasks.run(command, (conversation) => bind(conversation, "worker"), command.agent_id === undefined ? toolsets.worker : toolsets.agent);
   return { session, registry, tasks, inference, sources, resources, toolsets, tools, faux, bind, prepare, run, notices };
 }
 

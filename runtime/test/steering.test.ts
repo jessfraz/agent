@@ -45,7 +45,7 @@ test("attached worker admits native steering before the current tool finishes an
     const observer = { signal: controller.signal, async ready() {}, answer(_id: string, text: string) { answers.push(text); },
       idle() { idle(); }, rejected(id: string) { rejected.push(id); } };
     running = tasks.run(command, (conversation) => executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [],
-      call: async () => { effects += 1; started(); return effect; } }), () => {}, [tools.host], undefined, undefined, observer);
+      call: async () => { effects += 1; started(); return effect; } }), [tools.host], undefined, undefined, observer);
     await entered;
     const submit: (input: typeof command, text: string, id: string, mode: "steer" | "follow_up") => ReturnType<TaskStore["input"]> = tasks.input.bind(tasks);
     await submit(command, "Next turn only", "queued", "follow_up");
@@ -94,7 +94,7 @@ test("attached worker admits native steering before the current tool finishes an
     assert.equal(effects, beforeDetach + 1, "An already-admitted native follow-up keeps its execution binding while detached work drains");
     assert.deepEqual((await tasks.get(task.id)).pending.map((input) => input.id), ["detach-queued", "detach-steer"]);
     const beforeRecovery = faux.state.callCount;
-    const recovered = await tasks.run({ ...command, interactive: false }, () => () => {}, () => {});
+    const recovered = await tasks.run({ ...command, interactive: false }, () => () => {});
     assert.equal(recovered.text, "Queued answer after detach"); assert.equal(faux.state.callCount, beforeRecovery);
     assert.deepEqual((await tasks.get(task.id)).pending, []);
   } finally { release(); controller.abort(); await running?.catch(() => {}); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }

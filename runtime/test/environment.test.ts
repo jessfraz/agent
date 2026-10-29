@@ -237,7 +237,7 @@ test("main chat keeps its Pi history and coordinator default while a laptop disc
     assert.ok(old.worker.state === "bound"); const original = old.worker;
     app.faux.setResponses([fauxAssistantMessage("Laptop inspection recorded the sapphire connector measurement.")]);
     await app.tasks.run({ type: "run_task", task_id: old.id, allocation_id: original.allocation_id, binding: original.binding,
-      instructions: "Inspect the synthetic board.", model: fixtureModel, cwd: original.host.cwd }, () => () => {}, () => {});
+      instructions: "Inspect the synthetic board.", model: fixtureModel, cwd: original.host.cwd }, () => () => {});
     await app.tasks.enqueue(old.id, "Recheck the connector when the laptop is available.");
     const request = { host_id: laptop.host_id, task_id: old.id, allocation_id: randomUUID(), repository: "/home/laptop/project", branch: "connector-review" };
     await resources.allocate(request, async () => ({ type: "resource", report: { type: "observed", record: {
@@ -373,7 +373,7 @@ test("native model tools route main execution explicitly and expose coordinator 
       instructions: "Project instructions.", model: fixtureModel, cwd: host.cwd }, (conversation) => app.executions.bind(conversation.id.toString(), {
         role: "worker", cwd: host.cwd, hosts: [host], default_host: host,
         connectedHosts: () => app.environment.hosts(host.cwd, host.host_id ?? null, [host]), call,
-      }), () => {}, [app.tools.host, app.tools.worker]);
+      }), [app.tools.host, app.tools.worker]);
     assert.deepEqual(commands, [
       { type: "on_node", host_id: laptop.host_id, command: { type: "exec", program: "pwd", args: [], cwd: laptop.home_directory, timeout_seconds: 900 } },
       { type: "exec", program: "pwd", args: [], cwd: host.cwd, timeout_seconds: 900 },

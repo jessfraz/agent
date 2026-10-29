@@ -133,7 +133,7 @@ test("a live worker stop rejects only the queued input that Pi never placed", { 
     }]);
     const rejections: string[] = [];
     running = app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id, binding,
-      instructions: "Fixture rules", model: fixtureModel, cwd: host.cwd, interactive: true }, () => () => {}, () => {}, [], undefined, undefined,
+      instructions: "Fixture rules", model: fixtureModel, cwd: host.cwd, interactive: true }, () => () => {}, [], undefined, undefined,
     { signal: controller.signal, async ready() {}, answer() {}, idle() { idle(); }, rejected(id) { rejections.push(id); } });
     await entered;
     await app.views.input({ ...input(task.conversation_id, "queued-live", "Not yet saved at the stop"), mode: "follow_up" },
@@ -185,7 +185,7 @@ test("imported views and settings are inert; actual input uses one normal Rex ac
     let idleCount = 0, wake = () => {};
     const idle = async (count: number) => { while (idleCount < count) await new Promise<void>((resolve) => { wake = resolve; }); };
     running = app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: task.worker.allocation_id, binding,
-      instructions: "Current guidance", model: fixtureModel, cwd: "/example/project", interactive: true }, () => () => {}, () => {}, [], undefined, undefined,
+      instructions: "Current guidance", model: fixtureModel, cwd: "/example/project", interactive: true }, () => () => {}, [], undefined, undefined,
     { signal: controller.signal, async ready() {}, answer() {}, idle() { idleCount += 1; wake(); } });
     await idle(1); await view.until(() => view.frames.some((event) => event.type === "message" && event.message.text === "Continued the saved work"));
     const noAllocation: HostCall = async () => { throw new Error("An attached actor must wake without another Rex pane"); };
@@ -279,7 +279,7 @@ test("active child steering reuses its actor and closed child or task folders re
       allocation_id: worker.allocation_id, binding: initial, instructions: "Current rules", model: fixtureModel, cwd: host.cwd, interactive: true };
     let idles = 0, wake = () => {};
     const idle = async (count: number) => { while (idles < count) await new Promise<void>((resolve) => { wake = resolve; }); };
-    running = app.tasks.run(command, () => () => {}, () => {}, [], undefined, undefined,
+    running = app.tasks.run(command, () => () => {}, [], undefined, undefined,
       { signal: controller.signal, async ready() {}, answer() {}, idle() { idles += 1; wake(); } });
     await idle(1);
     await app.views.input(input(child.conversation_id, "second", "Additional review direction"), async () => { throw new Error("Active child must not allocate another terminal"); }, () => {});
@@ -297,7 +297,7 @@ test("active child steering reuses its actor and closed child or task folders re
     }, () => {});
     assert.equal(resumes, 1);
     const resumed = (await app.tasks.get(task.id)).agents[0]; assert.ok(resumed?.worker.state === "bound");
-    await app.tasks.run({ ...command, allocation_id: resumed.worker.allocation_id, binding: replacement, interactive: false }, () => () => {}, () => {});
+    await app.tasks.run({ ...command, allocation_id: resumed.worker.allocation_id, binding: replacement, interactive: false }, () => () => {});
     assert.equal(app.faux.state.callCount, 3);
     const nextParent = { ...binding, session_id: "session:77777777-7777-4777-8777-777777777777" };
     const nextChild = { ...nextParent, block_id: "block:88888888-8888-4888-8888-888888888888" }; let folders = 0, panes = 0;
@@ -311,7 +311,7 @@ test("active child steering reuses its actor and closed child or task folders re
     assert.equal(folders, 1); assert.equal(panes, 1);
     const recovered = (await app.tasks.get(task.id)).agents[0]; assert.ok(recovered?.worker.state === "bound");
     assert.equal(recovered.conversation_id, child.conversation_id);
-    await app.tasks.run({ ...command, allocation_id: recovered.worker.allocation_id, binding: nextChild, interactive: false }, () => () => {}, () => {});
+    await app.tasks.run({ ...command, allocation_id: recovered.worker.allocation_id, binding: nextChild, interactive: false }, () => () => {});
     assert.equal(app.faux.state.callCount, 4);
     const conversation = await app.tasks.conversation(child.conversation_id), messages = (await history(conversation, null)).flatMap((frame) => frame.messages);
     assert.equal(messages.filter((message) => message.role === "user").length, 4, "Each actual input must appear exactly once across recovery");
@@ -423,7 +423,7 @@ test("a detaching parent claims folder ownership before inspection so child reco
     let enteredReady = () => {}; const ready = new Promise<void>((resolve) => { enteredReady = resolve; }), readyGate = new Promise<void>((resolve) => { releaseReady = resolve; });
     const worker = (await app.tasks.get(task.id)).worker; assert.ok(worker.state === "bound");
     running = app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: worker.allocation_id, binding, instructions: "Current rules", model: fixtureModel, cwd: host.cwd, interactive: true },
-      () => () => {}, () => {}, [], undefined, undefined, { signal: controller.signal, async ready() { enteredReady(); await readyGate; }, async fence() { releaseReady(); }, answer() {}, idle() {} });
+      () => () => {}, [], undefined, undefined, { signal: controller.signal, async ready() { enteredReady(); await readyGate; }, async fence() { releaseReady(); }, answer() {}, idle() {} });
     await ready; controller.abort();
     let inspected = () => {}; const entered = new Promise<void>((resolve) => { inspected = resolve; }), held = new Promise<void>((resolve) => { releaseInspection = resolve; });
     recovering = app.tasks.dispatch(task.id, host, async () => { inspected(); await held; return { type: "worker_presence", presence: { state: "present", running: true } }; }).catch((error: unknown) => error);

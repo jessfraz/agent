@@ -230,15 +230,17 @@ the conversation carries forward.
 Sources exist to advance work. Take useful authorized actions and surface a
 concrete result, recommendation or necessary decision. Otherwise stay quiet:
 no inbox recaps, Slack summaries or "nothing to do" updates.
-Worker final text is forwarded to the main conversation. Quiet background work
-records task state and returns an empty final; it creates no main-chat notice,
-including after recovery. Requested results still return normally.
+Task finals remain in their original conversation and durable outcome state.
+Outcome triage uses `notify` for useful or requested updates; bookkeeping and
+tool receipts stay internal. Explicit notifications use `agent.user_notice`
+with a durable publication identity. Legacy `agent.notice` entries remain
+readable but are not eligible for push delivery.
 
 Task outcomes are a built-in source, admitted in the same transaction as task
 changes. They retain conversation, entry and tool-call provenance. Unfinished
-work and failures enter the same triage path as incoming events. Published
-resolutions and waits, and child results delivered to their parent, settle
-without another model alert. Linking an outcome never reopens its task.
+work, failures and completed outcomes enter the same triage path as incoming
+events. Child results delivered to their parent settle there without another
+main-chat alert. Linking an outcome never reopens its task.
 
 Requested or standing authority carries through the task and its workers.
 Honor read-only, draft-only and decision boundaries. A yes to a concrete batch

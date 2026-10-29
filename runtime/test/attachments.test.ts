@@ -178,7 +178,7 @@ test("Pi receives native images and delegation keeps immutable files on each act
       assert.equal(user.content.some((part) => part.type === "text" && part.text.includes("/invented/coordinator/private/")), false);
       assert.ok(user.content.some((part) => part.type === "image")); return fauxAssistantMessage("Worker read the supplied evidence.");
     }]);
-    await tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id, binding, instructions: "Use attached evidence", model: fixtureModel, cwd: host.cwd }, () => () => {}, () => {}, [], call("worker"));
+    await tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id, binding, instructions: "Use attached evidence", model: fixtureModel, cwd: host.cwd }, () => () => {}, [], call("worker"));
     assert.ok(writes.includes("coordinator:" + file.id)); assert.ok(writes.includes("worker:" + file.id));
     const workerMessages = (await history(await tasks.conversation(task.conversation_id), null)).flatMap((frame) => frame.messages);
     assert.ok(workerMessages.some((message) => message.role === "user" && message.text === "" && message.attachments?.length === 2));
@@ -188,7 +188,7 @@ test("Pi receives native images and delegation keeps immutable files on each act
     const stoppedTask = await tasks.get(stopped.id); assert.ok(stoppedTask.worker.state === "bound");
     const controller = new AbortController(), calls = faux.state.callCount;
     await tasks.run({ type: "run_task", task_id: stopped.id, allocation_id: stoppedTask.worker.allocation_id, binding, instructions: "", model: fixtureModel, cwd: host.cwd },
-      () => () => {}, () => {}, [], async (command) => { const result = await call("stopped")(command); controller.abort(); return result; }, undefined,
+      () => () => {}, [], async (command) => { const result = await call("stopped")(command); controller.abort(); return result; }, undefined,
       { signal: controller.signal, async ready() {}, answer() {}, idle() {} });
     assert.equal(faux.state.callCount, calls, "Detach during attachment preparation must not start inference");
     assert.equal((await tasks.get(stopped.id)).pending.length, 1);

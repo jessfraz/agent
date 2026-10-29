@@ -114,11 +114,11 @@ test("native hosted search keeps existing tools, fast policy, replay data and ci
     await app.tasks.enqueue(task.id, "Check a component source."); await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
     const bound = (await app.tasks.get(task.id)).worker; assert.equal(bound.state, "bound"); if (bound.state !== "bound") throw new Error("No task binding");
     const command = { type: "run_task", task_id: task.id, allocation_id: bound.allocation_id, binding, instructions: "", cwd: host.cwd, model: app.selection } satisfies Extract<import("../src/generated/RuntimeCommand.js").RuntimeCommand, { type: "run_task" }>;
-    const worked = await app.tasks.run(command, () => () => {}, () => {}, [app.fixture]); assert.match(worked.text, /https:\/\/example.com\/component/);
+    const worked = await app.tasks.run(command, () => () => {}, [app.fixture]); assert.match(worked.text, /https:\/\/example.com\/component/);
     const child = await app.tasks.createAgent(task.id, { id: "source-review", title: "Review source", outcome: "Verify the source", input: "Check the source independently.", inputId: "review-input" });
     await app.tasks.dispatchAgent(task.id, child.id, async () => ({ type: "spawned", binding: { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" } }));
     const childWorker = (await app.tasks.get(task.id)).agents[0]?.worker; assert.equal(childWorker?.state, "bound"); if (childWorker?.state !== "bound") throw new Error("No child binding");
-    const reviewed = await app.tasks.run({ ...command, agent_id: child.id, allocation_id: childWorker.allocation_id, binding: childWorker.binding }, () => () => {}, () => {}, [app.fixture]);
+    const reviewed = await app.tasks.run({ ...command, agent_id: child.id, allocation_id: childWorker.allocation_id, binding: childWorker.binding }, () => () => {}, [app.fixture]);
     assert.match(reviewed.text, /https:\/\/example.com\/component/); assert.equal(wire.requests.length, 3);
     for (const request of wire.requests) {
       assert.equal(request.service_tier, "priority");
@@ -241,7 +241,7 @@ test("provider capability rejection stays visible and does not silently retry wi
     await app.tasks.enqueue(task.id, "Search this account."); await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
     const worker = (await app.tasks.get(task.id)).worker; assert.equal(worker.state, "bound"); if (worker.state !== "bound") throw new Error("No worker binding");
     await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: worker.allocation_id, binding, instructions: "", cwd: host.cwd, model: app.selection },
-      () => () => {}, () => {}), /The provider rejected hosted web search for this model or account/);
+      () => () => {}), /The provider rejected hosted web search for this model or account/);
     assert.equal(wire.requests.length, 2, "Each actor makes one request; neither retries without search");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await wire.close(); await rm(directory, { recursive: true, force: true }); }
 });
@@ -266,7 +266,7 @@ test("subscription-sharing limits explain credit permission while retaining the 
       await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
       const worker = (await app.tasks.get(task.id)).worker; assert.equal(worker.state, "bound"); if (worker.state !== "bound") throw new Error("No worker binding");
       await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: worker.allocation_id, binding, instructions: "", cwd: host.cwd, model: app.selection },
-        () => () => {}, () => {}), { message: expected });
+        () => () => {}), { message: expected });
       assert.equal(wire.requests.length, 1, "A limit must not start another billable request");
       await app.session.close(BACKGROUND_CONTEXT); app = await open(directory, wire.url);
       const retained = await app.tasks.get(task.id);

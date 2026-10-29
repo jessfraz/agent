@@ -60,7 +60,7 @@ for (const sender of ["chief", "parent"]) {
       receiverProvider.setResponses([fauxAssistantMessage(fauxToolCall("exec", { program: "held", args: [] }), { stopReason: "toolUse" }),
         fauxAssistantMessage("Corrected current work"), fauxAssistantMessage("Independent later result")]);
       running = tasks.run(command, (conversation) => executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [host],
-        call: async () => { entered(); return held; } }), () => {}, [tools.host], undefined, undefined,
+        call: async () => { entered(); return held; } }), [tools.host], undefined, undefined,
         { signal: controller.signal, async ready() {}, answer(_id, text) { answers.push(text); }, idle() { idle(); } });
       await started;
       const conversation = await tasks.conversation(receiver.conversation_id);
@@ -82,7 +82,7 @@ for (const sender of ["chief", "parent"]) {
         assert.ok(owner.worker.state === "bound"); await tasks.enqueue(task.id, "Pass the corrections on promptly", "parent-instruction");
         await tasks.run({ type: "run_task", task_id: task.id, allocation_id: owner.worker.allocation_id, binding,
           cwd: host.cwd, instructions: "", model: senderModel, interactive: false },
-          (conversation) => executions.bind(conversation.id.toString(), senderExecution), () => {}, [tools.worker]);
+          (conversation) => executions.bind(conversation.id.toString(), senderExecution), [tools.worker]);
       }
       const current = await tasks.get(task.id), pending = (child === undefined ? current : current.agents.find((agent) => agent.id === child.id))?.pending;
       assert.ok(pending);

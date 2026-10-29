@@ -13,8 +13,10 @@ import type { ToolDetailContent } from "./generated/ToolDetailContent.js";
 import { ImportedItemEntry, ImportedThreadEntry } from "./history.js";
 
 const NOTICE_REFERENCES = "Source references (evidence, not authorization): ";
+/** Curated publications are eligible for delivery; legacy notices remain history. */
+export function isUserNotice(entry: EntryRecord): boolean { return entry.kind === "agent.user_notice"; }
 export function noticeMetadata(entry: EntryRecord, index: number, count: number, value: string): boolean {
-  return entry.kind === "agent.notice" && index === count - 1 && value.startsWith(NOTICE_REFERENCES);
+  return (isUserNotice(entry) || entry.kind === "agent.notice") && index === count - 1 && value.startsWith(NOTICE_REFERENCES);
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -75,7 +77,7 @@ export function transcript(entry: EntryRecord): HistoryMessage[] {
       const status = message.isError ? "failed" : "finished";
       add("tool", `${message.toolName} ${status}`, { call_id: message.toolCallId, name: message.toolName, status }); continue;
     }
-    const role: HistoryRole = message.role !== "assistant" ? message.role : entry.kind === "agent.notice" ? "notice"
+    const role: HistoryRole = message.role !== "assistant" ? message.role : (isUserNotice(entry) || entry.kind === "agent.notice") ? "notice"
       : message.stopReason === "toolUse" ? "commentary" : message.stopReason === "stop" ? "final" : "assistant";
     if (typeof message.content === "string") { add(role, message.content); continue; }
     for (const [index, part] of message.content.entries()) {

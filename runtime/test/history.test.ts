@@ -378,7 +378,7 @@ test("adoption reuses the historical Pi conversation and activates only the new 
     const bound = await app.tasks.get(first.id); assert.ok(bound.worker.state === "bound");
     app.faux.setResponses([fauxAssistantMessage("Current request completed.")]);
     await app.tasks.run({ type: "run_task", task_id: first.id, allocation_id: bound.worker.allocation_id, binding,
-      instructions: "Current rules only", model: fixtureModel, cwd: host.cwd }, () => () => {}, () => {});
+      instructions: "Current rules only", model: fixtureModel, cwd: host.cwd }, () => () => {});
     assert.equal(app.faux.state.callCount, 1);
     const conversation = await app.tasks.conversation(first.conversation_id); const context = await conversation.context(BACKGROUND_CONTEXT);
     const users = context.messages.filter((message) => message.role === "user").flatMap((message) => typeof message.content === "string" ? [message.content]

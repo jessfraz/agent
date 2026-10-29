@@ -210,8 +210,13 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     const repairActor = start(1, repairLaunch.command.slice(1), undefined,
       { REX_SESSION: repairLaunch.session_id, REX_BLOCK: repairLaunch.block_id }, true);
     await until(async () => events(repairActor.output()).some((event) => event.type === "worker_idle"));
-    await until(async () => (await cli(0, [], "/exit\n")).some((event) => event.type === "history" &&
-      event.conversation_id === first.conversation_id && event.messages.some((message) => message.text === "The feedback repair is verified and remains in the existing folder.")));
+    const repairFinal = "The feedback repair is verified and remains in the existing folder.";
+    assert.equal(events(repairActor.output()).filter((event) => event.type === "answer" && event.text === repairFinal).length, 1);
+    const repairHistory = await exchange({ type: "read_history", task_id: repair.id, agent_id: null, cursor: null });
+    assert.equal(repairHistory.flatMap((event) => event.type === "history" ? event.messages : [])
+      .filter((message) => message.text === repairFinal).length, 1);
+    assert.equal((await cli(0, [], "/exit\n")).some((event) => event.type === "history" &&
+      event.conversation_id === first.conversation_id && event.messages.some((message) => message.text === repairFinal)), false);
     await script("fixture-feedback-again", [{ text: "The additional feedback was checked in the same repair conversation." }]);
     actor.child.stdin.write("/feedback fixture-feedback-again: keep the queued correction too.\n");
     await until(async () => reports().length === 2);
@@ -344,7 +349,12 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     await until(async () => canonical.output().includes("Sapphire main detail retained."));
     const noticeOffset = canonical.output().length;
     const noticeInput = "fixture-canonical-worker-notice", noticeBody = "One durable worker result appears in the main chat.";
-    await script(noticeInput, [{ text: noticeBody }]); actor.child.stdin.write(noticeInput + "\n");
+    const internal = "Worker state and tool receipts are recorded.";
+    await script(noticeInput, [{ text: internal }]); actor.child.stdin.write(noticeInput + "\n");
+    await until(async () => actor.output().includes(internal));
+    assert.equal((await mainHistory()).messages.some((message) => message.text === internal), false);
+    await script("fixture-curated-worker-notice", [{ tool: "notify", args: { keys: [], text: noticeBody } }, { text: "" }]);
+    await cli(0, ["chat", "fixture-curated-worker-notice"]);
     await until(async () => canonical.output().slice(noticeOffset).includes(noticeBody));
     const savedNotices = (await mainHistory()).messages.filter((message) => message.role === "notice" && message.text === noticeBody);
     assert.equal(savedNotices.length, 1, "The worker result must have one canonical saved root entry");
