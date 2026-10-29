@@ -26,6 +26,15 @@ export type BrowserHostOptions = {
   environment?: Record<string, string>;
 };
 
+type ConnectionStage = "pairing" | "mcp_transport" | "extension_attach" | "endpoint_discovery"
+  | "browser_attach" | "profile_context" | "connector_identity" | "page_creation" | "connector_cleanup";
+type ControlLoss = "mcp_closed" | "browser_disconnected" | "owned_page_closed";
+
+/** Only fixed diagnostic labels can cross the secret-bearing bootstrap boundary. */
+class ConnectionFailure extends Error {
+  constructor(readonly stage: ConnectionStage) { super(`Chrome connection failed at ${stage}`); }
+}
+
 type OwnedTab = {
   info: BrowserTab;
   page: Page;
@@ -83,6 +92,7 @@ export class BrowserHost {
   private queue: Promise<void> = Promise.resolve();
   private disconnected = false;
   private closing = false;
+  private controlLoss: ControlLoss | undefined;
 
   constructor(private readonly config: Pick<BrowserConfig, "user_data_dir" | "profile_dir_name">,
     private readonly options: BrowserHostOptions = {}) {}
@@ -118,8 +128,14 @@ export class BrowserHost {
     return token === undefined || token.length === 0 ? value : value.replaceAll(token, "[redacted]");
   }
 
-  private lost(): void {
+  private lost(reason: ControlLoss): void {
+    if (!this.closing) this.controlLoss ??= reason;
     this.disconnected = true;
+  }
+
+  private failureDetail(error?: unknown): string {
+    if (error instanceof ConnectionFailure) return `Connection stage: ${error.stage}.`;
+    return this.controlLoss === undefined ? "Failure stage: browser_operation." : `Control lost: ${this.controlLoss}.`;
   }
 
   private liveBrowser(): Browser {
@@ -141,7 +157,7 @@ export class BrowserHost {
     const rawToken = this.options.extensionToken ?? process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN;
     // The extension's Copy button includes the environment assignment.
     const token = rawToken?.trim().replace(/^PLAYWRIGHT_MCP_EXTENSION_TOKEN=/, "");
-    if (token === undefined || !/^[A-Za-z0-9_-]{32,256}$/.test(token)) throw new Error("Chrome extension pairing is not configured");
+    if (token === undefined || !/^[A-Za-z0-9_-]{32,256}$/.test(token)) throw new ConnectionFailure("pairing");
     if (this.owner === undefined) throw new Error("Browser owner is missing");
     const name = "Agent " + this.owner.session_id;
     const executable = fileURLToPath(new URL("./cli.js", import.meta.resolve("@playwright/mcp/package.json")));
@@ -154,13 +170,16 @@ export class BrowserHost {
       inheritEnv: false, env, stderr: "pipe", maxStderrBytes: 4096, maxMessageBytes: 4 * 1024 * 1024 });
     const client = new McpClient({ name, version: "0.1.0", requestTimeoutMs: 45_000 });
     this.client = client;
-    client.onClose(() => this.lost());
+    client.onClose(() => this.lost("mcp_closed"));
+    let stage: ConnectionStage = "mcp_transport";
     try {
       await client.connect(transport);
+      stage = "extension_attach";
       // Connector URLs contain the token. Keep all bootstrap output, server
       // inventory, upstream errors and stderr out of model output and logs.
       const bootstrap = await client.callTool("browser_tabs", { action: "list" });
       if (bootstrap.isError === true) throw new Error("Chrome extension did not connect");
+      stage = "endpoint_discovery";
       const cli = fileURLToPath(new URL("./playwright-cli.js", import.meta.resolve("@playwright/cli/package.json")));
       const { PLAYWRIGHT_MCP_EXTENSION_TOKEN: _token, ...cliEnv } = env;
       const listed = await exec(process.execPath, [cli, "list", "--all", "--json"],
@@ -170,9 +189,11 @@ export class BrowserHost {
       const matches = inventory.servers.filter((server: unknown) => object(server) && server.title === name);
       const descriptor: unknown = matches[0];
       if (matches.length !== 1 || !object(descriptor) || typeof descriptor.endpoint !== "string") throw new Error("Browser endpoint identity was not confirmed");
+      stage = "browser_attach";
       const browser = await chromium.connect(descriptor.endpoint, { timeout: 15_000 });
       this.browser = browser;
-      browser.on("disconnected", () => this.lost());
+      browser.on("disconnected", () => this.lost("browser_disconnected"));
+      stage = "profile_context";
       const context = browser.contexts()[0];
       if (context === undefined || browser.contexts().length !== 1) throw new Error("Browser profile context was not confirmed");
       context.setDefaultTimeout(ACTION_TIMEOUT);
@@ -181,17 +202,20 @@ export class BrowserHost {
       // Script-created pages have direct creation provenance, just like popups
       // from an owned opener. Never infer ownership from a pages-list diff.
       context.newPage = async () => this.adopt(await newPage()).page;
+      stage = "connector_identity";
       const connectors = context.pages().filter(page => connector(page, name));
       if (connectors.length !== 1) throw new Error("Browser connector identity was not confirmed");
       // The final attached page disconnects the extension when closed. Create
       // a positively owned page before removing its private connector.
+      stage = "page_creation";
       const page = await context.newPage();
       this.adopt(page);
+      stage = "connector_cleanup";
       await connectors[0]?.close();
       return page;
     } catch {
-      await this.close();
-      throw new Error("Chrome extension connection failed");
+      await this.close().catch(() => {});
+      throw new ConnectionFailure(stage);
     }
   }
 
@@ -213,7 +237,7 @@ export class BrowserHost {
     page.once("close", () => {
       // The extension also emits Page.close when Chrome detaches its debugger.
       // Only our acknowledged native close can establish disposable cleanup.
-      if (this.owned.has(tab.info.id) && !tab.closing && !this.closing) this.lost();
+      if (this.owned.has(tab.info.id) && !tab.closing && !this.closing) this.lost("owned_page_closed");
     });
     return tab;
   }
@@ -237,7 +261,7 @@ export class BrowserHost {
     const modal = [...this.owned.values()].some(tab => tab.dialog !== undefined);
     for (const tab of this.owned.values()) {
       if (tab.page.isClosed()) {
-        this.lost();
+        this.lost("owned_page_closed");
         throw new Error("Owned browser page lost control without confirmed cleanup");
       }
       tab.info.url = tab.page.url();
@@ -302,7 +326,7 @@ export class BrowserHost {
     if (this.owner.owner_id !== request.owner_id || this.owner.session_id !== session_id) return {
       type: "failed", session_id, message: "This browser connection belongs to another conversation or session." };
     if (this.disconnected || this.closing) return { type: "disconnected", session_id,
-      message: "Chrome control was lost. Native tabs may still be open and their cleanup was not verified. Old tab handles are invalid; inspect Chrome before continuing." };
+      message: `${this.failureDetail()} Chrome control was lost. Native tabs may still be open and their cleanup was not verified. Old tab handles are invalid; inspect Chrome before continuing.` };
     if ((action.type === "open" || action.type === "new_tab" || action.type === "navigate") && !allowedUrl(action.url)) return {
       type: "failed", session_id, message: "Browser navigation requires an HTTP or HTTPS URL without embedded credentials, or about:blank." };
     if ("tab_id" in action && !this.owned.has(action.tab_id)) return { type: "failed", session_id,
@@ -383,10 +407,10 @@ export class BrowserHost {
         const detail = error instanceof Error ? error.message : object(error) && typeof error.message === "string"
           ? error.message : "The script did not confirm completion";
         return { type: "uncertain", session_id,
-          message: `Playwright code failed: ${this.redact(detail).slice(0, 8192)}. Earlier effects were not replayed. Inspect the page before running it again; native tab cleanup was not verified.` };
+          message: `${this.failureDetail(error)} Playwright code failed: ${this.redact(detail).slice(0, 8192)}. Earlier effects were not replayed. Inspect the page before running it again; native tab cleanup was not verified.` };
       }
       return { type: mutates(action) ? "uncertain" : "disconnected", session_id,
-        message: "Chrome did not confirm this operation. Native tabs may still be open and cleanup was not verified. Inspect its outcome before repeating it. Confirm the Playwright extension is installed in the configured profile and its pairing token is available to Agent. Old handles are invalid after disconnection." };
+        message: `${this.failureDetail(error)} Chrome did not confirm this operation. Native tabs may still be open and cleanup was not verified. Inspect its outcome before repeating it. Confirm the Playwright extension is installed in the configured profile and its pairing token is available to Agent. Old handles are invalid after disconnection.` };
     }
   }
 
@@ -422,8 +446,8 @@ export class BrowserHost {
       for (const tab of [...this.owned.values()]) await this.closeTab(tab);
       return { type: "closed", session_id, tabs: this.tabs(),
         output: output("Owned tabs were closed and the Chrome connection was released.") };
-    } catch {
-      return { type: "uncertain", session_id, message: "Owned tab cleanup could not be confirmed. Inspect Chrome before closing or repeating anything." };
+    } catch (error) {
+      return { type: "uncertain", session_id, message: `${this.failureDetail(error)} Owned tab cleanup could not be confirmed. Inspect Chrome before closing or repeating anything.` };
     } finally { await this.close(); }
   }
 }

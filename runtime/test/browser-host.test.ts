@@ -807,12 +807,24 @@ test("run_code uses the real Page API for dialogs, frames and owned tab lifecycl
   await f.assertUnrelatedGroup(); assert.equal(f.browser.exitCode, null);
 });
 
+test("unconfigured pairing reports a fixed stage without exposing the supplied credential", async () => {
+  const credential = "invalid-private-credential";
+  const host = new BrowserHost({ user_data_dir: null, profile_dir_name: null }, { extensionToken: credential });
+  const reply = (await host.execute(requests()({ type: "open", url: "about:blank" }))).response;
+  assert.ok(reply.type === "uncertain");
+  assert.match(reply.message, /Connection stage: pairing/);
+  assert.equal(JSON.stringify(reply).includes(credential), false);
+  await host.close();
+});
+
 test("run_code raw Page.close keeps its actual effect uncertain until native cleanup is known", { skip: skipChrome, timeout: 60_000 }, async t => {
   const f = await fixture(t), host = await f.nativeBroker(), request = requests();
   const opened = (await host.execute(request({ type: "open", url: `${f.origin}/form?phase=raw-close` }))).response;
   assert.ok(opened.type === "ready"); const tab = opened.tabs[0]; assert.ok(tab);
   const operation = request({ type: "run_code", tab_id: tab.id, code: "async page => { await page.close({runBeforeUnload:true}); return 'closed'; }" });
-  assert.equal((await host.execute(operation)).response.type, "uncertain");
+  const closed = (await host.execute(operation)).response;
+  assert.ok(closed.type === "uncertain");
+  assert.match(closed.message, /Control lost: (owned_page_closed|browser_disconnected|mcp_closed)/);
   assert.equal((await host.execute(operation)).response.type, "failed", "An uncertain script cannot be replayed");
   assert.equal((await f.client.pages()).some(page => page.url === tab.url), false, "The real Page.close effect must still occur");
   assert.equal((await host.execute(request({ type: "status" }))).response.type, "disconnected");
@@ -960,6 +972,7 @@ test("foreign extension iframe detach never masquerades as completed native tab 
   assert.equal(status.type, "disconnected", JSON.stringify({ status, released }));
   assert.ok(released.type === "disconnected", JSON.stringify(released));
   assert.match(released.message, /cleanup.*not verified/i);
+  assert.match(released.message, /Control lost: (owned_page_closed|browser_disconnected|mcp_closed)/);
   await f.host.close();
   assert.ok((await f.client.pages()).some(page => page.url === tab.url));
   await f.assertUnrelatedGroup();
