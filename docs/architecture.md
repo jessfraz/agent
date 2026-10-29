@@ -265,6 +265,7 @@ that source; a separate allowance for this app is unavailable.
 ## After the MVP
 
 These are future capabilities, not claims about the current implementation.
+The [roadmap](roadmap.md) tracks the implementation and evaluation checklist.
 
 ### Integrations and scheduling
 

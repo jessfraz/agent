@@ -129,7 +129,8 @@ keyword and semantic search use a rebuildable SQLite index. See
 [history](docs/history.md) for import, coverage and reopening commands.
 
 The [architecture](docs/architecture.md) describes ownership, later recovery,
-speech input and reviewed learning. Private settings,
+speech input and reviewed learning. The [roadmap](docs/roadmap.md) tracks
+remaining work and evaluations. Private settings,
 credentials and conversations stay outside this repository.
 
 For development:
