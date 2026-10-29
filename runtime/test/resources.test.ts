@@ -24,7 +24,10 @@ const identity: NativeWorktreeIdentity = { primary: "/workspace/example", top: "
   common_dir: "/workspace/example/.git", git_dir: "/workspace/example/.git/worktrees/review", branch: "review", head: "abc123" };
 function ready(request: WorktreeAllocation): ResourceRecord {
   return { id: request.allocation_id, host_id: request.host_id, task_id: request.task_id, repository: request.repository,
-    branch: request.branch, consumers: [], state: { state: "ready", identity } };
+    branch: request.branch, consumers: [], state: { state: "ready", identity: {
+      primary: request.repository, top: `${request.repository}-${request.branch}`, common_dir: `${request.repository}/.git`,
+      git_dir: `${request.repository}/.git/worktrees/${request.branch}`, branch: request.branch, head: identity.head,
+    } } };
 }
 async function open(directory: string) {
   const database = await openNodeSqliteDatabase(join(directory, "session.sqlite"));
@@ -34,7 +37,8 @@ async function open(directory: string) {
   models.setProvider(faux.provider); const registry = createRegistry();
   const session = await Harness.open(storage, { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(session, new ConversationModels(models)); const resources = new ResourceStore(session, tasks); tasks.guardResources(resources);
-  const executions = new Executions(); const tools = createResourceTools(resources, tasks, executions); registry.install(tools);
+  const executions = new Executions(); const tools = createResourceTools(resources, tasks, executions);
+  registry.install(tools.main); registry.install(tools.worker);
   return { session, tasks, resources, executions, tools, faux };
 }
 
@@ -187,7 +191,7 @@ test("the real model tool allocates only for its owning bound task", async () =>
       return { type: "resource", report: { type: "observed", record: ready(command.request) } };
     } });
     try {
-      await conversation.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.tools] }, BACKGROUND_CONTEXT);
+      await conversation.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.tools.worker] }, BACKGROUND_CONTEXT);
       app.faux.setResponses([
         fauxAssistantMessage(fauxToolCall("allocate_worktree", { repository: identity.primary, branch: "review" }), { stopReason: "toolUse" }),
         fauxAssistantMessage("Allocated the review worktree."),
@@ -195,5 +199,54 @@ test("the real model tool allocates only for its owning bound task", async () =>
       assert.equal((await (await conversation.submit({ type: "input", content: "Use an owned worktree" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
       assert.equal((await app.resources.list()).length, 1);
     } finally { release(); }
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("main reads every resource while task workers see only their own inventory", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-resource-inventory-")); const app = await open(directory);
+  try {
+    const first = await app.tasks.create({ title: "Review client", outcome: "Verify the client change" });
+    const second = await app.tasks.create({ title: "Review server", outcome: "Verify the server change" });
+    const records: ResourceRecord[] = [];
+    for (const task of [first, second]) {
+      const request: WorktreeAllocation = { host_id: hostId, task_id: task.id, allocation_id: randomUUID(),
+        repository: task.id === first.id ? "/workspace/client" : "/workspace/server", branch: "review" };
+      records.push({ ...ready(request), consumers: [task.id] });
+      await app.resources.allocate(request, async () => ({ type: "resource", report: { type: "observed", record: ready(request) } }));
+    }
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    const worker = await app.tasks.conversation(first.conversation_id);
+    let failure: unknown;
+    for (const [conversation, extension, expected, tools] of [
+      [root, app.tools.main, records, ["read_resources"]],
+      [worker, app.tools.worker, records.filter((record) => record.task_id === first.id), ["allocate_worktree", "read_resources"]],
+    ] satisfies Array<[typeof root, typeof app.tools.main, ResourceRecord[], string[]]>) {
+      const release = app.executions.bind(conversation.id.toString(), { cwd: identity.primary, hosts: [],
+        call: async () => { throw new Error("Reading inventory must not call a host"); } });
+      try {
+        await conversation.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [extension] }, BACKGROUND_CONTEXT);
+        app.faux.setResponses([
+          (context) => {
+            try {
+              const declared = context.messages.flatMap((message) => message.role === "system"
+                ? (message.toolsAdded ?? []).map((tool) => tool.name) : []);
+              assert.deepEqual(declared.sort(), [...tools].sort());
+            } catch (error) { failure = error; }
+            return fauxAssistantMessage(fauxToolCall("read_resources", {}), { stopReason: "toolUse" });
+          },
+          (context) => {
+            try {
+              const result = context.messages.findLast((message) => message.role === "toolResult");
+              assert.ok(result?.role === "toolResult");
+              assert.equal(result.isError, false);
+              assert.equal(result.content.filter((part) => part.type === "text").map((part) => part.text).join(""), JSON.stringify(expected));
+            } catch (error) { failure = error; }
+            return fauxAssistantMessage("Inventory inspected.");
+          },
+        ]);
+        assert.equal((await (await conversation.submit({ type: "input", content: "Inspect the worktree inventory" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+        if (failure !== undefined) throw failure;
+      } finally { release(); }
+    }
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

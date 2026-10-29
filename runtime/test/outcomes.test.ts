@@ -40,7 +40,8 @@ async function open(directory: string) {
   const session = await Harness.open(await SqliteStorage.open(database), { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(session, new ConversationModels(models)); const executions = new Executions(); const sources = new SourceJournal(session, tasks);
   const tools = createAppTools(tasks, executions); const sourceTools = createSourceTools(sources, executions);
-  registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker); registry.install(sourceTools.main); registry.install(sourceTools.worker);
+  registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker); registry.install(tools.agent); registry.install(tools.legacy);
+  registry.install(sourceTools.main); registry.install(sourceTools.worker);
   async function prepare(title = "Example task") {
     const task = await tasks.create({ title, model: fixtureModel, outcome: "Verify the requested outcome",
       sources: [{ provider: "mail", account: "alpha", thread_id: "example-thread" }] });
@@ -54,7 +55,7 @@ async function open(directory: string) {
   async function run(command: Extract<RuntimeCommand, { type: "run_task" }>) {
     return tasks.run(command, (conversation) => executions.bind(conversation.id.toString(), {
       cwd: host.cwd, hosts: [host], role: "worker", call: async () => ({ type: "written" }),
-    }), () => {}, [tools.host, tools.worker, sourceTools.worker]);
+    }), () => {}, [tools.host, command.agent_id === undefined ? tools.worker : tools.agent, sourceTools.worker]);
   }
   return { session, tasks, executions, sources, tools, sourceTools, faux, prepare, run };
 }
@@ -236,6 +237,26 @@ test("active progress defers source triage and linking the finished event does n
     assert.deepEqual(linked.sources, current.sources);
     assert.equal(await app.sources.hasWork(), false);
   } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("parent workers can read agents and record progress without being offered child-only result reporting", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-outcomes-")); const app = await open(directory);
+  try {
+    const command = await app.prepare("Continue parent work"); let offered: string[] = [];
+    app.faux.setResponses([
+      (input) => {
+        offered = getCurrentTools(input.messages).map((tool) => tool.name);
+        return fauxAssistantMessage(fauxToolCall("read_agents", {}), { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage(fauxToolCall("record_task", { summary: "The parent checked its agents and retained the next step.",
+        state: { state: "open" } }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("The parent checked its agents and retained the next step."),
+    ]);
+    await app.run(command);
+    assert.equal(offered.includes("read_agents"), true);
+    assert.equal(offered.includes("report_result"), false, "Only a child assignment can report an agent result");
+    assert.equal((await app.tasks.get(command.task_id)).summary, "The parent checked its agents and retained the next step.");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("workers are offered source reads without coordinator decisions and stale source calls remain guarded", async () => {

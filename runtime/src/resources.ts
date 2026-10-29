@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { defineDoc, defineExtension, defineTool, ROOT_CONVERSATION_ID, type Harness, type Tx } from "@earendil-works/pi-durable";
+import { defineDoc, defineExtension, defineTool, ROOT_CONVERSATION_ID, type Extension, type Harness, type Tx } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import type { CleanupPlan } from "./generated/CleanupPlan.js";
 import type { CleanupReceipt } from "./generated/CleanupReceipt.js";
@@ -134,26 +134,28 @@ export class ResourceStore {
   }
 }
 
-export function createResourceTools(resources: ResourceStore, tasks: TaskStore, executions: Executions) {
-  return defineExtension({ name: "app-resources", tools: [
-    defineTool({ name: "allocate_worktree", description: "Create an owned linked worktree for this task. Allocation and cleanup ownership are recorded durably.",
-      parameters: Type.Object({ repository: Type.String({ minLength: 1 }), branch: Type.String({ minLength: 1 }) }),
-      async execute(args, api, context) {
-        const execution = executions.get(api.conversationId.toString());
-        const owner = await tasks.owner(api.conversationId.toString());
-        const worker = owner.agent?.worker ?? owner.task.worker;
-        if (worker.state !== "bound") throw new TaskError("Worktree allocation requires a bound task host");
-        const allocation_id = await api.memo("worktree_allocation_id", randomUUID(), context);
-        const record = await resources.allocate({ ...args, allocation_id, task_id: owner.task.id, host_id: worker.binding.host_id }, execution.call);
-        return { output: [{ type: "text", text: JSON.stringify(record) }], isError: record.state.state !== "ready" };
-      } }),
-    defineTool({ name: "read_resources", description: "Read the owned worktree inventory and cleanup state.", replay: "safe", parameters: Type.Object({}),
-      async execute(_args, api) {
-        executions.get(api.conversationId.toString());
-        const all = await resources.list();
-        const owner = api.conversationId === ROOT_CONVERSATION_ID ? undefined : await tasks.owner(api.conversationId.toString());
-        const visible = owner === undefined ? all : all.filter((resource) => resource.task_id === owner.task.id);
-        return { output: [{ type: "text", text: JSON.stringify(visible) }] };
-      } }),
-  ] });
+export function createResourceTools(resources: ResourceStore, tasks: TaskStore, executions: Executions): { main: Extension; worker: Extension } {
+  const allocate = defineTool({ name: "allocate_worktree", description: "Create an owned linked worktree for this task. Allocation and cleanup ownership are recorded durably.",
+    parameters: Type.Object({ repository: Type.String({ minLength: 1 }), branch: Type.String({ minLength: 1 }) }),
+    async execute(args, api, context) {
+      const execution = executions.get(api.conversationId.toString());
+      const owner = await tasks.owner(api.conversationId.toString());
+      const worker = owner.agent?.worker ?? owner.task.worker;
+      if (worker.state !== "bound") throw new TaskError("Worktree allocation requires a bound task host");
+      const allocation_id = await api.memo("worktree_allocation_id", randomUUID(), context);
+      const record = await resources.allocate({ ...args, allocation_id, task_id: owner.task.id, host_id: worker.binding.host_id }, execution.call);
+      return { output: [{ type: "text", text: JSON.stringify(record) }], isError: record.state.state !== "ready" };
+    } });
+  const read = defineTool({ name: "read_resources", description: "Read the owned worktree inventory and cleanup state.", replay: "safe", parameters: Type.Object({}),
+    async execute(_args, api) {
+      executions.get(api.conversationId.toString());
+      const all = await resources.list();
+      const owner = api.conversationId === ROOT_CONVERSATION_ID ? undefined : await tasks.owner(api.conversationId.toString());
+      const visible = owner === undefined ? all : all.filter((resource) => resource.task_id === owner.task.id);
+      return { output: [{ type: "text", text: JSON.stringify(visible) }] };
+    } });
+  return {
+    main: defineExtension({ name: "resource-inventory", tools: [read] }),
+    worker: defineExtension({ name: "app-resources", tools: [allocate, read] }),
+  };
 }

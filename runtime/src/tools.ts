@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { Type } from "typebox";
+import { Check } from "typebox/value";
 import { defineExtension, defineTool, ROOT_CONVERSATION_ID, type Extension, type Harness, type ToolExecutionResult } from "@earendil-works/pi-durable";
 import { DEFAULT_MODEL } from "./models.js";
 import { recordDelegation } from "./delegation.js";
@@ -175,7 +176,7 @@ export function createJobTools(jobs: BackgroundScheduler, executions: Executions
 }
 
 export function createAppTools(tasks: TaskStore, executions: Executions): {
-  host: Extension; main: Extension; worker: Extension;
+  host: Extension; main: Extension; worker: Extension; agent: Extension; legacy: Extension;
 } {
   const host = defineExtension({ name: "host-tools", tools: [
     defineTool({ name: "exec", description: "Run a program and literal arguments. Main defaults to the coordinator; name a connected host for other machines. Workers use their owning host.",
@@ -250,19 +251,30 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
   const searchTask = defineTool({ name: "search_tasks", description: "Find related tasks and imported conversations before starting new work. Semantic search is the default; use keyword for literal identifiers, paths or errors. Read matching originals before continuing them.",
       replay: "safe", parameters: Type.Object({ query: Type.String(), sources: Type.Optional(Type.Array(source)), mode: Type.Optional(Type.Enum(searchModes)) }),
       async execute(args, api) { return output(await tasks.find(args.query, args.sources ?? [], 8, executions.search(api.conversationId.toString()), args.mode)); } });
-  const readTask = defineTool({ name: "read_task", description: "Read task state or an imported conversation's original evidence before continuing it.",
-      replay: "safe", parameters: Type.Object({ task_id: Type.Optional(Type.String()), conversation_id: Type.Optional(Type.String()), agent_id: Type.Optional(Type.String()),
-        entry_ids: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 16 })), offset: Type.Optional(Type.Integer({ minimum: 0 })) }),
+  const readTaskParameters = Type.Object({ task_id: Type.Optional(Type.String()), conversation_id: Type.Optional(Type.String()), agent_id: Type.Optional(Type.String()),
+    include_history: Type.Boolean({ description: "False for task or conversation status; true to include history or exact entry evidence." }),
+    entry_ids: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 16 })), offset: Type.Optional(Type.Integer({ minimum: 0 })) });
+  const readTask = defineTool({ name: "read_task", description: "Read task or conversation state. Set include_history:false for status checks; true for original turns or exact entry_ids before acting on their evidence.",
+      replay: "safe", parameters: readTaskParameters,
+      prepareArguments(value) {
+        // Saved calls predate the explicit history choice and requested history.
+        const prepared = typeof value === "object" && value !== null && !Array.isArray(value) && !("include_history" in value)
+          ? { ...value, include_history: true } : value;
+        if (!Check(readTaskParameters, prepared)) throw new TaskError("Invalid task read arguments");
+        return prepared;
+      },
       async execute(args) {
         if ((args.task_id === undefined) === (args.conversation_id === undefined)) throw new TaskError("Choose a task_id or conversation_id");
+        // An already checkpointed call resumes without prepareArguments.
+        const includeHistory = args.include_history !== false;
         if (args.conversation_id !== undefined) {
           if (args.agent_id !== undefined) throw new TaskError("A conversation already identifies its exact history");
           return output({ conversation_id: args.conversation_id, imported: await tasks.saved(args.conversation_id) ?? null,
-            history: args.entry_ids === undefined ? await tasks.readConversation(args.conversation_id) : undefined,
-            originals: args.entry_ids === undefined ? undefined : await tasks.originals(args.conversation_id, args.entry_ids, args.offset) });
+            history: includeHistory && args.entry_ids === undefined ? await tasks.readConversation(args.conversation_id) : undefined,
+            originals: includeHistory && args.entry_ids !== undefined ? await tasks.originals(args.conversation_id, args.entry_ids, args.offset) : undefined });
         }
         if (args.task_id === undefined) throw new TaskError("Choose a task");
-        return output({ task: await tasks.get(args.task_id), history: await tasks.history(args.task_id, 120_000, args.agent_id) });
+        return output({ task: await tasks.get(args.task_id), history: includeHistory ? await tasks.history(args.task_id, 120_000, args.agent_id) : undefined });
       } });
   const main = defineExtension({ name: "task-main", tools: [searchTask, readTask,
     defineTool({ name: "revoke_allocation", description: "Cancel one exact unresolved new allocation with no known Rex session. Preserves input and history; known sessions must be reconciled.",
@@ -345,8 +357,7 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
       } }),
     record,
   ] });
-  const worker = defineExtension({ name: "task-worker", tools: [record, searchTask, readTask,
-    defineTool({ name: "continue_agent", description: "Steer an existing agent with corrections or current context. Use mode:follow_up for an independent later turn. Reuses its conversation and named terminal.",
+  const continueAgent = defineTool({ name: "continue_agent", description: "Steer an existing agent with corrections or current context. Use mode:follow_up for an independent later turn. Reuses its conversation and named terminal.",
       parameters: Type.Object({ agent_id: Type.String({ minLength: 1 }), input: Type.String({ minLength: 1, maxLength: 16000 }),
         mode: Type.Optional(Type.Enum(inputModes)) }),
       async execute(args, api, context) {
@@ -355,8 +366,8 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         if (owner.agent !== undefined) throw new TaskError("Only the parent worker may continue task agents");
         const inputId = await api.memo("agent_input_id", randomUUID(), context);
         return output(await tasks.continueAgent(owner.task.id, args.agent_id, args.input, inputId, execution.call, args.mode ?? "steer"));
-      } }),
-    defineTool({ name: "spawn_agent", description: "Give a bounded assignment to a named terminal in this task's Rex session. The parent retains the overall outcome.",
+      } });
+  const spawnAgent = defineTool({ name: "spawn_agent", description: "Give a bounded assignment to a named terminal in this task's Rex session. The parent retains the overall outcome.",
       parameters: Type.Object({ title: Type.String({ minLength: 1, maxLength: 80 }),
         outcome: Type.String({ minLength: 1, maxLength: 4000 }), input: Type.String({ minLength: 1, maxLength: 16000 }) }),
       async execute(args, api, context) {
@@ -367,21 +378,21 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         const inputId = await api.memo("agent_input_id", randomUUID(), context);
         await tasks.createAgent(owner.task.id, { id, inputId, ...args });
         return output(await tasks.dispatchAgent(owner.task.id, id, execution.call));
-      } }),
-    defineTool({ name: "read_agents", description: "Read this task's agent progress and results.", replay: "safe",
+      } });
+  const readAgents = defineTool({ name: "read_agents", description: "Read this task's agent progress and results.", replay: "safe",
       parameters: Type.Object({}), async execute(_args, api) {
         executions.get(api.conversationId.toString());
         return output((await tasks.owner(api.conversationId.toString())).task.agents);
-      } }),
-    defineTool({ name: "wait_agents", description: "Wait briefly for this task's agents, then read their progress and results.", replay: "safe",
+      } });
+  const waitAgents = defineTool({ name: "wait_agents", description: "Wait briefly for this task's agents, then read their progress and results.", replay: "safe",
       parameters: Type.Object({ timeout_seconds: Type.Optional(Type.Integer({ minimum: 0, maximum: 60 })) }),
       async execute(args, api) {
         executions.get(api.conversationId.toString());
         const owner = await tasks.owner(api.conversationId.toString());
         if (owner.agent !== undefined) throw new TaskError("The parent worker waits for task agents");
         return output(await tasks.waitAgents(owner.task.id, (args.timeout_seconds ?? 30) * 1000));
-      } }),
-    defineTool({ name: "report_result", description: "Finish this agent's bounded assignment with evidence or a concrete failure. The parent still owns task resolution.",
+      } });
+  const reportResult = defineTool({ name: "report_result", description: "Finish this agent's bounded assignment with evidence or a concrete failure. The parent still owns task resolution.",
       parameters: Type.Object({ summary: Type.String({ minLength: 1, maxLength: 4000 }), failure: Type.Optional(Type.String({ minLength: 1 })) }),
       async execute(args, api) {
         executions.get(api.conversationId.toString());
@@ -389,7 +400,10 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         if (owner.agent === undefined) throw new TaskError("Only a task agent can report an agent result");
         return output(await tasks.reportAgent(owner.task.id, owner.agent.id, args.summary, args.failure,
           { conversation_id: api.conversationId.toString(), call_id: api.callId }));
-      } }),
-  ] });
-  return { host, main, worker };
+      } });
+  const worker = defineExtension({ name: "task-parent", tools: [record, searchTask, readTask, continueAgent, spawnAgent, readAgents, waitAgents] });
+  const agent = defineExtension({ name: "task-agent", tools: [searchTask, readTask, readAgents, reportResult] });
+  // Pending actors may recover before their next configuration refresh.
+  const legacy = defineExtension({ name: "task-worker", tools: [record, searchTask, readTask, continueAgent, spawnAgent, readAgents, waitAgents, reportResult] });
+  return { host, main, worker, agent, legacy };
 }

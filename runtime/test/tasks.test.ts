@@ -253,7 +253,7 @@ test("an idle interactive child delivers its result and accepts another assignme
     const idle = async (count: number) => { while (idleCount < count) await new Promise<void>((resolve) => { wake = resolve; }); };
     running = app.tasks.run(command, (conversation) => app.executions.bind(conversation.id.toString(), {
       cwd: host.cwd, hosts: [host], call: async () => { throw new Error("No Rex effects expected"); },
-    }), () => {}, [app.tools.worker], undefined, undefined, {
+    }), () => {}, [app.tools.agent], undefined, undefined, {
       signal: controller.signal, async ready() {}, answer() {}, idle() { idleCount += 1; wake(); },
     });
     await idle(1);
@@ -333,7 +333,7 @@ test("task agents own conversations and named terminals in one Rex session, then
     await app.tasks.run({ type: "run_task", task_id: task.id, agent_id: child.id, allocation_id: child.worker.allocation_id,
       binding: childBinding, instructions: "", model: fixtureModel, cwd: host.cwd }, (conversation) => app.executions.bind(conversation.id.toString(), {
         cwd: host.cwd, hosts: [host], call: async () => { throw new Error("No direct child host effects expected"); },
-      }), () => { throw new Error("Child results belong to the parent"); }, [app.tools.host, app.tools.worker], async (command) => {
+      }), () => { throw new Error("Child results belong to the parent"); }, [app.tools.host, app.tools.agent], async (command) => {
         assert.equal(command.type, "resume_worker"); resumed += 1;
         assert.equal((await app.tasks.get(task.id)).pending.length, 1);
         return { type: "spawned", binding: replacement };
@@ -374,7 +374,7 @@ async function open(directory: string) {
   const tasks = new TaskStore(session, new ConversationModels(models));
   const executions = new Executions();
   const tools = createAppTools(tasks, executions);
-  registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker);
+  registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker); registry.install(tools.agent); registry.install(tools.legacy);
   return { session, tasks, executions, tools, faux };
 }
 
