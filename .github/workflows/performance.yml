@@ -1,0 +1,83 @@
+name: CLI performance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-performance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conversation-render:
+    name: Conversation rendering
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          path: candidate
+          fetch-depth: 2
+      - name: Select baseline
+        id: baseline
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        working-directory: candidate
+        run: |
+          if [ -n "$PR_BASE" ]; then
+            revision="$PR_BASE"
+          elif [ -n "$PUSH_BASE" ] && [ "$PUSH_BASE" != 0000000000000000000000000000000000000000 ]; then
+            revision="$PUSH_BASE"
+          else
+            revision=$(git rev-parse HEAD^)
+          fi
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7.0.1
+        with:
+          path: baseline
+          ref: ${{ steps.baseline.outputs.revision }}
+      - uses: DeterminateSystems/nix-installer-action@v23
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.npm
+            candidate/target
+            baseline/target
+          key: cli-performance-${{ runner.os }}-${{ hashFiles('candidate/flake.lock', 'candidate/Cargo.lock', 'candidate/runtime/package-lock.json') }}-${{ github.sha }}
+          restore-keys: |
+            cli-performance-${{ runner.os }}-${{ hashFiles('candidate/flake.lock', 'candidate/Cargo.lock', 'candidate/runtime/package-lock.json') }}-
+      - name: Build paired release CLIs and retained-history runtimes
+        working-directory: candidate
+        run: |
+          nix develop --command bash -euo pipefail <<'BUILD'
+            for source in ../baseline .; do
+              (cd "$source" && npm --prefix runtime ci --ignore-scripts && npm --prefix runtime run build && cargo build --locked --release --bin agent)
+            done
+            cargo build --locked --release --example terminal-fixture --example cli-performance
+          BUILD
+      - name: Compare process-to-visible-conversation latency
+        working-directory: candidate
+        run: |
+          nix develop --command target/release/examples/cli-performance \
+            --baseline ../baseline/target/release/agent \
+            --baseline-runtime ../baseline/runtime/dist/src/bridge.js \
+            --candidate target/release/agent \
+            --candidate-runtime runtime/dist/src/bridge.js \
+            --terminal target/release/examples/terminal-fixture \
+            --seed runtime/dist/test/fixtures/performance.js \
+            --output performance/results.json
+      - name: Upload raw samples
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cli-performance
+          path: candidate/performance/
+          if-no-files-found: warn
