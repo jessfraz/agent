@@ -717,10 +717,9 @@ createInterface({input:process.stdin}).on('line',line=>{
                     .map(serde_json::from_str::<Record>)
                     .collect::<Result<Vec<_>, _>>()
                     .unwrap();
-                if records
-                    .iter()
-                    .any(|record| matches!(record.event, Event::Done))
-                {
+                if records.iter().any(|record| {
+                    record.request_id == history_request && matches!(record.event, Event::Done)
+                }) {
                     break (text, records);
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
