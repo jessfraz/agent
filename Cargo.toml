@@ -33,6 +33,7 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 dirs = "7"
 fs2 = "0.4"
+hex = "0.4"
 httparse = "1"
 libc = "0.2"
 pulldown-cmark = { version = "0.13", default-features = false }

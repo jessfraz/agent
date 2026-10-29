@@ -96,7 +96,7 @@ impl LlamaProvider {
             digest.update(&buffer[..count]);
         }
         ensure!(
-            format!("{:x}", digest.finalize()) == MODEL_DIGEST,
+            hex::encode(digest.finalize()) == MODEL_DIGEST,
             "Embedding model digest does not match the pinned space"
         );
         std::fs::create_dir_all(&self.directory)?;

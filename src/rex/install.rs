@@ -56,7 +56,7 @@ async fn install_at(
     module_source: &str,
     client: &RexClient,
 ) -> Result<InstallOutcome> {
-    let identity = format!("{:x}", Sha256::digest(module_source.as_bytes()));
+    let identity = hex::encode(Sha256::digest(module_source.as_bytes()));
     let module_source = format!(
         "{module_source}\nrex.action {{\n  name = 'agent_messages_identity',\n  title = 'Agent: Messages module identity',\n  run = function() return {{ sha256 = '{identity}' }} end,\n}}\n"
     );
