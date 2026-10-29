@@ -20,6 +20,7 @@ import type { AgentNode } from "../src/generated/AgentNode.js";
 import type { CoordinatorSettings } from "../src/generated/CoordinatorSettings.js";
 import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { HostResult } from "../src/generated/HostResult.js";
+import type { MachineSnapshot } from "../src/generated/MachineSnapshot.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
 import { fixtureModel } from "./model.js";
 
@@ -75,6 +76,60 @@ test("canonical settings and node history survive Pi reopen while online members
     assert.equal(connected[0]?.host_id, laptop.host_id, "The caller can still explicitly target its connected node");
     await assert.rejects(app.environment.register({ ...laptop, host_id: "66666666-6666-4666-8666-666666666666", name: "DESKTOP" }), /one native Rex host/);
     assert.equal((await app.environment.environment()).nodes.length, 2);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("machine refresh probes only online hosts concurrently and preserves sampled values and unknown coverage across SQLite reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-machines-")); let app = await open(directory);
+  const sample: MachineSnapshot = { observed_at_ms: 1000, os: "linux", architecture: "x86_64", logical_cpus: 8,
+    memory_total_bytes: 32 * 1024 ** 3, memory_available_bytes: 16 * 1024 ** 3, load_average: [1, 0.5, 0.25], tailscale_ip: "100.64.0.10" };
+  const server: AgentNode = { ...coordinator, host_id: "33333333-3333-4333-8333-333333333333", name: "server", machine: sample };
+  const legacy: AgentNode = { ...coordinator, host_id: "44444444-4444-4444-8444-444444444444", name: "legacy" };
+  try {
+    await app.environment.configure({ settings, node: { ...coordinator, machine: sample } });
+    await app.environment.register({ ...laptop, machine: sample }); await app.environment.register(server); await app.environment.register(legacy);
+    app.environment.setConnected([coordinator.host_id, laptop.host_id, legacy.host_id]);
+    const calls: string[] = [];
+    let entered = () => {}, release = () => {};
+    const began = new Promise<void>((resolve) => { entered = resolve; }), held = new Promise<void>((resolve) => { release = resolve; });
+    const refresh = app.environment.environment(async (command) => {
+      assert.ok(command.type === "on_node" && command.command.type === "machine_snapshot");
+      calls.push(command.host_id); if (calls.length === 2) entered(); await held;
+      return command.host_id === coordinator.host_id ? { type: "machine_snapshot", snapshot: sample } : { type: "failed", message: "Synthetic disconnected probe" };
+    });
+    await began;
+    assert.deepEqual(new Set(calls), new Set([coordinator.host_id, laptop.host_id]));
+    const before = await app.environment.environment();
+    assert.deepEqual(before.nodes.find((node) => node.host_id === coordinator.host_id)?.machine, sample, "Ordinary reads do not await or run probes");
+    release(); const result = await refresh;
+    assert.deepEqual(result.nodes.find((node) => node.host_id === coordinator.host_id)?.machine, sample);
+    assert.deepEqual(result.nodes.find((node) => node.host_id === server.host_id)?.machine, sample);
+    assert.deepEqual(result.unavailable_host_ids, [laptop.host_id, legacy.host_id]);
+    assert.deepEqual(result.nodes.find((node) => node.host_id === laptop.host_id)?.machine, sample);
+    assert.equal(result.nodes.find((node) => node.host_id === legacy.host_id)?.machine, undefined);
+    await app.environment.register(coordinator); // Older clients may register without telemetry.
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const saved = await app.environment.environment();
+    assert.deepEqual(saved.online_host_ids, []);
+    assert.deepEqual(saved.nodes.find((node) => node.host_id === coordinator.host_id)?.machine, sample);
+    assert.deepEqual(saved.nodes.find((node) => node.host_id === server.host_id)?.machine, sample);
+    assert.equal((await app.tasks.list()).length, 0); assert.equal(app.faux.state.callCount, 0);
+    app.environment.setConnected([coordinator.host_id]);
+    const downgraded = await app.environment.environment(async () => { assert.fail("An older worker must not receive an unsupported native host command"); });
+    assert.deepEqual(downgraded.unavailable_host_ids, [coordinator.host_id]);
+    assert.deepEqual(downgraded.nodes.find((node) => node.host_id === coordinator.host_id)?.machine, sample);
+    await app.environment.register({ ...coordinator, machine: sample });
+    let releaseOld = () => {}, oldStarted = () => {};
+    const oldGate = new Promise<void>((resolve) => { releaseOld = resolve; }), oldBegan = new Promise<void>((resolve) => { oldStarted = resolve; });
+    const old = app.environment.environment(async () => { oldStarted(); await oldGate; return { type: "machine_snapshot", snapshot: { ...sample, observed_at_ms: 2000 } }; });
+    await oldBegan;
+    await app.environment.environment(async () => ({ type: "machine_snapshot", snapshot: { ...sample, observed_at_ms: 3000 } }));
+    releaseOld(); await old;
+    assert.equal((await app.environment.environment()).nodes.find((node) => node.host_id === coordinator.host_id)?.machine?.observed_at_ms, 3000, "A late older probe cannot overwrite a newer observation");
+    await app.environment.register({ ...coordinator, agent_program: "/nix/store/updated/bin/agent", machine: sample });
+    const registered = (await app.environment.environment()).nodes.find((node) => node.host_id === coordinator.host_id);
+    assert.equal(registered?.machine?.observed_at_ms, 3000, "A delayed registration cannot overwrite a newer machine observation");
+    assert.equal(registered?.agent_program, "/nix/store/updated/bin/agent", "Registration still refreshes deployment metadata");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 

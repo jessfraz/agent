@@ -2,6 +2,7 @@ use crate::embeddings::{EmbeddingBatch, EmbeddingPurpose};
 use crate::feedback::{FeedbackBundle, FeedbackContext, FeedbackReceipt};
 use crate::history::{HistoryGap, HistoryItem, HistoryRequest, HistoryResponse, HistoryThread};
 use crate::instructions::{GuidanceSnapshot, GuidanceSource};
+use crate::machines::MachineSnapshot;
 use crate::models::{ModelProvider, ModelSelection, Reasoning};
 use crate::resources::{CleanupPlan, ResourceRecord, ResourceReport, WorktreeAllocation};
 use crate::sources::{SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage, SourceKey};
@@ -36,6 +37,8 @@ pub struct AgentNode {
     pub home_directory: String,
     pub coordinator: Option<String>,
     pub launch: WorkerLaunch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<MachineSnapshot>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -198,7 +201,10 @@ pub enum RuntimeCommand {
     SetConnectedNodes {
         host_ids: Vec<String>,
     },
-    Environment,
+    Environment {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        telemetry: bool,
+    },
     ConnectWorker {
         node: AgentNode,
     },
@@ -569,6 +575,7 @@ pub struct SourceState {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostCommand {
+    MachineSnapshot,
     ReadUsage {
         expected_email: String,
     },
@@ -663,6 +670,9 @@ pub enum HostCommand {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostResult {
+    MachineSnapshot {
+        snapshot: MachineSnapshot,
+    },
     Usage {
         usage: crate::usage::UsageAvailability,
     },
@@ -757,6 +767,8 @@ pub enum RuntimeEventKind {
         settings: CoordinatorSettings,
         nodes: Vec<AgentNode>,
         online_host_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unavailable_host_ids: Option<Vec<String>>,
     },
     Resources {
         resources: Vec<ResourceRecord>,
@@ -809,6 +821,9 @@ pub enum RuntimeEventKind {
         conversation_id: String,
         messages: Vec<HistoryMessage>,
         next_cursor: Option<String>,
+        // The final frame in this page, even when the worker stays open.
+        #[serde(default)]
+        page_complete: bool,
     },
     TaskReady {
         conversation_id: String,
@@ -1018,6 +1033,55 @@ mod tests {
         HistoryMessage, HistoryRole, RuntimeCommand, RuntimeEventKind, SearchMode, ToolHistory,
         ToolStatus,
     };
+
+    #[test]
+    fn history_page_completion_is_additive_for_older_wire_messages() {
+        let old: RuntimeEventKind = serde_json::from_str(
+            r#"{"type":"history","conversation_id":"saved","messages":[],"next_cursor":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            old,
+            RuntimeEventKind::History {
+                page_complete: false,
+                ..
+            }
+        ));
+        let complete = RuntimeEventKind::History {
+            conversation_id: "saved".into(),
+            messages: vec![],
+            next_cursor: None,
+            page_complete: true,
+        };
+        let round_trip: RuntimeEventKind =
+            serde_json::from_slice(&serde_json::to_vec(&complete).unwrap()).unwrap();
+        assert!(matches!(
+            round_trip,
+            RuntimeEventKind::History {
+                page_complete: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn existing_environment_reads_do_not_request_machine_probes() {
+        let command: RuntimeCommand = serde_json::from_str(r#"{"type":"environment"}"#).unwrap();
+        assert!(matches!(
+            command,
+            RuntimeCommand::Environment { telemetry: false }
+        ));
+        assert_eq!(
+            serde_json::to_string(&command).unwrap(),
+            r#"{"type":"environment"}"#
+        );
+        let command: RuntimeCommand =
+            serde_json::from_str(r#"{"type":"environment","telemetry":true}"#).unwrap();
+        assert!(matches!(
+            command,
+            RuntimeCommand::Environment { telemetry: true }
+        ));
+    }
 
     #[test]
     fn old_history_without_tool_metadata_and_new_tool_identity_share_the_wire_contract() {

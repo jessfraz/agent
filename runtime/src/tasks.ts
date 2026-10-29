@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AssistantEntry, defineDoc, ROOT_CONVERSATION_ID, type Conversation, type ConversationId, type Cursor, type EntryRecord, type Extension, type Harness, type Tx } from "@earendil-works/pi-durable";
 import type { CoordinatorEnvironment } from "./environment.js";
-import { ConversationModels, DEFAULT_MODEL, ModelError, savedHost, savedModel } from "./models.js";
+import { ConversationModels, DEFAULT_MODEL, ModelError, modelFailureMessage, savedHost, savedModel } from "./models.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { WorkerState } from "./generated/WorkerState.js";
 import type { HostCommand } from "./generated/HostCommand.js";
@@ -902,7 +902,7 @@ export class TaskStore {
           continue;
         }
         if (settled.type !== "input" || settled.status !== "done") {
-          throw new TaskError("The worker turn did not complete; its conversation is retained");
+          throw new TaskError(await modelFailureMessage(conversation, "The worker turn did not complete; its conversation is retained"));
         }
         const entry = await conversation.commit((tx) => tx.entry(settled.answer), BACKGROUND_CONTEXT);
         if (active.fenced) break;

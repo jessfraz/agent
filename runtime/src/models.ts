@@ -10,11 +10,25 @@ import type { Reasoning } from "./generated/Reasoning.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { ConversationChange } from "./generated/ConversationChange.js";
 import type { ModelOption } from "./generated/ModelOption.js";
+import { withWebSearch } from "./web-search.js";
 
 /** Keep application provider IDs aligned with the pinned upstream registry. */
 export const PROVIDERS: readonly ModelProvider[] = getBuiltinProviders();
 export const DEFAULT_MODEL: ModelSelection = { provider: "openai", model_id: "gpt-6.1-sol", reasoning: null, fast: false };
 export class ModelError extends Error {}
+
+/** Preserve a provider capability failure without exposing its raw response. */
+export async function modelFailureMessage(conversation: Conversation, fallback: string): Promise<string> {
+  const page = await conversation.entries({ order: "descending" }, 5, undefined, BACKGROUND_CONTEXT);
+  for (const entry of page.items) for (const message of entry.model ?? []) {
+    if (message.role !== "assistant") continue;
+    if (message.stopReason === "error" && message.errorMessage?.includes("web_search")) {
+      return "The provider rejected hosted web search for this model or account. Its conversation is retained.";
+    }
+    return fallback;
+  }
+  return fallback;
+}
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -48,6 +62,10 @@ export class ConversationModels {
   private bindSession: ((session: Harness) => void) | undefined;
   private readonly session = new Promise<Harness>((resolve) => { this.bindSession = resolve; });
   constructor(readonly models: MutableModels = builtinModels(), auth?: ChatGptAuth) {
+    for (const id of ["openai", "openai-codex"]) {
+      const provider = models.getProvider(id);
+      if (provider !== undefined) models.setProvider({ ...provider, streamSimple: withWebSearch(provider.streamSimple) });
+    }
     const openai = models.getProvider("openai");
     if (openai !== undefined) {
       const nativeKey = openai.auth.apiKey;

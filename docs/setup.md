@@ -91,6 +91,13 @@ Changes persist when the conversation reopens and apply to the next model
 generation. TOML supplies defaults for new work. `/help` has the accepted
 arguments; Pi validates model capabilities.
 
+OpenAI Responses models have hosted web search enabled, including page opening
+and find-in-page when the model supports them. The same tools apply to the main
+agent, tasks and child agents. Citations remain copyable links in saved history.
+Availability depends on the model and account; an unsupported tool is reported
+as a capability failure. Other providers keep their native tool configuration.
+This does not give the agent access to a signed-in Chrome session.
+
 `/feedback <description>` saves private diagnostics and starts a background
 repair worker on the originating machine. A repair started inside Rex uses a
 named terminal in that folder; later reports reuse the repair task. From a raw
@@ -196,6 +203,17 @@ existing configuration; other sources and chat can continue.
 `agent usage` and `/status` read quota through the coordinator's installed Codex
 app-server, after verifying its signed-in account matches the agent's. This
 does not expose a separate quota for agent, and requires Codex independently.
+Reset dates use the client's local timezone and include the time remaining.
+
+`/machines` reads the coordinator's host registry and refreshes supported online
+workers. It shows OS, CPU count, RAM, Tailscale IP and load averages. Unavailable
+probes retain their last sample with its age; unknown measurements stay unknown.
+
+Each service writes rotating lifecycle receipts to
+`<state_dir>/diagnostics/runtime.jsonl` (three files, 1 MiB each). These record
+input placement, activity, host-call timing and interruption without message
+bodies, reasoning, tool arguments or credentials. The files are private to the
+user; logging failure does not block chat.
 
 ## nix-darwin service
 

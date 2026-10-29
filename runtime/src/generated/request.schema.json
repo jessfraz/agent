@@ -44,6 +44,16 @@
         "launch": {
           "$ref": "#/$defs/WorkerLaunch"
         },
+        "machine": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MachineSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "name": {
           "type": "string"
         },
@@ -60,6 +70,14 @@
         "agent_program",
         "home_directory",
         "launch"
+      ]
+    },
+    "Architecture": {
+      "type": "string",
+      "enum": [
+        "aarch64",
+        "x86_64",
+        "other"
       ]
     },
     "CleanupPlan": {
@@ -815,6 +833,22 @@
         {
           "type": "object",
           "properties": {
+            "snapshot": {
+              "$ref": "#/$defs/MachineSnapshot"
+            },
+            "type": {
+              "type": "string",
+              "const": "machine_snapshot"
+            }
+          },
+          "required": [
+            "type",
+            "snapshot"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "type": {
               "type": "string",
               "const": "usage"
@@ -1085,6 +1119,70 @@
         "follow_up"
       ]
     },
+    "MachineSnapshot": {
+      "type": "object",
+      "properties": {
+        "architecture": {
+          "$ref": "#/$defs/Architecture"
+        },
+        "load_average": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "number",
+            "format": "double"
+          },
+          "maxItems": 3,
+          "minItems": 3
+        },
+        "logical_cpus": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "memory_available_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "memory_total_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "observed_at_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "os": {
+          "$ref": "#/$defs/OperatingSystem"
+        },
+        "tailscale_ip": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "ipv4"
+        }
+      },
+      "required": [
+        "observed_at_ms",
+        "os",
+        "architecture"
+      ]
+    },
     "ModelProvider": {
       "type": "string",
       "enum": [
@@ -1193,6 +1291,14 @@
         "git_dir",
         "branch",
         "head"
+      ]
+    },
+    "OperatingSystem": {
+      "type": "string",
+      "enum": [
+        "macos",
+        "linux",
+        "other"
       ]
     },
     "RateLimitBucket": {
@@ -1565,6 +1671,9 @@
         {
           "type": "object",
           "properties": {
+            "telemetry": {
+              "type": "boolean"
+            },
             "type": {
               "type": "string",
               "const": "environment"

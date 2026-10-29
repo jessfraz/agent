@@ -105,7 +105,7 @@ test("real bridge reads canonical settings and node history before a default-mod
     assert.deepEqual((await request({ type: "configure_coordinator", bootstrap: { node,
       settings: { model: DEFAULT_MODEL, instructions: "Brief updates.", context_repositories: [], sources: [] } } })).map((frame) => frame.event.type), ["configured", "done"]);
     await request({ type: "register_node", node }); await request({ type: "set_connected_nodes", host_ids: [node.host_id] });
-    const snapshot = (await request({ type: "environment" })).find((frame) => frame.event.type === "environment")?.event;
+    const snapshot = (await request({ type: "environment", telemetry: false })).find((frame) => frame.event.type === "environment")?.event;
     assert.ok(snapshot?.type === "environment"); assert.equal(snapshot.nodes.length, 1);
     assert.deepEqual(snapshot.online_host_ids, [node.host_id]); assert.deepEqual(snapshot.settings.model, DEFAULT_MODEL);
     const response = await request({ type: "chat", input: "Hello", instructions: "Project instructions.", model: null,
@@ -223,7 +223,7 @@ test("real bridge preserves literal Unicode separators through LF-framed request
     for (const byte of bytes) child.stdin.write(Buffer.from([byte]));
     child.stdin.write("\r"); child.stdin.write("\n"); await configured;
     assert.equal(frames.some((value) => value.id === 0), false, "Literal Unicode separators must not split a JSON protocol frame");
-    const snapshot = done(2); child.stdin.write(frame(2, { type: "environment" })); child.stdin.write("\n"); await snapshot;
+    const snapshot = done(2); child.stdin.write(frame(2, { type: "environment", telemetry: false })); child.stdin.write("\n"); await snapshot;
     const environment = frames.find((value) => value.id === 2 && value.event.type === "environment")?.event;
     assert.ok(environment?.type === "environment"); assert.equal(environment.settings.instructions, text);
     child.stdin.end(frame(3, { type: "status" })); assert.equal(await closed, 0, errors);

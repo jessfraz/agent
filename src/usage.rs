@@ -115,20 +115,27 @@ pub async fn account(expected_email: &str) -> UsageAvailability {
 
 impl fmt::Display for UsageSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&format_snapshot(self, SystemTime::now()))
+        f.write_str(&format_snapshot(
+            self,
+            &ResetContext::local(SystemTime::now()),
+        ))
     }
 }
 
 /// Codex-style account limits. Unknown metrics stay unknown, and the source is
 /// explicit because these are account-wide Codex limits, not an Agent-only cap.
 pub fn format_status(usage: &UsageAvailability, now: SystemTime) -> String {
+    format_status_in(usage, &ResetContext::local(now))
+}
+
+fn format_status_in(usage: &UsageAvailability, context: &ResetContext) -> String {
     match usage {
-        UsageAvailability::Available { snapshot } => format_snapshot(snapshot, now),
+        UsageAvailability::Available { snapshot } => format_snapshot(snapshot, context),
         UsageAvailability::Unavailable { reason } => format!("Usage: unavailable ({reason})"),
     }
 }
 
-fn format_snapshot(snapshot: &UsageSnapshot, now: SystemTime) -> String {
+fn format_snapshot(snapshot: &UsageSnapshot, context: &ResetContext) -> String {
     let mut heading = "ChatGPT usage (via Codex account)".to_owned();
     if let Some(plan) = snapshot.plan.as_deref().filter(|value| !value.is_empty()) {
         heading.push_str(" · ");
@@ -143,10 +150,10 @@ fn format_snapshot(snapshot: &UsageSnapshot, now: SystemTime) -> String {
         } else {
             Some(bucket.limit_name.as_deref().unwrap_or(id))
         };
-        bucket_rows(&mut rows, name, bucket, now);
+        bucket_rows(&mut rows, name, bucket, context);
     }
     if let Some(bucket) = &snapshot.unkeyed_bucket {
-        bucket_rows(&mut rows, None, bucket, now);
+        bucket_rows(&mut rows, None, bucket, context);
     }
     if rows.is_empty() {
         return heading + "\nLimits: unavailable";
@@ -180,7 +187,7 @@ fn bucket_rows(
     rows: &mut Vec<(String, String)>,
     name: Option<&str>,
     bucket: &RateLimitBucket,
-    now: SystemTime,
+    context: &ResetContext,
 ) {
     let count = usize::from(bucket.primary.is_some()) + usize::from(bucket.secondary.is_some());
     if count == 0 {
@@ -214,11 +221,12 @@ fn bucket_rows(
             }
             None => "unavailable".to_owned(),
         };
-        if let Some(reset) = window
-            .resets_at
-            .and_then(|seconds| format_reset(seconds, now))
-        {
-            value.push_str(&format!(" (resets {reset})"));
+        if let Some(seconds) = window.resets_at {
+            if let Some(reset) = format_reset(seconds, context) {
+                value.push_str(&format!(" (resets {reset})"));
+            } else {
+                value.push_str(" (reset time unavailable)");
+            }
         }
         rows.push((label, value));
     }
@@ -245,20 +253,94 @@ fn window_label(minutes: Option<u64>, secondary: bool) -> &'static str {
     }
 }
 
-fn format_reset(seconds: i64, now: SystemTime) -> Option<String> {
-    let reset = chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0)?;
-    let today = now
-        .duration_since(UNIX_EPOCH)
+struct ResetTime {
+    date: chrono::DateTime<chrono::FixedOffset>,
+    zone: String,
+}
+
+struct ResetContext {
+    now: SystemTime,
+    localize: fn(i64) -> Option<ResetTime>,
+}
+impl ResetContext {
+    fn local(now: SystemTime) -> Self {
+        Self {
+            now,
+            localize: local_reset_time,
+        }
+    }
+}
+
+fn local_reset_time(seconds: i64) -> Option<ResetTime> {
+    let utc = chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0)?;
+    let timestamp: libc::time_t = seconds;
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // localtime_r initializes the caller-owned tm and applies the system's
+    // timezone rules at the reset instant, including daylight transitions.
+    let result = unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()) };
+    if result.is_null() {
+        return None;
+    }
+    // A non-null return confirms the complete tm was initialized.
+    let local = unsafe { local.assume_init() };
+    let offset = chrono::FixedOffset::east_opt(i32::try_from(local.tm_gmtoff).ok()?)?;
+    utc.naive_utc()
+        .checked_add_signed(chrono::TimeDelta::seconds(i64::from(
+            offset.local_minus_utc(),
+        )))?;
+    let mut zone = [0_u8; 64];
+    // strftime owns interpretation of the native tm's timezone metadata.
+    let count =
+        unsafe { libc::strftime(zone.as_mut_ptr().cast(), zone.len(), c"%Z".as_ptr(), &local) };
+    let zone = std::str::from_utf8(&zone[..count])
         .ok()
-        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-        .and_then(|seconds| chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0));
-    Some(
-        if today.is_some_and(|today| today.date_naive() == reset.date_naive()) {
-            reset.format("%H:%M UTC").to_string()
-        } else {
-            reset.format("%H:%M UTC on %-d %b").to_string()
-        },
-    )
+        .map(safe_label)
+        .filter(|zone| !zone.is_empty())
+        .unwrap_or_else(|| format!("UTC{offset}"));
+    Some(ResetTime {
+        date: utc.with_timezone(&offset),
+        zone,
+    })
+}
+
+fn format_reset(seconds: i64, context: &ResetContext) -> Option<String> {
+    let local = (context.localize)(seconds)?;
+    let reset = if seconds >= 0 {
+        UNIX_EPOCH.checked_add(Duration::from_secs(seconds.unsigned_abs()))?
+    } else {
+        UNIX_EPOCH.checked_sub(Duration::from_secs(seconds.unsigned_abs()))?
+    };
+    let relative = match reset.duration_since(context.now) {
+        Ok(duration) if duration.is_zero() => "now".into(),
+        Ok(duration) => format!("in {}", reset_duration(duration)),
+        Err(elapsed) => format!("{} ago", reset_duration(elapsed.duration())),
+    };
+    Some(format!(
+        "{} {} · {relative}",
+        local.date.format("%b %-d, %Y %H:%M"),
+        local.zone
+    ))
+}
+
+fn reset_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        return "less than a minute".into();
+    }
+    let units = if seconds >= 86_400 {
+        [
+            (seconds / 86_400, "day"),
+            (seconds % 86_400 / 3_600, "hour"),
+        ]
+    } else {
+        [(seconds / 3_600, "hour"), (seconds % 3_600 / 60, "minute")]
+    };
+    units
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, unit)| format!("{count} {unit}{}", if count == 1 { "" } else { "s" }))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// All variants are safe to display: no upstream message or stderr is retained.
@@ -633,6 +715,57 @@ async fn frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, Usage
 mod tests {
     use super::*;
 
+    fn fixed_time(seconds: i64, east: i32, zone: &str) -> Option<ResetTime> {
+        let utc = chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0)?;
+        let offset = chrono::FixedOffset::east_opt(east)?;
+        utc.naive_utc()
+            .checked_add_signed(chrono::TimeDelta::seconds(i64::from(east)))?;
+        Some(ResetTime {
+            date: utc.with_timezone(&offset),
+            zone: zone.into(),
+        })
+    }
+    fn utc(seconds: i64) -> Option<ResetTime> {
+        fixed_time(seconds, 0, "UTC")
+    }
+    fn stamp(value: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .timestamp()
+    }
+    fn instant(value: &str) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(stamp(value).try_into().unwrap())
+    }
+    fn pacific(seconds: i64) -> Option<ResetTime> {
+        let transition = stamp("2026-11-01T09:00:00Z");
+        if seconds < transition {
+            fixed_time(seconds, -7 * 3_600, "PDT")
+        } else {
+            fixed_time(seconds, -8 * 3_600, "PST")
+        }
+    }
+    fn usage_reset(resets_at: Option<i64>) -> UsageAvailability {
+        UsageAvailability::Available {
+            snapshot: Box::new(UsageSnapshot {
+                source: UsageSource::CodexAccount,
+                email: None,
+                plan: None,
+                buckets: BTreeMap::new(),
+                unkeyed_bucket: Some(RateLimitBucket {
+                    limit_id: None,
+                    limit_name: None,
+                    plan_type: None,
+                    primary: Some(RateLimitWindow {
+                        used_percent: Some(50.0),
+                        window_duration_mins: Some(300),
+                        resets_at,
+                    }),
+                    secondary: None,
+                }),
+            }),
+        }
+    }
+
     const ACCOUNT: &str = r#"{"type":"chatgpt","email":"reader@example.invalid","planType":"pro"}"#;
     fn replies(account: &str, limits: &str) -> String {
         format!(
@@ -800,7 +933,34 @@ mod tests {
     }
 
     #[test]
-    fn status_renders_remaining_bars_window_labels_and_utc_resets_without_account_details() {
+    fn quota_resets_include_full_dates_and_relative_time() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let usage = UsageAvailability::Available {
+            snapshot: Box::new(UsageSnapshot {
+                source: UsageSource::CodexAccount,
+                email: None,
+                plan: None,
+                buckets: BTreeMap::new(),
+                unkeyed_bucket: Some(RateLimitBucket {
+                    limit_id: None,
+                    limit_name: None,
+                    plan_type: None,
+                    primary: Some(RateLimitWindow {
+                        used_percent: Some(50.0),
+                        window_duration_mins: Some(300),
+                        resets_at: Some(1_700_000_000 + 5 * 86_400 + 4 * 3_600),
+                    }),
+                    secondary: None,
+                }),
+            }),
+        };
+        let text = format_status(&usage, now);
+        assert!(text.contains("2023"), "{text}");
+        assert!(text.contains("· in 5 days 4 hours)"), "{text}");
+    }
+
+    #[test]
+    fn status_renders_remaining_bars_window_labels_and_local_resets_without_account_details() {
         let mut snapshot = UsageSnapshot {
             source: UsageSource::CodexAccount,
             email: Some("reader@example.invalid".into()),
@@ -826,17 +986,94 @@ mod tests {
                 }),
             },
         );
-        let text = format_status(
+        let text = format_status_in(
             &UsageAvailability::Available {
                 snapshot: Box::new(snapshot),
             },
-            UNIX_EPOCH,
+            &ResetContext {
+                now: UNIX_EPOCH,
+                localize: utc,
+            },
         );
         assert_eq!(
             text,
-            "ChatGPT usage (via Codex account) · pro\n5h limit:      [███████████████░░░░░] 75% left (resets 01:00 UTC)\nWeekly limit:  [████████░░░░░░░░░░░░] 40% left (resets 01:00 UTC on 2 Jan)"
+            "ChatGPT usage (via Codex account) · pro\n5h limit:      [███████████████░░░░░] 75% left (resets Jan 1, 1970 01:00 UTC · in 1 hour)\nWeekly limit:  [████████░░░░░░░░░░░░] 40% left (resets Jan 2, 1970 01:00 UTC · in 1 day 1 hour)"
         );
         assert!(!text.contains('@'));
+    }
+
+    #[test]
+    fn status_uses_the_reset_instants_local_zone_and_absolute_countdown_across_daylight_change() {
+        let context = ResetContext {
+            now: instant("2026-10-28T16:00:00Z"),
+            localize: pacific,
+        };
+        let text = format_status_in(&usage_reset(Some(stamp("2026-11-02T20:00:00Z"))), &context);
+        assert!(
+            text.contains("Nov 2, 2026 12:00 PST · in 5 days 4 hours"),
+            "{text}"
+        );
+        assert!(!text.contains("PDT"));
+        let context = ResetContext {
+            now: instant("2026-11-01T08:30:00Z"),
+            localize: pacific,
+        };
+        let text = format_status_in(&usage_reset(Some(stamp("2026-11-01T09:30:00Z"))), &context);
+        assert!(text.contains("Nov 1, 2026 01:30 PST · in 1 hour"), "{text}");
+    }
+
+    #[test]
+    fn status_shows_local_calendar_date_hours_and_minutes() {
+        let context = ResetContext {
+            now: instant("2026-10-29T00:00:00Z"),
+            localize: pacific,
+        };
+        let text = format_status_in(&usage_reset(Some(stamp("2026-10-29T01:05:00Z"))), &context);
+        assert!(
+            text.contains("Oct 28, 2026 18:05 PDT · in 1 hour 5 minutes"),
+            "{text}"
+        );
+        let text = format_status_in(&usage_reset(Some(stamp("2026-10-29T23:59:59Z"))), &context);
+        assert!(text.contains("in 23 hours 59 minutes"), "{text}");
+    }
+
+    #[test]
+    fn status_distinguishes_now_elapsed_and_unknown_reset_times() {
+        let context = ResetContext {
+            now: instant("2026-10-29T00:00:00Z"),
+            localize: pacific,
+        };
+        let now = stamp("2026-10-29T00:00:00Z");
+        let current = format_status_in(&usage_reset(Some(now)), &context);
+        assert!(current.contains("· now)"), "{current}");
+        let past = format_status_in(&usage_reset(Some(now - 125)), &context);
+        assert!(past.contains("· 2 minutes ago)"), "{past}");
+        let soon = format_status_in(&usage_reset(Some(now + 1)), &context);
+        assert!(soon.contains("· in less than a minute)"), "{soon}");
+        let missing = format_status_in(&usage_reset(None), &context);
+        assert!(!missing.contains("resets"));
+        let invalid = format_status_in(&usage_reset(Some(i64::MAX)), &context);
+        assert!(invalid.contains("reset time unavailable"));
+        assert!(!invalid.contains("· now"));
+        assert!(!invalid.contains("0 minutes"));
+    }
+
+    #[test]
+    fn public_status_formatter_uses_the_system_local_timezone() {
+        let reset = stamp("2026-10-29T01:05:00Z");
+        let local = local_reset_time(reset).unwrap();
+        let text = format_status(
+            &usage_reset(Some(reset)),
+            UNIX_EPOCH + Duration::from_secs((reset - 3_600).try_into().unwrap()),
+        );
+        assert!(
+            text.contains(&local.date.format("%b %-d, %Y %H:%M").to_string()),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(" {} · in 1 hour", local.zone)),
+            "{text}"
+        );
     }
 
     #[test]
@@ -857,7 +1094,15 @@ mod tests {
             }),
         };
         let mut rows = Vec::new();
-        bucket_rows(&mut rows, None, &bucket, UNIX_EPOCH);
+        bucket_rows(
+            &mut rows,
+            None,
+            &bucket,
+            &ResetContext {
+                now: UNIX_EPOCH,
+                localize: utc,
+            },
+        );
         assert_eq!(
             rows,
             [
@@ -868,7 +1113,16 @@ mod tests {
         assert_eq!(window_label(Some(285), false), "5h");
         assert_eq!(window_label(Some(316), false), "Usage");
         assert_eq!(window_label(Some(u64::MAX), true), "Secondary usage");
-        assert_eq!(format_reset(i64::MAX, UNIX_EPOCH), None);
+        assert_eq!(
+            format_reset(
+                i64::MAX,
+                &ResetContext {
+                    now: UNIX_EPOCH,
+                    localize: utc
+                }
+            ),
+            None
+        );
         let unknown = format_status(
             &UsageAvailability::Unavailable {
                 reason: UsageUnavailable::AccountMismatch,

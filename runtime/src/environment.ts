@@ -8,9 +8,10 @@ import type { HostCommand } from "./generated/HostCommand.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
+import type { HostCall } from "./tasks.js";
 
 type Registry = { settings: CoordinatorSettings | null; coordinator_host_id: string | null;
-  nodes: { node: AgentNode; seen_at: number }[] };
+  nodes: { node: AgentNode; seen_at: number; telemetry?: boolean }[] };
 const State = defineDoc<Registry>({ kind: "agent.environment", scope: "session", version: 1,
   initial: () => ({ settings: null, coordinator_host_id: null, nodes: [] }), checkpointWhen: () => true });
 const DEFAULT_SETTINGS: CoordinatorSettings = { model: DEFAULT_MODEL, instructions: "", context_repositories: [], sources: [] };
@@ -28,8 +29,17 @@ function upsert(registry: Registry, node: AgentNode): void {
     throw new EnvironmentError("Worker names must identify one native Rex host.");
   }
   const saved = registry.nodes.find((saved) => saved.node.host_id === node.host_id);
-  if (saved === undefined) registry.nodes.push({ node, seen_at: Date.now() });
-  else { saved.node = node; saved.seen_at = Date.now(); }
+  const telemetry = node.machine !== undefined && node.machine !== null;
+  if (saved === undefined) registry.nodes.push({ node, seen_at: Date.now(), telemetry });
+  else {
+    const { machine: incoming, ...metadata } = node;
+    const previous = saved.node.machine;
+    const machine = previous !== undefined && previous !== null &&
+      (incoming === undefined || incoming === null || previous.observed_at_ms > incoming.observed_at_ms) ? previous : incoming;
+    saved.node = { ...metadata, ...(machine === undefined || machine === null ? {} : { machine }) };
+    saved.telemetry = telemetry;
+    saved.seen_at = Date.now();
+  }
 }
 
 /** Persist metadata; only the owning Rust broker declares a connection online. */
@@ -51,10 +61,33 @@ export class CoordinatorEnvironment {
     await this.session.commit(async (tx) => upsert(await tx.doc(State), node), BACKGROUND_CONTEXT);
   }
   setConnected(hostIds: readonly string[]): void { this.connected = new Set(hostIds); }
-  async environment(): Promise<Extract<RuntimeEventKind, { type: "environment" }>> {
+  async environment(call?: HostCall): Promise<Extract<RuntimeEventKind, { type: "environment" }>> {
+    const unavailable: string[] = [];
+    if (call !== undefined) {
+      const current = await this.session.snapshot(State, BACKGROUND_CONTEXT);
+      const observed = await Promise.all((current?.nodes ?? []).filter(({ node }) => this.connected.has(node.host_id)).map(async ({ node, telemetry }) => {
+        // A retained sample can outlive its producer. Only the current
+        // registration advertises support for this newer read-only command.
+        if (telemetry !== true) { unavailable.push(node.host_id); return undefined; }
+        try {
+          const result = await call({ type: "on_node", host_id: node.host_id, command: { type: "machine_snapshot" } });
+          if (result.type === "machine_snapshot") return { host_id: node.host_id, snapshot: result.snapshot };
+        } catch { /* Preserve the last sample when a live read fails. */ }
+        unavailable.push(node.host_id); return undefined;
+      }));
+      if (observed.some((value) => value !== undefined)) await this.session.commit(async (tx) => {
+        const registry = await tx.doc(State);
+        for (const value of observed) {
+          if (value === undefined) continue;
+          const node = registry.nodes.find(({ node }) => node.host_id === value.host_id)?.node;
+          if (node !== undefined && (node.machine === undefined || node.machine === null || node.machine.observed_at_ms <= value.snapshot.observed_at_ms)) node.machine = value.snapshot;
+        }
+      }, BACKGROUND_CONTEXT);
+    }
     const registry = await this.session.snapshot(State, BACKGROUND_CONTEXT);
     return { type: "environment", settings: registry?.settings ?? DEFAULT_SETTINGS,
-      nodes: registry?.nodes.map((saved) => saved.node) ?? [], online_host_ids: [...this.connected] };
+      nodes: registry?.nodes.map((saved) => saved.node) ?? [], online_host_ids: [...this.connected],
+      ...(unavailable.length === 0 ? {} : { unavailable_host_ids: unavailable.sort() }) };
   }
   async model(override: ModelSelection | null): Promise<ModelSelection> {
     return override ?? (await this.environment()).settings.model;

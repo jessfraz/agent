@@ -17,6 +17,7 @@ pub mod broker;
 pub mod callback;
 pub mod instructions;
 pub mod intake;
+pub mod machines;
 pub mod sources;
 pub mod tailnet;
 pub mod tui;

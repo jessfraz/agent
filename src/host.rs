@@ -30,19 +30,28 @@ pub struct Executor {
     history: CodexHistory,
     embeddings: tokio::sync::Mutex<Option<Arc<LlamaProvider>>>,
     state: PathBuf,
+    daemon: crate::tailnet::Daemon,
 }
 
 impl Executor {
     pub fn new(state: &Path) -> Self {
+        Self::with_tailscale(state, crate::tailnet::Daemon::default())
+    }
+
+    pub fn with_tailscale(state: &Path, daemon: crate::tailnet::Daemon) -> Self {
         Self {
             history: CodexHistory::new(),
             embeddings: tokio::sync::Mutex::new(None),
             state: state.to_owned(),
+            daemon,
         }
     }
 
     pub async fn execute(&self, command: HostCommand) -> HostResult {
         let result = match command {
+            HostCommand::MachineSnapshot => crate::machines::observe(&self.daemon)
+                .await
+                .map(|snapshot| HostResult::MachineSnapshot { snapshot }),
             HostCommand::History { request } => self
                 .history
                 .request(request)
@@ -156,7 +165,10 @@ pub async fn execute(command: HostCommand) -> HostResult {
 
 async fn execute_inner(command: HostCommand) -> Result<HostResult> {
     match command {
-        HostCommand::History { .. } | HostCommand::Embed { .. } | HostCommand::ReadUsage { .. } => {
+        HostCommand::History { .. }
+        | HostCommand::Embed { .. }
+        | HostCommand::ReadUsage { .. }
+        | HostCommand::MachineSnapshot => {
             anyhow::bail!("This operation requires a service-owned host executor")
         }
         HostCommand::ReloadGuidance => anyhow::bail!("Shared guidance belongs to the coordinator"),

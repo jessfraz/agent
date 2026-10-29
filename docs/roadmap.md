@@ -14,6 +14,9 @@ recovery; [history](history.md) describes import and retrieval.
 
 ## Inputs and automation
 
+- [ ] Ship hosted web search and page retrieval with source links for supported
+  OpenAI models. The existing ChatGPT login has passed an isolated search,
+  open-page and find-in-page check. Other providers need their own integration.
 - [ ] Chrome browser tool as the last fallback after APIs and CLIs; reuse the
   selected machine's browser session.
 - [ ] WhatsApp or iMessage input for the main conversation, using the same
@@ -44,8 +47,10 @@ recovery; [history](history.md) describes import and retrieval.
 - [ ] Dreams and Dreams evals: inspect private logs nightly and propose useful
   improvements as reviewable diffs with before/after evidence. Learned changes
   take effect only after approval of that diff.
-- [ ] Connect Pi's native telemetry to the same diagnostics and expose its
-  per-run token metrics separately from subscription quota.
+- [ ] Connect Pi's native telemetry to the same diagnostics. Show token use,
+  cache hits and estimated cost for every chat, separately from subscription
+  quota; keep estimates distinct from billed amounts.
+- [ ] Benchmark deferred tool discovery before adopting it for larger toolsets.
 
 ## Recovery
 

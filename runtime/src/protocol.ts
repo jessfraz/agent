@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
+import { isIPv4 } from "node:net";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
@@ -7,6 +8,7 @@ import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import { AuthError } from "./auth.js";
 
 const ajv = new Ajv2020({ strict: true });
+ajv.addFormat("ipv4", { type: "string", validate: isIPv4 });
 ajv.addFormat("int64", { type: "number", validate: (value: number) => Number.isSafeInteger(value) });
 ajv.addFormat("float", { type: "number", validate: (value: number) => Number.isFinite(value) });
 ajv.addFormat("double", { type: "number", validate: (value: number) => Number.isFinite(value) });

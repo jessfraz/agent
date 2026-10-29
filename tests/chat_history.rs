@@ -126,6 +126,7 @@ async fn main_history(older: bool) {
                             } else {
                                 Some("older-root-page".into())
                             },
+                            page_complete: false,
                         };
                         let mut frame = serde_json::to_vec(&event).unwrap();
                         frame.push(b'\n');

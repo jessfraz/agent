@@ -705,6 +705,7 @@ impl State {
             RuntimeEventKind::History {
                 messages,
                 next_cursor,
+                page_complete,
                 ..
             } => {
                 self.output.banner.ready();
@@ -715,6 +716,7 @@ impl State {
                     self.committed(message, true);
                 }
                 self.input_history.sync(&self.messages, None);
+                if page_complete { self.finish_history_page(); }
             }
             RuntimeEventKind::Message { message } => {
                 self.output.banner.ready();
@@ -779,6 +781,9 @@ impl State {
             },
             RuntimeEventKind::TaskReady { title, .. } => {
                 self.output.banner.ready();
+                // Initial history is fetched after readiness. Keep newly
+                // placed input behind that page while the fetch is in flight.
+                self.output.collecting_history = true;
                 self.info.title = title;
                 self.worker = true;
                 self.history_offset = Some(0);
@@ -798,10 +803,8 @@ impl State {
             }
             RuntimeEventKind::Notice { text, .. } if !self.worker => self.push(Role::Notice, text),
             RuntimeEventKind::Done => {
-                self.output.collecting_history = false;
+                self.finish_history_page();
                 if !self.working { self.settle_legacy_answer(); }
-                self.loading_history = None;
-                self.history_entry = None;
             }
             RuntimeEventKind::Failure { message, .. } => {
                 self.compacting = false;
@@ -852,6 +855,11 @@ impl State {
         } else {
             "Ready"
         }
+    }
+    fn finish_history_page(&mut self) {
+        self.output.collecting_history = false;
+        self.loading_history = None;
+        self.history_entry = None;
     }
     fn input(&mut self, event: Event) -> Option<TuiInput> {
         self.sync_completion();
@@ -1640,6 +1648,7 @@ mod tests {
                 tool: None,
             }],
             next_cursor: None,
+            page_complete: false,
         };
         history.event(frame("Earlier ", false));
         rendered(&mut history, 80, 20);
@@ -2092,6 +2101,7 @@ mod tests {
             conversation_id: "main".into(),
             messages: vec![],
             next_cursor: Some("older".into()),
+            page_complete: false,
         });
         assert_eq!(
             state.input(key(KeyCode::Char('r'), KeyModifiers::CONTROL)),
@@ -2109,6 +2119,7 @@ mod tests {
                     tool: None,
                 }],
                 next_cursor: None,
+                page_complete: false,
             });
         }
         assert_eq!(
@@ -2201,6 +2212,7 @@ mod tests {
             conversation_id: "main".into(),
             messages,
             next_cursor: None,
+            page_complete: false,
         };
         let message = |id: &str, role, text: &str, continuation| HistoryMessage {
             entry_id: id.into(),
@@ -2265,6 +2277,7 @@ mod tests {
             })
             .collect(),
             next_cursor: None,
+            page_complete: false,
         });
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|frame| view.draw(frame)).unwrap();
@@ -2303,6 +2316,7 @@ mod tests {
                 tool: None,
             }],
             next_cursor: Some("older".into()),
+            page_complete: false,
         };
         view.event(frame("recent", "A different request"));
         view.event(RuntimeEventKind::Done);
@@ -2417,6 +2431,7 @@ mod tests {
                 tool: None,
             }],
             next_cursor: Some("older".into()),
+            page_complete: false,
         });
         rendered(&mut view, 80, 20);
         let mut request = None;
@@ -2445,6 +2460,7 @@ mod tests {
                 tool: None,
             }],
             next_cursor: None,
+            page_complete: false,
         });
         view.event(RuntimeEventKind::Done);
         assert_eq!(
@@ -2633,6 +2649,7 @@ mod tests {
                 },
             ],
             next_cursor: None,
+            page_complete: false,
         });
         view.event(RuntimeEventKind::Done);
         view.event(RuntimeEventKind::Message {
@@ -2727,6 +2744,7 @@ mod tests {
             conversation_id: "main".into(),
             messages: old.clone(),
             next_cursor: None,
+            page_complete: false,
         });
         view.event(RuntimeEventKind::Done);
         let mut refreshed = old;
@@ -2743,6 +2761,7 @@ mod tests {
                 conversation_id: "main".into(),
                 messages: vec![message],
                 next_cursor: None,
+                page_complete: false,
             });
         }
         view.event(RuntimeEventKind::Done);

@@ -65,6 +65,16 @@
         "launch": {
           "$ref": "#/$defs/WorkerLaunch"
         },
+        "machine": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MachineSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "name": {
           "type": "string"
         },
@@ -234,6 +244,14 @@
             "type"
           ]
         }
+      ]
+    },
+    "Architecture": {
+      "type": "string",
+      "enum": [
+        "aarch64",
+        "x86_64",
+        "other"
       ]
     },
     "AuthStatus": {
@@ -1113,6 +1131,18 @@
         {
           "type": "object",
           "properties": {
+            "type": {
+              "type": "string",
+              "const": "machine_snapshot"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "expected_email": {
               "type": "string"
             },
@@ -1694,6 +1724,70 @@
         "follow_up"
       ]
     },
+    "MachineSnapshot": {
+      "type": "object",
+      "properties": {
+        "architecture": {
+          "$ref": "#/$defs/Architecture"
+        },
+        "load_average": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "number",
+            "format": "double"
+          },
+          "maxItems": 3,
+          "minItems": 3
+        },
+        "logical_cpus": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "memory_available_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "memory_total_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "observed_at_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "os": {
+          "$ref": "#/$defs/OperatingSystem"
+        },
+        "tailscale_ip": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "ipv4"
+        }
+      },
+      "required": [
+        "observed_at_ms",
+        "os",
+        "architecture"
+      ]
+    },
     "ModelActivity": {
       "oneOf": [
         {
@@ -1912,6 +2006,14 @@
         "git_dir",
         "branch",
         "head"
+      ]
+    },
+    "OperatingSystem": {
+      "type": "string",
+      "enum": [
+        "macos",
+        "linux",
+        "other"
       ]
     },
     "RateLimitBucket": {
@@ -2319,6 +2421,15 @@
             "type": {
               "type": "string",
               "const": "environment"
+            },
+            "unavailable_host_ids": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -2592,6 +2703,10 @@
                 "string",
                 "null"
               ]
+            },
+            "page_complete": {
+              "type": "boolean",
+              "default": false
             },
             "type": {
               "type": "string",

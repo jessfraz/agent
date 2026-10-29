@@ -4,6 +4,11 @@ use ratatui::{
     text::{Line, Span},
 };
 
+struct Link {
+    destination: String,
+    label: String,
+}
+
 /// Render content as cells, never as terminal escape sequences.
 pub(crate) fn plain(value: &str) -> String {
     value
@@ -20,6 +25,7 @@ pub(crate) fn render(source: &str) -> Vec<Line<'static>> {
     let mut lists: Vec<Option<u64>> = Vec::new();
     let mut code = false;
     let mut quote: usize = 0;
+    let mut link: Option<Link> = None;
     let flush = |lines: &mut Vec<Line<'static>>, line: &mut Vec<Span<'static>>| {
         if !line.is_empty() {
             lines.push(Line::from(std::mem::take(line)));
@@ -39,8 +45,12 @@ pub(crate) fn render(source: &str) -> Vec<Line<'static>> {
                 Tag::Emphasis => styles.push(current.add_modifier(Modifier::ITALIC)),
                 Tag::Strong => styles.push(current.add_modifier(Modifier::BOLD)),
                 Tag::Strikethrough => styles.push(current.add_modifier(Modifier::CROSSED_OUT)),
-                Tag::Link { .. } => {
-                    styles.push(current.fg(Color::Blue).add_modifier(Modifier::UNDERLINED))
+                Tag::Link { dest_url, .. } => {
+                    link = Some(Link {
+                        destination: dest_url.chars().filter(|ch| !ch.is_control()).collect(),
+                        label: String::new(),
+                    });
+                    styles.push(current.fg(Color::Blue).add_modifier(Modifier::UNDERLINED));
                 }
                 Tag::CodeBlock(_) => {
                     flush(&mut lines, &mut line);
@@ -80,7 +90,16 @@ pub(crate) fn render(source: &str) -> Vec<Line<'static>> {
                     code = false;
                     lines.push(Line::default());
                 }
-                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
+                TagEnd::Link => {
+                    if let Some(link) = link.take()
+                        && !link.destination.is_empty()
+                        && link.label.trim() != link.destination
+                    {
+                        line.push(Span::styled(format!(" ({})", link.destination), current));
+                    }
+                    styles.pop();
+                }
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                     styles.pop();
                 }
                 TagEnd::Paragraph | TagEnd::Item => {
@@ -102,6 +121,9 @@ pub(crate) fn render(source: &str) -> Vec<Line<'static>> {
                 _ => {}
             },
             Event::Text(value) | Event::Html(value) | Event::InlineHtml(value) => {
+                if let Some(link) = &mut link {
+                    link.label.push_str(&value);
+                }
                 for (index, segment) in value.split('\n').enumerate() {
                     if index > 0 {
                         flush(&mut lines, &mut line);
@@ -122,10 +144,23 @@ pub(crate) fn render(source: &str) -> Vec<Line<'static>> {
                 }
             }
             Event::Code(value) => {
+                if let Some(link) = &mut link {
+                    link.label.push_str(&value);
+                }
                 line.push(Span::styled(value.to_string(), current.fg(Color::Yellow)))
             }
-            Event::SoftBreak => line.push(Span::raw(" ")),
-            Event::HardBreak => flush(&mut lines, &mut line),
+            Event::SoftBreak => {
+                if let Some(link) = &mut link {
+                    link.label.push(' ');
+                }
+                line.push(Span::raw(" "));
+            }
+            Event::HardBreak => {
+                if let Some(link) = &mut link {
+                    link.label.push('\n');
+                }
+                flush(&mut lines, &mut line);
+            }
             Event::Rule => {
                 flush(&mut lines, &mut line);
                 lines.push(Line::styled(
@@ -150,6 +185,31 @@ pub(crate) fn render(source: &str) -> Vec<Line<'static>> {
 mod tests {
     use crate::tui::markdown::render;
     use ratatui::{Terminal, backend::TestBackend, style::Modifier, widgets::Paragraph};
+
+    #[test]
+    fn markdown_links_keep_copyable_destinations_without_repeating_autolinks() {
+        let lines = render(
+            "Read [the **source**](https://example.com/source) and [reference][ref].\n\n<https://example.com/direct>\n\n[ref]: https://example.com/reference",
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 8)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new(lines), frame.area()))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("the source (https://example.com/source)"));
+        assert!(text.contains("reference (https://example.com/reference)"));
+        assert_eq!(text.matches("https://example.com/direct").count(), 1);
+        assert_eq!(
+            render("[https://example.com](https://example.com)")[0].to_string(),
+            "https://example.com"
+        );
+    }
 
     #[test]
     fn markdown_has_native_styles_and_code_is_literal() {

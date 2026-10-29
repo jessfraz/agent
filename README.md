@@ -57,6 +57,8 @@ live activity. Enter steers, Tab queues a separate FIFO turn, Shift+Enter insert
 a newline, and Esc stops. Press `?` in an empty editor or use `/help` for the
 current commands and shortcuts. `/model`, `/reasoning` and `/fast` control this
 conversation; `/status` shows its settings, connection and available plan usage.
+Reset times use the client's local timezone and include a countdown.
+`/machines` shows connected hosts, hardware capacity and recent load samples.
 Use `--no-tui` for plain output.
 
 `/feedback <description>` starts a background repair on the same machine with
@@ -111,6 +113,10 @@ default; other providers use Pi's environment or ambient credentials. New tasks
 inherit the coordinator's typed model, reasoning and fast-mode settings;
 resumed tasks retain their saved selection. `agent usage` reads the installed
 Codex account's quota and cannot report a separate allowance for this app.
+
+Supported OpenAI Responses models get hosted web search, page opening and
+find-in-page tools. Source links stay in saved replies. Other providers need
+their own search integration; Chrome control is planned separately.
 
 Sources use existing authenticated CLIs: Google mail and calendars through
 Switchboard and `gws`, GitHub through Switchboard and `gh`, a configured Slack

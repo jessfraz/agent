@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs::{File, OpenOptions},
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::Path,
@@ -19,6 +19,9 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
+
+mod diagnostics;
+use crate::runtime::diagnostics::{Diagnostics, Event as DiagnosticEvent, HostTiming, Trace};
 
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
@@ -64,7 +67,8 @@ enum CommandMessage {
 
 struct Pending {
     events: Option<mpsc::Sender<RuntimeEventKind>>,
-    host_calls: HashSet<String>,
+    host_calls: HashMap<String, HostTiming>,
+    trace: Trace,
     login: bool,
     worker: bool,
     main_view: bool,
@@ -120,6 +124,7 @@ impl Runtime {
         let (life, alive) = watch::channel(true);
         let (notices, _) = broadcast::channel(64);
         let notifications = notices.clone();
+        let diagnostics = Diagnostics::start(state);
         let actor = tokio::spawn(async move {
             let result = run_actor(
                 child,
@@ -128,6 +133,7 @@ impl Runtime {
                 incoming,
                 guard,
                 notifications,
+                diagnostics,
             )
             .await;
             let _ = life.send(false);
@@ -246,21 +252,30 @@ impl Drop for Runtime {
     }
 }
 
-async fn send(stdin: &mut ChildStdin, request: RuntimeRequest) -> Result<()> {
+async fn send(stdin: &mut ChildStdin, request: RuntimeRequest) -> Result<Option<String>> {
     let mut bytes = serde_json::to_vec(&request)?;
     ensure!(
         bytes.len() <= MAX_FRAME_BYTES,
         "Runtime request exceeds its size limit"
     );
+    let kind = diagnostics::command_kind(&bytes);
     bytes.push(b'\n');
     timeout(Duration::from_secs(10), stdin.write_all(&bytes))
         .await
         .context("Pi runtime stopped reading commands")?
-        .context("Could not write to Pi runtime")
+        .context("Could not write to Pi runtime")?;
+    Ok(kind)
 }
 
-async fn reject_host_calls(stdin: &mut ChildStdin, id: u32, pending: &mut Pending) -> Result<()> {
-    pending.events.take();
+async fn reject_host_calls(
+    stdin: &mut ChildStdin,
+    id: u32,
+    pending: &mut Pending,
+    diagnostics: &mut Diagnostics,
+) -> Result<()> {
+    if pending.events.take().is_some() {
+        diagnostics.record(id, &pending.trace, DiagnosticEvent::Detached);
+    }
     if pending.worker {
         pending.worker = false;
         send(
@@ -285,7 +300,8 @@ async fn reject_host_calls(stdin: &mut ChildStdin, id: u32, pending: &mut Pendin
         )
         .await?;
     }
-    for call_id in pending.host_calls.drain() {
+    for (call_id, timing) in pending.host_calls.drain() {
+        diagnostics.record(id, &pending.trace, timing.reply(&call_id));
         send(
             stdin,
             RuntimeRequest {
@@ -313,6 +329,7 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
     mut commands: mpsc::Receiver<CommandMessage>,
     _writer_guard: File,
     notices: broadcast::Sender<RuntimeNotice>,
+    mut diagnostics: Diagnostics,
 ) -> Result<()> {
     let mut output = FrameReader::new(output);
     let mut next_id = 1_u32;
@@ -330,23 +347,29 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                         let id = next_id;
                         next_id = id.checked_add(1).context("Runtime request IDs exhausted")?;
                         let (sender, events) = mpsc::channel(64);
-                        send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id, command }).await?;
-                        pending.insert(id, Pending { events: Some(sender), host_calls: HashSet::new(), login, worker, main_view, interruptible });
+                        let trace = Trace::new(&command);
+                        diagnostics.record(id, &trace, DiagnosticEvent::RequestReceived);
+                        if let Some(event) = trace.input(&command) { diagnostics.record(id, &trace, event); }
+                        if let Some(command) = send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id, command }).await? {
+                            diagnostics.record(id, &trace, DiagnosticEvent::CommandSent { command });
+                        }
+                        pending.insert(id, Pending { events: Some(sender), host_calls: HashMap::new(), trace, login, worker, main_view, interruptible });
                         if admitted.send(Ok(RuntimeCall { request_id: id, events })).is_err()
                             && let Some(call) = pending.get_mut(&id) {
-                            reject_host_calls(&mut stdin, id, call).await?;
+                            reject_host_calls(&mut stdin, id, call, &mut diagnostics).await?;
                         }
                     }
                     Some(CommandMessage::Reply { request_id, call_id, result }) => {
                         if let Some(call) = pending.get_mut(&request_id)
-                            && call.host_calls.remove(&call_id) {
+                            && let Some(timing) = call.host_calls.remove(&call_id) {
+                            diagnostics.record(request_id, &call.trace, timing.reply(&call_id));
                             send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id: request_id,
                                 command: RuntimeCommand::HostReply { call_id, result } }).await?;
                         }
                     }
                     Some(CommandMessage::Detached(id)) => {
                         if let Some(call) = pending.get_mut(&id) {
-                            reject_host_calls(&mut stdin, id, call).await?;
+                            reject_host_calls(&mut stdin, id, call, &mut diagnostics).await?;
                         }
                     }
                     Some(CommandMessage::OAuthCallback { request_id, target }) => {
@@ -356,11 +379,16 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                         }
                     }
                     Some(CommandMessage::WorkerControl { request_id, command }) => {
-                        if pending.get(&request_id).is_some_and(|request| request.events.is_some() &&
-                            (request.worker || (request.interruptible && matches!(*command,
+                        let request = pending.get(&request_id);
+                        let unowned = Trace::unowned();
+                        let trace = request.map_or(&unowned, |request| &request.trace);
+                        if let Some(event) = trace.input(&command) { diagnostics.record(request_id, trace, event); }
+                        if request.is_some_and(|request| request.events.is_some() && (request.worker || (request.interruptible && matches!(*command,
                                 RuntimeCommand::Interrupt | RuntimeCommand::SubmitInput { .. })))) {
-                            send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id: request_id, command: *command }).await?;
-                        }
+                            if let Some(command) = send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id: request_id, command: *command }).await? {
+                                diagnostics.record(request_id, trace, DiagnosticEvent::CommandSent { command });
+                            }
+                        } else { diagnostics.record(request_id, trace, DiagnosticEvent::ControlIgnored); }
                     }
                     Some(CommandMessage::Shutdown) | None => break Ok(()),
                 },
@@ -388,17 +416,30 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                         let _ = notices.send(RuntimeNotice { request_id: frame.id, event: frame.event.clone() });
                     }
                     if let RuntimeEventKind::HostCall { call_id, .. } = &frame.event {
-                        ensure!(call.host_calls.insert(call_id.clone()), "Pi reused an active host call ID");
+                        let timing = HostTiming::new(&bytes);
+                        diagnostics.record(frame.id, &call.trace, timing.received(call_id));
+                        ensure!(call.host_calls.insert(call_id.clone(), timing).is_none(), "Pi reused an active host call ID");
                     }
+                    if let RuntimeEventKind::HostCancel { call_id } = &frame.event {
+                        diagnostics.record(frame.id, &call.trace, HostTiming::cancel(call_id, call.host_calls.get(call_id)));
+                    }
+                    for event in call.trace.observe(&frame.event).into_iter().flatten() { diagnostics.record(frame.id, &call.trace, event); }
                     let done = matches!(frame.event, RuntimeEventKind::Done);
                     let detached = call.events.as_ref().is_none_or(|sender| sender.try_send(frame.event).is_err());
-                    if detached { reject_host_calls(&mut stdin, frame.id, call).await?; }
+                    if detached { reject_host_calls(&mut stdin, frame.id, call, &mut diagnostics).await?; }
                     if done { pending.remove(&frame.id); }
                 }
             }
         }
     }.await;
-    for call in pending.into_values() {
+    for (id, call) in pending {
+        diagnostics.record(
+            id,
+            &call.trace,
+            DiagnosticEvent::RuntimeStopped {
+                code: ErrorCode::Internal,
+            },
+        );
         if let Some(sender) = call.events {
             let _ = sender.try_send(RuntimeEventKind::Failure {
                 code: ErrorCode::Internal,
@@ -504,6 +545,283 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_runtime_logs_correlated_lifecycle_without_private_payloads() {
+        use crate::protocol::{InputMode, RuntimeCommand, RuntimeEventKind};
+        use crate::runtime::{
+            Runtime,
+            diagnostics::{Event, Record},
+        };
+        let state = tempfile::tempdir().unwrap();
+        let script = state.path().join("fixture.mjs");
+        std::fs::write(&script, r#"
+import {createInterface} from 'node:readline';
+const model={provider:'openai',model_id:'fixture',reasoning:null,fast:false};
+createInterface({input:process.stdin}).on('line',line=>{
+ const {id,command}=JSON.parse(line);
+ const emit=event=>process.stdout.write(JSON.stringify({version:1,id,event})+'\n');
+ if(command.type==='chat') {
+  emit({type:'main_ready',conversation_id:'conversation-one',model,cwd:'/PRIVATE_DIRECTORY_SENTINEL'});
+  emit({type:'input_placed',input_id:command.input_id,entry_id:'entry-one'});
+  emit({type:'message',message:{entry_id:'entry-one',role:'user',text:'PRIVATE_HISTORY_SENTINEL',continuation:false,final_chunk:true}});
+  emit({type:'activity',activity:{type:'thinking',text:'PRIVATE_THINKING_SENTINEL'}});
+  emit({type:'activity',activity:{type:'tool_started',call_id:'tool-one',name:'PRIVATE_TOOL_NAME_SENTINEL'}});
+  emit({type:'host_call',call_id:'host-one',command:{type:'on_node',host_id:'PRIVATE_IDENTITY_SENTINEL',command:{type:'exec',program:'PRIVATE_PROGRAM_SENTINEL',args:['PRIVATE_ARGUMENT_SENTINEL'],cwd:'/PRIVATE_PATH_SENTINEL',timeout_seconds:10}}});
+ } else if(command.type==='host_reply') {
+  emit({type:'activity',activity:{type:'tool_finished',call_id:'tool-one',name:'PRIVATE_TOOL_NAME_SENTINEL'}});
+ } else if(command.type==='submit_input') {
+  emit({type:'input_accepted',input_id:command.input_id});
+  emit({type:'input_placed',input_id:command.input_id,entry_id:'entry-two'});
+  emit({type:'host_call',call_id:'host-two',command:{type:'embed',texts:['PRIVATE_EMBEDDING_SENTINEL'],purpose:'query'}});
+ } else if(command.type==='read_history') {
+  emit({type:'history',conversation_id:'child-conversation',messages:[],next_cursor:null}); emit({type:'done'});
+ } else if(command.type==='interrupt') {
+  emit({type:'host_cancel',call_id:'host-two'});
+  emit({type:'input_rejected',input_id:'queued-input',message:'PRIVATE_REJECTION_SENTINEL'});
+  emit({type:'interrupted'});
+  emit({type:'failure',code:'provider_unavailable',message:'PRIVATE_FAILURE_SENTINEL'});
+  emit({type:'done'});
+ }
+});
+"#).unwrap();
+        let runtime = Runtime::start(&script, state.path()).unwrap();
+        let mut call = runtime
+            .request(RuntimeCommand::Chat {
+                input: "PRIVATE_PROMPT_SENTINEL".into(),
+                input_id: Some("initial-input".into()),
+                instructions: "PRIVATE_INSTRUCTIONS_SENTINEL".into(),
+                model: None,
+                origin_host_id: None,
+                cwd: "/PRIVATE_WORKSPACE_SENTINEL".into(),
+                hosts: vec![],
+            })
+            .await
+            .unwrap();
+        let request_id = call.request_id;
+        timeout(Duration::from_secs(3), async {
+            loop {
+                match call.events.recv().await.unwrap() {
+                    RuntimeEventKind::HostCall { call_id, .. } => runtime
+                        .reply(
+                            request_id,
+                            call_id,
+                            crate::protocol::HostResult::Process {
+                                exit_code: 0,
+                                stdout: "PRIVATE_STDOUT_SENTINEL".into(),
+                                stderr: "PRIVATE_STDERR_SENTINEL".into(),
+                                truncated: false,
+                            },
+                        )
+                        .await
+                        .unwrap(),
+                    RuntimeEventKind::Activity {
+                        activity: crate::protocol::ModelActivity::ToolFinished { .. },
+                    } => break,
+                    _ => {}
+                }
+            }
+            runtime
+                .worker_control(
+                    request_id,
+                    RuntimeCommand::SubmitInput {
+                        input_id: "queued-input".into(),
+                        input: "PRIVATE_STEERING_SENTINEL".into(),
+                        mode: InputMode::FollowUp,
+                    },
+                )
+                .await
+                .unwrap();
+            while !matches!(
+                call.events.recv().await.unwrap(),
+                RuntimeEventKind::HostCall { .. }
+            ) {}
+            runtime
+                .worker_control(request_id, RuntimeCommand::Interrupt)
+                .await
+                .unwrap();
+            while !matches!(call.events.recv().await.unwrap(), RuntimeEventKind::Done) {}
+        })
+        .await
+        .unwrap();
+        runtime
+            .worker_control(
+                request_id,
+                RuntimeCommand::SubmitInput {
+                    input_id: "late-input".into(),
+                    input: "PRIVATE_LATE_INPUT_SENTINEL".into(),
+                    mode: InputMode::Steer,
+                },
+            )
+            .await
+            .unwrap();
+        let task_id = crate::protocol::TaskId::new();
+        let mut history = runtime
+            .request(RuntimeCommand::ReadHistory {
+                task_id: Some(task_id.clone()),
+                agent_id: Some("child-one".into()),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let history_request = history.request_id;
+        timeout(Duration::from_secs(3), async {
+            while !matches!(history.events.recv().await.unwrap(), RuntimeEventKind::Done) {}
+        })
+        .await
+        .unwrap();
+        runtime.close().await.unwrap();
+        let path = state.path().join("diagnostics/runtime.jsonl");
+        let (text, records) = timeout(Duration::from_secs(3), async {
+            loop {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let complete = text.rsplit_once('\n').map_or("", |(complete, _)| complete);
+                let records = complete
+                    .lines()
+                    .map(serde_json::from_str::<Record>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                if records
+                    .iter()
+                    .any(|record| matches!(record.event, Event::Done))
+                {
+                    break (text, records);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !text.contains("PRIVATE_"),
+            "No prompts, paths, identities, tool names, arguments, thinking, output or errors belong in mechanical logs"
+        );
+        assert!(records.iter().all(|record| record.timestamp_ms > 0));
+        let child = records
+            .iter()
+            .filter(|record| record.request_id == history_request)
+            .collect::<Vec<_>>();
+        assert!(child.iter().all(|record| record.task_id.as_deref()
+            == Some(task_id.to_string().as_str())
+            && record.agent_id.as_deref() == Some("child-one")));
+        assert_eq!(
+            child.last().unwrap().conversation_id.as_deref(),
+            Some("child-conversation")
+        );
+        let records = records
+            .into_iter()
+            .filter(|record| record.request_id == request_id)
+            .collect::<Vec<_>>();
+        assert!(
+            records
+                .iter()
+                .filter_map(|record| record.elapsed_ms)
+                .collect::<Vec<_>>()
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1])
+        );
+        let events = records
+            .iter()
+            .map(|record| &record.event)
+            .collect::<Vec<_>>();
+        assert!(matches!(events[0], Event::RequestReceived));
+        assert!(
+            matches!(events[1], Event::InputReceived { input_id: Some(id), mode: None } if id == "initial-input")
+        );
+        assert!(matches!(events[2], Event::CommandSent { command } if command == "chat"));
+        assert!(matches!(events[3], Event::Ready));
+        assert!(
+            matches!(events[4], Event::InputPlaced { input_id: Some(id), .. } if id == "initial-input")
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::FirstActivity))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(
+            |event| matches!(event, Event::HostCall { command: Some(kind), .. } if kind == "exec")
+        ));
+        assert!(events.iter().any(
+            |event| matches!(event, Event::HostReply { command: Some(kind), .. } if kind == "exec")
+        ));
+        assert!(events.iter().any(|event| matches!(event, Event::InputReceived { input_id: Some(id), mode: Some(InputMode::FollowUp) } if id == "queued-input")));
+        assert!(events.iter().any(|event| matches!(event, Event::HostCancelRequested { call_id: Some(id), duration_ms: Some(_) } if id == "host-two")));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Failure {
+                code: crate::protocol::ErrorCode::ProviderUnavailable
+            }
+        )));
+        let done = events
+            .iter()
+            .position(|event| matches!(event, Event::Done))
+            .unwrap();
+        assert!(
+            matches!(events[done + 1], Event::InputReceived { input_id: Some(id), mode: Some(InputMode::Steer) } if id == "late-input")
+        );
+        assert!(matches!(events[done + 2], Event::ControlIgnored));
+        assert!(
+            records
+                .iter()
+                .skip(done + 1)
+                .all(|record| record.elapsed_ms.is_none() && record.conversation_id.is_none())
+        );
+        assert!(
+            records
+                .iter()
+                .skip(3)
+                .filter(|record| record.elapsed_ms.is_some())
+                .all(|record| record.conversation_id.as_deref() == Some("conversation-one"))
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_diagnostics_does_not_block_or_change_runtime_results() {
+        use crate::protocol::{RuntimeCommand, RuntimeEventKind};
+        use crate::runtime::Runtime;
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(
+            state.path().join("diagnostics"),
+            "Preserve existing unrelated file",
+        )
+        .unwrap();
+        let script = state.path().join("fixture.mjs");
+        std::fs::write(
+            &script,
+            r#"
+import {createInterface} from 'node:readline';
+createInterface({input:process.stdin}).on('line',line=>{
+ const {id}=JSON.parse(line);
+ process.stdout.write(JSON.stringify({version:1,id,event:{type:'configured'}})+'\n');
+ process.stdout.write(JSON.stringify({version:1,id,event:{type:'done'}})+'\n');
+});
+"#,
+        )
+        .unwrap();
+        let runtime = Runtime::start(&script, state.path()).unwrap();
+        for _ in 0..3 {
+            let mut call = runtime.request(RuntimeCommand::Status).await.unwrap();
+            timeout(Duration::from_secs(3), async {
+                assert!(matches!(
+                    call.events.recv().await,
+                    Some(RuntimeEventKind::Configured)
+                ));
+                assert!(matches!(
+                    call.events.recv().await,
+                    Some(RuntimeEventKind::Done)
+                ));
+            })
+            .await
+            .unwrap();
+        }
+        runtime.close().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(state.path().join("diagnostics")).unwrap(),
+            "Preserve existing unrelated file"
         );
     }
 }

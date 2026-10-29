@@ -27,6 +27,7 @@ pub async fn local_node(
     coordinator: Option<&str>,
     launch: WorkerLaunch,
     name: Option<&str>,
+    daemon: &crate::tailnet::Daemon,
 ) -> Result<AgentNode> {
     let identity = RexClient::new(None).whoami().await?;
     let output = host::execute(HostCommand::Exec {
@@ -84,6 +85,7 @@ pub async fn local_node(
             .into_owned(),
         coordinator: coordinator.map(str::to_owned),
         launch,
+        machine: crate::machines::observe(daemon).await.ok(),
     };
     validate_node(&node)?;
     Ok(node)

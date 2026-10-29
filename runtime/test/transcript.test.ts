@@ -304,3 +304,28 @@ test("native thinking updates and final snapshots render each block once while p
     assert.equal(faux.state.callCount, 2);
   } finally { await stop?.(); await stopNative?.(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
+
+
+test("native history pages mark only their final frame independently of worker lifetime", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-history-page-"));
+  const models = createModels();
+  const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  try {
+    const root = await session.root(BACKGROUND_CONTEXT);
+    for (let index = 0; index < 25; index += 1) await root.commit((tx) => tx.appendEntry(root.id, {
+      kind: "fixture.history", model: [{ role: "user", content: `Saved ${index}: ` + "x".repeat(9000), timestamp: index }],
+    }), BACKGROUND_CONTEXT);
+    const frames = await history(root, null);
+    assert.ok(frames.length > 1, "Native history must exercise a page split across transport frames");
+    assert.deepEqual(frames.map((frame) => frame.page_complete), frames.map((_, index) => index === frames.length - 1));
+    assert.ok(frames.at(-1)?.next_cursor, "Page completion is independent from exhausting older history");
+    assert.ok(frames.slice(0, -1).every((frame) => frame.next_cursor === null));
+    for (const event of frames) assert.ok(validEvent({ version: 1, id: 1, event }));
+    const tail = frames.at(-1); assert.ok(tail);
+    const older = await history(root, tail.next_cursor);
+    assert.equal(older.at(-1)?.page_complete, true); assert.equal(older.at(-1)?.next_cursor, null);
+    const empty = await history(await session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT), null);
+    assert.equal(empty.length, 1); assert.equal(empty[0]?.page_complete, true); assert.deepEqual(empty[0]?.messages, []);
+  } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});

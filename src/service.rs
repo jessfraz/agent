@@ -133,7 +133,7 @@ async fn serve_with_transport(
 ) -> Result<()> {
     // Claim the writer before deciding an old socket is stale.
     let owner = Runtime::start(script, state)?;
-    let broker = match Broker::new(bootstrap.as_ref(), state) {
+    let broker = match Broker::with_tailscale(bootstrap.as_ref(), state, daemon.clone()) {
         Ok(broker) => Arc::new(broker),
         Err(error) => {
             owner.close().await?;

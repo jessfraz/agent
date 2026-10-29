@@ -413,6 +413,27 @@ async fn invoke<T: DeserializeOwned>(daemon: &Daemon, args: &[&str]) -> Result<T
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selected_daemon_is_preserved_by_the_native_status_command() {
+        let socket = std::path::Path::new("/example/system-tailscale.sock");
+        let selected = crate::tailnet::Daemon::new(Some(socket)).unwrap();
+        let command = selected.command(&["status", "--json"]);
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            [
+                "--socket",
+                "/example/system-tailscale.sock",
+                "status",
+                "--json"
+            ]
+        );
+        let command = crate::tailnet::Daemon::default().command(&["status", "--json"]);
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            ["status", "--json"]
+        );
+    }
+
     use crate::tailnet::{
         PeerNode, PeerPolicy, SelfNode, Status, UserProfile, Whois, authorize, current_address,
         tailnet_v4,

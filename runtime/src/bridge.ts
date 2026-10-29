@@ -9,7 +9,7 @@ import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ErrorCode } from "./generated/ErrorCode.js";
 import { CoordinatorEnvironment, EnvironmentError } from "./environment.js";
-import { ConversationModels, ModelError } from "./models.js";
+import { ConversationModels, ModelError, modelFailureMessage } from "./models.js";
 import { ChatGptAuth } from "./auth.js";
 import { validRequest, validEvent, errorEvent, invalidHostReply, protocolLines } from "./protocol.js";
 import { TaskError, TaskStore, type HostCall } from "./tasks.js";
@@ -177,7 +177,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         await (await app()).environment.register(command.node); emit(id, { type: "node_registered", host_id: command.node.host_id }); break;
       case "set_connected_nodes":
         (await app()).environment.setConnected(command.host_ids); emit(id, { type: "configured" }); break;
-      case "environment": emit(id, await (await app()).environment.environment()); break;
+      case "environment": emit(id, await (await app()).environment.environment(command.telemetry ? (operation) => hostRequests.call(id, operation) : undefined)); break;
       case "login": {
         try {
           emit(id, { type: "auth_status", status: await auth.login((url) => {
@@ -435,7 +435,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
                 if (input.input_id !== undefined) emit(id, { type: "input_rejected", input_id: input.input_id, message: "The stopped turn withdrew this input; submit it again to continue." });
                 continue;
               }
-              if (settled.type !== "input" || settled.status !== "done") throw new TaskError("The model turn did not complete; its state is retained");
+              if (settled.type !== "input" || settled.status !== "done") throw new TaskError(await modelFailureMessage(root, "The model turn did not complete; its state is retained"));
               if (answers.has(settled.answer.toString())) continue;
               answers.add(settled.answer.toString());
               const entry = await root.commit((tx) => tx.entry(AssistantEntry, settled.answer), BACKGROUND_CONTEXT);

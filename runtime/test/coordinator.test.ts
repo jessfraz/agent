@@ -109,6 +109,13 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     const run = () => start(1, launch.command.slice(1), undefined, { REX_SESSION: launch.session_id, REX_BLOCK: launch.block_id }, true);
     await script("fixture-initial-worker", [{ text: "Sapphire laptop measurement retained." }]);
     let actor = run(); await until(async () => events(actor.output()).some((event) => event.type === "worker_idle"));
+    const initialWorker = events(actor.output());
+    const readyIndex = initialWorker.findIndex((event) => event.type === "task_ready");
+    const idleIndex = initialWorker.findIndex((event) => event.type === "worker_idle");
+    const page = initialWorker.slice(readyIndex + 1, idleIndex).filter((event) => event.type === "history");
+    assert.ok(readyIndex >= 0 && idleIndex > readyIndex && page.length > 0);
+    assert.equal(page.at(-1)?.page_complete, true, "A live RunTask must complete its history page before idle without ending the session");
+    assert.equal(initialWorker.slice(0, idleIndex + 1).some((event) => event.type === "done"), false);
     actor.child.stdin.end("/exit\n"); assert.equal(await actor.exited, 0, actor.errors());
     const taskSettings = (await exchange({ type: "conversation_settings", task_id: old.id, agent_id: null,
       change: { type: "set_reasoning", reasoning: "high" }, catalog: false })).find((event) => event.type === "conversation_settings");

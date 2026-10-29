@@ -100,6 +100,8 @@ pub enum ChatCommand {
     Help,
     /// Show this conversation's model and connection.
     Status,
+    /// Show machines, capacity and observed load.
+    Machines,
     /// Show available models, or choose [provider/]model.
     Model {
         #[arg(value_name = "MODEL")]
@@ -257,6 +259,18 @@ mod tests {
             ChatCommand::parse("/quit").unwrap().unwrap(),
             ChatCommand::Exit
         );
+        assert_eq!(
+            ChatCommand::parse("/machines").unwrap().unwrap(),
+            ChatCommand::Machines
+        );
+        assert_eq!(
+            crate::chat_commands::completions("/mac", 4)
+                .into_iter()
+                .map(|item| item.text)
+                .collect::<Vec<_>>(),
+            ["/machines"]
+        );
+        assert!(ChatCommand::Machines.settings(None).is_none());
     }
 
     #[test]

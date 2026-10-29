@@ -41,6 +41,14 @@ pub struct Broker {
 
 impl Broker {
     pub fn new(bootstrap: Option<&CoordinatorBootstrap>, state: &Path) -> Result<Self> {
+        Self::with_tailscale(bootstrap, state, crate::tailnet::Daemon::default())
+    }
+
+    pub fn with_tailscale(
+        bootstrap: Option<&CoordinatorBootstrap>,
+        state: &Path,
+        daemon: crate::tailnet::Daemon,
+    ) -> Result<Self> {
         let local = bootstrap.and_then(|bootstrap| bootstrap.node.clone());
         if let Some(node) = &local {
             validate_node(node)?;
@@ -59,7 +67,7 @@ impl Broker {
         Ok(Self {
             local,
             contexts,
-            executor: host::Executor::new(state),
+            executor: host::Executor::with_tailscale(state, daemon),
             instructions: bootstrap
                 .and_then(|value| value.node.as_ref())
                 .and_then(|node| node.launch.instructions.as_ref())
@@ -463,6 +471,7 @@ mod tests {
                     instructions: None,
                     model: Some(ModelSelection::default()),
                 },
+                machine: None,
             };
             let task = tokio::spawn(async move {
                 broker

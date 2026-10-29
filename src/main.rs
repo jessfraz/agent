@@ -450,6 +450,7 @@ async fn main() -> Result<()> {
                 .clone()
                 .context("Missing local launch metadata")?,
             config.node_name.as_deref(),
+            &daemon,
         )
         .await
         {
@@ -535,7 +536,7 @@ async fn main() -> Result<()> {
         },
         Action::Logout => RuntimeCommand::Logout,
         Action::Sources => RuntimeCommand::SourceStates,
-        Action::Nodes => RuntimeCommand::Environment,
+        Action::Nodes => RuntimeCommand::Environment { telemetry: false },
         Action::Feedback { command } => RuntimeCommand::ReadFeedback {
             id: match command {
                 FeedbackAction::Latest => None,
@@ -642,7 +643,9 @@ async fn main() -> Result<()> {
                     }
                     ChatCommand::Feedback { .. } => {}
                     command => {
-                        if let Some(model) = model {
+                        if !matches!(command, ChatCommand::Machines)
+                            && let Some(model) = model
+                        {
                             conversation_settings(
                                 &config,
                                 coordinator.as_deref(),
@@ -654,7 +657,7 @@ async fn main() -> Result<()> {
                             )
                             .await?;
                         }
-                        return settings_plain(
+                        return local_command_plain(
                             ClientContext {
                                 config: &config,
                                 coordinator: coordinator.as_deref(),
@@ -773,7 +776,7 @@ async fn main() -> Result<()> {
                             Ok(ChatCommand::Exit) => return Ok(()),
                             Ok(ChatCommand::History | ChatCommand::Feedback { .. }) => {}
                             Ok(command) => {
-                                if let Err(error) = settings_plain(
+                                if let Err(error) = local_command_plain(
                                     ClientContext {
                                         config: &config,
                                         coordinator: coordinator.as_deref(),
@@ -1330,7 +1333,7 @@ async fn conversation_usage(
     })
 }
 
-fn settings_from_ui(
+fn local_command_from_ui(
     config: &ClientConfig,
     coordinator: Option<&str>,
     script: &Path,
@@ -1347,6 +1350,16 @@ fn settings_from_ui(
     while ui.controls.try_join_next().is_some() {}
     ui.controls.spawn(async move {
         let changed = async {
+            if matches!(command, ChatCommand::Machines) {
+                let inventory = machine_inventory(ClientContext {
+                    config: &config,
+                    coordinator: coordinator.as_deref(),
+                    script: &script,
+                    directory: &directory,
+                })
+                .await?;
+                return handle.notice(inventory.format(SystemTime::now()));
+            }
             let info = handle.info().await?;
             let settings = local_settings(
                 &config,
@@ -1383,6 +1396,7 @@ fn settings_from_ui(
     });
 }
 
+#[derive(Clone, Copy)]
 struct ClientContext<'a> {
     config: &'a ClientConfig,
     coordinator: Option<&'a str>,
@@ -1390,13 +1404,50 @@ struct ClientContext<'a> {
     directory: &'a Path,
 }
 
-async fn settings_plain(
+async fn machine_inventory(
+    client: ClientContext<'_>,
+) -> Result<agent_cli::machines::MachineInventory> {
+    exchange(
+        client.config,
+        client.coordinator,
+        client.script,
+        client.directory,
+        RuntimeCommand::Environment { telemetry: true },
+    )
+    .await?
+    .into_iter()
+    .find_map(|event| match event {
+        RuntimeEventKind::Environment {
+            nodes,
+            online_host_ids,
+            unavailable_host_ids,
+            ..
+        } => Some(agent_cli::machines::MachineInventory {
+            nodes,
+            online_host_ids,
+            unavailable_host_ids: unavailable_host_ids.unwrap_or_default(),
+        }),
+        _ => None,
+    })
+    .context("The coordinator returned no machine inventory")
+}
+
+async fn local_command_plain(
     client: ClientContext<'_>,
     command: &ChatCommand,
     target: Option<(TaskId, Option<String>)>,
     cwd: &Path,
     json: bool,
 ) -> Result<()> {
+    if matches!(command, ChatCommand::Machines) {
+        let inventory = machine_inventory(client).await?;
+        if json {
+            println!("{}", serde_json::to_string(&inventory)?);
+        } else {
+            println!("{}", inventory.format(SystemTime::now()));
+        }
+        return Ok(());
+    }
     let settings = local_settings(
         client.config,
         client.coordinator,
@@ -1498,7 +1549,7 @@ async fn chat_tui(
                         continue;
                     }
                     TuiInput::Command(command) => {
-                        settings_from_ui(config, coordinator, script, directory, &mut ui, None, command);
+                        local_command_from_ui(config, coordinator, script, directory, &mut ui, None, command);
                         continue;
                     }
                     TuiInput::History => {
@@ -1589,7 +1640,7 @@ async fn environment(
         coordinator,
         script,
         directory,
-        RuntimeCommand::Environment,
+        RuntimeCommand::Environment { telemetry: false },
     )
     .await?
     .into_iter()
@@ -1642,7 +1693,8 @@ async fn worker_service(
         coordinator.is_some(),
         "A worker needs a selected coordinator"
     );
-    let executor = Arc::new(host::Executor::new(directory));
+    let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
+    let executor = Arc::new(host::Executor::with_tailscale(directory, daemon.clone()));
     let mut delay = 1;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -1655,6 +1707,7 @@ async fn worker_service(
                     .clone()
                     .context("Missing worker launch metadata")?,
                 config.node_name.as_deref(),
+                &daemon,
             )
             .await?;
             let settings = environment(config, coordinator, script, directory).await?;
@@ -2072,7 +2125,10 @@ async fn request_presented(
     let mut operations = tokio::task::JoinSet::new();
     let mut feedback = tokio::task::JoinSet::new();
     let mut cancellations: HashMap<String, tokio::sync::watch::Sender<bool>> = HashMap::new();
-    let executor = Arc::new(host::Executor::new(directory));
+    let executor = Arc::new(host::Executor::with_tailscale(
+        directory,
+        agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?,
+    ));
     let mut thinking = false;
     let mut wire = connection(config, coordinator, script, directory, login).await?;
     let relay_needed = match (
@@ -2135,7 +2191,7 @@ async fn request_presented(
                     }
                     TuiInput::Command(command) => {
                         if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
-                            settings_from_ui(config, coordinator, script, directory, ui, history_target.clone(), command);
+                            local_command_from_ui(config, coordinator, script, directory, ui, history_target.clone(), command);
                         }
                     }
                     TuiInput::Interrupt => {
@@ -2181,7 +2237,7 @@ async fn request_presented(
                             Ok(ChatCommand::History | ChatCommand::Feedback { .. }) => {}
                             Ok(command) => {
                                 let cwd = feedback_settings.as_ref().map(|(_, cwd)| Path::new(cwd)).unwrap_or_else(|| Path::new("."));
-                                if let Err(error) = settings_plain(ClientContext { config, coordinator, script, directory }, &command, history_target.clone(), cwd, arguments.json).await { eprintln!("Local command failed: {error}"); }
+                                if let Err(error) = local_command_plain(ClientContext { config, coordinator, script, directory }, &command, history_target.clone(), cwd, arguments.json).await { eprintln!("Local command failed: {error}"); }
                                 continue;
                             }
                         }
@@ -2856,6 +2912,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn machine_command_reads_native_inventory_without_model_or_conversation_requests() {
+        use agent_cli::{
+            config,
+            machines::MachineSnapshot,
+            protocol::{
+                AgentNode, CoordinatorSettings, RuntimeCommand, RuntimeEventKind, WorkerLaunch,
+            },
+            runtime::FrameReader,
+        };
+        use tokio::{io::AsyncWriteExt, net::UnixListener};
+        let directory = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();
+        let snapshot = MachineSnapshot::native().unwrap();
+        let expected = snapshot.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = FrameReader::new(tokio::io::BufReader::new(reader));
+            let command: RuntimeCommand =
+                serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(
+                command,
+                RuntimeCommand::Environment { telemetry: true }
+            ));
+            let node = AgentNode {
+                host_id: "11111111-1111-4111-8111-111111111111".into(),
+                name: "desktop".into(),
+                rex_server: None,
+                agent_program: "/example/agent".into(),
+                home_directory: "/example".into(),
+                coordinator: None,
+                launch: WorkerLaunch {
+                    state_dir: None,
+                    runtime: None,
+                    config: None,
+                    instructions: None,
+                    model: None,
+                },
+                machine: Some(snapshot),
+            };
+            let event = RuntimeEventKind::Environment {
+                settings: CoordinatorSettings {
+                    model: ModelSelection::default(),
+                    instructions: String::new(),
+                    context_repositories: vec![],
+                    sources: vec![],
+                },
+                online_host_ids: vec![node.host_id.clone()],
+                nodes: vec![node],
+                unavailable_host_ids: None,
+            };
+            let mut frame = serde_json::to_vec(&event).unwrap();
+            frame.push(b'\n');
+            writer.write_all(&frame).await.unwrap();
+            writer.write_all(b"{\"type\":\"done\"}\n").await.unwrap();
+        });
+        let config = config::ClientConfig::default();
+        let result = crate::machine_inventory(crate::ClientContext {
+            config: &config,
+            coordinator: None,
+            script: Path::new("/unused-runtime"),
+            directory: directory.path(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].machine.as_ref(), Some(&expected));
+        assert_eq!(result.online_host_ids, [result.nodes[0].host_id.clone()]);
+        assert!(result.unavailable_host_ids.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn plain_chat_uses_server_defaults_and_partial_overrides_fetch_the_selected_coordinator()
     {
         use agent_cli::{
@@ -2895,7 +3024,10 @@ mod tests {
             let mut reader = FrameReader::new(BufReader::new(reader));
             let command: RuntimeCommand =
                 serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
-            assert!(matches!(command, RuntimeCommand::Environment));
+            assert!(matches!(
+                command,
+                RuntimeCommand::Environment { telemetry: false }
+            ));
             let event = RuntimeEventKind::Environment {
                 settings: CoordinatorSettings {
                     model: ModelSelection {
@@ -2910,6 +3042,7 @@ mod tests {
                 },
                 nodes: vec![],
                 online_host_ids: vec![],
+                unavailable_host_ids: None,
             };
             let mut frame = serde_json::to_vec(&event).unwrap();
             frame.push(b'\n');

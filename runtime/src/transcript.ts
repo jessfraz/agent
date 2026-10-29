@@ -90,11 +90,11 @@ export async function history(conversation: Conversation, value: string | null):
   let messages: HistoryMessage[] = []; let size = 0;
   for (const message of projected) {
     if (size + message.text.length > 65_536) {
-      frames.push({ type: "history", conversation_id: id, messages, next_cursor: null }); messages = []; size = 0;
+      frames.push({ type: "history", conversation_id: id, messages, next_cursor: null, page_complete: false }); messages = []; size = 0;
     }
     messages.push(message); size += message.text.length;
   }
-  frames.push({ type: "history", conversation_id: id, messages, next_cursor });
+  frames.push({ type: "history", conversation_id: id, messages, next_cursor, page_complete: true });
   return frames;
 }
 
