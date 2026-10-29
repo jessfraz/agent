@@ -87,38 +87,41 @@ export class CodexImporter {
   }
   private async walk(nodes: AgentNode[], online: string[], call: HostCall, index: () => Promise<void>): Promise<ImportProgress> {
     const progress = initial(); await this.publish(progress);
-    // Publish retained text before a large source walk. This is not a saved
-    // postwalk indexing checkpoint: an interrupted owner must still read sources.
+    // Retained text can index while source pages commit. Only finish records a
+    // postwalk checkpoint, and this request retains both operations until drained.
     let indexingGap: string | undefined;
-    try { await index(); } catch (error) { indexingGap = `Search indexing before source import: ${message(error)}`; }
+    const indexing = Promise.resolve().then(index).catch((error: unknown) => { indexingGap = `Initial search indexing: ${message(error)}`; });
     const publish = () => {
       const snapshot = { ...progress, gaps: [...progress.gaps] };
       if (indexingGap !== undefined) addGap(snapshot, indexingGap);
       return this.publish(snapshot);
     };
-    if (indexingGap !== undefined) await publish();
-    for (const node of nodes) {
-      progress.host_id = node.host_id;
-      if (!online.includes(node.host_id)) { addGap(progress, `${node.name}: host is offline`); continue; }
-      for (const archived of [false, true]) {
-        let cursor: string | null = null; const cursors = new Set<string>();
-        try {
-          do {
-            const page = await this.read(node.host_id, { type: "list", archived, cursor }, call);
-            if (page.type !== "list") throw new Error("History host returned no thread inventory");
-            for (const thread of page.threads) {
-              progress.threads_seen += 1; progress.phase = "importing";
-              try { await this.thread(node.host_id, thread, progress, call); }
-              catch (error) { addGap(progress, `${node.name}: ${thread.id}: ${message(error)}`); }
-              await publish();
-            }
-            cursor = page.next_cursor;
-            if (cursor !== null) { if (cursors.has(cursor)) throw new Error("History inventory repeated a cursor"); cursors.add(cursor); }
-          } while (cursor !== null);
-        } catch (error) { addGap(progress, `${node.name}: ${archived ? "archived" : "active"} inventory: ${message(error)}`); }
+    try {
+      for (const node of nodes) {
+        progress.host_id = node.host_id;
+        if (!online.includes(node.host_id)) { addGap(progress, `${node.name}: host is offline`); continue; }
+        for (const archived of [false, true]) {
+          let cursor: string | null = null; const cursors = new Set<string>();
+          try {
+            do {
+              const page = await this.read(node.host_id, { type: "list", archived, cursor }, call);
+              if (page.type !== "list") throw new Error("History host returned no thread inventory");
+              for (const thread of page.threads) {
+                const firstThread = progress.phase === "discovering";
+                progress.threads_seen += 1; progress.phase = "importing";
+                if (firstThread) await publish();
+                try { await this.thread(node.host_id, thread, progress, call); }
+                catch (error) { addGap(progress, `${node.name}: ${thread.id}: ${message(error)}`); }
+                await publish();
+              }
+              cursor = page.next_cursor;
+              if (cursor !== null) { if (cursors.has(cursor)) throw new Error("History inventory repeated a cursor"); cursors.add(cursor); }
+            } while (cursor !== null);
+          } catch (error) { addGap(progress, `${node.name}: ${archived ? "archived" : "active"} inventory: ${message(error)}`); }
+        }
       }
-    }
-    return this.finish(progress, index);
+      return await this.finish(progress, async () => { await indexing; await index(); });
+    } finally { await indexing; }
   }
   private async finish(progress: ImportProgress, index: () => Promise<void>): Promise<ImportProgress> {
     progress.phase = "indexing"; progress.host_id = null;

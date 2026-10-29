@@ -17,14 +17,14 @@ Run import again to catch up. Completed reliable source versions are skipped;
 partial reads resume their committed cursor. Once a transcript scan reaches its
 end, missing attachments retry only their affected source pages. Changed or
 unreliable sources are scanned again; older partial checkpoints reconcile once
-before using targeted retries. Retained text is indexed before
-source scanning and again afterward, so attachment retries do not hold existing
-conversations out of search. Interrupted or failed final indexing resumes from
-the retained corpus before the next fresh import. Explicit
+before using targeted retries. Retained text is indexed alongside source
+scanning and catches up again afterward, so neither a large vector backlog nor
+attachment retries block the other work. Interrupted or failed final indexing
+resumes from the retained corpus before the next fresh import. Explicit
 `--host` selection starts a fresh walk of those hosts when no import is active.
 Concurrent commands join the running import; closing its CLI leaves it running.
-The same native thread
-and item versions are retained once across hosts. Neither importing nor
+A native thread maps to one conversation across hosts; each item version is
+saved once. Neither importing nor
 searching opens Rex sessions. Opening a historical conversation adopts it into
 one task using current settings, then opens its named interactive session.
 
