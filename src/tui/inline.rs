@@ -1,7 +1,7 @@
 //! Normal terminal scrollback owns completed output. Only mutable cells and the
 //! composer remain in the inline viewport; native selection never needs mouse capture.
 
-use crate::tui::{State, TerminalModes, WindowTitle, terminal_title};
+use crate::tui::{State, TerminalModes, WindowTitle, activity, terminal_title};
 use anyhow::{Context, Result};
 use crossterm::{
     cursor::{MoveTo, Show},
@@ -229,7 +229,11 @@ impl Drop for TerminalModes {
 
 impl State {
     fn viewport_height(&mut self, size: Size, top: u16) -> u16 {
-        if self.output.view == View::History || self.help_open || self.picker.is_some() {
+        if self.output.view == View::History
+            || self.help_open
+            || self.picker.is_some()
+            || self.activity.is_open()
+        {
             return size.height;
         }
         self.prepare_editor();
@@ -259,7 +263,7 @@ impl State {
         terminal: &mut Terminal<B>,
         ending: bool,
     ) -> std::result::Result<(), B::Error> {
-        if self.picker.is_some() && !ending {
+        if (self.picker.is_some() || self.activity.is_open()) && !ending {
             return Ok(());
         }
         if matches!(self.output.banner, Banner::Waiting) && !ending {
@@ -285,7 +289,34 @@ impl State {
         }
         let width = terminal.size()?.width;
         let mut emitted = 0;
-        while let Some(message) = self.messages.get_mut(self.output.cursor) {
+        while self.output.cursor < self.messages.len() {
+            if matches!(
+                self.messages[self.output.cursor].output,
+                CellOutput::Printed | CellOutput::Retained
+            ) {
+                self.output.cursor += 1;
+                continue;
+            }
+            if let Some(range) = activity::group(&self.messages, self.output.cursor) {
+                if emitted == OUTPUT_CELLS_PER_FRAME
+                    || (!ending && !activity::ready(&self.messages, &range, self.working))
+                {
+                    break;
+                }
+                let mut cached = activity::compact(&self.messages, range.clone());
+                let rows = cached.layout(width);
+                let height = u16::try_from(rows).unwrap_or(u16::MAX);
+                terminal.insert_before(height, |buffer| {
+                    cached.draw_buffer(buffer, 0);
+                })?;
+                for message in &mut self.messages[range.clone()] {
+                    message.output = CellOutput::Printed;
+                }
+                self.output.cursor = range.end;
+                emitted += 1;
+                continue;
+            }
+            let message = &mut self.messages[self.output.cursor];
             match message.output {
                 CellOutput::Mutable | CellOutput::AwaitingIdle if !ending => break,
                 CellOutput::Ready | CellOutput::Mutable | CellOutput::AwaitingIdle => {
@@ -313,16 +344,24 @@ impl State {
     }
 
     fn has_native_output(&self) -> bool {
-        !self.output.collecting_history
-            && self.picker.is_none()
-            && self.history_replay.is_none()
-            && !matches!(self.output.banner, Banner::Waiting)
-            && self.messages[self.output.cursor..]
-                .iter()
-                .find(|message| {
-                    !matches!(message.output, CellOutput::Printed | CellOutput::Retained)
-                })
-                .is_some_and(|message| message.output == CellOutput::Ready)
+        if self.output.collecting_history
+            || self.picker.is_some()
+            || self.activity.is_open()
+            || self.history_replay.is_some()
+            || matches!(self.output.banner, Banner::Waiting)
+        {
+            return false;
+        }
+        let first = (self.output.cursor..self.messages.len()).find(|index| {
+            !matches!(
+                self.messages[*index].output,
+                CellOutput::Printed | CellOutput::Retained
+            )
+        });
+        first.is_some_and(|index| match activity::group(&self.messages, index) {
+            Some(range) => activity::ready(&self.messages, &range, self.working),
+            None => self.messages[index].output == CellOutput::Ready,
+        })
     }
 
     pub(super) fn live_base(&self) -> usize {
@@ -344,7 +383,6 @@ impl State {
     }
 
     fn output_rows(&mut self, width: u16) -> OutputRows {
-        let total = self.layout_transcript(width);
         let mut ready = if matches!(self.output.banner, Banner::Ready) {
             usize::from(BANNER_ROWS)
         } else {
@@ -356,35 +394,33 @@ impl State {
             && self.history_replay.is_none()
             && !matches!(self.output.banner, Banner::Waiting)
         {
-            while self.messages.get(frontier).is_some_and(|message| {
-                !matches!(
-                    message.output,
-                    CellOutput::Mutable | CellOutput::AwaitingIdle
-                )
-            }) {
-                if self.messages[frontier].output == CellOutput::Ready {
-                    if cells == OUTPUT_CELLS_PER_FRAME {
+            while let Some(message) = self.messages.get(frontier) {
+                if matches!(message.output, CellOutput::Printed | CellOutput::Retained) {
+                    frontier += 1;
+                    continue;
+                }
+                if cells == OUTPUT_CELLS_PER_FRAME {
+                    break;
+                }
+                if let Some(range) = activity::group(&self.messages, frontier) {
+                    if !activity::ready(&self.messages, &range, self.working) {
                         break;
                     }
-                    let before = frontier
-                        .checked_sub(1)
-                        .and_then(|index| self.row_ends.get(index))
-                        .copied()
-                        .unwrap_or(0);
-                    ready = ready.saturating_add(self.row_ends[frontier].saturating_sub(before));
-                    cells += 1;
+                    ready += activity::compact(&self.messages, range.clone()).layout(width);
+                    frontier = range.end;
+                } else {
+                    if self.messages[frontier].output != CellOutput::Ready {
+                        break;
+                    }
+                    ready += self.messages[frontier].cached().layout(width);
+                    frontier += 1;
                 }
-                frontier += 1;
+                cells += 1;
             }
         }
-        let base = frontier
-            .checked_sub(1)
-            .and_then(|index| self.row_ends.get(index))
-            .copied()
-            .unwrap_or(0);
         OutputRows {
             ready,
-            pending: total.saturating_sub(base),
+            pending: activity::Projection::new(self, frontier, width).height,
         }
     }
 
@@ -448,6 +484,15 @@ mod tests {
                     .trim_end()
                     .to_string()
             })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn retained(state: &State) -> String {
+        state
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -772,7 +817,13 @@ mod tests {
         );
         state.flush_output(&mut terminal, false).unwrap();
         let initial = output(&terminal);
-        assert_eq!(initial.matches("Inspecting current evidence.").count(), 1);
+        assert!(!initial.contains("Inspecting current evidence."));
+        assert_eq!(
+            retained(&state)
+                .matches("Inspecting current evidence.")
+                .count(),
+            1
+        );
         assert!(!initial.contains("inspect repository"));
         assert!(!initial.contains("Later notice"));
         state.event(RuntimeEventKind::Activity {
@@ -798,10 +849,8 @@ mod tests {
         state.event(RuntimeEventKind::Message { message: canonical });
         state.flush_output(&mut terminal, false).unwrap();
         let finished = output(&terminal);
-        assert_eq!(finished.matches("✗ inspect repository").count(), 1);
-        assert!(
-            finished.find("inspect repository").unwrap() < finished.find("Later notice").unwrap()
-        );
+        assert_eq!(finished.matches("1 failed").count(), 1);
+        assert!(finished.find("Activity ·").unwrap() < finished.find("Later notice").unwrap());
         assert!(!finished.contains("Use the new context"));
         state.event(RuntimeEventKind::InputPlaced {
             input_id: "steer".into(),
@@ -984,7 +1033,7 @@ mod tests {
         });
         state.event(RuntimeEventKind::Message { message: result });
         state.flush_output(&mut terminal, false).unwrap();
-        assert_eq!(output(&terminal).matches("✗ run check").count(), 1);
+        assert_eq!(output(&terminal).matches("1 failed").count(), 1);
         assert!(!output(&terminal).contains("• run check"));
     }
 
@@ -1051,10 +1100,10 @@ mod tests {
         state.event(RuntimeEventKind::Message { message: result });
         state.flush_output(&mut terminal, false).unwrap();
         let saved = output(&terminal);
-        assert_eq!(saved.matches("✗ run check").count(), 1);
+        assert_eq!(saved.matches("1 failed").count(), 1);
         assert_eq!(saved.matches("Completed answer").count(), 1);
         assert!(!saved.contains("✓ run check"));
-        assert!(saved.find("run check").unwrap() < saved.find("Completed answer").unwrap());
+        assert!(saved.find("Activity ·").unwrap() < saved.find("Completed answer").unwrap());
     }
 
     #[test]
@@ -1152,7 +1201,7 @@ mod tests {
             draw_inline(&mut state, &mut terminal);
             for text in [first, second] {
                 assert_eq!(
-                    output(&terminal).matches(text).count(),
+                    retained(&state).matches(text).count(),
                     occurrences,
                     "{history_first}: {text}"
                 );
@@ -1208,7 +1257,7 @@ mod tests {
         });
         draw_inline(&mut state, &mut terminal);
         assert_eq!(
-            output(&terminal)
+            retained(&state)
                 .matches("Reasoning before the owned tool")
                 .count(),
             1
@@ -1265,7 +1314,7 @@ mod tests {
         });
         draw_inline(&mut state, &mut terminal);
         assert_eq!(
-            output(&terminal)
+            retained(&state)
                 .matches("Reasoning before the owned tool")
                 .count(),
             2,
@@ -1339,7 +1388,7 @@ mod tests {
             "Current generation reasoning",
             "Current answer",
         ] {
-            assert_eq!(output(&terminal).matches(text).count(), 1, "{text}");
+            assert_eq!(retained(&state).matches(text).count(), 1, "{text}");
         }
     }
 
@@ -1994,7 +2043,7 @@ mod tests {
         });
         state.event(RuntimeEventKind::ConversationState { working: false });
         draw_inline(&mut state, &mut terminal);
-        let rendered = output(&terminal);
+        let rendered = retained(&state);
         assert_eq!(rendered.matches("Completed reasoning").count(), 1);
         assert_eq!(rendered.matches("Current reasoning prefix").count(), 1);
         assert!(rendered.contains("Current reasoning prefix and suffix"));

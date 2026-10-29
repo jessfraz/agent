@@ -1,4 +1,5 @@
 //! Terminal presentation only. Request ownership, model calls and durable input stay outside this module.
+pub mod activity;
 pub mod attachments;
 mod conversations;
 mod inline;
@@ -6,6 +7,7 @@ mod markdown;
 mod transcript;
 
 use crate::tui::{
+    activity::{ActivityPanel, PanelAction, ToolDetailRequest},
     attachments::{ComposerFile, ComposerInput, dropped_files},
     conversations::ConversationPicker,
     inline::{CellOutput, Output, Screen, View},
@@ -47,6 +49,7 @@ pub enum TuiInput {
     Feedback(ComposerInput),
     Command(ChatCommand),
     History,
+    ToolDetails(Option<ToolDetailRequest>),
     Interrupt,
     Exit,
 }
@@ -66,6 +69,10 @@ pub enum ObservationState {
 }
 
 enum Update {
+    ToolDetails {
+        request: ToolDetailRequest,
+        result: Result<crate::native::ToolDetails, String>,
+    },
     Event(Box<RuntimeEventKind>),
     Status(TuiInfo),
     Working(bool),
@@ -151,6 +158,13 @@ impl TuiHandle {
         self.sender
             .send(update)
             .context("The terminal interface is closed")
+    }
+    pub fn tool_details(
+        &self,
+        request: ToolDetailRequest,
+        result: Result<crate::native::ToolDetails, String>,
+    ) -> Result<()> {
+        self.send(Update::ToolDetails { request, result })
     }
     pub fn event(&self, event: RuntimeEventKind) -> Result<()> {
         self.send(Update::Event(Box::new(event)))
@@ -641,6 +655,7 @@ struct LayoutWork {
 struct State {
     info: TuiInfo,
     messages: Vec<Message>,
+    activity: ActivityPanel,
     output: Output,
     row_ends: Vec<usize>,
     row_width: u16,
@@ -683,6 +698,7 @@ impl State {
         Self {
             info,
             messages: Vec::new(),
+            activity: ActivityPanel::default(),
             output: Output::default(),
             row_ends: Vec::new(),
             row_width: 0,
@@ -1430,6 +1446,30 @@ impl State {
         self.changed = true;
     }
     fn input(&mut self, event: Event) -> Option<TuiInput> {
+        if let Event::Key(key) = event
+            && key.kind != KeyEventKind::Release
+            && self.picker.is_none()
+        {
+            if self.activity.is_open() {
+                self.changed = true;
+                match self.activity.input(key, &self.messages) {
+                    PanelAction::Request(request) => {
+                        return Some(TuiInput::ToolDetails(Some(request)));
+                    }
+                    PanelAction::Cancel => return Some(TuiInput::ToolDetails(None)),
+                    PanelAction::PassThrough => {}
+                    PanelAction::Consumed | PanelAction::Closed => return None,
+                }
+            } else if key.code == KeyCode::Char('t')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                self.activity.open();
+                self.changed = true;
+                return None;
+            }
+        } else if self.activity.is_open() {
+            return None;
+        }
         self.sync_completion();
         let input = self.input_event(event);
         self.sync_completion();
@@ -1848,6 +1888,11 @@ impl State {
             self.changed = false;
             return;
         }
+        if self.activity.is_open() {
+            self.activity.draw(frame, frame.area(), &mut self.messages);
+            self.changed = false;
+            return;
+        }
         self.prepare_editor();
         let attachment_height = u16::try_from(self.attachment_count()).unwrap_or(u16::MAX);
         let height = self.editor_height(
@@ -1903,6 +1948,28 @@ impl State {
             frame.render_widget(
                 paragraph.scroll((u16::try_from(self.help_scroll).unwrap_or(u16::MAX), 0)),
                 areas[0],
+            );
+        } else if self.output.view == View::Live {
+            let first = self.output.cursor;
+            let mut projection = activity::Projection::new(self, first, areas[0].width);
+            let maximum = projection
+                .height
+                .saturating_sub(usize::from(areas[0].height));
+            if self.scroll > 0 && self.previous_width == areas[0].width && !self.history_changed {
+                self.scroll = self
+                    .scroll
+                    .saturating_add(projection.height.saturating_sub(self.previous_rows));
+            }
+            self.scroll = self.scroll.min(maximum);
+            self.previous_rows = projection.height;
+            self.previous_width = areas[0].width;
+            self.history_changed = false;
+            self.page = usize::from(areas[0].height).saturating_sub(1).max(1);
+            projection.draw(
+                &mut self.messages,
+                frame,
+                areas[0],
+                maximum.saturating_sub(self.scroll),
             );
         } else {
             let total = self.layout_transcript(areas[0].width);
@@ -2127,6 +2194,7 @@ enum Shortcut {
     Exit,
     Scroll,
     History,
+    Activity,
     Recall,
     RemoveFile,
     Help,
@@ -2153,6 +2221,11 @@ impl Shortcut {
                 "Browse saved messages; wheel/trackpad uses terminal scrollback",
             ),
             Self::History => ("Ctrl+R", "older", "Load older saved messages"),
+            Self::Activity => (
+                "Ctrl+T",
+                "activity",
+                "Expand reasoning, tool arguments and output",
+            ),
             Self::Recall => (
                 "Up/Down",
                 "recall",
@@ -2211,6 +2284,10 @@ fn run(
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Ok(Update::Event(event)) => state.event(*event),
+                Ok(Update::ToolDetails { request, result }) => {
+                    state.activity.receive(&request, result);
+                    state.changed = true;
+                }
                 Ok(Update::Status(info)) => {
                     state.info = info;
                     state.changed = true;
@@ -2592,6 +2669,8 @@ mod tests {
             after_live.measured_messages + 1_001
         );
         view.input(key(KeyCode::End, KeyModifiers::CONTROL));
+        assert!(rendered(&mut view, 80, 20).contains("Activity ·"));
+        view.output.view = crate::tui::inline::View::History;
         assert!(rendered(&mut view, 80, 20).contains("New live context"));
 
         let mut history = state();
@@ -2733,6 +2812,10 @@ mod tests {
                 name: "read_file".into(),
             },
         });
+        let compact = rendered(&mut state, 110, 24);
+        assert_eq!(compact.matches("Activity ·").count(), 1);
+        assert!(!compact.contains("First second"));
+        state.output.view = crate::tui::inline::View::History;
         let before = rendered(&mut state, 110, 24);
         assert_eq!(before.matches("Thinking").count(), 1);
         assert!(before.contains("First second"));
@@ -3921,6 +4004,7 @@ mod tests {
     #[test]
     fn completed_tools_and_reasoning_keep_their_original_chronological_positions() {
         let mut view = state();
+        view.output.view = crate::tui::inline::View::History;
         view.event(RuntimeEventKind::Activity {
             activity: ModelActivity::Thinking {
                 text: "EARLY_THOUGHT".into(),
@@ -3968,6 +4052,7 @@ mod tests {
     fn reopened_tools_update_by_native_call_identity_and_failure_is_not_downgraded() {
         use crate::protocol::{ToolHistory, ToolStatus};
         let mut view = state();
+        view.output.view = crate::tui::inline::View::History;
         view.event(RuntimeEventKind::History {
             conversation_id: "main".into(),
             messages: vec![

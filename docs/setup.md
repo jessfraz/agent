@@ -75,7 +75,11 @@ status. Enter steers active work; Tab queues a separate follow-up turn. Queued
 messages run in FIFO order. Esc stops, and Shift+Enter or Alt+Enter inserts a
 newline. Press `?` in an empty editor or use `/help` for commands and shortcuts,
 generated from the same definitions used to parse them.
-Input sent after Esc waits for that conversation's stop receipt; editing and
+Reasoning and tool calls stay in compact activity rows. Ctrl+T opens the
+activity viewer; Enter expands a group or a saved tool's arguments and output.
+Esc returns to chat without stopping its work.
+
+In chat, input sent after Esc waits for its stop receipt; editing and
 other chats stay responsive. If stopping cannot be confirmed, the input stays
 unsent for recovery.
 Pi's compaction shows as **Compacting context**; current instructions reload

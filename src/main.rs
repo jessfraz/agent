@@ -1233,6 +1233,7 @@ struct UiSession {
     submitted: VecDeque<QueuedInput>,
     errors: VecDeque<String>,
     controls: tokio::task::JoinSet<()>,
+    tool_lookup: Option<tokio::task::AbortHandle>,
     selected: Option<SavedConversation>,
     admissions: tokio::task::JoinSet<()>,
     pending_admissions: Vec<Arc<chat_admission::Admission>>,
@@ -1260,6 +1261,7 @@ impl UiSession {
             submitted: VecDeque::new(),
             errors: VecDeque::new(),
             controls: tokio::task::JoinSet::new(),
+            tool_lookup: None,
             selected: None,
             admissions: tokio::task::JoinSet::new(),
             pending_admissions: Vec::new(),
@@ -2521,6 +2523,7 @@ async fn chat_tui(
                     );
                 }
                 TuiInput::Interrupt => selected_interrupt(client, &mut ui).await?,
+                TuiInput::ToolDetails(request) => tool_details_from_ui(client, &mut ui, None, request),
                 TuiInput::History => {} // All native pages are already being replayed in the background.
                 TuiInput::Exit => {
                     ui.finish_admissions().await?;
@@ -2608,6 +2611,76 @@ async fn chat_tui(
         .and(stopped)
         .and(retained)
         .and(observed_recovery.map(|_| ()))
+}
+
+// A detail read owns one cancellable action connection. It never enters the
+// model-input/admission path and its UI identity rejects late view results.
+fn tool_details_from_ui(
+    client: ClientContext<'_>,
+    ui: &mut UiSession,
+    fallback: Option<(agent_cli::protocol::TaskId, Option<String>)>,
+    request: Option<agent_cli::tui::activity::ToolDetailRequest>,
+) {
+    if let Some(previous) = ui.tool_lookup.take() {
+        previous.abort();
+    }
+    let Some(request) = request else {
+        return;
+    };
+    let target = ui.selected.as_ref().map_or(fallback, |selected| {
+        selected
+            .task_id
+            .clone()
+            .map(|task| (task, selected.agent_id.clone()))
+    });
+    let config = client.config.clone();
+    let coordinator = client.coordinator.map(str::to_owned);
+    let script = client.script.to_owned();
+    let directory = client.directory.to_owned();
+    let handle = ui.handle.clone();
+    while ui.controls.try_join_next().is_some() {}
+    ui.tool_lookup = Some(ui.controls.spawn(async move {
+        let details = read_tool_details(
+            ClientContext {
+                config: &config,
+                coordinator: coordinator.as_deref(),
+                script: &script,
+                directory: &directory,
+            },
+            &request,
+            target,
+        )
+        .await
+        .map_err(|error| error.to_string());
+        let _ = handle.tool_details(request, details);
+    }));
+}
+
+async fn read_tool_details(
+    client: ClientContext<'_>,
+    request: &agent_cli::tui::activity::ToolDetailRequest,
+    target: Option<(agent_cli::protocol::TaskId, Option<String>)>,
+) -> Result<agent_cli::native::ToolDetails> {
+    let (task_id, agent_id) = target.map_or((None, None), |(task, agent)| (Some(task), agent));
+    let events = tokio::time::timeout(
+        Duration::from_secs(30),
+        exchange(
+            client.config,
+            client.coordinator,
+            client.script,
+            client.directory,
+            request.command(task_id, agent_id),
+        ),
+    )
+    .await
+    .context("Tool details timed out; expand the tool to retry.")??;
+    events
+        .into_iter()
+        .find_map(|event| match event {
+            RuntimeEventKind::ToolDetails { details } => Some(details),
+            _ => None,
+        })
+        .context("The coordinator returned no tool details.")
 }
 
 async fn exchange(
@@ -3261,6 +3334,11 @@ async fn request_presented(
                         } else if active_turn { write_command(&mut *wire.writer, &RuntimeCommand::Interrupt).await?; }
                         else if let Some(view) = &presentation { view.handle.working(false)?; }
                     }
+                    TuiInput::ToolDetails(request) => {
+                        if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
+                            tool_details_from_ui(ClientContext { config, coordinator, script, directory }, ui, history_target.clone(), request);
+                        }
+                    }
                     TuiInput::History => {
                         if presentation.as_ref().and_then(|view|view.session.as_ref()).is_some_and(|ui|ui.selected.is_some()) {continue;}
                         let view = presentation.as_mut().context("Missing terminal presentation")?;
@@ -3827,6 +3905,164 @@ mod tests {
     use agent_cli::protocol::SearchMode;
     use clap::Parser;
     use std::path::Path;
+
+    #[tokio::test]
+    async fn tool_details_read_uses_only_the_shared_request_and_closes_the_action_socket() {
+        use agent_cli::{
+            native::{ToolDetailContent, ToolDetails},
+            protocol::{RuntimeCommand, RuntimeEventKind, ToolStatus},
+            runtime::FrameReader,
+            tui::activity::ToolDetailRequest,
+        };
+        use tokio::{
+            io::{AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
+        for (recorded, scoped) in [(true, false), (false, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = FrameReader::new(BufReader::new(reader));
+                let command: RuntimeCommand =
+                    serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
+                assert!(
+                    matches!(command, RuntimeCommand::ReadToolDetails { entry_id, call_id, task_id, agent_id } if entry_id == "42" && call_id == "call-example" && task_id.is_some() == scoped && agent_id.as_deref() == scoped.then_some("delegate-example"))
+                );
+                let details = if recorded {
+                    ToolDetails::Available {
+                        call_id: "call-example".into(),
+                        name: "exec".into(),
+                        status: ToolStatus::Failed,
+                        input: ToolDetailContent::Text {
+                            text: "printf 'example command'".into(),
+                            truncated: false,
+                        },
+                        output: ToolDetailContent::Text {
+                            text: "exit_code: 1\nexample failure".into(),
+                            truncated: true,
+                        },
+                    }
+                } else {
+                    ToolDetails::Unavailable {
+                        call_id: "call-example".into(),
+                    }
+                };
+                for event in [
+                    RuntimeEventKind::ToolDetails { details },
+                    RuntimeEventKind::Done,
+                ] {
+                    writer
+                        .write_all(&serde_json::to_vec(&event).unwrap())
+                        .await
+                        .unwrap();
+                    writer.write_all(b"\n").await.unwrap();
+                }
+                assert!(
+                    reader.next_frame().await.unwrap().is_none(),
+                    "completed action must close its connection"
+                );
+            });
+            let request = ToolDetailRequest {
+                id: uuid::Uuid::new_v4(),
+                entry_id: "42".into(),
+                call_id: "call-example".into(),
+            };
+            let config = agent_cli::config::ClientConfig::default();
+            let details = crate::read_tool_details(
+                crate::ClientContext {
+                    config: &config,
+                    coordinator: None,
+                    script: Path::new("/example/unused-runtime"),
+                    directory: directory.path(),
+                },
+                &request,
+                scoped.then(|| {
+                    (
+                        "11111111-1111-4111-8111-111111111111".parse().unwrap(),
+                        Some("delegate-example".into()),
+                    )
+                }),
+            )
+            .await
+            .unwrap();
+            if recorded {
+                assert!(
+                    matches!(details, ToolDetails::Available { name, status: ToolStatus::Failed, input: ToolDetailContent::Text { text: input, truncated: false }, output: ToolDetailContent::Text { text: output, truncated: true }, .. } if name == "exec" && input == "printf 'example command'" && output == "exit_code: 1\nexample failure")
+                );
+            } else {
+                assert!(
+                    matches!(details, ToolDetails::Unavailable { call_id } if call_id == request.call_id)
+                );
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn canceling_tool_details_closes_the_inflight_action_connection() {
+        use agent_cli::{
+            protocol::RuntimeCommand, runtime::FrameReader, tui::activity::ToolDetailRequest,
+        };
+        use tokio::{io::BufReader, net::UnixListener};
+        let directory = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();
+        let (observed, command_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = FrameReader::new(BufReader::new(stream));
+            let command: RuntimeCommand =
+                serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(command, RuntimeCommand::ReadToolDetails { .. }));
+            observed.send(()).unwrap();
+            assert!(
+                reader.next_frame().await.unwrap().is_none(),
+                "canceling the owner must close its action socket"
+            );
+        });
+        let path = directory.path().to_owned();
+        let mut controls = tokio::task::JoinSet::new();
+        let task = controls.spawn(async move {
+            let config = agent_cli::config::ClientConfig::default();
+            let request = ToolDetailRequest {
+                id: uuid::Uuid::new_v4(),
+                entry_id: "42".into(),
+                call_id: "call-example".into(),
+            };
+            crate::read_tool_details(
+                crate::ClientContext {
+                    config: &config,
+                    coordinator: None,
+                    script: Path::new("/example/unused-runtime"),
+                    directory: &path,
+                },
+                &request,
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), command_received)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(
+            controls
+                .join_next()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn feedback_cli_reads_a_typed_private_bundle_without_starting_chat() {
