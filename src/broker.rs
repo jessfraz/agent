@@ -589,7 +589,7 @@ mod tests {
             .execute(HostCommand::Browser {
                 host_id: id.into(),
                 request: crate::browser::BrowserRequest {
-                    owner_id: uuid::Uuid::new_v4(),
+                    owner_id: uuid::Uuid::new_v4().to_string(),
                     session_id,
                     operation_id: "browser-open".into(),
                     action: crate::browser::BrowserAction::Open {

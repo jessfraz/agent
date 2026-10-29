@@ -204,7 +204,7 @@ async function closeChrome(browser: ChildProcess, exited: Promise<void>, client:
   if (!await exitsWithin(exited, 5_000)) throw new Error("Disposable Chrome did not stop during fixture cleanup", { cause: protocolError });
 }
 
-async function fixture(t: TestContext, slowSubmit = false) {
+async function fixture(t: TestContext, options: { slowSubmit?: boolean; foreignFrame?: boolean } = {}) {
   assert.ok(chrome && existsSync(chrome), "AGENT_TEST_CHROME must name a disposable-test-capable Chrome binary");
   assert.ok(extensionDirectory && existsSync(extensionDirectory), "AGENT_TEST_PLAYWRIGHT_EXTENSION_DIR must name the extracted official extension");
   const manifest: unknown = JSON.parse(await readFile(join(extensionDirectory, "manifest.json"), "utf8"));
@@ -215,13 +215,15 @@ async function fixture(t: TestContext, slowSubmit = false) {
   let submissions = 0;
   const submittedForms: { path: string; body: string }[] = [];
   let delayed: ServerResponse | undefined;
+  let validation: ServerResponse | undefined;
+  let validationFinished = false;
   let submittedResolve = () => {};
   const submitted = new Promise<void>(resolve => { submittedResolve = resolve; });
   const server = createServer((request, response) => {
     const url = new URL(request.url ?? "/", "http://fixture.invalid");
     if (url.pathname === "/validate") {
       // Alpha's native Save waits for server validation while Beta can submit.
-      if (url.searchParams.get("owner") === "alpha") void setTimeout(1000).then(() => response.end("valid"));
+      if (url.searchParams.get("owner") === "alpha" && !validationFinished) validation = response;
       else response.end("valid");
       return;
     }
@@ -231,7 +233,7 @@ async function fixture(t: TestContext, slowSubmit = false) {
       request.on("data", (chunk: string) => { body += chunk; });
       request.on("end", () => {
         submittedForms.push({ path: url.pathname + url.search, body }); submissions++; submittedResolve();
-        if (slowSubmit) { delayed = response; return; }
+        if (options.slowSubmit) { delayed = response; return; }
         response.writeHead(303, { Location: "/done" + url.search }).end();
       });
       return;
@@ -248,6 +250,7 @@ async function fixture(t: TestContext, slowSubmit = false) {
       <button type="button" onclick="alert('First sequential dialog'); alert('Second sequential dialog')">Open two dialogs</button><button type="submit">Save</button></form>`);
     else if (url.pathname === "/done") response.end("<!doctype html><title>Saved form</title><h1>Saved</h1>");
     else if (request.url === "/popup") response.end("<!doctype html><title>Owned popup</title><h1>Popup ready</h1>");
+    else if (url.pathname === "/embedded") response.end("<!doctype html><label>Frame note<input name=note></label>");
     else if (request.url === "/retained") response.end("<!doctype html><title>Retained result</title><h1>Draft ready for review</h1>");
     else if (url.pathname === "/beforeunload") response.end(`<!doctype html><title>Owned draft</title><button onclick="this.textContent='Draft edited'">Edit draft</button>
       <script>addEventListener('beforeunload', event => { event.preventDefault(); event.returnValue=''; });</script>`);
@@ -257,6 +260,24 @@ async function fixture(t: TestContext, slowSubmit = false) {
   const address = server.address(); assert.ok(address !== null && typeof address !== "string");
   const origin = `http://127.0.0.1:${address.port}`;
   const directory = await mkdtemp(join(tmpdir(), "agent-browser-test-"));
+  const extensions = [extensionDirectory];
+  if (options.foreignFrame) {
+    const menu = join(directory, "foreign-menu"); await mkdir(menu);
+    await writeFile(join(menu, "manifest.json"), JSON.stringify({ manifest_version: 3, name: "Synthetic inline menu", version: "1.0",
+      content_scripts: [{ matches: ["http://127.0.0.1/*"], js: ["inject.js"], run_at: "document_start" }],
+      web_accessible_resources: [{ resources: ["menu.html"], matches: ["http://127.0.0.1/*"] }] }));
+    await writeFile(join(menu, "menu.html"), "<!doctype html><p>Synthetic menu</p>");
+    await writeFile(join(menu, "inject.js"), `let inserted = false;
+document.addEventListener('focusin', event => {
+  if (inserted || location.origin !== ${JSON.stringify(origin)} || !(event.target instanceof HTMLInputElement)) return;
+  inserted = true;
+  const host = document.createElement('fixture-inline-menu');
+  const frame = document.createElement('iframe'); frame.src = chrome.runtime.getURL('menu.html');
+  host.attachShadow({mode:'closed'}).append(frame); document.documentElement.append(host);
+});
+`);
+    extensions.push(menu);
+  }
   // Unix socket names are short even when macOS TMPDIR is deeply nested.
   const sockets = await mkdtemp("/tmp/agent-browser-sockets-");
   type Running = { browser: ChildProcess; exited: Promise<void>; client: ChromeFixtureClient };
@@ -318,7 +339,7 @@ socket.once('data', data => { socket.destroy(); process.exit(data === 'ok\\n' ? 
       catch (error) { failures.push(error); stopped = false; }
       process.client?.close();
     }
-    delayed?.end();
+    delayed?.end(); validation?.end();
     server.closeAllConnections();
     try { await new Promise<void>((resolve, reject) => server.close(error => error === undefined ? resolve() : reject(error))); }
     catch (error) { failures.push(error); }
@@ -338,10 +359,14 @@ socket.once('data', data => { socket.destroy(); process.exit(data === 'ok\\n' ? 
     assert.ok(chrome && extensionDirectory);
     await unlink(join(directory, "DevToolsActivePort")).catch(() => {});
     const args = ["--headless=new", "--remote-debugging-port=0", `--user-data-dir=${directory}`,
-      `--disable-extensions-except=${extensionDirectory}`, `--load-extension=${extensionDirectory}`, "--use-mock-keychain", "--password-store=basic",
+      `--disable-extensions-except=${extensions.join(",")}`, `--load-extension=${extensions.join(",")}`, "--use-mock-keychain", "--password-store=basic",
       "--disable-background-networking", "--disable-component-update", "--no-first-run", "--no-default-browser-check", "about:blank"];
-    if (process.getuid?.() === 0) args.unshift("--no-sandbox");
-    const browser = spawn(chrome, args, { stdio: "ignore" });
+    // Match Playwright's disposable Linux fixture launch under Ubuntu AppArmor.
+    if (process.platform === "linux" || process.getuid?.() === 0) args.unshift("--no-sandbox");
+    const browser = spawn(chrome, args, { stdio: ["ignore", "ignore", "pipe"] });
+    let startupOutput = "";
+    const captureStartup = (chunk: Buffer) => { startupOutput = (startupOutput + chunk.toString("utf8")).slice(-8192); };
+    browser.stderr?.on("data", captureStartup);
     const exited = new Promise<void>(resolve => browser.once("close", () => resolve()));
     const tracked: { browser: ChildProcess; exited: Promise<void>; client?: ChromeFixtureClient } = { browser, exited };
     processes.push(tracked);
@@ -354,10 +379,12 @@ socket.once('data', data => { socket.destroy(); process.exit(data === 'ok\\n' ? 
         if (port && path) { endpoint = `ws://127.0.0.1:${port}${path}`; break; }
       } catch { /* The exact disposable process has not published its endpoint yet. */ }
       if (startupError !== undefined) throw startupError;
-      if (browser.exitCode !== null || browser.signalCode !== null) throw new Error("Synthetic Chrome exited before publishing its endpoint");
+      if (browser.exitCode !== null || browser.signalCode !== null) throw new Error("Synthetic Chrome exited before publishing its endpoint: "
+        + startupOutput.replace(/(PLAYWRIGHT_MCP_EXTENSION_TOKEN=|token=)[^&\s"']+/g, "$1[redacted]"));
       await setTimeout(50);
     }
     assert.notEqual(endpoint, "", "Disposable Chrome must start within ten seconds");
+    browser.stderr?.off("data", captureStartup); browser.stderr?.resume();
     const client = new ChromeFixtureClient(endpoint); tracked.client = client;
     const status = await client.call("Target.createTarget", { url: `chrome-extension://${extensionId}/status.html`, background: true });
     assert.ok(typeof status.targetId === "string"); statusTarget = status.targetId;
@@ -392,7 +419,13 @@ socket.once('data', data => { socket.destroy(); process.exit(data === 'ok\\n' ? 
     hosts.push(host); return host;
   };
   return {
-    origin, get browser() { return current().browser; }, get client() { return current().client; }, submitted, host: newHost(), newHost,
+    origin, pairingToken: token, get browser() { return current().browser; }, get client() { return current().client; }, submitted, host: newHost(), newHost,
+    finishValidation() { validationFinished = true; validation?.end("valid"); validation = undefined; },
+    async waitForActiveTab(url: string) {
+      await within((async () => {
+        while (await statusEval("(async () => (await chrome.tabs.query({active:true,lastFocusedWindow:true}))[0]?.url ?? null)()") !== url) await setTimeout(10);
+      })(), 5000, "The pending native input must activate its owned tab");
+    },
     async nativeBroker() {
       const executable = process.env.AGENT_TEST_BROWSER_BROKER ?? fileURLToPath(new URL("../../../target/debug/examples/browser_fixture", import.meta.url));
       assert.ok(existsSync(executable), "Build the native browser fixture with cargo build --example browser_fixture");
@@ -455,7 +488,9 @@ try {
       return { kill() { if (!killed) { killed = true; process.kill(pid, "SIGKILL"); } } };
     },
     assertNoBootstrapDetails(value: unknown) {
-      const serialized = JSON.stringify(value); assert.equal(serialized.includes(token), false); assert.equal(serialized.includes("chrome-extension://"), false);
+      const serialized = JSON.stringify(value);
+      assert.equal(serialized.includes(token.slice(0, Math.ceil(token.length / 2))), false, "No pairing token prefix may escape a response");
+      assert.equal(serialized.includes("chrome-extension://"), false);
     },
     count: () => submissions,
     submittedBodies: () => submittedForms.map(form => form.body),
@@ -464,7 +499,7 @@ try {
   };
 }
 
-function requests(owner_id = randomUUID()) {
+function requests(owner_id: string = randomUUID()) {
   const session_id = randomUUID();
   return (action: BrowserAction, operation_id = randomUUID()): BrowserRequest => ({ owner_id, session_id, operation_id, action });
 }
@@ -678,13 +713,25 @@ test("concurrent browser connections keep form input, tab ownership and cleanup 
     assert.ok(response.type === "ready", JSON.stringify(response)); assert.equal(response.is_error, false);
     return { ...owner, output: response.output };
   }));
-  const saved = await Promise.all(selected.map(async owner => {
+  const save = async (owner: typeof selected[number]) => {
     const response = (await owner.host.execute(owner.request({ type: "click", tab_id: owner.tab.id,
       element_ref: elementRef(owner.output, "button", "Save") }))).response;
     assert.ok(response.type === "ready", JSON.stringify({ response, submitted: f.submittedForms() })); assert.equal(response.is_error, false);
     assert.deepEqual(response.tabs, [{ ...owner.tab, url: `${f.origin}/done?owner=${owner.key}`, title: "Saved form" }]);
     return owner;
-  }));
+  };
+  const alpha = selected[0], beta = selected[1]; assert.ok(alpha && beta);
+  await f.client.activate(`${f.origin}/unrelated`);
+  const alphaSave = save(alpha); void alphaSave.catch(() => {});
+  let saved: typeof selected;
+  try {
+    // Alpha is awaiting a real server response when Beta's simultaneous native
+    // click arrives. The calls overlap; only the host may serialize their input.
+    await f.waitForActiveTab(alpha.tab.url);
+    const both = Promise.all([alphaSave, save(beta)]); void both.catch(() => {});
+    await setTimeout(1000); f.finishValidation();
+    saved = await both;
+  } finally { f.finishValidation(); }
   assert.equal(f.count(), 2);
   const submitted = new Map(f.submittedForms().map(form => [form.path, new URLSearchParams(form.body)]));
   assert.equal(submitted.size, 2);
@@ -712,6 +759,93 @@ test("concurrent browser connections keep form input, tab ownership and cleanup 
   assert.ok((await f.client.pages()).some(page => page.url === `${f.origin}/unrelated`));
   await f.assertUnrelatedGroup();
   assert.equal(f.browser.exitCode, null, "Releasing either connection must preserve the shared Chrome instance");
+});
+
+test("run_code uses the real Page API for dialogs, frames and owned tab lifecycle", { skip: skipChrome, timeout: 90_000 }, async t => {
+  const f = await fixture(t), host = await f.nativeBroker(), request = requests("1");
+  const opened = (await host.execute(request({ type: "open", url: `${f.origin}/form?phase=run-code` }))).response;
+  assert.ok(opened.type === "ready"); const tab = opened.tabs[0]; assert.ok(tab);
+  const operation = request({ type: "run_code", tab_id: tab.id, code: `async page => {
+    await page.bringToFront();
+    console.log('script started');
+    page.once('dialog', async dialog => { await dialog.accept(); });
+    await page.getByRole('button', {name:'Open dialog', exact:true}).click();
+    await page.evaluate(() => {
+      const frame = document.createElement('iframe'); frame.title = 'Script frame'; frame.src = '/embedded'; document.body.append(frame);
+    });
+    const note = page.frameLocator('iframe[title="Script frame"]').getByRole('textbox', {name:'Frame note'});
+    await note.fill('Inside the frame'); const frameValue = await note.inputValue();
+    await page.getByRole('textbox', {name:'Name', exact:true}).fill('Scripted owner');
+    await page.getByRole('combobox', {name:'Choice'}).selectOption({label:'Second'});
+    await page.getByRole('button', {name:'Save', exact:true}).click();
+    const child = await page.context().newPage();
+    await child.goto(new URL('/form?phase=script-child', page.url()).href);
+    child.once('dialog', async dialog => { await dialog.dismiss(); });
+    await child.getByRole('button', {name:'Open dialog', exact:true}).click();
+    const childUrl = child.url();
+    console.log('script submitted');
+    return {url:page.url(), frameValue, childUrl};
+  }` });
+  const completed = (await host.execute(operation)).response;
+  assert.ok(completed.type === "ready", JSON.stringify(completed)); assert.equal(completed.is_error, false);
+  assert.equal(completed.tabs.length, 2); assert.ok(completed.tabs.some(current => current.id === tab.id));
+  const successor = completed.tabs.find(current => current.url === `${f.origin}/form?phase=script-child`); assert.ok(successor);
+  assert.notEqual(successor.id, tab.id);
+  const output: unknown = JSON.parse(completed.output); assert.ok(object(output));
+  assert.deepEqual(output.result, { url: `${f.origin}/done?phase=run-code`, frameValue: "Inside the frame", childUrl: `${f.origin}/form?phase=script-child` });
+  assert.deepEqual(output.logs, ["script started", "script submitted"]);
+  assert.equal(f.count(), 1);
+  const form = new URLSearchParams(f.submittedBodies()[0]);
+  assert.equal(form.get("name"), "Scripted owner"); assert.equal(form.get("choice"), "Second");
+  assert.equal((await host.execute(operation)).response.type, "failed"); assert.equal(f.count(), 1);
+  assert.ok((await f.client.pages()).some(page => page.url === `${f.origin}/form?phase=script-child`));
+  const released = (await host.execute(request({ type: "release" }))).response;
+  assert.ok(released.type === "closed", JSON.stringify(released)); assert.equal(released.tabs.length, 0);
+  const pages = await f.client.pages();
+  assert.equal(pages.some(page => page.url === `${f.origin}/done?phase=run-code` || page.url === successor.url), false);
+  assert.ok(pages.some(page => page.url === `${f.origin}/unrelated`));
+  await f.assertUnrelatedGroup(); assert.equal(f.browser.exitCode, null);
+});
+
+test("run_code raw Page.close keeps its actual effect uncertain until native cleanup is known", { skip: skipChrome, timeout: 60_000 }, async t => {
+  const f = await fixture(t), host = await f.nativeBroker(), request = requests();
+  const opened = (await host.execute(request({ type: "open", url: `${f.origin}/form?phase=raw-close` }))).response;
+  assert.ok(opened.type === "ready"); const tab = opened.tabs[0]; assert.ok(tab);
+  const operation = request({ type: "run_code", tab_id: tab.id, code: "async page => { await page.close({runBeforeUnload:true}); return 'closed'; }" });
+  assert.equal((await host.execute(operation)).response.type, "uncertain");
+  assert.equal((await host.execute(operation)).response.type, "failed", "An uncertain script cannot be replayed");
+  assert.equal((await f.client.pages()).some(page => page.url === tab.url), false, "The real Page.close effect must still occur");
+  assert.equal((await host.execute(request({ type: "status" }))).response.type, "disconnected");
+  await f.assertUnrelatedGroup(); assert.equal(f.browser.exitCode, null);
+});
+
+test("run_code redacts pairing tokens before result and error truncation and from native tab metadata", { skip: skipChrome, timeout: 90_000 }, async t => {
+  const f = await fixture(t), host = await f.nativeBroker(), request = requests();
+  const opened = (await host.execute(request({ type: "open", url: "about:blank" }))).response;
+  assert.ok(opened.type === "ready"); const tab = opened.tabs[0]; assert.ok(tab);
+  const run = async (code: string) => (await host.execute(request({ type: "run_code", tab_id: tab.id, code }))).response;
+  const payloadLength = (text: string) => { const match = text.match(/x{32,}/); assert.ok(match); return match[0].length; };
+  // Measure the public producer's actual cutoff with safe data, then straddle it
+  // with this disposable profile's synthetic token. No token enters a receipt.
+  const probe = await run("async () => 'x'.repeat(70000)"); assert.ok(probe.type === "ready");
+  const resultPadding = payloadLength(probe.output) - Math.ceil(f.pairingToken.length / 2);
+  const result = await run(`async () => 'x'.repeat(${resultPadding}) + ${JSON.stringify(f.pairingToken)} + 'x'.repeat(70000)`);
+  assert.ok(result.type === "ready"); f.assertNoBootstrapDetails(result);
+  assert.ok(result.output.includes("[redacted]")); assert.ok(result.output.length <= 65536);
+
+  const errorProbe = await run("async () => { throw new Error('x'.repeat(10000)); }"); assert.ok(errorProbe.type === "uncertain");
+  assert.equal((await host.execute(request({ type: "status" }))).response.type, "ready");
+  const errorPadding = payloadLength(errorProbe.message) - Math.ceil(f.pairingToken.length / 2);
+  const error = await run(`async () => { throw new Error('x'.repeat(${errorPadding}) + ${JSON.stringify(f.pairingToken)} + 'x'.repeat(10000)); }`);
+  assert.ok(error.type === "uncertain"); f.assertNoBootstrapDetails(error);
+  assert.ok(error.message.includes("[redacted]"));
+  const status = (await host.execute(request({ type: "status" }))).response; assert.ok(status.type === "ready");
+
+  const metadata = await run(`async page => { await page.goto(${JSON.stringify(`${f.origin}/redaction?synthetic=${f.pairingToken}`)}); await page.evaluate(value => { document.title = value; }, ${JSON.stringify(f.pairingToken)}); return 'metadata'; }`);
+  assert.ok(metadata.type === "ready"); f.assertNoBootstrapDetails(metadata);
+  assert.ok(metadata.tabs[0]?.url.includes("[redacted]")); assert.equal(metadata.tabs[0]?.title === "[redacted]", true);
+  const released = (await host.execute(request({ type: "release" }))).response;
+  assert.ok(released.type === "closed"); await f.assertUnrelatedGroup();
 });
 
 test("unattended extension pairing survives helper and Chrome restarts without consent interactions", { skip: skipChrome, timeout: 180_000 }, async t => {
@@ -791,7 +925,7 @@ test("direct input activates only its owned native page while snapshots stay in 
 });
 
 test("lost browser transport leaves a submitted mutation uncertain without replaying or closing its tab", { skip: skipChrome, timeout: 60_000 }, async t => {
-  const f = await fixture(t, true), host = f.host, request = requests();
+  const f = await fixture(t, { slowSubmit: true }), host = f.host, request = requests();
   const opened = (await host.execute(request({ type: "open", url: `${f.origin}/form` }))).response;
   assert.ok(opened.type === "ready", JSON.stringify(opened)); const tab = opened.tabs[0]; assert.ok(tab);
   const operation = request({ type: "click", tab_id: tab.id, element_ref: elementRef(opened.output, "button", "Save") });
@@ -804,6 +938,31 @@ test("lost browser transport leaves a submitted mutation uncertain without repla
   assert.equal((await host.execute(request({ type: "snapshot", tab_id: tab.id }))).response.type, "disconnected");
   const pages = await f.client.pages();
   assert.ok(pages.some(page => page.url.startsWith(f.origin) && page.url !== `${f.origin}/unrelated`));
+  assert.equal(f.browser.exitCode, null);
+});
+
+test("foreign extension iframe detach never masquerades as completed native tab cleanup", { skip: skipChrome, timeout: 60_000 }, async t => {
+  const f = await fixture(t, { foreignFrame: true }), request = requests();
+  const opened = (await f.host.execute(request({ type: "open", url: `${f.origin}/form?phase=detached` }))).response;
+  assert.ok(opened.type === "ready"); const tab = opened.tabs[0]; assert.ok(tab);
+  const companion = (await f.host.execute(request({ type: "new_tab", url: `${f.origin}/form?phase=companion` }))).response;
+  assert.ok(companion.type === "ready"); assert.equal(companion.tabs.length, 2);
+  await f.host.execute(request({ type: "fill", tab_id: tab.id, element_ref: elementRef(opened.output, "textbox", "Name"), value: "Synthetic input" }));
+  const status = await within((async () => {
+    for (;;) {
+      const response = (await f.host.execute(request({ type: "status" }))).response;
+      if (response.type !== "ready" || !response.tabs.some(current => current.id === tab.id)) return response;
+      await setTimeout(10);
+    }
+  })(), 5000, "The detached native page must invalidate its adapter handle");
+  const released = (await f.host.execute(request({ type: "release" }))).response;
+  assert.ok((await f.client.pages()).some(page => page.url === tab.url), "Debugger detach must not be mistaken for native tab closure");
+  assert.equal(status.type, "disconnected", JSON.stringify({ status, released }));
+  assert.ok(released.type === "disconnected", JSON.stringify(released));
+  assert.match(released.message, /cleanup.*not verified/i);
+  await f.host.close();
+  assert.ok((await f.client.pages()).some(page => page.url === tab.url));
+  await f.assertUnrelatedGroup();
   assert.equal(f.browser.exitCode, null);
 });
 

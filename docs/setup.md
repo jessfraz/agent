@@ -120,7 +120,7 @@ configuration:
 
 ```toml
 [browser]
-# Existing profile directory name. Default is "Default".
+# Optional: pin an existing profile instead of upstream's last-used paired profile.
 # profile_dir_name = "Profile 1"
 # Optional credential launcher prefix; secrets enter only the browser helper.
 # credential_command = ["with-credentials", "browser", "--"]
@@ -148,17 +148,23 @@ can start installed Chrome with that same profile when it is closed.
 profile path, such as `Default` or `Profile 1`. `user_data_dir` selects the
 existing browser's data root, not the profile directory inside it. The token
 must belong to that exact profile. Confirm the website's account before an
-account-specific action. Browser state remains local; the adapter's action
-allowlist is not a process sandbox.
+account-specific action. Browser state remains local. Script scope is not a
+process security sandbox; the existing task authorization applies to code.
 
 Ask Agent to use Chrome on a named machine when necessary. `browser_open`
 creates an owned tab. `browser_status` inspects the live connection;
-`browser_action` navigates, reads accessibility snapshots, fills forms, selects
-options by displayed text, clicks, presses keys and handles dialogs. Handles
+`browser_run_code` runs an `async (page) => { ... }` function with the normal
+Playwright Page API. Use whichever locators, waits, frames, evaluation, file
+uploads, downloads and other browser operations the task needs. Await the
+operations and handle dialogs through normal Page event handlers. Return a
+serializable result or use `console.log` for output. Pages created through
+`page.context().newPage()` and popups from owned pages are tracked for cleanup.
+`browser_action` also provides convenience commands for snapshots, navigation,
+form input, clicks, keys, dialogs and retaining a result tab. Handles
 refer to exact live Page objects; tab reordering cannot retarget an action.
-Only owned tabs and popups from those pages reach the model. Other pages
-dragged into the task's group remain unowned. Moving an owned page out drops
-its handle and preserves the page.
+Handles and automatic cleanup cover owned pages and their popups. Other pages
+dragged into the task's group remain unowned and are preserved. Moving an owned
+page out invalidates its control handle and preserves the page.
 
 Clicks, form input, and key presses bring their owned tab to the front. Reading
 snapshots leaves the foreground tab alone.
@@ -173,10 +179,15 @@ inspects their outcome before repeating them. A browser or host restart
 invalidates old tab handles; it does not prove a submission failed. Reconnect
 to continue, preserving tabs whose ownership cannot be verified.
 
-The first version uses accessibility snapshots. Canvas-only interfaces,
-screenshots sent to the model, uploads and downloads need additional support.
-Chrome settings, desktop applications and general desktop control are outside
-these tools. No arbitrary JavaScript tool is exposed to the model.
+Scripts can use Playwright screenshots and file APIs on the execution host;
+image and file attachments in model output need additional support. Chrome
+settings, desktop applications and general desktop control use other tools.
+
+Chrome may detach an extension debugger when another extension inserts a
+protected frame, including some password-manager menus. That loses the live
+Page handle even if the native tab stays open. Agent reports the interrupted
+operation and unverified cleanup rather than treating the tab as closed or
+replaying its actions. This upstream compatibility issue remains unresolved.
 
 See the upstream [extension setup](https://github.com/microsoft/playwright/blob/main/packages/extension/README.md)
 for installation, profile selection and token pairing.

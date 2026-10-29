@@ -690,6 +690,29 @@
         {
           "type": "object",
           "properties": {
+            "code": {
+              "type": "string"
+            },
+            "tab_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "run_code"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "tab_id",
+            "code"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "tab_id": {
               "type": "integer",
               "format": "uint32",
@@ -802,8 +825,7 @@
           "type": "string"
         },
         "owner_id": {
-          "type": "string",
-          "format": "uuid"
+          "type": "string"
         },
         "session_id": {
           "type": "string",

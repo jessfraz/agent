@@ -38,7 +38,7 @@ pub struct BrowserConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserRequest {
-    pub owner_id: Uuid,
+    pub owner_id: String,
     pub session_id: Uuid,
     pub operation_id: String,
     pub action: BrowserAction,
@@ -73,6 +73,10 @@ pub enum BrowserAction {
     PressKey {
         tab_id: u32,
         key: String,
+    },
+    RunCode {
+        tab_id: u32,
+        code: String,
     },
     WaitFor {
         tab_id: u32,
@@ -159,7 +163,7 @@ pub enum BrowserConnectionState {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct BrowserBinding {
-    pub owner_id: Uuid,
+    pub owner_id: String,
     pub host_id: String,
     pub session_id: Uuid,
     pub state: BrowserConnectionState,
@@ -267,7 +271,8 @@ impl Process {
 pub struct BrowserHost {
     runtime: Option<PathBuf>,
     config: Option<BrowserConfig>,
-    sessions: Mutex<HashMap<Uuid, Arc<Mutex<Process>>>>,
+    sessions: Mutex<HashMap<String, Arc<Mutex<Process>>>>,
+    native_input: Mutex<()>,
 }
 
 impl Default for BrowserHost {
@@ -276,6 +281,7 @@ impl Default for BrowserHost {
             runtime: None,
             config: None,
             sessions: Mutex::new(HashMap::new()),
+            native_input: Mutex::new(()),
         }
     }
 }
@@ -286,6 +292,7 @@ impl BrowserHost {
             runtime: Some(runtime.to_owned()),
             config,
             sessions: Mutex::new(HashMap::new()),
+            native_input: Mutex::new(()),
         }
     }
 
@@ -333,7 +340,7 @@ impl BrowserHost {
                     message: "The browser runtime could not start. Build or update Agent on this host before connecting Chrome.".into(),
                 }),
             };
-            sessions.insert(request.owner_id, Arc::new(Mutex::new(process)));
+            sessions.insert(request.owner_id.clone(), Arc::new(Mutex::new(process)));
         }
         let Some(process) = sessions.get(&request.owner_id).cloned() else {
             return Ok(BrowserResponse::Disconnected { session_id: request.session_id,
@@ -345,6 +352,32 @@ impl BrowserHost {
             return Ok(BrowserResponse::Disconnected { session_id: request.session_id,
                 message: "This browser handle belongs to an older connection; inspect the current conversation's browser state.".into() });
         }
+        // Helpers share Chrome's native focus. Keep activation and its effect
+        // together, including tab creation/navigation and active-tab cleanup.
+        // Reads and dialog answers must still unblock another owner's renderer.
+        let _native_input = if matches!(
+            request.action,
+            BrowserAction::Status
+                | BrowserAction::Snapshot { .. }
+                | BrowserAction::WaitFor { .. }
+                | BrowserAction::RetainTab { .. }
+                | BrowserAction::HandleDialog { .. }
+        ) {
+            None
+        } else {
+            let mut interrupted = cancelled.clone();
+            tokio::select! {
+                guard = self.native_input.lock() => Some(guard),
+                () = async {
+                    loop {
+                        if *interrupted.borrow() { break; }
+                        if interrupted.changed().await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                } => None,
+            }
+        };
         if *cancelled.borrow() {
             if matches!(request.action, BrowserAction::Open { .. }) {
                 // Allocation can finish while an interrupt arrives. No browser
@@ -408,7 +441,7 @@ mod tests {
     };
 
     const FIXTURE: &str = r#"
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 const {user_data_dir: directory} = JSON.parse(process.argv[2]);
@@ -418,6 +451,10 @@ const input = createInterface({input:process.stdin});
 input.on('line', async line => {
   const request = JSON.parse(line);
   appendFileSync(join(directory, 'effects'), request.operation_id + '\n');
+  if (request.operation_id === 'leased') {
+    writeFileSync(join(directory, 'leased'), 'leased');
+    while (!existsSync(join(directory, 'continue'))) await new Promise(resolve => setTimeout(resolve, 10));
+  }
   if (request.operation_id === 'held') await new Promise(resolve => setTimeout(resolve, 200));
   if (request.operation_id === 'wrong-receipt') {
     process.stdout.write(JSON.stringify({operation_id:'other-operation',response:{type:'ready',session_id:request.session_id,tabs:[],output:'PRIVATE_FIXTURE_SENTINEL',is_error:false}})+'\n');
@@ -445,13 +482,13 @@ input.on('close', () => { writeFileSync(join(directory, 'closed'), 'closed'); })
     }
 
     fn request(
-        owner: Uuid,
+        owner: impl ToString,
         session: Uuid,
         operation: &str,
         action: BrowserAction,
     ) -> BrowserRequest {
         BrowserRequest {
-            owner_id: owner,
+            owner_id: owner.to_string(),
             session_id: session,
             operation_id: operation.into(),
             action,
@@ -466,6 +503,138 @@ input.on('close', () => { writeFileSync(join(directory, 'closed'), 'closed'); })
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_input_cancels_while_other_owners_read_and_handle_dialogs() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = std::sync::Arc::new(host(directory.path()).await);
+        let reader = "1";
+        let reader_session = Uuid::new_v4();
+        let (_stop, cancelled) = watch::channel(false);
+        assert!(matches!(
+            host.execute(
+                request(
+                    reader,
+                    reader_session,
+                    "reader-open",
+                    BrowserAction::Open {
+                        url: "about:blank".into()
+                    }
+                ),
+                cancelled.clone()
+            )
+            .await,
+            BrowserResponse::Ready { .. }
+        ));
+        let active_host = host.clone();
+        let active_cancelled = cancelled.clone();
+        let active = tokio::spawn(async move {
+            active_host
+                .execute(
+                    request(
+                        Uuid::new_v4(),
+                        Uuid::new_v4(),
+                        "leased",
+                        BrowserAction::Open {
+                            url: "about:blank".into(),
+                        },
+                    ),
+                    active_cancelled,
+                )
+                .await
+        });
+        wait_for(&directory.path().join("leased")).await;
+        let queued_owner = Uuid::new_v4();
+        let queued_host = host.clone();
+        let (stop_queued, queued_cancelled) = watch::channel(false);
+        let mut queued = tokio::spawn(async move {
+            queued_host
+                .execute(
+                    request(
+                        queued_owner,
+                        Uuid::new_v4(),
+                        "queued",
+                        BrowserAction::Open {
+                            url: "about:blank".into(),
+                        },
+                    ),
+                    queued_cancelled,
+                )
+                .await
+        });
+        timeout(Duration::from_secs(3), async {
+            while !host
+                .sessions
+                .lock()
+                .await
+                .contains_key(&queued_owner.to_string())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let reads = timeout(Duration::from_secs(3), async {
+            let status = host
+                .execute(
+                    request(
+                        reader,
+                        reader_session,
+                        "reader-status",
+                        BrowserAction::Status,
+                    ),
+                    cancelled.clone(),
+                )
+                .await;
+            let dialog = host
+                .execute(
+                    request(
+                        reader,
+                        reader_session,
+                        "reader-dialog",
+                        BrowserAction::HandleDialog {
+                            tab_id: 1,
+                            accept: true,
+                            prompt_text: None,
+                        },
+                    ),
+                    cancelled,
+                )
+                .await;
+            (status, dialog)
+        })
+        .await;
+        stop_queued.send(true).unwrap();
+        let cancelled_reply = timeout(Duration::from_secs(3), &mut queued).await;
+        fs::write(directory.path().join("continue"), "continue")
+            .await
+            .unwrap();
+        let active_reply = active.await.unwrap();
+        // Drain held input before assertions, including a failed queue test.
+        if cancelled_reply.is_err() {
+            let _ = queued.await;
+        }
+        assert!(matches!(active_reply, BrowserResponse::Ready { .. }));
+        let (status, dialog) = reads.unwrap();
+        assert!(matches!(status, BrowserResponse::Ready { .. }));
+        assert!(matches!(dialog, BrowserResponse::Ready { .. }));
+        assert!(matches!(
+            cancelled_reply.unwrap().unwrap(),
+            BrowserResponse::Failed { .. }
+        ));
+        assert!(
+            !host
+                .sessions
+                .lock()
+                .await
+                .contains_key(&queued_owner.to_string())
+        );
+        let effects = fs::read_to_string(directory.path().join("effects"))
+            .await
+            .unwrap();
+        assert!(effects.contains("reader-status\n") && effects.contains("reader-dialog\n"));
+        assert!(!effects.contains("queued\n"));
     }
 
     #[tokio::test]

@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import { promisify } from "node:util";
+import { format, promisify } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { runInNewContext } from "node:vm";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { McpClient, StdioTransport } from "@earendil-works/pi-mcp";
 import { chromium, type Browser, type Dialog, type Page } from "playwright-core";
@@ -36,14 +37,16 @@ type OwnedTab = {
   popup: (page: Page) => void;
   onDialog: (dialog: Dialog) => void;
   onDialogClosed: (dialog: Dialog) => void;
+  closing: boolean;
+  script?: { result?: unknown; logs: string[] };
 };
 
 function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function output(message: string, state: Record<string, unknown> = {}): string {
-  const bytes = Buffer.from(JSON.stringify({ message, ...state }));
+function output(message: string, state: Record<string, unknown> = {}, redact: (value: string) => string = value => value): string {
+  const bytes = Buffer.from(redact(JSON.stringify({ message, ...state })));
   return bytes.length <= OUTPUT_LIMIT ? bytes.toString("utf8")
     : bytes.subarray(0, OUTPUT_LIMIT - 64).toString("utf8") + "\n[Browser output truncated.]";
 }
@@ -106,11 +109,17 @@ export class BrowserHost {
     }
   }
 
-  private tabs(): BrowserTab[] { return [...this.owned.values()].map(tab => ({ ...tab.info })); }
+  private tabs(): BrowserTab[] { return [...this.owned.values()].map(tab => ({ ...tab.info,
+    url: this.redact(tab.info.url), title: this.redact(tab.info.title) })); }
+
+  private redact(value: string): string {
+    const token = (this.options.extensionToken ?? process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN)
+      ?.trim().replace(/^PLAYWRIGHT_MCP_EXTENSION_TOKEN=/, "");
+    return token === undefined || token.length === 0 ? value : value.replaceAll(token, "[redacted]");
+  }
 
   private lost(): void {
     this.disconnected = true;
-    this.owned.clear();
   }
 
   private liveBrowser(): Browser {
@@ -137,7 +146,7 @@ export class BrowserHost {
     const name = "Agent " + this.owner.session_id;
     const executable = fileURLToPath(new URL("./cli.js", import.meta.resolve("@playwright/mcp/package.json")));
     const args = this.options.serverArguments ?? ["--extension", "--browser", "chrome",
-      "--profile-dir-name", this.config.profile_dir_name ?? "Default",
+      ...(this.config.profile_dir_name === null ? [] : ["--profile-dir-name", this.config.profile_dir_name]),
       ...(this.config.user_data_dir === null ? [] : ["--user-data-dir", this.config.user_data_dir])];
     const env = this.childEnvironment(token);
     const transport = new StdioTransport({ command: process.execPath,
@@ -168,6 +177,10 @@ export class BrowserHost {
       if (context === undefined || browser.contexts().length !== 1) throw new Error("Browser profile context was not confirmed");
       context.setDefaultTimeout(ACTION_TIMEOUT);
       context.setDefaultNavigationTimeout(ACTION_TIMEOUT);
+      const newPage = context.newPage.bind(context);
+      // Script-created pages have direct creation provenance, just like popups
+      // from an owned opener. Never infer ownership from a pages-list diff.
+      context.newPage = async () => this.adopt(await newPage()).page;
       const connectors = context.pages().filter(page => connector(page, name));
       if (connectors.length !== 1) throw new Error("Browser connector identity was not confirmed");
       // The final attached page disconnects the extension when closed. Create
@@ -192,12 +205,16 @@ export class BrowserHost {
       dialogOpened, notifyDialog: notify,
       popup: popup => { if (this.owned.has(tab.info.id)) this.adopt(popup); },
       onDialog: dialog => { tab.dialog = dialog; tab.notifyDialog(); },
-      onDialogClosed: dialog => this.dialogClosed(tab, dialog) };
+      onDialogClosed: dialog => this.dialogClosed(tab, dialog), closing: false };
     this.owned.set(tab.info.id, tab);
     page.on("popup", tab.popup);
     page.on("dialog", tab.onDialog);
     page.on("dialogclosed", tab.onDialogClosed);
-    page.once("close", () => this.owned.delete(tab.info.id));
+    page.once("close", () => {
+      // The extension also emits Page.close when Chrome detaches its debugger.
+      // Only our acknowledged native close can establish disposable cleanup.
+      if (this.owned.has(tab.info.id) && !tab.closing && !this.closing) this.lost();
+    });
     return tab;
   }
 
@@ -219,7 +236,10 @@ export class BrowserHost {
     // reads must not delay returning the dialog that the next action handles.
     const modal = [...this.owned.values()].some(tab => tab.dialog !== undefined);
     for (const tab of this.owned.values()) {
-      if (tab.page.isClosed()) { this.owned.delete(tab.info.id); continue; }
+      if (tab.page.isClosed()) {
+        this.lost();
+        throw new Error("Owned browser page lost control without confirmed cleanup");
+      }
       tab.info.url = tab.page.url();
       // Native modals block page commands, including title and snapshot.
       if (!modal) tab.info.title = await tab.page.title();
@@ -227,8 +247,9 @@ export class BrowserHost {
   }
 
   private async state(tab: OwnedTab, message: string): Promise<string> {
+    const script = tab.script === undefined ? {} : { result: tab.script.result, logs: tab.script.logs };
     if (tab.dialog !== undefined) return output(message, { dialog: { type: tab.dialog.type(),
-      message: tab.dialog.message(), defaultValue: tab.dialog.defaultValue() } });
+      message: tab.dialog.message(), defaultValue: tab.dialog.defaultValue() }, ...script }, value => this.redact(value));
     const children = await tab.page.locator("body").ariaSnapshotJSON({ mode: "ai" });
     tab.refs.clear();
     const collect = (node: unknown): void => {
@@ -238,7 +259,26 @@ export class BrowserHost {
       if (Array.isArray(node.children)) for (const child of node.children) collect(child);
     };
     collect(children);
-    return output(message, { snapshot: { children } });
+    return output(message, { snapshot: { children }, ...script }, value => this.redact(value));
+  }
+
+  private async runCode(tab: OwnedTab, code: string): Promise<void> {
+    const script: { result?: unknown; logs: string[] } = { logs: [] };
+    const log = (...values: unknown[]) => { script.logs.push(format(...values)); };
+    // This is the normal Playwright Page, with its full API. The VM provides
+    // script scope, not a security sandbox; task authorization still applies.
+    const invoke: unknown = runInNewContext(`(${code})`, {
+      console: { log, info: log, warn: log, error: log },
+      Buffer, URL, URLSearchParams, TextEncoder, TextDecoder, setTimeout, clearTimeout,
+      setInterval, clearInterval, AbortController, AbortSignal, fetch, Headers,
+      Request, Response, FormData, Blob, crypto, atob, btoa, structuredClone,
+    });
+    if (typeof invoke !== "function") throw new Error("Playwright code must be an async function receiving page");
+    tab.script = script;
+    // Normal Playwright scripts await their operations and handle dialogs with
+    // Page event handlers. Keep the host's native-input lease until completion.
+    await tab.page.bringToFront();
+    script.result = await invoke(tab.page);
   }
 
   private async effect(tab: OwnedTab, action: () => Promise<unknown>): Promise<void> {
@@ -262,7 +302,7 @@ export class BrowserHost {
     if (this.owner.owner_id !== request.owner_id || this.owner.session_id !== session_id) return {
       type: "failed", session_id, message: "This browser connection belongs to another conversation or session." };
     if (this.disconnected || this.closing) return { type: "disconnected", session_id,
-      message: "The Chrome connection is closed. Old tab handles are invalid; open a new connection to continue." };
+      message: "Chrome control was lost. Native tabs may still be open and their cleanup was not verified. Old tab handles are invalid; inspect Chrome before continuing." };
     if ((action.type === "open" || action.type === "new_tab" || action.type === "navigate") && !allowedUrl(action.url)) return {
       type: "failed", session_id, message: "Browser navigation requires an HTTP or HTTPS URL without embedded credentials, or about:blank." };
     if ("tab_id" in action && !this.owned.has(action.tab_id)) return { type: "failed", session_id,
@@ -297,6 +337,7 @@ export class BrowserHost {
             await this.close();
             return { type: "closed", session_id, tabs: [], output: output("The final owned tab was closed and the Chrome connection was released.") };
           }
+          this.liveBrowser();
           return { type: "ready", session_id, tabs: this.tabs(), output: output("The owned tab was closed."), is_error: false };
         }
         if (action.type === "handle_dialog") {
@@ -309,6 +350,7 @@ export class BrowserHost {
         } else if (tab.dialog === undefined) {
           switch (action.type) {
             case "snapshot": break;
+            case "run_code": await this.runCode(tab, action.code); break;
             case "navigate": await this.effect(tab, () => tab.page.goto(action.url, { waitUntil: "domcontentloaded" })); break;
             case "click":
               await tab.page.bringToFront();
@@ -336,9 +378,15 @@ export class BrowserHost {
       await this.refresh();
       this.liveBrowser();
       return { type: "ready", session_id, tabs: this.tabs(), output: result, is_error: false };
-    } catch {
+    } catch (error) {
+      if (action.type === "run_code") {
+        const detail = error instanceof Error ? error.message : object(error) && typeof error.message === "string"
+          ? error.message : "The script did not confirm completion";
+        return { type: "uncertain", session_id,
+          message: `Playwright code failed: ${this.redact(detail).slice(0, 8192)}. Earlier effects were not replayed. Inspect the page before running it again; native tab cleanup was not verified.` };
+      }
       return { type: mutates(action) ? "uncertain" : "disconnected", session_id,
-        message: "Chrome did not confirm this operation. Inspect its outcome before repeating it. Confirm the Playwright extension is installed in the configured profile and its pairing token is available to Agent. Old handles are invalid after disconnection." };
+        message: "Chrome did not confirm this operation. Native tabs may still be open and cleanup was not verified. Inspect its outcome before repeating it. Confirm the Playwright extension is installed in the configured profile and its pairing token is available to Agent. Old handles are invalid after disconnection." };
     }
   }
 
@@ -354,18 +402,19 @@ export class BrowserHost {
     };
     tab.page.on("dialog", handle);
     try {
+      if (tab.page.isClosed()) throw new Error("Owned page lost control before cleanup");
+      tab.closing = true;
       if (tab.dialog !== undefined) handle(tab.dialog);
       const closed = tab.page.waitForEvent("close", { timeout: ACTION_TIMEOUT });
-      // runBeforeUnload receives a native command acknowledgement and does not
-      // suppress TargetClosedError like default Page.close(). Require both that
-      // acknowledgement and the page event: transport death can fake the event.
+      // Require a native command acknowledgement and its close event. Default
+      // Page.close suppresses TargetClosedError, including debugger detach.
       await Promise.all([tab.page.close({ runBeforeUnload: true }), closed]);
       await Promise.all(dialogs);
       const client = this.client;
       if (client === undefined) throw new Error("Browser owner is closed");
       await client.ping({ timeoutMs: 5000 });
       this.owned.delete(tab.info.id);
-    } finally { tab.page.off("dialog", handle); }
+    } finally { tab.closing = false; tab.page.off("dialog", handle); }
   }
 
   private async release(session_id: string): Promise<BrowserResponse> {
