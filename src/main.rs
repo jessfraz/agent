@@ -2274,6 +2274,11 @@ async fn selected_model(
     ))
 }
 
+fn service_notice(message: impl std::fmt::Display) {
+    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    eprintln!("[{timestamp}] {message}");
+}
+
 async fn configure_messages(sources: &[agent_cli::sources::SourceConfig]) {
     if sources.iter().any(|source| {
         matches!(
@@ -2282,7 +2287,7 @@ async fn configure_messages(sources: &[agent_cli::sources::SourceConfig]) {
         )
     }) && let Err(error) = agent_cli::rex::install::install(agent_cli::rex::source::MODULE).await
     {
-        eprintln!("Messages Rex setup is unavailable: {error}");
+        service_notice(format_args!("Messages Rex setup is unavailable: {error}"));
     }
 }
 
@@ -2338,7 +2343,7 @@ async fn worker_service(
                 "Coordinator did not accept this worker"
             );
             delay = 1;
-            eprintln!("Worker connected as {}.", node.name);
+            service_notice(format_args!("Worker connected as {}.", node.name));
             // Collection uses another request while this connection continues
             // serving its effects. Doing both on one loop would deadlock.
             let profile = config.clone();
@@ -2359,8 +2364,8 @@ async fn worker_service(
                     .await
                     .is_err()
                     {
-                        eprintln!(
-                            "Worker cleanup could not complete; saved ownership is retained."
+                        service_notice(
+                            "Worker cleanup could not complete; saved ownership is retained.",
                         );
                     }
                     sleep(Duration::from_secs(interval.into())).await;
@@ -2399,7 +2404,7 @@ async fn worker_service(
             Ok::<(), anyhow::Error>(())
         };
         tokio::select! {
-            result = attempt => { if result.is_err() { eprintln!("Worker connection unavailable; retrying in {delay}s. Saved work is retained."); } }
+            result = attempt => { if result.is_err() { service_notice(format_args!("Worker connection unavailable; retrying in {delay}s. Saved work is retained.")); } }
             signal = &mut shutdown => { signal?; return Ok(()); }
         }
         tokio::select! {
