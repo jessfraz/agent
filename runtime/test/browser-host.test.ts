@@ -191,18 +191,39 @@ async function exitsWithin(exited: Promise<void>, milliseconds: number): Promise
 }
 
 async function closeChrome(browser: ChildProcess, exited: Promise<void>, client: ChromeFixtureClient | undefined): Promise<void> {
-  if (browser.exitCode !== null || browser.signalCode !== null) { await exited; return; }
+  const group = process.platform !== "win32" ? browser.pid : undefined;
+  const signal = (value: NodeJS.Signals) => {
+    if (group === undefined) { browser.kill(value); return; }
+    try { process.kill(-group, value); }
+    catch (error) { if (!object(error) || error.code !== "ESRCH") throw error; }
+  };
+  const groupAlive = () => {
+    if (group === undefined) return false;
+    try { process.kill(-group, 0); return true; }
+    catch (error) { if (object(error) && error.code === "ESRCH") return false; throw error; }
+  };
+  const stopped = async () => {
+    const deadline = performance.now() + 5_000;
+    if (!await exitsWithin(exited, 5_000)) return false;
+    while (groupAlive()) {
+      if (performance.now() >= deadline) return false;
+      await setTimeout(25);
+    }
+    return true;
+  };
   let protocolError: unknown;
-  if (client !== undefined) {
+  if (client !== undefined && browser.exitCode === null && browser.signalCode === null) {
     // Chrome may close CDP before acknowledging Browser.close. Its own process
     // completion is authoritative; allow that graceful shutdown to finish.
     void client.call("Browser.close").catch(error => { protocolError = error; });
-    if (await exitsWithin(exited, 5_000)) return;
   }
-  browser.kill("SIGTERM");
-  if (await exitsWithin(exited, 5_000)) return;
-  browser.kill("SIGKILL");
-  if (!await exitsWithin(exited, 5_000)) throw new Error("Disposable Chrome did not stop during fixture cleanup", { cause: protocolError });
+  if (await stopped()) return;
+  // Only this fixture's detached group is owned. Descendants can retain stderr
+  // after the browser exits, so both stdio completion and group exit matter.
+  signal("SIGTERM");
+  if (await stopped()) return;
+  signal("SIGKILL");
+  if (!await stopped()) throw new Error("Disposable Chrome process group or stdio did not stop during fixture cleanup", { cause: protocolError });
 }
 
 async function fixture(t: TestContext, options: { slowSubmit?: boolean; foreignFrame?: boolean } = {}) {
@@ -371,7 +392,7 @@ socket.once('data', data => { socket.destroy(); process.exit(data === 'ok\\n' ? 
       "--disable-background-networking", "--disable-component-update", "--no-first-run", "--no-default-browser-check", "about:blank"];
     // Match Playwright's disposable Linux fixture launch under Ubuntu AppArmor.
     if (process.platform === "linux" || process.getuid?.() === 0) args.unshift("--no-sandbox");
-    const browser = spawn(chrome, args, { stdio: ["ignore", "ignore", "pipe"] });
+    const browser = spawn(chrome, args, { stdio: ["ignore", "ignore", "pipe"], detached: process.platform !== "win32" });
     let startupOutput = "";
     const captureStartup = (chunk: Buffer) => { startupOutput = (startupOutput + chunk.toString("utf8")).slice(-8192); };
     browser.stderr?.on("data", captureStartup);

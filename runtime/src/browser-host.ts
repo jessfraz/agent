@@ -563,8 +563,8 @@ export class BrowserHost {
 
   private async state(tab: OwnedTab, message: string): Promise<string> {
     const script = tab.script === undefined ? {} : { result: tab.script.result, logs: tab.script.logs };
-    if (tab.dialog !== undefined) return output(message, { dialog: { type: tab.dialog.type(),
-      message: tab.dialog.message(), defaultValue: tab.dialog.defaultValue() }, ...script }, value => this.redact(value));
+    if (tab.dialog !== undefined) return output(message, { ...script, dialog: { type: tab.dialog.type(),
+      message: tab.dialog.message(), defaultValue: tab.dialog.defaultValue() } }, value => this.redact(value));
     const children = await tab.page.locator("body").ariaSnapshotJSON({ mode: "ai" });
     await this.capturePasswords(tab);
     tab.refs.clear();
@@ -575,7 +575,7 @@ export class BrowserHost {
       if (Array.isArray(node.children)) for (const child of node.children) collect(child);
     };
     collect(children);
-    return output(message, { snapshot: { children }, ...script }, value => this.redact(value));
+    return output(message, { ...script, snapshot: { children } }, value => this.redact(value));
   }
 
   private async runCode(tab: OwnedTab, code: string): Promise<void> {
