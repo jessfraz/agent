@@ -20,7 +20,7 @@
         src = pkgs.lib.fileset.toSource {
           root = ./runtime;
           fileset = pkgs.lib.fileset.unions [
-            ./runtime/src ./runtime/test ./runtime/package.json
+            ./runtime/src ./runtime/package.json
             ./runtime/package-lock.json ./runtime/tsconfig.json
           ];
         };

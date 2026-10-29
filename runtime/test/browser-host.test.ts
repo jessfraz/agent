@@ -124,6 +124,7 @@ async function fixture(t: TestContext, slowSubmit = false) {
   const address = server.address(); assert.ok(address !== null && typeof address !== "string");
   const origin = `http://127.0.0.1:${address.port}`;
   const directory = await mkdtemp(join(tmpdir(), "agent-browser-test-"));
+  const driverLog = join(directory, "chrome-driver.log");
   const args = ["--headless=new", "--remote-debugging-port=0", `--user-data-dir=${directory}`, "--no-first-run", "--no-default-browser-check", "about:blank"];
   if (process.getuid?.() === 0) args.unshift("--no-sandbox");
   const browser: ChildProcess = spawn(chrome, args, { stdio: "ignore" });
@@ -136,6 +137,10 @@ async function fixture(t: TestContext, slowSubmit = false) {
     const failures: unknown[] = [];
     let stopped = false;
     try { await host?.close(); } catch (error) { failures.push(error); }
+    if (!t.passed && existsSync(driverLog)) {
+      try { t.diagnostic("Disposable Chrome driver:\n" + (await readFile(driverLog, "utf8")).slice(-16_384)); }
+      catch (error) { failures.push(error); }
+    }
     try { await closeChrome(browser, exited, client); stopped = true; } catch (error) { failures.push(error); }
     client?.close(); delayed?.end();
     server.closeAllConnections();
@@ -166,7 +171,7 @@ async function fixture(t: TestContext, slowSubmit = false) {
   await client.call("Storage.setCookies", { cookies: [{ name: "fixture_login", value: "signed-in", url: origin, httpOnly: true, sameSite: "Lax" }] });
   await client.call("Target.createTarget", { url: `${origin}/unrelated` });
   const fixtureClient = client;
-  host = new BrowserHost({ user_data_dir: null }, { serverArguments: [`--browser-url=http://127.0.0.1:${port}`] });
+  host = new BrowserHost({ user_data_dir: null }, { serverArguments: [`--browser-url=http://127.0.0.1:${port}`, "--logFile", driverLog] });
   return {
     origin, browser, client: fixtureClient, submitted, host,
     count: () => submissions,
@@ -214,7 +219,7 @@ test("real Chrome adapter owns exact tabs and scoped popups, preserves unrelated
 
   const popupRequest = request({ type: "click", tab_id: tab.id, element_ref: elementRef(waited.output, "button", "Open popup") });
   const popupPending = host.execute(popupRequest);
-  await f.client.call("Target.createTarget", { url: `${f.origin}/user-concurrent` });
+  await f.client.call("Target.createTarget", { url: `${f.origin}/user-concurrent`, background: true });
   const popup = (await popupPending).response;
   assert.ok(popup.type === "ready", JSON.stringify(popup)); assert.equal(popup.is_error, false);
   assert.equal(popup.tabs.length, 2); assert.ok(popup.tabs.some(page => page.url === `${f.origin}/popup`));
