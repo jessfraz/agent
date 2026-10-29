@@ -1,0 +1,6 @@
+{"type":"native","request":{"type":"observe","input_ids":["example"]}}
+{"type":"native","request":{"type":"submit","input_id":"example","text":"example","mode":"steer"}}
+{"type":"native","request":{"type":"submit","input_id":"example","text":"example","mode":"follow_up"}}
+{"type":"native","request":{"type":"history","cursor":"example"}}
+{"type":"native","request":{"type":"history","cursor":null}}
+{"type":"native","request":{"type":"interrupt"}}

@@ -1,0 +1,73 @@
+// !$*UTF8*$!
+{
+    archiveVersion = 1;
+    classes = {};
+    objectVersion = 60;
+    objects = {
+        A00000000000000000000001 = {isa = PBXBuildFile; fileRef = A00000000000000000000002; };
+        A00000000000000000000002 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentApp.swift; sourceTree = "<group>"; };
+        A00000000000000000000003 = {isa = PBXFileReference; explicitFileType = wrapper.application; path = Agent.app; sourceTree = BUILT_PRODUCTS_DIR; };
+        A00000000000000000000004 = {isa = PBXBuildFile; productRef = A00000000000000000000005; };
+        A00000000000000000000005 = {isa = XCSwiftPackageProductDependency; package = A00000000000000000000006; productName = AgentUI; };
+        A00000000000000000000006 = {isa = XCLocalSwiftPackageReference; relativePath = .; };
+        A00000000000000000000007 = {isa = PBXGroup; children = (A00000000000000000000008, A00000000000000000000009, A00000000000000000000015); sourceTree = "<group>"; };
+        A00000000000000000000008 = {isa = PBXGroup; children = (A00000000000000000000002); path = AgentApp; sourceTree = "<group>"; };
+        A00000000000000000000009 = {isa = PBXGroup; children = (A00000000000000000000003); name = Products; sourceTree = "<group>"; };
+        A0000000000000000000000A = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000001); runOnlyForDeploymentPostprocessing = 0; };
+        A0000000000000000000000B = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000004); runOnlyForDeploymentPostprocessing = 0; };
+        A0000000000000000000000C = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+        A0000000000000000000000D = {
+            isa = PBXNativeTarget;
+            buildConfigurationList = A00000000000000000000010;
+            buildPhases = (A0000000000000000000000A, A0000000000000000000000B, A0000000000000000000000C);
+            buildRules = ();
+            dependencies = ();
+            name = Agent;
+            packageProductDependencies = (A00000000000000000000005);
+            productName = Agent;
+            productReference = A00000000000000000000003;
+            productType = "com.apple.product-type.application";
+        };
+        A0000000000000000000000E = {
+            isa = PBXProject;
+            attributes = {BuildIndependentTargetsInParallel = YES; LastSwiftUpdateCheck = 2600; LastUpgradeCheck = 2600; };
+            buildConfigurationList = A0000000000000000000000F;
+            compatibilityVersion = "Xcode 15.0";
+            developmentRegion = en;
+            hasScannedForEncodings = 0;
+            knownRegions = (en, Base);
+            mainGroup = A00000000000000000000007;
+            packageReferences = (A00000000000000000000006);
+            productRefGroup = A00000000000000000000009;
+            projectDirPath = "";
+            projectRoot = "";
+            targets = (A0000000000000000000000D);
+        };
+        A0000000000000000000000F = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000011, A00000000000000000000012); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+        A00000000000000000000010 = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000013, A00000000000000000000014); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+        A00000000000000000000011 = {
+            isa = XCBuildConfiguration;
+            buildSettings = {CLANG_ENABLE_MODULES = YES; IPHONEOS_DEPLOYMENT_TARGET = 18.0; SDKROOT = iphoneos; SWIFT_VERSION = 6.0; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; DEBUG_INFORMATION_FORMAT = dwarf; };
+            name = Debug;
+        };
+        A00000000000000000000012 = {
+            isa = XCBuildConfiguration;
+            buildSettings = {CLANG_ENABLE_MODULES = YES; IPHONEOS_DEPLOYMENT_TARGET = 18.0; SDKROOT = iphoneos; SWIFT_VERSION = 6.0; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_COMPILATION_MODE = wholemodule; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; };
+            name = Release;
+        };
+        A00000000000000000000013 = {
+            isa = XCBuildConfiguration;
+            baseConfigurationReference = A00000000000000000000015;
+            buildSettings = {};
+            name = Debug;
+        };
+        A00000000000000000000014 = {
+            isa = XCBuildConfiguration;
+            baseConfigurationReference = A00000000000000000000015;
+            buildSettings = {};
+            name = Release;
+        };
+        A00000000000000000000015 = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = App.xcconfig; sourceTree = "<group>"; };
+    };
+    rootObject = A0000000000000000000000E;
+}

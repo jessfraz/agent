@@ -41,6 +41,12 @@ jobs:
         run: nix develop --command make runtime check
       - name: Check generated bindings
         run: git diff --exit-code
+      - name: Check native client
+        if: runner.os == 'macOS'
+        run: swift test --package-path ios --scratch-path target/ios
+      - name: Build iOS client
+        if: runner.os == 'macOS'
+        run: xcodebuild -project ios/Agent.xcodeproj -scheme Agent -destination 'generic/platform=iOS Simulator' -derivedDataPath target/ios-app CODE_SIGNING_ALLOWED=NO build
       - name: Evaluate flake
         run: nix flake check --no-build --all-systems
       - name: Build packaged CLI
