@@ -329,8 +329,8 @@ Reset dates use the client's local timezone and include the time remaining.
 workers. It shows OS, CPU count, RAM, Tailscale IP and load averages. Unavailable
 probes retain their last sample with its age; unknown measurements stay unknown.
 
-Each service writes rotating lifecycle receipts to
-Worker lifecycle notices include UTC timestamps. Structured runtime logs live in
+Worker lifecycle notices include UTC timestamps. Each service also writes
+rotating structured lifecycle receipts to
 `<state_dir>/diagnostics/runtime.jsonl` and its numbered archives (1 MiB per
 segment). Retention targets 48 hours, with a 128 MiB total disk cap including
 coverage metadata and its atomic replacement. Whole expired segments leave
