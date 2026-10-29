@@ -338,10 +338,11 @@ async fn unused(record: &ResourceRecord, identity: &NativeWorktreeIdentity) -> R
         Path::new(&identity.primary),
     )
     .await?;
-    ensure!(
-        (output.code == 0 || output.code == 1) && output.stderr.is_empty(),
-        "Could not inspect active resource processes; preserving worktree"
-    );
+    unused_processes(&output, identity)
+}
+
+fn unused_processes(output: &Output, identity: &NativeWorktreeIdentity) -> Result<()> {
+    // A confirmed consumer holds the tree even when another path was unreadable.
     let mut process = "unknown";
     for line in output.stdout.lines() {
         if let Some(pid) = line.strip_prefix('p') {
@@ -354,6 +355,10 @@ async fn unused(record: &ResourceRecord, identity: &NativeWorktreeIdentity) -> R
             anyhow::bail!("Worktree is still used by process {process}");
         }
     }
+    ensure!(
+        (output.code == 0 || output.code == 1) && output.stderr.is_empty(),
+        "Could not inspect active resource processes; preserving worktree"
+    );
     Ok(())
 }
 
@@ -1019,25 +1024,69 @@ mod tests {
                 .spawn()
                 .unwrap(),
         );
+        let reason = held_reason(
+            GitBackend::default()
+                .plan_cleanup(resource, &fixture.plans())
+                .await,
+        );
+        assert!(reason.contains("still used by process"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn missing_cleanup_helper_reports_its_failure_directly() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend = GitBackend::new(vec!["/nonexistent-agent-guarded-cleanup".into()]).unwrap();
+        let error = backend
+            .helper(directory.path(), &["--plan"])
+            .await
+            .err()
+            .unwrap();
         assert!(
-            held_reason(
-                GitBackend::default()
-                    .plan_cleanup(resource, &fixture.plans())
-                    .await
-            )
-            .contains("still used by process")
+            error.to_string().contains("helper is unavailable"),
+            "{error}"
         );
     }
 
     #[tokio::test]
-    async fn missing_cleanup_helper_is_a_specific_hold() {
+    async fn missing_cleanup_helper_preserves_the_worktree() {
         let fixture = Fixture::new();
         let resource = fixture.allocate().await;
         let identity = resource.state.identity().unwrap().clone();
         let backend = GitBackend::new(vec!["/nonexistent-agent-guarded-cleanup".into()]).unwrap();
-        let reason = held_reason(backend.plan_cleanup(resource, &fixture.plans()).await);
-        assert!(reason.contains("helper is unavailable"), "{reason}");
+        held_reason(backend.plan_cleanup(resource, &fixture.plans()).await);
         assert!(Path::new(&identity.top).exists());
+    }
+
+    #[test]
+    fn incomplete_process_coverage_keeps_positive_consumers_and_holds_unknowns() {
+        let identity = NativeWorktreeIdentity {
+            primary: "/fixture/repository".into(),
+            top: "/fixture/worktree".into(),
+            git_dir: "/fixture/repository/.git/worktrees/task".into(),
+            common_dir: "/fixture/repository/.git".into(),
+            branch: "task/fixture".into(),
+            head: "fixture-head".into(),
+        };
+        let mut output = Output {
+            code: 1,
+            stdout: format!("p123\nn{}\n", identity.top),
+            stderr: "lsof: WARNING: inaccessible file system; output may be incomplete".into(),
+        };
+        for path in [&identity.top, &identity.git_dir] {
+            output.stdout = format!("p123\nn{path}\n");
+            let error = unused_processes(&output, &identity).unwrap_err();
+            assert_eq!(error.to_string(), "Worktree is still used by process 123");
+        }
+        output.stdout = "p456\nn/fixture/worktree-other\n".into();
+        let error = unused_processes(&output, &identity).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Could not inspect active resource processes; preserving worktree"
+        );
+        output.stdout.clear();
+        assert!(unused_processes(&output, &identity).is_err());
+        output.stderr.clear();
+        assert!(unused_processes(&output, &identity).is_ok());
     }
 
     #[tokio::test]
