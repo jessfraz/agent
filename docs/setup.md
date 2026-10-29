@@ -126,7 +126,7 @@ configuration:
 
 ```toml
 [browser]
-# Optional: pin an existing profile instead of upstream's last-used paired profile.
+# Optional: pin a profile instead of the last-used one with Playwright installed.
 # profile_dir_name = "Profile 1"
 # Optional credential launcher prefix; secrets enter only the browser helper.
 # credential_command = ["with-credentials", "browser", "--"]
@@ -389,6 +389,12 @@ first; capacity pressure can remove younger segments. These record
 input placement, activity, host-call timing and interruption without message
 bodies, reasoning, tool arguments or credentials. The files are private to the
 user; logging failure does not block chat.
+
+Browser host-call records correlate the conversation, session, operation and
+local tab handle with duration, outcome and owned-tab count. Cancellation keeps
+those same identifiers. Fixed connection stages and control-loss causes explain
+failures without recording URLs, page content, scripts, input values or pairing
+tokens. Script results and redacted error details remain in private tool history.
 
 A slow runtime write records one `write_backpressure` event with its request,
 command kind and byte counts. Event reads continue while that write is pending.

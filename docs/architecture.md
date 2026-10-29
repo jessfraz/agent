@@ -301,17 +301,20 @@ configured private credential provider.
 
 Reuse supported APIs and configured CLIs before adding an adapter. Existing
 coding-agent plugins are not automatically portable to this runtime. Chrome
-tools are the final UI fallback. Rust owns the host and helper lifetime; a
-small TypeScript helper uses Pi's MCP client and the pinned Chrome DevTools
-server. Chrome retains its normal sign-in state and process lifetime. Desktop
-Computer Use and copied browser profiles are outside the design.
+tools are the final UI fallback. Rust owns the host and helper lifetime. A
+TypeScript helper pairs the official Playwright extension through Pi's MCP
+client and connects the Playwright API to that conversation's browser session.
+Chrome retains its normal sign-in state and process lifetime. Desktop Computer
+Use and copied browser profiles are outside the design.
 
 Each conversation owns a connection on one host. Pi records its generation
-and pending operation before dispatch. Native page IDs, including popups
-attributed to an owned page's action, establish tab ownership. Inventory
-differences, titles and URLs never establish ownership. The adapter returns
-only owned pages and their accessibility snapshots. A browser reconnection
-invalidates all handles. Offline hosts never redirect browser effects.
+and pending operation before dispatch. Exact live Page objects, pages created
+through their context, and popups from owned openers establish tab ownership.
+Inventory differences, titles and URLs never establish ownership. General
+Playwright code receives the normal Page API; snapshots and cleanup track owned
+pages. Rust serializes native input across conversations while reads and dialog
+answers remain available. Reconnection invalidates old handles. Offline hosts
+never redirect browser effects.
 
 Mutations are not replay-safe. Missing receipts remain uncertain until a live
 status check, followed by page or provider inspection. Interruption fences new
