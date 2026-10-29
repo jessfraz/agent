@@ -44,6 +44,7 @@ function offered(input: Context, role: ToolRole): void {
   assert.ok(["exec", "read_file", "browser_status", "read_source_events"].every((name) => names.includes(name)));
   assert.deepEqual(names.filter((name) => sourceDecisions.includes(name)).sort(), role === "main" || role === "triage" ? [...sourceDecisions].sort() : []);
   assert.equal(names.includes("read_resources"), role !== "triage");
+  assert.equal(names.includes("collect_worktrees"), role === "main");
   assert.equal(names.includes("allocate_worktree"), role === "worker" || role === "agent");
   assert.equal(names.includes("list_jobs"), role === "main" || role === "triage");
 }

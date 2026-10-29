@@ -94,7 +94,7 @@ test("waiting tasks, unsettled child consumers and other hosts hold resources; r
       assert.equal((await app.resources.list())[0]?.state.state, "retiring");
       await assert.rejects(app.tasks.enqueue(task.id, "Reuse while retiring"), /retiring/);
       assert.equal((await app.tasks.get(task.id)).pending.length, 0);
-      throw new Error("Lost collect receipt");
+      return { type: "failed", message: "Lost collect receipt" };
     }), /Lost collect receipt/);
     assert.equal(calls, 3);
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
@@ -132,12 +132,12 @@ test("new work during cleanup planning retains the consumer and prevents native 
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("one task retains multiple repository worktrees and their independent cleanup outcomes after reopen", async () => {
+test("main cleanup tool uses the periodic collector and retains per-repository outcomes after reopen", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-resource-")); let app = await open(directory);
   try {
     const task = await app.tasks.create({ title: "Update clients", outcome: "Merge both repository changes" });
-    const requests: WorktreeAllocation[] = ["client", "server"].map((name) => ({
-      allocation_id: randomUUID(), host_id: hostId, task_id: task.id, repository: `/workspace/${name}`, branch: "update",
+    const requests: WorktreeAllocation[] = ["client", "server"].map((name, index) => ({
+      allocation_id: randomUUID(), host_id: index === 0 ? hostId : "22222222-2222-4222-8222-222222222222", task_id: task.id, repository: `/workspace/${name}`, branch: "update",
     }));
     for (const request of requests) {
       const record = ready(request);
@@ -151,7 +151,7 @@ test("one task retains multiple repository worktrees and their independent clean
     assert.deepEqual((await app.resources.list()).map((record) => record.task_id), [task.id, task.id]);
     await app.tasks.update(task.id, (saved) => { saved.state = { state: "resolved", evidence: "Both changes verified" }; });
     const collected: string[] = [];
-    await app.resources.collect(hostId, async (command) => {
+    const collect = async (command: HostCommand): Promise<HostResult> => {
       if (command.type === "resource_inspect") return { type: "resource", report: { type: "observed", record: command.record } };
       if (command.type === "resource_plan_cleanup") {
         if (command.record.state.state !== "ready") throw new Error("Only ready resources are planned");
@@ -168,7 +168,22 @@ test("one task retains multiple repository worktrees and their independent clean
       return { type: "resource", report: { type: "collected", record: { ...command.record, state: { state: "removed", identity: command.plan.identity } },
         receipt: { status: "completed", worktree_removed: true, branch_deleted: command.record.branch,
           primary_worktree: command.record.repository, retained_submodules: null, summary: "Removed merged client worktree" } } };
-    });
+    };
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    const release = app.executions.bind(root.id.toString(), { cwd: identity.primary, hosts: [], call: async (command) => {
+      assert.equal(command.type, "on_node");
+      if (command.type !== "on_node" || !("record" in command.command)) throw new Error("Expected a routed resource operation");
+      assert.equal(command.host_id, command.command.record.host_id);
+      return collect(command.command);
+    } });
+    try {
+      await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.tools.main] }, BACKGROUND_CONTEXT);
+      app.faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("collect_worktrees", {}), { stopReason: "toolUse" }),
+        fauxAssistantMessage("Cleanup completed; the server worktree is held."),
+      ]);
+      assert.equal((await (await root.submit({ type: "input", content: "Clean up eligible owned worktrees" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+    } finally { release(); }
     assert.deepEqual(collected, ["/workspace/client"]);
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
     const records = await app.resources.list();
@@ -176,6 +191,39 @@ test("one task retains multiple repository worktrees and their independent clean
     assert.equal(records.find((record) => record.repository === "/workspace/client")?.state.state, "removed");
     assert.equal(records.find((record) => record.repository === "/workspace/server")?.state.state, "held");
     assert.ok(records.every((record) => record.task_id === task.id));
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("cleanup tool retains inventory and reports an unconfirmed host effect as a gap", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-resource-gap-")); const app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "Review", outcome: "Verify review" });
+    const request: WorktreeAllocation = { host_id: hostId, task_id: task.id, allocation_id: randomUUID(), repository: identity.primary, branch: "review" };
+    await app.resources.allocate(request, async () => ({ type: "resource", report: { type: "observed", record: ready(request) } }));
+    await app.tasks.update(task.id, (saved) => { saved.state = { state: "resolved", evidence: "Verified" }; });
+    const root = await app.session.root(BACKGROUND_CONTEXT); let calls = 0, failure: unknown;
+    const release = app.executions.bind(root.id.toString(), { cwd: identity.primary, hosts: [], call: async (command) => {
+      assert.equal(command.type, "on_node"); calls += 1;
+      return { type: "failed", message: "Host is unavailable" };
+    } });
+    try {
+      await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.tools.main] }, BACKGROUND_CONTEXT);
+      app.faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("collect_worktrees", {}), { stopReason: "toolUse" }),
+        (context) => {
+          try {
+            const result = context.messages.findLast((message) => message.role === "toolResult");
+            assert.ok(result?.role === "toolResult"); assert.equal(result.isError, true);
+            const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("");
+            for (const expected of [request.allocation_id, hostId, "Collection gaps", "resource_inspect", "Host is unavailable"]) assert.ok(text.includes(expected), text);
+          } catch (error) { failure = error; }
+          return fauxAssistantMessage("The worktree is retained; collection was not confirmed.");
+        },
+      ]);
+      await (await root.submit({ type: "input", content: "Collect eligible worktrees" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+      if (failure !== undefined) throw failure;
+      assert.equal(calls, 1); assert.equal((await app.resources.list())[0]?.state.state, "ready");
+    } finally { release(); }
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -221,7 +269,7 @@ test("main reads every resource while task workers see only their own inventory"
     const worker = await app.tasks.conversation(first.conversation_id);
     let failure: unknown;
     for (const [conversation, extension, expected, tools] of [
-      [root, app.tools.main, records, ["read_resources"]],
+      [root, app.tools.main, records, ["read_resources", "collect_worktrees"]],
       [worker, app.tools.worker, records.filter((record) => record.task_id === first.id), ["allocate_worktree", "read_resources"]],
     ] satisfies Array<[typeof root, typeof app.tools.main, ResourceRecord[], string[]]>) {
       const release = app.executions.bind(conversation.id.toString(), { cwd: identity.primary, hosts: [],

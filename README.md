@@ -139,6 +139,7 @@ remain visible as coverage gaps. Task outcomes are built in.
 Tasks can own multiple worktrees. `agent resources list` shows their inventory;
 `agent resources collect` uses the installed guarded `git cleanup` workflow.
 `/worktrees` shows the same inventory in terminal and native chat clients.
+The main agent can invoke that collector with `collect_worktrees`.
 Only merged, clean, inactive work is eligible. Missing helpers, uncertain
 ownership and partial results stay visible. Services check local resources
 every five minutes.

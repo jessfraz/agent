@@ -7,6 +7,7 @@ import type { CleanupReceipt } from "./generated/CleanupReceipt.js";
 import type { ResourceRecord } from "./generated/ResourceRecord.js";
 import type { ResourceReport } from "./generated/ResourceReport.js";
 import type { WorktreeAllocation } from "./generated/WorktreeAllocation.js";
+import type { HostCommand } from "./generated/HostCommand.js";
 import { TaskError, TaskStore, type HostCall } from "./tasks.js";
 import { Executions } from "./tools.js";
 
@@ -114,23 +115,24 @@ export class ResourceStore {
         if (current.record.consumers.length > 0) continue;
         // A persisted retiring plan is replayable only through the backend's exact identity checks.
         if (current.record.state.state === "retiring" && current.plan !== null) {
-          const result = await call({ type: "resource_collect", record: current.record, plan: current.plan });
-          if (result.type === "resource") await this.adopt(result.report);
+          await this.adopt(await this.report({ type: "resource_collect", record: current.record, plan: current.plan }, call));
           continue;
         }
-        const inspected = await call({ type: "resource_inspect", record: current.record });
-        if (inspected.type !== "resource") continue;
-        await this.adopt(inspected.report);
-        if (inspected.report.record.state.state !== "ready") continue;
-        const planned = await call({ type: "resource_plan_cleanup", record: inspected.report.record });
-        if (planned.type !== "resource") continue;
-        await this.adopt(planned.report);
-        if (planned.report.type !== "planned") continue;
-        const result = await call({ type: "resource_collect", record: planned.report.record, plan: planned.report.plan });
-        if (result.type === "resource") await this.adopt(result.report);
+        const inspected = await this.report({ type: "resource_inspect", record: current.record }, call);
+        await this.adopt(inspected);
+        if (inspected.record.state.state !== "ready") continue;
+        const planned = await this.report({ type: "resource_plan_cleanup", record: inspected.record }, call);
+        await this.adopt(planned);
+        if (planned.type !== "planned") continue;
+        await this.adopt(await this.report({ type: "resource_collect", record: planned.record, plan: planned.plan }, call));
       } finally { this.collecting.delete(initial.id); }
     }
     return this.list();
+  }
+  private async report(command: HostCommand, call: HostCall): Promise<ResourceReport> {
+    const result = await call(command);
+    if (result.type !== "resource") throw new TaskError(`${command.type} was not confirmed: ${result.type === "failed" ? result.message : `unexpected ${result.type} result`}. Resource state is retained.`);
+    return result.report;
   }
 }
 
@@ -154,8 +156,19 @@ export function createResourceTools(resources: ResourceStore, tasks: TaskStore, 
       const visible = owner === undefined ? all : all.filter((resource) => resource.task_id === owner.task.id);
       return { output: [{ type: "text", text: JSON.stringify(visible) }] };
     } });
+  const collect = defineTool({ name: "collect_worktrees", description: "Run the background collector for eligible Agent-owned worktrees on their recorded hosts. Active, dirty, unmerged or uncertain work is retained. Returns inventory and any collection gaps.",
+    replay: "safe", parameters: Type.Object({}), async execute(_args, api) {
+      const execution = executions.get(api.conversationId.toString());
+      const hosts = [...new Set((await resources.list()).filter((resource) => resource.state.state !== "removed" && resource.state.state !== "partial").map((resource) => resource.host_id))];
+      const results = await Promise.allSettled(hosts.map((host_id) => resources.collect(host_id,
+        (command) => execution.call({ type: "on_node", host_id, command }))));
+      const gaps = results.flatMap((result, index) => result.status === "fulfilled" ? []
+        : [`${hosts[index]}: ${result.reason instanceof Error ? result.reason.message : "Collection was not confirmed"}`]);
+      const inventory = JSON.stringify(await resources.list());
+      return { output: [{ type: "text", text: gaps.length === 0 ? inventory : `${inventory}\n\nCollection gaps:\n${gaps.join("\n")}` }], isError: gaps.length > 0 };
+    } });
   return {
-    main: defineExtension({ name: "resource-inventory", tools: [read] }),
+    main: defineExtension({ name: "resource-inventory", tools: [read, collect] }),
     worker: defineExtension({ name: "app-resources", tools: [allocate, read] }),
   };
 }
