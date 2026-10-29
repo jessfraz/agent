@@ -44,7 +44,7 @@ async fn reset_client_does_not_cancel_admitted_owned_work() {
         .unwrap();
     let (server, _) = listener.accept().await.unwrap();
     let owner = runtime.clone();
-    let handler = tokio::spawn(async move { handle(server, owner, broker).await });
+    let mut handler = tokio::spawn(async move { handle(server, owner, broker).await });
     let observe = async {
         let mut command = serde_json::to_vec(&RuntimeCommand::Logout).unwrap();
         command.push(b'\n');
@@ -72,23 +72,24 @@ async fn reset_client_does_not_cancel_admitted_owned_work() {
             0
         );
         drop(client);
-        let reply = directory.path().join("reply.json");
-        while !reply.exists() {
-            sleep(Duration::from_millis(10)).await;
-        }
-        let result: HostResult = serde_json::from_slice(&std::fs::read(reply).unwrap()).unwrap();
-        (result, directory.path().join("finished").exists())
+        // Done follows the fixture's complete write. File creation alone can
+        // expose a zero-byte receipt while writeFileSync is still publishing it.
+        (&mut handler).await
     };
     let observed = timeout(Duration::from_secs(8), observe).await;
     if observed.is_err() {
         handler.abort();
+        let _ = handler.await;
     }
-    let handled = handler.await;
     match Arc::try_unwrap(runtime) {
         Ok(runtime) => runtime.close().await.unwrap(),
         Err(_) => panic!("Fixture runtime ownership leaked"),
     }
-    let (result, completed) = observed.unwrap();
+    let handled = observed.unwrap();
+    let result: HostResult =
+        serde_json::from_slice(&std::fs::read(directory.path().join("reply.json")).unwrap())
+            .unwrap();
+    let completed = directory.path().join("finished").exists();
     assert!(
         matches!(result, HostResult::Process { exit_code: 0, .. }),
         "Ordinary reset cancelled work: {result:?}"
