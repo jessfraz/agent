@@ -41,6 +41,7 @@ pub struct Runtime {
     alive: watch::Receiver<bool>,
     notices: broadcast::Sender<RuntimeNotice>,
     actor: Option<JoinHandle<Result<()>>>,
+    shutdown: watch::Sender<bool>,
 }
 
 enum CommandMessage {
@@ -62,7 +63,11 @@ enum CommandMessage {
         request_id: u32,
         command: Box<RuntimeCommand>,
     },
-    Shutdown,
+}
+
+struct ActorControl {
+    commands: mpsc::Receiver<CommandMessage>,
+    shutdown: watch::Receiver<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -136,6 +141,7 @@ impl Runtime {
             .context("Runtime output pipe is unavailable")?;
         let (commands, incoming) = mpsc::channel(64);
         let (life, alive) = watch::channel(true);
+        let (shutdown, stopping) = watch::channel(false);
         let (notices, _) = broadcast::channel(64);
         let notifications = notices.clone();
         let diagnostics = Diagnostics::start(state);
@@ -144,7 +150,10 @@ impl Runtime {
                 child,
                 stdin,
                 BufReader::new(stdout),
-                incoming,
+                ActorControl {
+                    commands: incoming,
+                    shutdown: stopping,
+                },
                 guard,
                 notifications,
                 diagnostics,
@@ -158,6 +167,7 @@ impl Runtime {
             alive,
             notices,
             actor: Some(actor),
+            shutdown,
         })
     }
 
@@ -252,7 +262,7 @@ impl Runtime {
     }
 
     pub async fn close(mut self) -> Result<()> {
-        let _ = self.commands.send(CommandMessage::Shutdown).await;
+        let _ = self.shutdown.send(true);
         match self.actor.take() {
             Some(actor) => actor.await.context("Pi runtime owner stopped")?,
             None => Ok(()),
@@ -263,95 +273,167 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         // Do not abort the actor: it owns the lock until the child really exits.
-        let _ = self.commands.try_send(CommandMessage::Shutdown);
+        let _ = self.shutdown.send(true);
     }
 }
 
-async fn send(stdin: &mut ChildStdin, request: RuntimeRequest) -> Result<Option<String>> {
-    let mut bytes = serde_json::to_vec(&request)?;
-    ensure!(
-        bytes.len() <= MAX_FRAME_BYTES,
-        "Runtime request exceeds its size limit"
-    );
-    let kind = diagnostics::command_kind(&bytes);
-    bytes.push(b'\n');
-    timeout(Duration::from_secs(10), stdin.write_all(&bytes))
-        .await
-        .context("Pi runtime stopped reading commands")?
-        .context("Could not write to Pi runtime")?;
-    Ok(kind)
+enum WriteCompletion {
+    Admission {
+        admitted: oneshot::Sender<Result<RuntimeCall>>,
+        call: RuntimeCall,
+    },
+    Control,
+    Effect,
+}
+struct PendingWrite {
+    id: u32,
+    bytes: Vec<u8>,
+    offset: usize,
+    kind: Option<String>,
+    trace: Trace,
+    completion: WriteCompletion,
+    backpressure_at: Option<tokio::time::Instant>,
+}
+impl PendingWrite {
+    fn new(request: RuntimeRequest, trace: Trace, completion: WriteCompletion) -> Result<Self> {
+        let mut bytes = serde_json::to_vec(&request)?;
+        ensure!(
+            bytes.len() <= MAX_FRAME_BYTES,
+            "Runtime request exceeds its size limit"
+        );
+        let kind = diagnostics::command_kind(&bytes);
+        bytes.push(b'\n');
+        Ok(Self {
+            id: request.id,
+            bytes,
+            offset: 0,
+            kind,
+            trace,
+            completion,
+            backpressure_at: Some(tokio::time::Instant::now() + Duration::from_secs(10)),
+        })
+    }
+    fn context(&self) -> String {
+        format!(
+            "Pi command request {} ({}; bytes {}/{})",
+            self.id,
+            self.kind.as_deref().unwrap_or("unknown"),
+            self.offset,
+            self.bytes.len()
+        )
+    }
 }
 
-async fn reject_host_calls(
-    stdin: &mut ChildStdin,
-    id: u32,
-    pending: &mut Pending,
-    diagnostics: &mut Diagnostics,
-) -> Result<()> {
+fn reject_host_calls(id: u32, pending: &mut Pending, diagnostics: &mut Diagnostics) {
     if pending.events.take().is_some() {
         diagnostics.record(id, &pending.trace, DiagnosticEvent::Detached);
     }
-    if pending.worker {
-        pending.worker = false;
-        send(
-            stdin,
-            RuntimeRequest {
-                version: PROTOCOL_VERSION,
-                id,
-                command: RuntimeCommand::DetachWorker,
-            },
-        )
-        .await?;
-    }
-    if let Some(view) = pending.view.take() {
-        send(
-            stdin,
-            RuntimeRequest {
-                version: PROTOCOL_VERSION,
-                id,
-                command: view.command(),
-            },
-        )
-        .await?;
-    }
-    for (call_id, timing) in pending.host_calls.drain() {
-        diagnostics.record(id, &pending.trace, timing.reply(&call_id));
-        send(
-            stdin,
-            RuntimeRequest {
-                version: PROTOCOL_VERSION,
-                id,
-                command: RuntimeCommand::HostReply {
-                    call_id,
-                    result: HostResult::Failed {
-                        message:
-                            "The execution client disconnected; no command ran on a fallback host."
-                                .into(),
-                    },
+}
+
+// Disconnected controls remain in their existing request state until the pipe
+// has room. Materialize one frame, not an unbounded second output queue.
+fn disconnected_write(
+    pending: &mut HashMap<u32, Pending>,
+    diagnostics: &mut Diagnostics,
+) -> Result<Option<PendingWrite>> {
+    for (id, call) in pending.iter_mut().filter(|(_, call)| call.events.is_none()) {
+        let command = if call.worker {
+            call.worker = false;
+            RuntimeCommand::DetachWorker
+        } else if let Some(view) = call.view.take() {
+            view.command()
+        } else if let Some(call_id) = call.host_calls.keys().next().cloned() {
+            if let Some(timing) = call.host_calls.remove(&call_id) {
+                diagnostics.record(*id, &call.trace, timing.reply(&call_id));
+            }
+            RuntimeCommand::HostReply {
+                call_id,
+                result: HostResult::Failed {
+                    message:
+                        "The execution client disconnected; no command ran on a fallback host."
+                            .into(),
                 },
+            }
+        } else {
+            continue;
+        };
+        return PendingWrite::new(
+            RuntimeRequest {
+                version: PROTOCOL_VERSION,
+                id: *id,
+                command,
             },
+            call.trace.clone(),
+            WriteCompletion::Effect,
         )
-        .await?;
+        .map(Some);
     }
-    Ok(())
+    Ok(None)
 }
 
 async fn run_actor<R: AsyncBufRead + Unpin>(
     mut child: Child,
     mut stdin: ChildStdin,
     output: R,
-    mut commands: mpsc::Receiver<CommandMessage>,
+    control: ActorControl,
     _writer_guard: File,
     notices: broadcast::Sender<RuntimeNotice>,
     mut diagnostics: Diagnostics,
 ) -> Result<()> {
+    let ActorControl {
+        mut commands,
+        mut shutdown,
+    } = control;
     let mut output = FrameReader::new(output);
     let mut next_id = 1_u32;
     let mut pending: HashMap<u32, Pending> = HashMap::new();
+    // The bounded command channel is the queue. Exactly one encoded frame owns
+    // its byte offset; cancelling a select branch never rewrites its prefix.
+    let mut outgoing: Option<PendingWrite> = None;
     let result: Result<()> = async {
         loop {
+            if *shutdown.borrow() { break Ok(()); }
+            if outgoing.is_none() { outgoing = disconnected_write(&mut pending, &mut diagnostics)?; }
+            let backpressure = outgoing.as_ref().and_then(|frame| frame.backpressure_at);
             tokio::select! {
-                message = commands.recv() => match message {
+                _ = shutdown.changed() => break Ok(()),
+                written = async {
+                    match outgoing.as_ref() {
+                        Some(frame) => stdin.write(&frame.bytes[frame.offset..]).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let frame = outgoing.as_mut().context("No Pi command owns the write result")?;
+                    let count = written.with_context(|| format!("Could not write {}", frame.context()))?;
+                    ensure!(count > 0, "Pi input closed while writing {}", frame.context());
+                    frame.offset += count;
+                    if frame.offset == frame.bytes.len() {
+                        let frame = outgoing.take().context("Completed Pi command is unavailable")?;
+                        if !matches!(frame.completion, WriteCompletion::Effect)
+                            && let Some(command) = frame.kind {
+                            diagnostics.record(frame.id, &frame.trace, DiagnosticEvent::CommandSent { command });
+                        }
+                        if let WriteCompletion::Admission { admitted, call } = frame.completion
+                            && admitted.send(Ok(call)).is_err()
+                            && let Some(call) = pending.get_mut(&frame.id) {
+                            reject_host_calls(frame.id, call, &mut diagnostics);
+                        }
+                    }
+                },
+                _ = async {
+                    match backpressure {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(frame) = outgoing.as_mut() {
+                        frame.backpressure_at = None;
+                        diagnostics.record(frame.id, &frame.trace, DiagnosticEvent::WriteBackpressure {
+                            command: frame.kind.clone(), written_bytes: frame.offset, frame_bytes: frame.bytes.len(),
+                        });
+                    }
+                },
+                message = commands.recv(), if outgoing.is_none() => match message {
                     Some(CommandMessage::Request { command, admitted }) => {
                         let command = *command;
                         let login = matches!(command, RuntimeCommand::Login);
@@ -368,32 +450,27 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                         let trace = Trace::new(&command);
                         diagnostics.record(id, &trace, DiagnosticEvent::RequestReceived);
                         if let Some(event) = trace.input(&command) { diagnostics.record(id, &trace, event); }
-                        if let Some(command) = send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id, command }).await? {
-                            diagnostics.record(id, &trace, DiagnosticEvent::CommandSent { command });
-                        }
+                        outgoing = Some(PendingWrite::new(RuntimeRequest { version: PROTOCOL_VERSION, id, command }, trace.clone(),
+                            WriteCompletion::Admission { admitted, call: RuntimeCall { request_id: id, events } })?);
                         pending.insert(id, Pending { events: Some(sender), host_calls: HashMap::new(), trace, login, worker, view, interruptible });
-                        if admitted.send(Ok(RuntimeCall { request_id: id, events })).is_err()
-                            && let Some(call) = pending.get_mut(&id) {
-                            reject_host_calls(&mut stdin, id, call, &mut diagnostics).await?;
-                        }
                     }
                     Some(CommandMessage::Reply { request_id, call_id, result }) => {
                         if let Some(call) = pending.get_mut(&request_id)
                             && let Some(timing) = call.host_calls.remove(&call_id) {
                             diagnostics.record(request_id, &call.trace, timing.reply(&call_id));
-                            send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id: request_id,
-                                command: RuntimeCommand::HostReply { call_id, result } }).await?;
+                            outgoing = Some(PendingWrite::new(RuntimeRequest { version: PROTOCOL_VERSION, id: request_id,
+                                command: RuntimeCommand::HostReply { call_id, result } }, call.trace.clone(), WriteCompletion::Effect)?);
                         }
                     }
                     Some(CommandMessage::Detached(id)) => {
                         if let Some(call) = pending.get_mut(&id) {
-                            reject_host_calls(&mut stdin, id, call, &mut diagnostics).await?;
+                            reject_host_calls(id, call, &mut diagnostics);
                         }
                     }
                     Some(CommandMessage::OAuthCallback { request_id, target }) => {
-                        if pending.get(&request_id).is_some_and(|request| request.login) {
-                            send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id: request_id,
-                                command: RuntimeCommand::OAuthCallback { target } }).await?;
+                        if let Some(call) = pending.get(&request_id).filter(|request| request.login) {
+                            outgoing = Some(PendingWrite::new(RuntimeRequest { version: PROTOCOL_VERSION, id: request_id,
+                                command: RuntimeCommand::OAuthCallback { target } }, call.trace.clone(), WriteCompletion::Effect)?);
                         }
                     }
                     Some(CommandMessage::WorkerControl { request_id, command }) => {
@@ -403,12 +480,11 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                         if let Some(event) = trace.input(&command) { diagnostics.record(request_id, trace, event); }
                         if request.is_some_and(|request| request.events.is_some() && (request.worker || (request.interruptible && matches!(*command,
                                 RuntimeCommand::Interrupt | RuntimeCommand::SubmitInput { .. })))) {
-                            if let Some(command) = send(&mut stdin, RuntimeRequest { version: PROTOCOL_VERSION, id: request_id, command: *command }).await? {
-                                diagnostics.record(request_id, trace, DiagnosticEvent::CommandSent { command });
-                            }
+                            outgoing = Some(PendingWrite::new(RuntimeRequest { version: PROTOCOL_VERSION, id: request_id,
+                                command: *command }, trace.clone(), WriteCompletion::Control)?);
                         } else { diagnostics.record(request_id, trace, DiagnosticEvent::ControlIgnored); }
                     }
-                    Some(CommandMessage::Shutdown) | None => break Ok(()),
+                    None => break Ok(()),
                 },
                 frame = output.next_frame() => {
                     let bytes = frame?.context("Pi runtime exited")?;
@@ -444,7 +520,7 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                     for event in call.trace.observe(&frame.event).into_iter().flatten() { diagnostics.record(frame.id, &call.trace, event); }
                     let done = matches!(frame.event, RuntimeEventKind::Done);
                     let detached = call.events.as_ref().is_none_or(|sender| sender.try_send(frame.event).is_err());
-                    if detached { reject_host_calls(&mut stdin, frame.id, call, &mut diagnostics).await?; }
+                    if detached { reject_host_calls(frame.id, call, &mut diagnostics); }
                     if done { pending.remove(&frame.id); }
                 }
             }
@@ -466,6 +542,8 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
             let _ = sender.try_send(RuntimeEventKind::Done);
         }
     }
+    drop(outgoing);
+    drop(commands);
     drop(stdin);
     let reaped = match timeout(Duration::from_secs(5), child.wait()).await {
         Ok(status) => status.context("Could not confirm Pi exit"),
@@ -540,6 +618,313 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncWriteExt, BufReader};
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn native_duplex_backpressure_keeps_stdout_readable_during_a_partial_command_write() {
+        use crate::{
+            protocol::{RuntimeCommand, RuntimeEventKind},
+            runtime::Runtime,
+        };
+        use std::sync::Arc;
+        let state = tempfile::tempdir().unwrap();
+        let script = state.path().join("duplex.mjs");
+        std::fs::write(&script, r#"
+import {writeFileSync} from 'node:fs';
+import {join} from 'node:path';
+let input='', paused=false, first,backpressureOwner;const order=[];
+const emit=(id,event,done)=>process.stdout.write(JSON.stringify({version:1,id,event})+'\n',done);
+process.stdin.setEncoding('utf8');
+process.stdin.on('data',chunk=>{
+ input+=chunk;
+ if(first!==undefined&&!paused&&!input.includes('\n')){
+  paused=true;process.stdin.pause();
+  emit(backpressureOwner,{type:'notice',task_id:null,text:'n'.repeat(1024*1024)},()=>process.stdin.resume());
+ }
+ while(input.includes('\n')){
+  const end=input.indexOf('\n'),{id,command}=JSON.parse(input.slice(0,end));input=input.slice(end+1);
+  order.push(command.type);writeFileSync(join(process.argv[2],'wire-order.json'),JSON.stringify(order));
+  if(first===undefined){first=id;backpressureOwner=id;emit(id,{type:'configured'});}
+  else if(command.type==='status'){
+   backpressureOwner=id;paused=false;emit(id,{type:'configured'});
+   emit(id,{type:'host_call',call_id:'large-result',command:{type:'exec',program:'fixture',args:[],cwd:'/',timeout_seconds:10}});
+  }else if(command.type==='host_reply'){
+   if(command.call_id!=='large-result'||command.result.type!=='process'||command.result.stdout!=='z'.repeat(2*1024*1024))throw Error('Host reply frame changed');
+   emit(id,{type:'configured'});emit(id,{type:'done'});
+  }
+  else {
+   if(command.type!=='chat'||command.input!=='x'.repeat(2*1024*1024))throw Error('Command framing changed');
+   emit(id,{type:'answer',conversation_id:'1',text:command.input_id});emit(id,{type:'done'});emit(first,{type:'done'});
+  }
+ }
+});
+"#).unwrap();
+        let runtime = Arc::new(Runtime::start(&script, state.path()).unwrap());
+        let mut first = runtime.request(RuntimeCommand::Status).await.unwrap();
+        assert!(matches!(
+            first.events.recv().await,
+            Some(RuntimeEventKind::Configured)
+        ));
+        let owner = runtime.clone();
+        let submission = tokio::spawn(async move {
+            owner
+                .request(RuntimeCommand::Chat {
+                    input: "x".repeat(2 * 1024 * 1024),
+                    input_id: Some("large-input".into()),
+                    instructions: String::new(),
+                    model: None,
+                    origin_host_id: None,
+                    cwd: "/".into(),
+                    hosts: vec![],
+                })
+                .await
+        });
+        let observed = timeout(Duration::from_secs(2), first.events.recv()).await;
+        if observed.is_err() {
+            submission.abort();
+        }
+        let following = if observed.is_ok() {
+            let mut call = runtime.request(RuntimeCommand::Status).await.unwrap();
+            Some(timeout(Duration::from_secs(3), async {
+                assert!(matches!(call.events.recv().await, Some(RuntimeEventKind::Configured)));
+                let call_id = match call.events.recv().await { Some(RuntimeEventKind::HostCall { call_id, .. }) => call_id,
+                    _ => panic!("The native owner did not request its host result") };
+                runtime.reply(call.request_id, call_id, crate::protocol::HostResult::Process {
+                    exit_code: 0, stdout: "z".repeat(2 * 1024 * 1024), stderr: String::new(), truncated: false,
+                }).await.unwrap();
+                assert!(matches!(call.events.recv().await, Some(RuntimeEventKind::Notice { text, .. }) if text.len() == 1024 * 1024));
+                (call.events.recv().await, call.events.recv().await)
+            }).await)
+        } else {
+            None
+        };
+        let submitted = submission.await;
+        let completed = match submitted {
+            Ok(Ok(mut call)) => Some(
+                timeout(Duration::from_secs(2), async {
+                    (call.events.recv().await, call.events.recv().await)
+                })
+                .await,
+            ),
+            _ => None,
+        };
+        let runtime = match Arc::try_unwrap(runtime) {
+            Ok(runtime) => runtime,
+            Err(_) => panic!("Submission retained runtime ownership"),
+        };
+        runtime.close().await.unwrap_or_else(|error| {
+            assert!(observed.is_err(), "Unexpected transport failure: {error:#}");
+        });
+        assert!(
+            matches!(observed, Ok(Some(RuntimeEventKind::Notice { text, .. })) if text.len() == 1024 * 1024),
+            "Runtime stopped reading stdout while the child waited to drain it before reading more stdin"
+        );
+        assert!(
+            matches!(completed, Some(Ok((Some(RuntimeEventKind::Answer { text, .. }), Some(RuntimeEventKind::Done)))) if text == "large-input")
+        );
+        assert!(matches!(
+            following,
+            Some(Ok((
+                Some(RuntimeEventKind::Configured),
+                Some(RuntimeEventKind::Done)
+            )))
+        ));
+        let order: Vec<String> =
+            serde_json::from_slice(&std::fs::read(state.path().join("wire-order.json")).unwrap())
+                .unwrap();
+        assert_eq!(order, ["status", "chat", "status", "host_reply"]);
+    }
+
+    #[tokio::test]
+    async fn canceled_partial_admission_finishes_its_frame_and_rejects_unowned_host_calls() {
+        use crate::{
+            protocol::{RuntimeCommand, RuntimeEventKind},
+            runtime::Runtime,
+        };
+        use std::sync::Arc;
+        let state = tempfile::tempdir().unwrap();
+        let script = state.path().join("cancel.mjs");
+        std::fs::write(&script, r#"
+import {watch} from 'node:fs';
+let input='',first,paused=false;
+const emit=(id,event)=>process.stdout.write(JSON.stringify({version:1,id,event})+'\n');
+process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
+ input+=chunk;
+ if(first!==undefined&&!paused&&!input.includes('\n')){
+  paused=true;process.stdin.pause();
+  const waiting=watch(process.argv[2],(_,name)=>{if(name==='release'){waiting.close();process.stdin.resume();}});
+  emit(first,{type:'notice',task_id:null,text:'partial command is waiting'});
+ }
+ while(input.includes('\n')){
+  const end=input.indexOf('\n'),{id,command}=JSON.parse(input.slice(0,end));input=input.slice(end+1);
+  if(first===undefined){first=id;emit(id,{type:'configured'});}
+  else if(command.type==='chat'){
+   if(command.input!=='x'.repeat(2*1024*1024))throw Error('Canceled command frame changed');
+   emit(id,{type:'host_call',call_id:'unowned-host',command:{type:'machine_snapshot'}});
+  }else{
+   if(command.type!=='host_reply'||command.call_id!=='unowned-host'||command.result.type!=='failed')throw Error('Unowned host effect was not rejected');
+   emit(first,{type:'notice',task_id:null,text:'unowned host effect rejected'});emit(id,{type:'done'});emit(first,{type:'done'});
+  }
+ }
+});
+"#).unwrap();
+        let runtime = Arc::new(Runtime::start(&script, state.path()).unwrap());
+        let mut first = runtime.request(RuntimeCommand::Status).await.unwrap();
+        assert!(matches!(
+            first.events.recv().await,
+            Some(RuntimeEventKind::Configured)
+        ));
+        let owner = runtime.clone();
+        let submission = tokio::spawn(async move {
+            owner
+                .request(RuntimeCommand::Chat {
+                    input: "x".repeat(2 * 1024 * 1024),
+                    input_id: Some("canceled-input".into()),
+                    instructions: String::new(),
+                    model: None,
+                    origin_host_id: None,
+                    cwd: "/".into(),
+                    hosts: vec![],
+                })
+                .await
+        });
+        assert!(
+            matches!(timeout(Duration::from_secs(2), first.events.recv()).await.unwrap(),
+            Some(RuntimeEventKind::Notice { text, .. }) if text == "partial command is waiting")
+        );
+        let log = state.path().join("diagnostics/runtime.jsonl");
+        timeout(Duration::from_secs(12), async {
+            loop {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                let complete = text.rsplit_once('\n').map_or("", |(complete, _)| complete);
+                let records = complete.lines().map(serde_json::from_str::<crate::runtime::diagnostics::Record>)
+                    .collect::<Result<Vec<_>, _>>().unwrap();
+                let blocked = records.iter().filter(|record| matches!(record.event,
+                    crate::runtime::diagnostics::Event::WriteBackpressure { .. })).collect::<Vec<_>>();
+                if let Some(record) = blocked.first() {
+                    assert_eq!(blocked.len(), 1);
+                    assert_eq!(record.request_id, 2);
+                    assert!(matches!(&record.event, crate::runtime::diagnostics::Event::WriteBackpressure {
+                        command: Some(command), written_bytes, frame_bytes,
+                    } if command == "chat" && *written_bytes > 0 && written_bytes < frame_bytes && *frame_bytes <= MAX_FRAME_BYTES + 1));
+                    assert!(!text.contains("xxxx"), "Backpressure diagnostics cannot retain command content");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("Backpressure must be reported while the child stays alive, without ending the runtime");
+        submission.abort();
+        assert!(matches!(submission.await, Err(error) if error.is_cancelled()));
+        std::fs::write(state.path().join("release"), "Complete the same frame").unwrap();
+        assert!(
+            matches!(timeout(Duration::from_secs(2), first.events.recv()).await.unwrap(),
+            Some(RuntimeEventKind::Notice { text, .. }) if text == "unowned host effect rejected")
+        );
+        let runtime = match Arc::try_unwrap(runtime) {
+            Ok(runtime) => runtime,
+            Err(_) => panic!("Canceled admission retained the runtime"),
+        };
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_bypasses_a_saturated_queue_and_reaps_a_child_that_never_reads_again() {
+        use crate::{
+            protocol::{RuntimeCommand, RuntimeEventKind},
+            runtime::{CommandMessage, Runtime},
+        };
+        use tokio::sync::oneshot;
+        let state = tempfile::tempdir().unwrap();
+        let script = state.path().join("blocked.mjs");
+        std::fs::write(&script, r#"
+import {writeFileSync} from 'node:fs';import {join} from 'node:path';
+let input='',first,paused=false;
+const emit=(id,event)=>process.stdout.write(JSON.stringify({version:1,id,event})+'\n');
+process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
+ input+=chunk;
+ if(first!==undefined&&!paused){paused=true;process.stdin.pause();emit(first,{type:'notice',task_id:null,text:'stdin paused'});}
+ if(first===undefined&&input.includes('\n')){
+  const end=input.indexOf('\n'),{id}=JSON.parse(input.slice(0,end));input=input.slice(end+1);first=id;
+  writeFileSync(join(process.argv[2],'pid'),String(process.pid));emit(id,{type:'configured'});
+ }
+});setInterval(()=>{},1000);
+"#).unwrap();
+        let runtime = Runtime::start(&script, state.path()).unwrap();
+        let mut first = runtime.request(RuntimeCommand::Status).await.unwrap();
+        assert!(matches!(
+            first.events.recv().await,
+            Some(RuntimeEventKind::Configured)
+        ));
+        let (admitted, mut admission) = oneshot::channel();
+        runtime
+            .commands
+            .send(CommandMessage::Request {
+                command: Box::new(RuntimeCommand::Chat {
+                    input: "x".repeat(2 * 1024 * 1024),
+                    input_id: Some("blocked-input".into()),
+                    instructions: String::new(),
+                    model: None,
+                    origin_host_id: None,
+                    cwd: "/".into(),
+                    hosts: vec![],
+                }),
+                admitted,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(2), first.events.recv())
+                .await
+                .unwrap(),
+            Some(RuntimeEventKind::Notice { .. })
+        ));
+        assert!(
+            matches!(
+                admission.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "A partial frame cannot be admitted"
+        );
+        let mut queued = Vec::new();
+        for _ in 0..64 {
+            let (admitted, receiver) = oneshot::channel();
+            queued.push(receiver);
+            assert!(
+                runtime
+                    .commands
+                    .try_send(CommandMessage::Request {
+                        command: Box::new(RuntimeCommand::Status),
+                        admitted
+                    })
+                    .is_ok()
+            );
+        }
+        assert_eq!(runtime.commands.capacity(), 0);
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                runtime.request(RuntimeCommand::Status)
+            )
+            .await
+            .is_err()
+        );
+        let pid: i32 = std::fs::read_to_string(state.path().join("pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        timeout(Duration::from_secs(6), runtime.close())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(admission.await.is_err());
+        for receiver in queued {
+            assert!(receiver.await.is_err());
+        }
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "The unresponsive child must be reaped before writer ownership is released"
+        );
+    }
 
     #[tokio::test]
     async fn partial_frame_survives_select_cancellation() {

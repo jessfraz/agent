@@ -345,6 +345,9 @@ input placement, activity, host-call timing and interruption without message
 bodies, reasoning, tool arguments or credentials. The files are private to the
 user; logging failure does not block chat.
 
+A slow runtime write records one `write_backpressure` event with its request,
+command kind and byte counts. Event reads continue while that write is pending.
+
 `diagnostics/retention.json` records the policy, expiry watermark and cumulative
 timestamp bounds of capacity evictions, including uncertain timestamp coverage.
 It also flags unknown history when upgrading legacy rotations. Read actual

@@ -57,6 +57,11 @@ pub(crate) enum Event {
     CommandSent {
         command: String,
     },
+    WriteBackpressure {
+        command: Option<String>,
+        written_bytes: usize,
+        frame_bytes: usize,
+    },
     InputReceived {
         input_id: Option<String>,
         mode: Option<InputMode>,
@@ -110,6 +115,7 @@ pub(crate) enum Event {
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct Trace {
     started: Option<Instant>,
     conversation_id: Option<String>,

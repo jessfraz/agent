@@ -76,6 +76,10 @@ connection could replace transport, but would still require this process.
 A process lock is inherited by the Pi child, so losing its Rust supervisor does
 not admit a second writer.
 
+The supervisor reads Pi events while command writes are pending. One frame owns
+its write offset, and the bounded command queue provides backpressure. Shutdown
+has an independent signal so a saturated pipe cannot prevent cleanup.
+
 Workers connect to the coordinator and announce their actual Rex host ID,
 name, executable and local launch paths. Agent reuses Rex's shared host
 inventory when available; each node can announce its own native Rex metadata
