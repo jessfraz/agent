@@ -22,7 +22,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::runtime::{FrameReader, Runtime};
+use crate::runtime::{FrameReader, Runtime, ShutdownSignal};
 
 const SOCKET_NAME: &str = "agent.sock";
 
@@ -96,19 +96,26 @@ pub async fn serve_configured(
     .await
 }
 
-async fn shutdown_signal() -> Result<()> {
+#[derive(Clone, Copy)]
+enum ShutdownReason {
+    Signal(ShutdownSignal),
+    #[cfg(test)]
+    Requested,
+}
+
+async fn shutdown_signal() -> Result<ShutdownReason> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => { result?; }
-        _ = terminate.recv() => {}
-    }
-    Ok(())
+    let signal = tokio::select! {
+        result = tokio::signal::ctrl_c() => { result?; ShutdownSignal::Sigint }
+        _ = terminate.recv() => ShutdownSignal::Sigterm,
+    };
+    Ok(ShutdownReason::Signal(signal))
 }
 
 async fn serve_until(
     script: &Path,
     state: &Path,
-    shutdown: impl Future<Output = Result<()>>,
+    shutdown: impl Future<Output = Result<ShutdownReason>>,
 ) -> Result<()> {
     serve_with_transport(
         script,
@@ -129,7 +136,7 @@ async fn serve_with_transport(
     policy: crate::tailnet::PeerPolicy,
     daemon: crate::tailnet::Daemon,
     bootstrap: Option<CoordinatorBootstrap>,
-    shutdown: impl Future<Output = Result<()>>,
+    shutdown: impl Future<Output = Result<ShutdownReason>>,
 ) -> Result<()> {
     // Claim the writer before deciding an old socket is stale.
     let background = bootstrap
@@ -234,7 +241,12 @@ async fn serve_with_transport(
                 background = None;
                 break Err(anyhow::anyhow!("The background transport stopped; saved work is retained: {result:?}"));
             },
-            result = &mut shutdown => break result,
+            result = &mut shutdown => {
+                if let Ok(ShutdownReason::Signal(signal)) = &result {
+                    owner.record_shutdown(*signal);
+                }
+                break result.map(|_| ());
+            },
             Some(_) = clients.join_next(), if !clients.is_empty() => {}
         }
     };
@@ -545,9 +557,9 @@ mod reset_tests;
 #[cfg(test)]
 mod tests {
     use crate::protocol::{AuthStatus, HostResult, InputMode, RuntimeCommand, RuntimeEventKind};
-    use crate::runtime::{FrameReader, Runtime};
+    use crate::runtime::{FrameReader, Runtime, ShutdownSignal};
     use crate::service::{
-        SOCKET_NAME, SocketOwner, authenticated, connect, serve_until, write_frame,
+        SOCKET_NAME, ShutdownReason, SocketOwner, authenticated, connect, serve_until, write_frame,
     };
     use anyhow::Result;
     use std::{fs, path::PathBuf, sync::Arc, time::Duration};
@@ -720,6 +732,10 @@ mod tests {
 
     impl Running {
         async fn start() -> Self {
+            Self::start_with_shutdown(ShutdownReason::Requested).await
+        }
+
+        async fn start_with_shutdown(reason: ShutdownReason) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let script = directory.path().join("fixture.mjs");
             fs::write(&script, FIXTURE).unwrap();
@@ -728,7 +744,7 @@ mod tests {
             let task = tokio::spawn(async move {
                 serve_until(&script, &state, async {
                     let _ = stopped.await;
-                    Ok(())
+                    Ok(reason)
                 })
                 .await
             });
@@ -775,6 +791,131 @@ mod tests {
                 sleep(Duration::from_millis(5)).await;
             }
             path
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_shutdown_records_exact_intent_before_stopping_active_requests() {
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "event", rename_all = "snake_case")]
+        enum StopEvent {
+            ServiceShutdown {
+                signal: ShutdownSignal,
+            },
+            RuntimeStopped {
+                code: crate::protocol::ErrorCode,
+            },
+            #[serde(other)]
+            Other,
+        }
+        #[derive(serde::Deserialize)]
+        struct StopRecord {
+            timestamp_ms: u64,
+            request_id: u32,
+            elapsed_ms: Option<u64>,
+            conversation_id: Option<String>,
+            task_id: Option<String>,
+            agent_id: Option<String>,
+            #[serde(flatten)]
+            event: StopEvent,
+        }
+        let now = || {
+            u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap()
+        };
+        for signal in [ShutdownSignal::Sigint, ShutdownSignal::Sigterm] {
+            let service = Running::start_with_shutdown(ShutdownReason::Signal(signal)).await;
+            let mut client = service.client().await;
+            write_frame(
+                &mut client,
+                &RuntimeCommand::Chat {
+                    input: "Keep this synthetic request active".into(),
+                    input_id: None,
+                    instructions: String::new(),
+                    model: None,
+                    origin_host_id: None,
+                    cwd: "/".into(),
+                    hosts: vec![],
+                },
+            )
+            .await
+            .unwrap();
+            let mut client = FrameReader::new(BufReader::new(client));
+            let event: RuntimeEventKind =
+                serde_json::from_slice(&client.next_frame().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(event, RuntimeEventKind::Notice { .. }));
+            let before = now();
+            let Running {
+                directory,
+                stop,
+                task,
+            } = service;
+            stop.send(()).unwrap();
+            timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let after = now();
+            let records = timeout(Duration::from_secs(3), async {
+                loop {
+                    let text =
+                        fs::read_to_string(directory.path().join("diagnostics/runtime.jsonl"))
+                            .unwrap_or_default();
+                    let complete = text.rsplit_once('\n').map_or("", |(complete, _)| complete);
+                    let records = complete
+                        .lines()
+                        .map(serde_json::from_str::<StopRecord>)
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap();
+                    if records
+                        .iter()
+                        .any(|record| matches!(record.event, StopEvent::RuntimeStopped { .. }))
+                    {
+                        break records;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let shutdowns = records
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| matches!(record.event, StopEvent::ServiceShutdown { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(shutdowns.len(), 1);
+            let (intent_index, intent) = shutdowns[0];
+            assert!(
+                matches!(intent.event, StopEvent::ServiceShutdown { signal: actual } if actual == signal)
+            );
+            assert!((before..=after).contains(&intent.timestamp_ms));
+            assert_eq!(intent.request_id, 0);
+            assert!(
+                intent.elapsed_ms.is_none()
+                    && intent.conversation_id.is_none()
+                    && intent.task_id.is_none()
+                    && intent.agent_id.is_none()
+            );
+            assert!(
+                records
+                    .iter()
+                    .enumerate()
+                    .any(|(index, record)| index > intent_index
+                        && record.request_id == 1
+                        && matches!(
+                            record.event,
+                            StopEvent::RuntimeStopped {
+                                code: crate::protocol::ErrorCode::Internal
+                            }
+                        ))
+            );
+            drop(client);
         }
     }
 

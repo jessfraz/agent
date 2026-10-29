@@ -1,4 +1,4 @@
-//! Content-free runtime receipts. The actor only enqueues bounded records;
+//! Content-free runtime receipts. The actor and service enqueue bounded records;
 //! a separate writer owns private files and rotation.
 use std::{
     cmp::Reverse,
@@ -53,6 +53,9 @@ fn token(value: &str) -> Option<String> {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum Event {
+    ServiceShutdown {
+        signal: crate::runtime::ShutdownSignal,
+    },
     RequestReceived,
     CommandSent {
         command: String,
@@ -359,6 +362,12 @@ pub(crate) struct Diagnostics {
     dropped: u64,
 }
 impl Diagnostics {
+    pub fn fork(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            dropped: 0,
+        }
+    }
     pub fn start(state: &Path) -> Self {
         let (sender, mut records) = mpsc::channel(CAPACITY);
         let directory = state.join("diagnostics");

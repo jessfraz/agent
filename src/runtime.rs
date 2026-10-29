@@ -4,6 +4,7 @@ use std::{
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::Path,
     process::Stdio,
+    sync::Mutex,
     time::Duration,
 };
 
@@ -25,6 +26,13 @@ use crate::runtime::diagnostics::{Diagnostics, Event as DiagnosticEvent, HostTim
 
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub(crate) enum ShutdownSignal {
+    Sigint,
+    Sigterm,
+}
+
 pub struct RuntimeCall {
     pub request_id: u32,
     pub events: mpsc::Receiver<RuntimeEventKind>,
@@ -42,6 +50,7 @@ pub struct Runtime {
     notices: broadcast::Sender<RuntimeNotice>,
     actor: Option<JoinHandle<Result<()>>>,
     shutdown: watch::Sender<bool>,
+    service_diagnostics: Mutex<Diagnostics>,
 }
 
 enum CommandMessage {
@@ -145,6 +154,7 @@ impl Runtime {
         let (notices, _) = broadcast::channel(64);
         let notifications = notices.clone();
         let diagnostics = Diagnostics::start(state);
+        let service_diagnostics = Mutex::new(diagnostics.fork());
         let actor = tokio::spawn(async move {
             let result = run_actor(
                 child,
@@ -168,6 +178,7 @@ impl Runtime {
             notices,
             actor: Some(actor),
             shutdown,
+            service_diagnostics,
         })
     }
 
@@ -259,6 +270,16 @@ impl Runtime {
 
     pub fn subscribe(&self) -> broadcast::Receiver<RuntimeNotice> {
         self.notices.subscribe()
+    }
+
+    pub(crate) fn record_shutdown(&self, signal: ShutdownSignal) {
+        if let Ok(mut diagnostics) = self.service_diagnostics.lock() {
+            diagnostics.record(
+                0,
+                &Trace::unowned(),
+                DiagnosticEvent::ServiceShutdown { signal },
+            );
+        }
     }
 
     pub async fn close(mut self) -> Result<()> {
