@@ -7,7 +7,8 @@ import { createServer, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout } from "node:timers/promises";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
+import { inspect } from "node:util";
 import { BrowserHost } from "../src/browser-host.js";
 import type { BrowserAction } from "../src/generated/BrowserAction.js";
 import type { BrowserRequest } from "../src/generated/BrowserRequest.js";
@@ -64,7 +65,29 @@ class ChromeFixtureClient {
   close(): void { this.socket.close(); }
 }
 
-async function fixture(slowSubmit = false) {
+async function exitsWithin(exited: Promise<void>, milliseconds: number): Promise<boolean> {
+  const timer = new AbortController();
+  try {
+    return await Promise.race([exited.then(() => true), setTimeout(milliseconds, false, { signal: timer.signal, ref: false })]);
+  } finally { timer.abort(); }
+}
+
+async function closeChrome(browser: ChildProcess, exited: Promise<void>, client: ChromeFixtureClient | undefined): Promise<void> {
+  if (browser.exitCode !== null || browser.signalCode !== null) { await exited; return; }
+  let protocolError: unknown;
+  if (client !== undefined) {
+    // Chrome may close CDP before acknowledging Browser.close. Its own process
+    // completion is authoritative; allow that graceful shutdown to finish.
+    void client.call("Browser.close").catch(error => { protocolError = error; });
+    if (await exitsWithin(exited, 5_000)) return;
+  }
+  browser.kill("SIGTERM");
+  if (await exitsWithin(exited, 5_000)) return;
+  browser.kill("SIGKILL");
+  if (!await exitsWithin(exited, 5_000)) throw new Error("Disposable Chrome did not stop during fixture cleanup", { cause: protocolError });
+}
+
+async function fixture(t: TestContext, slowSubmit = false) {
   assert.ok(chrome);
   let submissions = 0;
   const submittedBodies: string[] = [];
@@ -104,41 +127,52 @@ async function fixture(slowSubmit = false) {
   const args = ["--headless=new", "--remote-debugging-port=0", `--user-data-dir=${directory}`, "--no-first-run", "--no-default-browser-check", "about:blank"];
   if (process.getuid?.() === 0) args.unshift("--no-sandbox");
   const browser: ChildProcess = spawn(chrome, args, { stdio: "ignore" });
-  const exited = new Promise<void>(resolve => browser.once("exit", () => resolve()));
+  const exited = new Promise<void>(resolve => browser.once("close", () => resolve()));
+  let startupError: Error | undefined;
+  browser.once("error", error => { startupError = error; });
   let client: ChromeFixtureClient | undefined;
-  try {
-    let port = "", endpoint = "";
-    for (let attempt = 0; attempt < 200; attempt++) {
-      try {
-        const lines = (await readFile(join(directory, "DevToolsActivePort"), "utf8")).trim().split("\n");
-        const foundPort = lines[0], foundPath = lines[1];
-        if (foundPort !== undefined && foundPath !== undefined) { port = foundPort; endpoint = `ws://127.0.0.1:${port}${foundPath}`; break; }
-      } catch { /* The disposable browser has not published its endpoint yet. */ }
-      if (browser.exitCode !== null) throw new Error("Synthetic Chrome exited before publishing its endpoint");
-      await setTimeout(50);
+  let host: BrowserHost | undefined;
+  t.after(async () => {
+    const failures: unknown[] = [];
+    let stopped = false;
+    try { await host?.close(); } catch (error) { failures.push(error); }
+    try { await closeChrome(browser, exited, client); stopped = true; } catch (error) { failures.push(error); }
+    client?.close(); delayed?.end();
+    server.closeAllConnections();
+    try { await new Promise<void>((resolve, reject) => server.close(error => error === undefined ? resolve() : reject(error))); }
+    catch (error) { failures.push(error); }
+    if (stopped) {
+      try { await rm(directory, { recursive: true, force: true }); } catch (error) { failures.push(error); }
     }
-    assert.notEqual(endpoint, "", "Disposable Chrome must start within ten seconds");
-    client = new ChromeFixtureClient(endpoint);
-    await client.call("Storage.setCookies", { cookies: [{ name: "fixture_login", value: "signed-in", url: origin, httpOnly: true, sameSite: "Lax" }] });
-    await client.call("Target.createTarget", { url: `${origin}/unrelated` });
-    const fixtureClient = client;
-    return {
-      origin, browser, client: fixtureClient, submitted,
-      host: () => new BrowserHost({ user_data_dir: null }, { serverArguments: [`--browser-url=http://127.0.0.1:${port}`] }),
-      count: () => submissions,
-      submittedBodies: () => [...submittedBodies],
-      finishSubmission() { delayed?.writeHead(303, { Location: "/done" }).end(); delayed = undefined; },
-      async close() {
-        delayed?.end(); fixtureClient.close(); browser.kill("SIGTERM"); await exited;
-        server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
-        await rm(directory, { recursive: true, force: true });
-      },
-    };
-  } catch (error) {
-    client?.close(); browser.kill("SIGTERM"); await exited;
-    server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
-    await rm(directory, { recursive: true, force: true }); throw error;
+    if (failures.length > 0) {
+      const error = new AggregateError(failures, "Chrome fixture cleanup failed");
+      // Node preserves a failed test body but otherwise omits its hook error.
+      t.diagnostic(inspect(error)); throw error;
+    }
+  });
+  let port = "", endpoint = "";
+  for (let attempt = 0; attempt < 200; attempt++) {
+    try {
+      const lines = (await readFile(join(directory, "DevToolsActivePort"), "utf8")).trim().split("\n");
+      const foundPort = lines[0], foundPath = lines[1];
+      if (foundPort !== undefined && foundPath !== undefined) { port = foundPort; endpoint = `ws://127.0.0.1:${port}${foundPath}`; break; }
+    } catch { /* The disposable browser has not published its endpoint yet. */ }
+    if (startupError !== undefined) throw startupError;
+    if (browser.exitCode !== null || browser.signalCode !== null) throw new Error("Synthetic Chrome exited before publishing its endpoint");
+    await setTimeout(50);
   }
+  assert.notEqual(endpoint, "", "Disposable Chrome must start within ten seconds");
+  client = new ChromeFixtureClient(endpoint);
+  await client.call("Storage.setCookies", { cookies: [{ name: "fixture_login", value: "signed-in", url: origin, httpOnly: true, sameSite: "Lax" }] });
+  await client.call("Target.createTarget", { url: `${origin}/unrelated` });
+  const fixtureClient = client;
+  host = new BrowserHost({ user_data_dir: null }, { serverArguments: [`--browser-url=http://127.0.0.1:${port}`] });
+  return {
+    origin, browser, client: fixtureClient, submitted, host,
+    count: () => submissions,
+    submittedBodies: () => [...submittedBodies],
+    finishSubmission() { delayed?.writeHead(303, { Location: "/done" }).end(); delayed = undefined; },
+  };
 }
 
 function requests() {
@@ -158,99 +192,95 @@ function elementRef(output: string, role: string, name: string): string {
   const result = find(value.snapshot); assert.ok(result, `Snapshot must contain ${role} ${name}`); return result;
 }
 
-test("real Chrome adapter owns exact tabs and scoped popups, preserves unrelated pages and deduplicates mutations", { skip: skipChrome, timeout: 120_000 }, async () => {
-  const f = await fixture(), host = f.host(), request = requests();
-  try {
-    const opened = (await host.execute(request({ type: "open", url: `${f.origin}/form` }))).response;
-    assert.ok(opened.type === "ready", JSON.stringify(opened)); assert.equal(opened.is_error, false);
-    assert.equal(opened.tabs.length, 1); const tab = opened.tabs[0]; assert.ok(tab);
-    assert.equal(tab.url, `${f.origin}/form`);
-    assert.equal(JSON.stringify(opened).includes("User tab sentinel"), false);
-    assert.equal(JSON.stringify(opened).includes("Unrelated user content sentinel"), false);
-    const mismatch = (await host.execute({ ...request({ type: "new_tab", url: `${f.origin}/form` }), owner_id: randomUUID() })).response;
-    assert.equal(mismatch.type, "failed");
-    const unowned = (await host.execute(request({ type: "close_tab", tab_id: 0xffff_ffff }))).response;
-    assert.equal(unowned.type, "failed");
+test("real Chrome adapter owns exact tabs and scoped popups, preserves unrelated pages and deduplicates mutations", { skip: skipChrome, timeout: 120_000 }, async t => {
+  const f = await fixture(t), host = f.host, request = requests();
+  const opened = (await host.execute(request({ type: "open", url: `${f.origin}/form` }))).response;
+  assert.ok(opened.type === "ready", JSON.stringify(opened)); assert.equal(opened.is_error, false);
+  assert.equal(opened.tabs.length, 1); const tab = opened.tabs[0]; assert.ok(tab);
+  assert.equal(tab.url, `${f.origin}/form`);
+  assert.equal(JSON.stringify(opened).includes("User tab sentinel"), false);
+  assert.equal(JSON.stringify(opened).includes("Unrelated user content sentinel"), false);
+  const mismatch = (await host.execute({ ...request({ type: "new_tab", url: `${f.origin}/form` }), owner_id: randomUUID() })).response;
+  assert.equal(mismatch.type, "failed");
+  const unowned = (await host.execute(request({ type: "close_tab", tab_id: 0xffff_ffff }))).response;
+  assert.equal(unowned.type, "failed");
 
-    const filled = (await host.execute(request({ type: "fill", tab_id: tab.id, element_ref: elementRef(opened.output, "textbox", "Name"), value: "Synthetic user" }))).response;
-    assert.ok(filled.type === "ready", JSON.stringify(filled)); assert.equal(filled.is_error, false);
-    const selected = (await host.execute(request({ type: "fill", tab_id: tab.id, element_ref: elementRef(filled.output, "combobox", "Choice"), value: "Second" }))).response;
-    assert.ok(selected.type === "ready", JSON.stringify(selected)); assert.equal(selected.is_error, false);
-    const waited = (await host.execute(request({ type: "wait_for", tab_id: tab.id, text: "Form ready" }))).response;
-    assert.ok(waited.type === "ready"); assert.equal(waited.is_error, false);
+  const filled = (await host.execute(request({ type: "fill", tab_id: tab.id, element_ref: elementRef(opened.output, "textbox", "Name"), value: "Synthetic user" }))).response;
+  assert.ok(filled.type === "ready", JSON.stringify(filled)); assert.equal(filled.is_error, false);
+  const selected = (await host.execute(request({ type: "fill", tab_id: tab.id, element_ref: elementRef(filled.output, "combobox", "Choice"), value: "Second" }))).response;
+  assert.ok(selected.type === "ready", JSON.stringify(selected)); assert.equal(selected.is_error, false);
+  const waited = (await host.execute(request({ type: "wait_for", tab_id: tab.id, text: "Form ready" }))).response;
+  assert.ok(waited.type === "ready"); assert.equal(waited.is_error, false);
 
-    const popupRequest = request({ type: "click", tab_id: tab.id, element_ref: elementRef(waited.output, "button", "Open popup") });
-    const popupPending = host.execute(popupRequest);
-    await f.client.call("Target.createTarget", { url: `${f.origin}/user-concurrent` });
-    const popup = (await popupPending).response;
-    assert.ok(popup.type === "ready", JSON.stringify(popup)); assert.equal(popup.is_error, false);
-    assert.equal(popup.tabs.length, 2); assert.ok(popup.tabs.some(page => page.url === `${f.origin}/popup`));
-    assert.equal(JSON.stringify(popup).includes("user-concurrent"), false);
-    const dialog = (await host.execute(request({ type: "click", tab_id: tab.id, element_ref: elementRef(popup.output, "button", "Open dialog") }))).response;
-    assert.ok(dialog.type === "ready"); assert.ok(dialog.output.includes("Fixture dialog"));
-    const accepted = (await host.execute(request({ type: "handle_dialog", tab_id: tab.id, accept: true, prompt_text: null }))).response;
-    assert.ok(accepted.type === "ready"); assert.equal(accepted.is_error, false);
+  const popupRequest = request({ type: "click", tab_id: tab.id, element_ref: elementRef(waited.output, "button", "Open popup") });
+  const popupPending = host.execute(popupRequest);
+  await f.client.call("Target.createTarget", { url: `${f.origin}/user-concurrent` });
+  const popup = (await popupPending).response;
+  assert.ok(popup.type === "ready", JSON.stringify(popup)); assert.equal(popup.is_error, false);
+  assert.equal(popup.tabs.length, 2); assert.ok(popup.tabs.some(page => page.url === `${f.origin}/popup`));
+  assert.equal(JSON.stringify(popup).includes("user-concurrent"), false);
+  const dialog = (await host.execute(request({ type: "click", tab_id: tab.id, element_ref: elementRef(popup.output, "button", "Open dialog") }))).response;
+  assert.ok(dialog.type === "ready"); assert.ok(dialog.output.includes("Fixture dialog"));
+  const accepted = (await host.execute(request({ type: "handle_dialog", tab_id: tab.id, accept: true, prompt_text: null }))).response;
+  assert.ok(accepted.type === "ready"); assert.equal(accepted.is_error, false);
 
-    const submission = request({ type: "click", tab_id: tab.id, element_ref: elementRef(accepted.output, "button", "Save") });
-    const saved = (await host.execute(submission)).response;
-    assert.ok(saved.type === "ready", JSON.stringify(saved)); assert.equal(saved.is_error, false); assert.equal(f.count(), 1);
-    const body = new URLSearchParams(f.submittedBodies()[0]);
-    assert.equal(body.get("name"), "Synthetic user");
-    assert.equal(body.get("choice"), "Second");
-    assert.equal((await host.execute(submission)).response.type, "failed"); assert.equal(f.count(), 1, "A reused operation ID cannot submit twice");
-    const partialFailure = (await host.execute(request({ type: "click", tab_id: tab.id, element_ref: "missing-element" }))).response;
-    assert.equal(partialFailure.type, "uncertain", "An upstream mutation error does not establish that nothing happened");
-    const inspection = request({ type: "status" });
-    const inspected = (await host.execute(inspection)).response;
-    assert.ok(inspected.type === "ready"); assert.equal(inspected.tabs.length, 2);
-    const resultTab = (await host.execute(request({ type: "new_tab", url: `${f.origin}/retained` }))).response;
-    assert.ok(resultTab.type === "ready"); const retained = resultTab.tabs.find(page => page.url === `${f.origin}/retained`); assert.ok(retained);
-    const replayedRead = (await host.execute(inspection)).response;
-    assert.ok(replayedRead.type === "ready");
-    assert.equal(replayedRead.tabs.length, 3, "A replay-safe status gets fresh state while duplicate mutations stay fenced");
-    const retainedResult = (await host.execute(request({ type: "retain_tab", tab_id: retained.id }))).response;
-    assert.ok(retainedResult.type === "ready"); assert.equal(retainedResult.tabs.some(page => page.id === retained.id), false);
-    const released = (await host.execute(request({ type: "release" }))).response;
-    assert.ok(released.type === "closed", JSON.stringify(released)); assert.equal(released.tabs.length, 0);
-    const pages = await f.client.pages();
-    assert.ok(pages.some(page => page.url === `${f.origin}/unrelated`));
-    assert.ok(pages.some(page => page.url === `${f.origin}/user-concurrent`));
-    assert.ok(pages.some(page => page.url === `${f.origin}/retained`), "An explicitly retained draft must survive cleanup");
-    assert.equal(pages.some(page => page.url === `${f.origin}/done` || page.url === `${f.origin}/popup`), false);
-    assert.equal(f.browser.exitCode, null, "Disconnect must leave attached Chrome running");
-  } finally { await host.close(); await f.close(); }
+  const submission = request({ type: "click", tab_id: tab.id, element_ref: elementRef(accepted.output, "button", "Save") });
+  const saved = (await host.execute(submission)).response;
+  assert.ok(saved.type === "ready", JSON.stringify(saved)); assert.equal(saved.is_error, false); assert.equal(f.count(), 1);
+  const body = new URLSearchParams(f.submittedBodies()[0]);
+  assert.equal(body.get("name"), "Synthetic user");
+  assert.equal(body.get("choice"), "Second");
+  assert.equal((await host.execute(submission)).response.type, "failed"); assert.equal(f.count(), 1, "A reused operation ID cannot submit twice");
+  const partialFailure = (await host.execute(request({ type: "click", tab_id: tab.id, element_ref: "missing-element" }))).response;
+  assert.equal(partialFailure.type, "uncertain", "An upstream mutation error does not establish that nothing happened");
+  const inspection = request({ type: "status" });
+  const inspected = (await host.execute(inspection)).response;
+  assert.ok(inspected.type === "ready"); assert.equal(inspected.tabs.length, 2);
+  const resultTab = (await host.execute(request({ type: "new_tab", url: `${f.origin}/retained` }))).response;
+  assert.ok(resultTab.type === "ready"); const retained = resultTab.tabs.find(page => page.url === `${f.origin}/retained`); assert.ok(retained);
+  const replayedRead = (await host.execute(inspection)).response;
+  assert.ok(replayedRead.type === "ready");
+  assert.equal(replayedRead.tabs.length, 3, "A replay-safe status gets fresh state while duplicate mutations stay fenced");
+  const retainedResult = (await host.execute(request({ type: "retain_tab", tab_id: retained.id }))).response;
+  assert.ok(retainedResult.type === "ready"); assert.equal(retainedResult.tabs.some(page => page.id === retained.id), false);
+  const released = (await host.execute(request({ type: "release" }))).response;
+  assert.ok(released.type === "closed", JSON.stringify(released)); assert.equal(released.tabs.length, 0);
+  const pages = await f.client.pages();
+  assert.ok(pages.some(page => page.url === `${f.origin}/unrelated`));
+  assert.ok(pages.some(page => page.url === `${f.origin}/user-concurrent`));
+  assert.ok(pages.some(page => page.url === `${f.origin}/retained`), "An explicitly retained draft must survive cleanup");
+  assert.equal(pages.some(page => page.url === `${f.origin}/done` || page.url === `${f.origin}/popup`), false);
+  await host.close();
+  assert.equal(f.browser.exitCode, null, "Disconnect must leave attached Chrome running");
 });
 
-test("lost browser transport leaves a submitted mutation uncertain without replaying or closing its tab", { skip: skipChrome, timeout: 60_000 }, async () => {
-  const f = await fixture(true), host = f.host(), request = requests();
-  try {
-    const opened = (await host.execute(request({ type: "open", url: `${f.origin}/form` }))).response;
-    assert.ok(opened.type === "ready", JSON.stringify(opened)); const tab = opened.tabs[0]; assert.ok(tab);
-    const operation = request({ type: "click", tab_id: tab.id, element_ref: elementRef(opened.output, "button", "Save") });
-    const pending = host.execute(operation);
-    await Promise.race([f.submitted, setTimeout(15_000, undefined, { ref: false }).then(() => { throw new Error("Fixture submission did not arrive"); })]);
-    assert.equal(f.count(), 1); await host.close();
-    assert.equal((await pending).response.type, "uncertain");
-    assert.equal((await host.execute(operation)).response.type, "failed"); assert.equal(f.count(), 1);
-    f.finishSubmission();
-    assert.equal((await host.execute(request({ type: "snapshot", tab_id: tab.id }))).response.type, "disconnected");
-    const pages = await f.client.pages();
-    assert.ok(pages.some(page => page.url.startsWith(f.origin) && page.url !== `${f.origin}/unrelated`));
-    assert.equal(f.browser.exitCode, null);
-  } finally { await host.close(); await f.close(); }
+test("lost browser transport leaves a submitted mutation uncertain without replaying or closing its tab", { skip: skipChrome, timeout: 60_000 }, async t => {
+  const f = await fixture(t, true), host = f.host, request = requests();
+  const opened = (await host.execute(request({ type: "open", url: `${f.origin}/form` }))).response;
+  assert.ok(opened.type === "ready", JSON.stringify(opened)); const tab = opened.tabs[0]; assert.ok(tab);
+  const operation = request({ type: "click", tab_id: tab.id, element_ref: elementRef(opened.output, "button", "Save") });
+  const pending = host.execute(operation);
+  await Promise.race([f.submitted, setTimeout(15_000, undefined, { ref: false }).then(() => { throw new Error("Fixture submission did not arrive"); })]);
+  assert.equal(f.count(), 1); await host.close();
+  assert.equal((await pending).response.type, "uncertain");
+  assert.equal((await host.execute(operation)).response.type, "failed"); assert.equal(f.count(), 1);
+  f.finishSubmission();
+  assert.equal((await host.execute(request({ type: "snapshot", tab_id: tab.id }))).response.type, "disconnected");
+  const pages = await f.client.pages();
+  assert.ok(pages.some(page => page.url.startsWith(f.origin) && page.url !== `${f.origin}/unrelated`));
+  assert.equal(f.browser.exitCode, null);
 });
 
-test("release reports final-page closure from native readback, including any retained page", { skip: skipChrome, timeout: 60_000 }, async () => {
-  const f = await fixture(), host = f.host(), request = requests();
-  try {
-    const opened = (await host.execute(request({ type: "open", url: `${f.origin}/form` }))).response;
-    assert.ok(opened.type === "ready", JSON.stringify(opened)); const tab = opened.tabs[0]; assert.ok(tab);
-    for (const page of await f.client.pages()) if (page.url !== tab.url) await f.client.call("Target.closeTarget", { targetId: page.targetId });
-    const released = (await host.execute(request({ type: "release" }))).response;
-    assert.ok(released.type === "closed", JSON.stringify(released));
-    const remaining = (await f.client.pages()).filter(page => page.url === tab.url);
-    assert.equal(released.tabs.length, remaining.length, "The receipt must agree with independent native readback, whether the final-page guard retained it or closure completed");
-    if (remaining.length > 0) assert.equal(released.tabs[0]?.id, tab.id);
-    assert.equal(f.browser.exitCode, null);
-  } finally { await host.close(); await f.close(); }
+test("release reports final-page closure from native readback, including any retained page", { skip: skipChrome, timeout: 60_000 }, async t => {
+  const f = await fixture(t), host = f.host, request = requests();
+  const opened = (await host.execute(request({ type: "open", url: `${f.origin}/form` }))).response;
+  assert.ok(opened.type === "ready", JSON.stringify(opened)); const tab = opened.tabs[0]; assert.ok(tab);
+  for (const page of await f.client.pages()) if (page.url !== tab.url) await f.client.call("Target.closeTarget", { targetId: page.targetId });
+  const released = (await host.execute(request({ type: "release" }))).response;
+  assert.ok(released.type === "closed", JSON.stringify(released));
+  const remaining = (await f.client.pages()).filter(page => page.url === tab.url);
+  assert.equal(released.tabs.length, remaining.length, "The receipt must agree with independent native readback, whether the final-page guard retained it or closure completed");
+  if (remaining.length > 0) assert.equal(released.tabs[0]?.id, tab.id);
+  await host.close();
+  assert.equal(f.browser.exitCode, null);
 });
