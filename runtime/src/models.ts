@@ -17,11 +17,17 @@ export const PROVIDERS: readonly ModelProvider[] = getBuiltinProviders();
 export const DEFAULT_MODEL: ModelSelection = { provider: "openai", model_id: "gpt-6.1-sol", reasoning: null, fast: false };
 export class ModelError extends Error {}
 
-/** Preserve a provider capability failure without exposing its raw response. */
+/** Classify known provider failures without exposing their raw responses. */
 export async function modelFailureMessage(conversation: Conversation, fallback: string): Promise<string> {
   const page = await conversation.entries({ order: "descending" }, 5, undefined, BACKGROUND_CONTEXT);
   for (const entry of page.items) for (const message of entry.model ?? []) {
     if (message.role !== "assistant") continue;
+    // Pi preserves this code in HTTP error bodies and failed response streams.
+    // It can mean an app-specific limit, even when the account has credits.
+    if (message.stopReason === "error" && message.provider === "openai" &&
+        /\bsubscription_sharing_usage_limit_exceeded\b/u.test(message.errorMessage ?? "")) {
+      return 'ChatGPT plan usage reached a limit for this app. In Settings → Usage → App limits (https://chatgpt.com/settings/usage), review the app limit and enable "Allow other apps to use credits after reaching your usage limit" to use available credits. Its conversation is retained.';
+    }
     if (message.stopReason === "error" && message.errorMessage?.includes("web_search")) {
       return "The provider rejected hosted web search for this model or account. Its conversation is retained.";
     }
