@@ -64,6 +64,9 @@ provider and interactive sources. Read metadata with
 installed full-history read. Thread IDs establish identity; filenames and
 directories are locators, not thread IDs or assumptions about which threads
 are roots.
+Read metadata once when starting a cursor walk. Continuations retain that
+observed version and native paging mode while validating their page and cursor;
+a later inventory discovers changed source versions.
 
 Rust owns a small `HistorySource` trait for enumeration, transcript reads and
 asset reads. Codex is its first implementation. Rust also owns import records

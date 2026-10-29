@@ -125,49 +125,52 @@ impl CodexHistory {
 
     async fn read(&self, thread_id: String, cursor: Option<String>) -> Result<HistoryResponse> {
         ensure!(!thread_id.is_empty(), "A Codex thread ID is required");
-        let metadata: NativeRead = match self
-            .rpc(
-                "thread/read",
-                ReadParams {
-                    thread_id: &thread_id,
-                    include_turns: false,
-                },
-            )
-            .await
-        {
-            Ok(value) => value,
-            Err(error) => {
-                return Ok(gap_response(
-                    thread_id,
-                    String::new(),
-                    classify(&error),
-                    "Codex thread metadata could not be read",
-                ));
-            }
-        };
-        ensure!(
-            metadata.thread.id == thread_id,
-            "Codex returned another thread"
-        );
-        let hint = metadata.thread.metadata(false)?.version;
         let mut position = match cursor {
             Some(cursor) => serde_json::from_str::<ReadCursor>(&cursor)
                 .context("Invalid Codex history cursor")?,
-            None => ReadCursor {
-                thread_id: thread_id.clone(),
-                version: hint.clone(),
-                mode: if metadata.thread.history_mode == "paginated" {
-                    Mode::Items
-                } else {
-                    Mode::Turns
-                },
-                native: None,
-                offset: 0,
-                order: 0,
-                page_hash: None,
-                incomplete: false,
-            },
+            None => {
+                let metadata: NativeRead = match self
+                    .rpc(
+                        "thread/read",
+                        ReadParams {
+                            thread_id: &thread_id,
+                            include_turns: false,
+                        },
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Ok(gap_response(
+                            thread_id,
+                            String::new(),
+                            classify(&error),
+                            "Codex thread metadata could not be read",
+                        ));
+                    }
+                };
+                ensure!(
+                    metadata.thread.id == thread_id,
+                    "Codex returned another thread"
+                );
+                ReadCursor {
+                    thread_id: thread_id.clone(),
+                    version: metadata.thread.metadata(false)?.version,
+                    mode: if metadata.thread.history_mode == "paginated" {
+                        Mode::Items
+                    } else {
+                        Mode::Turns
+                    },
+                    native: None,
+                    offset: 0,
+                    order: 0,
+                    page_hash: None,
+                    incomplete: false,
+                }
+            }
         };
+        // Continuations retain their original observation and native paging mode.
+        // A later listing schedules changed sources without restarting this walk.
         ensure!(
             position.thread_id == thread_id,
             "Codex history cursor belongs to another thread"
@@ -189,7 +192,7 @@ impl CodexHistory {
                 Err(error) => {
                     return Ok(gap_response(
                         thread_id,
-                        hint,
+                        position.version.clone(),
                         classify(&error),
                         "Codex history page could not be read",
                     ));
@@ -206,7 +209,7 @@ impl CodexHistory {
         if position.offset > native.items.len() {
             return Ok(gap_response(
                 thread_id,
-                hint,
+                position.version.clone(),
                 HistoryGapCode::Changed,
                 "Codex history page shrank; reread from its first page",
             ));
@@ -221,7 +224,7 @@ impl CodexHistory {
         {
             return Ok(gap_response(
                 thread_id,
-                hint,
+                position.version.clone(),
                 HistoryGapCode::Changed,
                 "Codex history page changed; reread from its first page",
             ));
@@ -1423,7 +1426,7 @@ mod tests {
     use crate::{
         history::{
             HistoryGapCode, HistoryRequest, HistoryResponse, HistorySource,
-            codex::{CodexHistory, NativeEntry, NativeThread, PAGE_BYTES, digest},
+            codex::{CodexHistory, NativeEntry, NativeThread, PAGE_BYTES, ReadCursor, digest},
         },
         protocol::HistoryRole,
     };
@@ -1458,7 +1461,7 @@ const fail=(id,code,message)=>process.stdout.write(JSON.stringify({id,error:{cod
 readline.createInterface({input:process.stdin}).on('line',line=>{
   const r=JSON.parse(line),p=r.params||{};
   const data=JSON.parse(fs.readFileSync(path.join(dir,'native.json')));
-  fs.appendFileSync(path.join(dir,'calls'),JSON.stringify({method:r.method,pid:process.pid})+'\n');
+  fs.appendFileSync(path.join(dir,'calls'),JSON.stringify({method:r.method,pid:process.pid,includeTurns:p.includeTurns})+'\n');
   if(r.method==='initialized') return;
   process.stdout.write(JSON.stringify({method:'history/fixture',params:{}})+'\n');
   if(r.method==='initialize') return send(r.id,{codexHome:dir});
@@ -1478,6 +1481,13 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     if(data.unsupportedTurns)return fail(r.id,-32601,'unsupported');
     if(p.itemsView!=='full'||p.sortDirection!=='asc')return fail(r.id,-32602,'summary would lose evidence');
     return send(r.id,{data:data.turns,nextCursor:null});
+  }
+  if(r.method==='thread/items/list') {
+    if(data.failItems)return fail(r.id,-32600,'no rollout found');
+    if(p.sortDirection!=='asc')return fail(r.id,-32602,'unexpected item order');
+    const items=data.turns.flatMap(turn=>turn.items.map(item=>({turnId:turn.id,item})));
+    const start=Number(p.cursor||0),end=Math.min(start+p.limit,items.length);
+    return send(r.id,{data:items.slice(start,end),nextCursor:end<items.length?String(end):null});
   }
   return fail(r.id,-32601,'unknown method');
 });
@@ -2133,15 +2143,33 @@ try{
             (0..80).map(|n| format!("message-{n}")).collect::<Vec<_>>()
         );
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct Call {
             pid: u32,
+            method: String,
+            include_turns: Option<bool>,
         }
         let calls = std::fs::read_to_string(directory.path().join("calls"))
             .unwrap()
             .lines()
-            .map(|line| serde_json::from_str::<Call>(line).unwrap().pid)
-            .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 1);
+            .map(|line| serde_json::from_str::<Call>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.pid)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.method == "thread/read" && call.include_turns == Some(false))
+                .count(),
+            1,
+            "One cursor walk must read metadata only on its first page"
+        );
         let missing = source
             .request(HistoryRequest::Read {
                 thread_id: "missing".into(),
@@ -2151,6 +2179,176 @@ try{
             .unwrap();
         assert!(
             matches!(missing,HistoryResponse::Read{complete:false,gaps,..} if matches!(gaps[0].code,HistoryGapCode::Missing))
+        );
+    }
+
+    #[tokio::test]
+    async fn native_item_cursor_walk_reads_metadata_once_and_preserves_failed_page_provenance() {
+        #[derive(serde::Serialize)]
+        struct Message {
+            id: String,
+            #[serde(rename = "type")]
+            kind: &'static str,
+            text: &'static str,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Call {
+            method: String,
+            include_turns: Option<bool>,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut native = provider_fixture(
+            (0..55)
+                .map(|number| {
+                    serde_json::to_value(Message {
+                        id: format!("message-{number}"),
+                        kind: "agentMessage",
+                        text: "Preserved native evidence",
+                    })
+                    .unwrap()
+                })
+                .collect(),
+        );
+        native
+            .get_mut("threads")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .first_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("historyMode".into(), Value::String("paginated".into()));
+        let source = fixture(directory.path(), &native);
+        let mut cursor = None;
+        let mut first_cursor = None;
+        let mut first_version = None;
+        let mut ids = Vec::new();
+        let mut pages = 0;
+        loop {
+            let HistoryResponse::Read {
+                items,
+                next_cursor,
+                version,
+                gaps,
+                complete,
+                source_exhausted,
+                ..
+            } = source.read("thread-a".into(), cursor).await.unwrap()
+            else {
+                panic!("Expected native items");
+            };
+            if pages == 0 {
+                first_cursor = next_cursor.clone();
+                first_version = Some(version.clone());
+            }
+            assert_eq!(Some(&version), first_version.as_ref());
+            assert!(gaps.is_empty());
+            ids.extend(items.into_iter().map(|item| item.id));
+            pages += 1;
+            if next_cursor.is_none() {
+                assert!(complete && source_exhausted);
+                break;
+            }
+            assert!(!complete && !source_exhausted);
+            cursor = next_cursor;
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(
+            ids,
+            (0..55)
+                .map(|number| format!("message-{number}"))
+                .collect::<Vec<_>>()
+        );
+        let calls = std::fs::read_to_string(directory.path().join("calls"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Call>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.method == "thread/read" && call.include_turns == Some(false))
+                .count(),
+            1,
+            "Native item continuations already carry their metadata"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.method == "thread/items/list")
+                .count(),
+            pages
+        );
+        let before_invalid = calls.len();
+        assert!(
+            source
+                .read("thread-a".into(), Some("invalid cursor".into()))
+                .await
+                .is_err()
+        );
+        let mut foreign: ReadCursor = serde_json::from_str(first_cursor.as_ref().unwrap()).unwrap();
+        foreign.thread_id = "another-thread".into();
+        assert!(
+            source
+                .read(
+                    "thread-a".into(),
+                    Some(serde_json::to_string(&foreign).unwrap())
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            before_invalid,
+            "Invalid or foreign cursors must fail before a native RPC"
+        );
+        native
+            .get_mut("threads")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .first_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("updatedAt".into(), Value::from(9));
+        native
+            .as_object_mut()
+            .unwrap()
+            .insert("failItems".into(), Value::Bool(true));
+        std::fs::write(
+            directory.path().join("native.json"),
+            serde_json::to_vec(&native).unwrap(),
+        )
+        .unwrap();
+        let HistoryResponse::Read {
+            version,
+            items,
+            gaps,
+            next_cursor,
+            complete,
+            source_exhausted,
+            ..
+        } = source.read("thread-a".into(), first_cursor).await.unwrap()
+        else {
+            panic!("Expected a failed page");
+        };
+        assert_eq!(Some(version), first_version);
+        assert!(items.is_empty() && next_cursor.is_none() && !complete && !source_exhausted);
+        assert_eq!(gaps.len(), 1);
+        assert!(matches!(gaps[0].code, HistoryGapCode::Missing));
+        assert!(gaps[0].item_id.is_none());
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            before_invalid + 1
         );
     }
 
