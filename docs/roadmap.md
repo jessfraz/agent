@@ -60,7 +60,8 @@ recovery; [history](history.md) describes import and retrieval.
   long-history scrolling, search and import contention. Separate application
   delay from model latency; track CPU, RAM and token use.
 - [x] Nightly operational log review through scheduled jobs, with coordinator
-  collection, retained summaries and explicit coverage gaps.
+  collection, retained task summaries and explicit coverage gaps. Repeat a
+  review through the [scheduled-job run command](setup.md#scheduled-jobs).
 - [ ] Dreams and Dreams evals: inspect private logs nightly and propose useful
   improvements as reviewable diffs with before/after evidence. Learned changes
   take effect only after approval of that diff.
