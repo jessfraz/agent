@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -713,6 +713,95 @@ test("deleted advertised media preserves mixed user text and same-version recove
     assert.equal((await app.histories.checkpoint(source.id, laptop.host_id))?.complete, true);
     assert.equal(app.faux.state.callCount, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("verified coordinator assets survive reopen and avoid repeat host transfers across source paths", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-importer-cached-assets-")); let app = await open(directory);
+  try {
+    const source = thread("shared-media"), evidence = item("with-shared-media");
+    const original = { type: "userMessage", content: [{ type: "text", text: "Synthetic retained evidence. ".repeat(8_000) }] };
+    const bytes = Buffer.from(JSON.stringify(original)), digest = createHash("sha256").update(bytes).digest("hex");
+    evidence.data = null;
+    const transfers: string[] = []; let known = true, sized = true;
+    const producer: Producer = (host, request) => {
+      if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+      if (request.type === "read") return page(source, [{ ...evidence, assets: [{ path: `/native/${host}/evidence.json`,
+        item_id: evidence.id, version: evidence.version, kind: "cold_evidence", media_type: "application/json",
+        sha256: known ? digest : null, size: sized ? bytes.length : null }] }]);
+      transfers.push(host);
+      assert.ok(host !== laptop.host_id && host !== "unknown-size", "An identical retained asset must not need another host transfer");
+      const end = Math.min(bytes.length, request.offset + 17_000);
+      return { type: "asset", path: request.path, offset: request.offset, data_base64: bytes.subarray(request.offset, end).toString("base64"),
+        next_offset: end === bytes.length ? null : end, total_bytes: bytes.length, sha256: digest };
+    };
+    assert.equal((await app.run(producer)).phase, "complete");
+    assert.ok(transfers.length > 1); const initialTransfers = transfers.length;
+    const destination = join(app.assets, digest); assert.deepEqual(await readFile(destination), bytes);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const reused = await app.run(producer, [laptop]);
+    assert.equal(reused.phase, "complete"); assert.equal(reused.items_added, 0); assert.equal(reused.assets_saved, 1);
+    assert.equal(transfers.length, initialTransfers);
+    const retained = await originals(app, source.id); assert.equal(retained.entries.length, 1);
+    const entry = retained.entries[0]; assert.ok(entry);
+    assert.deepEqual(await app.histories.original(entry), original);
+    const updated = await app.histories.entry(retained.conversation.id.toString(), entry.id.toString()); assert.ok(ImportedItemEntry.is(updated));
+    assert.equal(updated.data.item.assets[0]?.path, destination); assert.equal(updated.data.item.assets[0]?.size, bytes.length);
+    sized = false;
+    assert.equal((await app.run(producer, [node("unknown-size")])).phase, "complete");
+    assert.equal(transfers.length, initialTransfers, "A verified digest still identifies the entire asset when source size is unknown");
+    known = false;
+    assert.equal((await app.run(producer, [node("unknown-digest")])).phase, "complete");
+    assert.ok(transfers.length > initialTransfers, "Without an advertised digest the ordinary transfer must still verify the source bytes");
+    assert.equal((await originals(app, source.id)).entries.length, 1); assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("invalid coordinator asset copies are repaired by verified transfer without losing evidence or temporary files", async t => {
+  const corruptions: ("same-size" | "truncated" | "symlink" | "directory")[] = ["same-size", "truncated", "symlink", "directory"];
+  for (const corruption of corruptions) await t.test(corruption, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-importer-cache-repair-")); const app = await open(directory);
+    try {
+      const source = thread("repair-media"), evidence = item("repair-evidence"), original = evidence.data;
+      const bytes = Buffer.from(JSON.stringify(original)), digest = createHash("sha256").update(bytes).digest("hex");
+      evidence.data = null; evidence.assets = [{ path: "/native/evidence.json", item_id: evidence.id, version: evidence.version,
+        kind: "cold_evidence", media_type: "application/json", sha256: digest, size: bytes.length }];
+      let interrupted = false, assetReads = 0;
+      const producer: Producer = (_host, request) => {
+        if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+        if (request.type === "read") return page(source, [evidence]);
+        assetReads += 1;
+        if (interrupted && request.offset > 0) throw new Error("Synthetic repair transfer interrupted");
+        const end = Math.min(bytes.length, request.offset + 17);
+        return { type: "asset", path: request.path, offset: request.offset, data_base64: bytes.subarray(request.offset, end).toString("base64"),
+          next_offset: end === bytes.length ? null : end, total_bytes: bytes.length, sha256: digest };
+      };
+      assert.equal((await app.run(producer)).phase, "complete");
+      const destination = join(app.assets, digest), outside = join(directory, "unowned-evidence.json");
+      if (corruption === "symlink") {
+        await writeFile(outside, bytes); await rm(destination); await symlink(outside, destination);
+      } else if (corruption === "directory") {
+        await rm(destination); await mkdir(destination);
+      } else await writeFile(destination, corruption === "same-size" ? Buffer.alloc(bytes.length, 120) : bytes.subarray(0, bytes.length - 1));
+      const initialReads = assetReads; interrupted = true;
+      const failed = await app.run(producer, [laptop]);
+      assert.equal(failed.phase, "partial"); assert.equal(failed.items_added, 0); assert.ok(assetReads > initialReads);
+      assert.deepEqual(await readdir(app.assets), [digest], "Failed repairs must remove their temporary transfer file");
+      assert.equal((await originals(app, source.id)).entries.length, 1);
+      if (corruption === "directory") {
+        assert.equal((await lstat(destination)).isDirectory(), true, "An invalid directory must not be removed by the importer");
+        await rm(destination, { recursive: true });
+      }
+      interrupted = false;
+      const repaired = await app.run(producer, [laptop]);
+      assert.equal(repaired.phase, "complete"); assert.equal(repaired.items_added, 0);
+      assert.equal((await lstat(destination)).isFile(), true); assert.deepEqual(await readFile(destination), bytes);
+      assert.equal((await stat(destination)).mode & 0o777, 0o600);
+      if (corruption === "symlink") assert.deepEqual(await readFile(outside), bytes, "The symlink target is not owned by the asset cache");
+      const saved = await originals(app, source.id); assert.equal(saved.entries.length, 1);
+      const entry = saved.entries[0]; assert.ok(entry); assert.deepEqual(await app.histories.original(entry), original);
+      assert.equal(app.faux.state.callCount, 0);
+    } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
 });
 
 test("a failed chunked asset transfer leaves a gap and retries the same item version into private coordinator storage", async () => {

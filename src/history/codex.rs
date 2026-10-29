@@ -34,7 +34,8 @@ use crate::{
 const PAGE_BYTES: usize = 500 * 1024;
 const ITEM_BYTES: usize = 128 * 1024;
 const NATIVE_BYTES: usize = 64 * 1024 * 1024;
-const ASSET_BYTES: usize = 128 * 1024;
+// Leave room for base64 expansion and metadata within PAGE_BYTES.
+const ASSET_BYTES: usize = 320 * 1024;
 const SOURCES: &[&str] = &[
     "cli",
     "vscode",
@@ -2027,9 +2028,13 @@ try{
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        let original = serde_json::to_vec(&data).unwrap();
+        let expected_digest = digest(&original);
+        let mut requests = 0;
         let mut all = Vec::new();
         let mut offset = 0;
         loop {
+            requests += 1;
             let response = source
                 .request(HistoryRequest::Asset {
                     thread_id: "thread-a".into(),
@@ -2038,23 +2043,37 @@ try{
                 })
                 .await
                 .unwrap();
-            assert!(serde_json::to_vec(&response).unwrap().len() <= PAGE_BYTES);
+            let wire = serde_json::to_vec(&response).unwrap();
+            assert!(wire.len() <= PAGE_BYTES);
             let HistoryResponse::Asset {
+                offset: returned_offset,
                 data_base64,
                 next_offset,
+                total_bytes,
                 sha256,
                 ..
-            } = response
+            } = serde_json::from_slice::<HistoryResponse>(&wire).unwrap()
             else {
                 panic!("Expected asset")
             };
+            assert_eq!(returned_offset, offset);
+            assert_eq!(total_bytes, original.len() as u64);
             all.extend(STANDARD.decode(data_base64).unwrap());
-            assert_eq!(sha256, digest(&serde_json::to_vec(&data).unwrap()));
+            assert_eq!(sha256, expected_digest);
             match next_offset {
-                Some(next) => offset = next,
+                Some(next) => {
+                    assert_eq!(next, all.len() as u64);
+                    offset = next;
+                }
                 None => break,
             }
         }
+        assert_eq!(
+            requests, 2,
+            "Large evidence should need two bounded transfers"
+        );
+        assert_eq!(all, original);
+        assert_eq!(digest(&all), expected_digest);
         assert_eq!(serde_json::from_slice::<Value>(&all).unwrap(), data);
         assert!(
             source

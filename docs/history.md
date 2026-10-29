@@ -108,8 +108,9 @@ Retain available tool arguments/results, structured payloads and referenced
 assets privately on the coordinator, including large cold payloads. A
 path on an unavailable source machine is insufficient. Materialize and verify
 assets before committing references; record missing payloads. Historical tool
-calls are evidence, never replayed. Render these data entries alongside Pi
-model messages.
+calls are evidence, never replayed. Reuse retained assets by verified size and
+digest before requesting source bytes again. Render these data entries alongside
+Pi model messages.
 
 ## One derived search index
 

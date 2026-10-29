@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
 import { mkdir, open, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -235,8 +236,32 @@ export class CodexImporter {
     }
     return unique(retries.flatMap((page) => page.gaps));
   }
+  private async retainedAsset(source: HistoryAssetRef): Promise<HistoryAssetRef | undefined> {
+    if (source.sha256 === null || !/^[a-f0-9]{64}$/.test(source.sha256)) return;
+    const destination = join(this.assetRoot, source.sha256);
+    try {
+      const file = await open(destination, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        const before = await file.stat();
+        if (!before.isFile() || source.size !== null && source.size !== before.size) return;
+        const hash = createHash("sha256"), buffer = Buffer.alloc(64 * 1024); let size = 0;
+        while (true) {
+          const { bytesRead } = await file.read(buffer, 0, buffer.length, null);
+          if (bytesRead === 0) break;
+          hash.update(buffer.subarray(0, bytesRead)); size += bytesRead;
+        }
+        const after = await file.stat();
+        if (size !== before.size || after.size !== size || after.mtimeMs !== before.mtimeMs ||
+          after.ctimeMs !== before.ctimeMs || hash.digest("hex") !== source.sha256) return;
+        return { ...source, path: destination, size };
+      } finally { await file.close(); }
+    } catch { /* Missing or invalid local copies use the ordinary verified transfer. */ }
+    return;
+  }
   private async asset(host: string, thread: string, source: HistoryAssetRef, call: HostCall): Promise<HistoryAssetRef> {
     await mkdir(this.assetRoot, { recursive: true, mode: 0o700 });
+    const retained = await this.retainedAsset(source);
+    if (retained !== undefined) return retained;
     const temporary = join(this.assetRoot, "." + randomUUID());
     const file = await open(temporary, "wx", 0o600);
     let offset = 0; let digest: string | undefined; let total: number | undefined; const hash = createHash("sha256");
