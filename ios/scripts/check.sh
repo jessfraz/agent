@@ -17,6 +17,10 @@ find "$native_dir/AgentApp" "$native_dir/Sources" "$native_dir/Tests" \
 mkdir "$run_dir/macos-rendered"
 swift test --package-path "$native_dir" --scratch-path "$run_dir/macos" \
   --attachments-path "$run_dir/macos-rendered"
+performance_test=pagedHistoryAndStreamingPreparationRemainBoundedAndKeepCanonicalIdentity
+swift test --configuration release --package-path "$native_dir" \
+  --scratch-path "$run_dir/macos" --filter "$performance_test" \
+  --attachments-path "$run_dir/macos-rendered"
 xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
   -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath "$run_dir/app" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO build
@@ -97,11 +101,17 @@ xcodebuild -quiet -workspace "$run_dir/NativeTests.xcworkspace" -scheme AgentCor
   -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
   -parallel-testing-enabled NO -derivedDataPath "$run_dir/tests" \
   -resultBundlePath "$run_dir/ios-core-tests.xcresult" CODE_SIGNING_ALLOWED=NO test
+xcodebuild -quiet -workspace "$run_dir/NativeTests.xcworkspace" -scheme AgentCoreTests \
+  -configuration Release -only-testing:"AgentCoreTests/$performance_test()" \
+  -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
+  -parallel-testing-enabled NO -derivedDataPath "$run_dir/tests" \
+  -resultBundlePath "$run_dir/ios-performance-tests.xcresult" \
+  CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES test
 xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
   -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
   -parallel-testing-enabled NO -derivedDataPath "$run_dir/app" \
   -resultBundlePath "$run_dir/ios-rendering-tests.xcresult" CODE_SIGNING_ALLOWED=NO test
-for suite in core rendering; do
+for suite in core performance rendering; do
   xcrun xcresulttool get test-results summary --path "$run_dir/ios-$suite-tests.xcresult" \
     --compact > "$run_dir/ios-$suite-summary.json"
   python3 - "$run_dir/ios-$suite-summary.json" "$suite" <<'PY'

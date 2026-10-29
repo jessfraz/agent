@@ -97,41 +97,48 @@ private func exercisePreparation() -> PreparationSample {
 }
 
 @Test func pagedHistoryAndStreamingPreparationRemainBoundedAndKeepCanonicalIdentity() {
-  // A warmup and sample medians reduce initialization and scheduling noise.
-  // These CI budgets leave several times the measured preparation cost as
-  // headroom; they catch substantial regressions, not 1% changes or frame pacing.
-  _ = exercisePreparation()
-  let samples = (0..<5).map { _ in exercisePreparation() }
-  let firstPageMedian = samples.map(\.firstPage).sorted()[samples.count / 2]
-  let historyMedian = samples.map(\.history).sorted()[samples.count / 2]
-  let streamMedian = samples.map(\.stream).sorted()[samples.count / 2]
-  let firstPageBudget: Duration = .milliseconds(20)
-  let historyBudget: Duration = .milliseconds(250)
-  let streamBudget: Duration = .milliseconds(500)
-  let workload = samples[0]
-  let report = """
-    Native transcript preparation, invented content, ContinuousClock elapsed time.
-    One warmup followed by \(samples.count) measured iterations; CI gates each sample median.
-    Cursor-style history: \(workload.pageCount) pages of 20 messages, each split across two frames, retained window 500 rows.
-    Stream: \(workload.chunkCount) chunks, \(workload.streamBytes) UTF-8 bytes, one canonical answer.
-    First-page samples (ms): \(samples.map { milliseconds($0.firstPage) }.joined(separator: ", ")).
-    All-page samples (ms): \(samples.map { milliseconds($0.history) }.joined(separator: ", ")).
-    Stream samples (ms): \(samples.map { milliseconds($0.stream) }.joined(separator: ", ")).
-    First 20-entry page median: \(milliseconds(firstPageMedian)) ms; budget: \(milliseconds(firstPageBudget)) ms.
-    All-page median: \(milliseconds(historyMedian)) ms; budget: \(milliseconds(historyBudget)) ms.
-    Stream median: \(milliseconds(streamMedian)) ms; budget: \(milliseconds(streamBudget)) ms.
-    Includes actual Transcript and RichText preparation. Excludes network, JSON decoding, SwiftUI layout and device frame pacing.
-    Budgets have headroom for CI variation and gate substantial preparation regressions, not every small slowdown.
-    """
-  Attachment.record(report, named: "native-history-performance.txt")
-  print(report)
-  #expect(
-    firstPageMedian <= firstPageBudget,
-    "20-entry page preparation exceeded its CI regression budget.")
-  #expect(
-    historyMedian <= historyBudget,
-    "Cursor-paged history preparation exceeded its CI regression budget.")
-  #expect(
-    streamMedian <= streamBudget,
-    "Stream preparation exceeded its CI regression budget.")
+  #if DEBUG
+    // Debug runs still cover identity, ordering and bounds. Time the shipped
+    // configuration in a separate process so other tests cannot compete with it.
+    _ = exercisePreparation()
+  #else
+    // A warmup and sample medians reduce initialization and scheduling noise.
+    // These CI budgets leave several times the measured preparation cost as
+    // headroom; they catch substantial regressions, not 1% changes or frame pacing.
+    _ = exercisePreparation()
+    let samples = (0..<5).map { _ in exercisePreparation() }
+    let firstPageMedian = samples.map(\.firstPage).sorted()[samples.count / 2]
+    let historyMedian = samples.map(\.history).sorted()[samples.count / 2]
+    let streamMedian = samples.map(\.stream).sorted()[samples.count / 2]
+    let firstPageBudget: Duration = .milliseconds(20)
+    let historyBudget: Duration = .milliseconds(250)
+    let streamBudget: Duration = .milliseconds(500)
+    let workload = samples[0]
+    let report = """
+      Native transcript preparation, invented content, ContinuousClock elapsed time.
+      Release configuration. OS: \(ProcessInfo.processInfo.operatingSystemVersionString); CPUs: \(ProcessInfo.processInfo.processorCount).
+      One warmup followed by \(samples.count) measured iterations; CI gates each sample median.
+      Cursor-style history: \(workload.pageCount) pages of 20 messages, each split across two frames, retained window 500 rows.
+      Stream: \(workload.chunkCount) chunks, \(workload.streamBytes) UTF-8 bytes, one canonical answer.
+      First-page samples (ms): \(samples.map { milliseconds($0.firstPage) }.joined(separator: ", ")).
+      All-page samples (ms): \(samples.map { milliseconds($0.history) }.joined(separator: ", ")).
+      Stream samples (ms): \(samples.map { milliseconds($0.stream) }.joined(separator: ", ")).
+      First 20-entry page median: \(milliseconds(firstPageMedian)) ms; budget: \(milliseconds(firstPageBudget)) ms.
+      All-page median: \(milliseconds(historyMedian)) ms; budget: \(milliseconds(historyBudget)) ms.
+      Stream median: \(milliseconds(streamMedian)) ms; budget: \(milliseconds(streamBudget)) ms.
+      Includes actual Transcript and RichText preparation. Excludes network, JSON decoding, SwiftUI layout and device frame pacing.
+      Budgets have headroom for CI variation and gate substantial preparation regressions, not every small slowdown.
+      """
+    Attachment.record(report, named: "native-history-performance.txt")
+    print(report)
+    #expect(
+      firstPageMedian <= firstPageBudget,
+      "20-entry page preparation exceeded its CI regression budget.")
+    #expect(
+      historyMedian <= historyBudget,
+      "Cursor-paged history preparation exceeded its CI regression budget.")
+    #expect(
+      streamMedian <= streamBudget,
+      "Stream preparation exceeded its CI regression budget.")
+  #endif
 }
