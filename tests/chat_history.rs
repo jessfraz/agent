@@ -228,6 +228,9 @@ async fn observer_disconnect(after_admission: bool) {
     read_terminal_until(&mut output, &mut bytes, "A retained draft").await;
     if !after_admission {
         input.write_all(b"\r").await.unwrap();
+        // A PTY write does not mean the CLI has processed Enter. Keep the
+        // observer open until the input is visibly waiting for attachment.
+        read_terminal_until(&mut output, &mut bytes, "You · sending").await;
     }
     disconnect.add_permits(1);
     read_terminal_until(
