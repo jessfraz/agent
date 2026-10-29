@@ -330,10 +330,22 @@ workers. It shows OS, CPU count, RAM, Tailscale IP and load averages. Unavailabl
 probes retain their last sample with its age; unknown measurements stay unknown.
 
 Each service writes rotating lifecycle receipts to
-`<state_dir>/diagnostics/runtime.jsonl` (three files, 1 MiB each). These record
+`<state_dir>/diagnostics/runtime.jsonl` and its numbered archives (1 MiB per
+segment). Retention targets 48 hours, with a 128 MiB total disk cap including
+coverage metadata and its atomic replacement. Whole expired segments leave
+first; capacity pressure can remove younger segments. These record
 input placement, activity, host-call timing and interruption without message
 bodies, reasoning, tool arguments or credentials. The files are private to the
 user; logging failure does not block chat.
+
+`diagnostics/retention.json` records the policy, expiry watermark and cumulative
+timestamp bounds of capacity evictions, including uncertain timestamp coverage.
+It also flags unknown history when upgrading legacy rotations. Read actual
+receipt files to establish the available interval; the watermark is coverage
+evidence, not an inventory of retained files. An interrupted prune can report a
+conservative possible gap. `dropped_before` counts channel overflow only, so
+zero does not establish complete log coverage. No finite cap guarantees a full
+audit interval at an unbounded event rate.
 
 ## nix-darwin service
 

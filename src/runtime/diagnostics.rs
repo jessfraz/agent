@@ -1,8 +1,10 @@
 //! Content-free runtime receipts. The actor only enqueues bounded records;
 //! a separate writer owns private files and rotation.
 use std::{
+    cmp::Reverse,
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, BufRead, BufReader, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -391,12 +393,128 @@ impl Diagnostics {
     }
 }
 
+/// The total cap includes room for the watermark and its atomic replacement.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct RetentionPolicy {
+    segment_bytes: u64,
+    horizon_ms: u64,
+    max_total_bytes: u64,
+}
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            segment_bytes: MAX_BYTES,
+            horizon_ms: 48 * 60 * 60 * 1000,
+            max_total_bytes: 128 * MAX_BYTES,
+        }
+    }
+}
+const WATERMARK_BYTES: u64 = 4096;
+impl RetentionPolicy {
+    fn receipt_budget(self) -> io::Result<u64> {
+        self.max_total_bytes
+            .checked_sub(2 * WATERMARK_BYTES)
+            .filter(|budget| {
+                self.segment_bytes > 0 && *budget >= self.segment_bytes && self.horizon_ms > 0
+            })
+            .ok_or_else(|| io::Error::other("Diagnostics retention policy is too small"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Timestamps {
+    first: Option<u64>,
+    last: Option<u64>,
+    unknown: bool,
+}
+impl Timestamps {
+    fn observe(&mut self, timestamp: u64) {
+        self.first = Some(self.first.map_or(timestamp, |first| first.min(timestamp)));
+        self.last = Some(self.last.map_or(timestamp, |last| last.max(timestamp)));
+    }
+    fn expired(self, cutoff: u64) -> bool {
+        !self.unknown && self.last.is_none_or(|last| last < cutoff)
+    }
+}
+struct Segment {
+    index: u32,
+    bytes: u64,
+    timestamps: Timestamps,
+}
+impl Segment {
+    fn path(directory: &Path, index: u32) -> PathBuf {
+        directory.join(if index == 0 {
+            "runtime.jsonl".into()
+        } else {
+            format!("runtime.jsonl.{index}")
+        })
+    }
+    fn read(file: &File, index: u32) -> io::Result<Self> {
+        #[derive(Deserialize)]
+        struct Timestamp {
+            timestamp_ms: u64,
+        }
+        let mut segment = Self {
+            index,
+            bytes: file.metadata()?.len(),
+            timestamps: Timestamps::default(),
+        };
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        while reader.read_until(b'\n', &mut line)? != 0 {
+            match serde_json::from_slice::<Timestamp>(&line) {
+                Ok(record) => segment.timestamps.observe(record.timestamp_ms),
+                Err(_) => segment.timestamps.unknown = true,
+            }
+            line.clear();
+        }
+        Ok(segment)
+    }
+}
+
+/// Bounds summarize capacity loss; they do not claim every timestamp between
+/// them was lost. An interrupted prune can conservatively report possible loss.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+struct CapacityLoss {
+    first_timestamp_ms: Option<u64>,
+    last_timestamp_ms: Option<u64>,
+    unknown_timestamps: bool,
+    segments: u64,
+    bytes: u64,
+}
+impl CapacityLoss {
+    fn include(&mut self, segment: &Segment) {
+        if let Some(first) = segment.timestamps.first {
+            self.first_timestamp_ms =
+                Some(self.first_timestamp_ms.map_or(first, |old| old.min(first)));
+        }
+        if let Some(last) = segment.timestamps.last {
+            self.last_timestamp_ms = Some(self.last_timestamp_ms.map_or(last, |old| old.max(last)));
+        }
+        self.unknown_timestamps |= segment.timestamps.unknown;
+        self.segments = self.segments.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(segment.bytes);
+    }
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RetentionWatermark {
+    version: u32,
+    policy: RetentionPolicy,
+    prior_history_unknown: bool,
+    expired_through_ms: Option<u64>,
+    capacity_loss: Option<CapacityLoss>,
+}
+
 struct Writer {
     lock: File,
     directory: PathBuf,
     file: File,
-    bytes: u64,
-    limit: u64,
+    current: Segment,
+    // Oldest first, including the legacy .2 / .1 ordering after an upgrade.
+    archives: Vec<Segment>,
+    policy: RetentionPolicy,
+    watermark: RetentionWatermark,
 }
 impl Drop for Writer {
     fn drop(&mut self) {
@@ -407,7 +525,21 @@ impl Drop for Writer {
 }
 
 impl Writer {
-    fn open(directory: PathBuf, limit: u64) -> io::Result<Self> {
+    fn open(directory: PathBuf, segment_bytes: u64) -> io::Result<Self> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, millis);
+        Self::open_at(
+            directory,
+            RetentionPolicy {
+                segment_bytes,
+                ..RetentionPolicy::default()
+            },
+            now,
+        )
+    }
+    fn open_at(directory: PathBuf, policy: RetentionPolicy, now: u64) -> io::Result<Self> {
+        policy.receipt_budget()?;
         match fs::DirBuilder::new().mode(0o700).create(&directory) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -430,48 +562,248 @@ impl Writer {
         lock.set_permissions(fs::Permissions::from_mode(0o600))?;
         fs2::FileExt::lock_exclusive(&lock)?;
         let file = Self::file(&directory)?;
-        let bytes = file.metadata()?.len();
-        Ok(Self {
+        let current = Segment::read(&file, 0)?;
+        let mut archives = Vec::new();
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(index) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("runtime.jsonl."))
+                .and_then(|suffix| suffix.parse::<u32>().ok())
+                .filter(|index| *index > 0)
+            else {
+                continue;
+            };
+            if name != format!("runtime.jsonl.{index}").as_str() {
+                continue;
+            }
+            let archive = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(entry.path())?;
+            if !archive.metadata()?.is_file() {
+                return Err(io::Error::other(
+                    "Diagnostics segment is not a regular file",
+                ));
+            }
+            archive.set_permissions(fs::Permissions::from_mode(0o600))?;
+            archives.push(Segment::read(&archive, index)?);
+        }
+        archives.sort_unstable_by_key(|segment| Reverse(segment.index));
+        let mut watermark = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(directory.join("retention.json"))
+        {
+            Ok(file) => {
+                if !file.metadata()?.is_file() || file.metadata()?.len() > WATERMARK_BYTES {
+                    return Err(io::Error::other(
+                        "Diagnostics retention watermark is unavailable",
+                    ));
+                }
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                let mut watermark: RetentionWatermark = serde_json::from_reader(file)?;
+                if watermark.version != 1 {
+                    return Err(io::Error::other(
+                        "Unsupported diagnostics retention watermark",
+                    ));
+                }
+                watermark.policy = policy;
+                watermark
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => RetentionWatermark {
+                version: 1,
+                policy,
+                prior_history_unknown: current.bytes > 0
+                    || archives.iter().any(|segment| segment.bytes > 0),
+                expired_through_ms: None,
+                capacity_loss: None,
+            },
+            Err(error) => return Err(error),
+        };
+        watermark.prior_history_unknown |=
+            current.timestamps.unknown || archives.iter().any(|segment| segment.timestamps.unknown);
+        let mut writer = Self {
             lock,
             directory,
             file,
-            bytes,
-            limit,
-        })
+            current,
+            archives,
+            policy,
+            watermark,
+        };
+        if writer.current.bytes > 0
+            && writer
+                .current
+                .timestamps
+                .expired(now.saturating_sub(policy.horizon_ms))
+        {
+            writer.rotate()?;
+        }
+        writer.prune(now, 0, true)?;
+        Ok(writer)
     }
     fn file(directory: &Path) -> io::Result<File> {
         let file = OpenOptions::new()
+            .read(true)
             .append(true)
             .create(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(directory.join("runtime.jsonl"))?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other(
+                "Diagnostics segment is not a regular file",
+            ));
+        }
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         Ok(file)
+    }
+    fn rotate(&mut self) -> io::Result<()> {
+        for segment in &mut self.archives {
+            let next = segment
+                .index
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("Diagnostics segment index overflow"))?;
+            fs::rename(
+                Segment::path(&self.directory, segment.index),
+                Segment::path(&self.directory, next),
+            )?;
+            segment.index = next;
+        }
+        fs::rename(
+            Segment::path(&self.directory, 0),
+            Segment::path(&self.directory, 1),
+        )?;
+        self.file = Self::file(&self.directory)?;
+        self.archives.push(std::mem::replace(
+            &mut self.current,
+            Segment {
+                index: 0,
+                bytes: 0,
+                timestamps: Timestamps::default(),
+            },
+        ));
+        if let Some(previous) = self.archives.last_mut() {
+            previous.index = 1;
+        }
+        Ok(())
+    }
+    fn save_watermark(&self, watermark: &RetentionWatermark) -> io::Result<()> {
+        let path = self.directory.join("retention.json");
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(io::Error::other(
+                    "Diagnostics retention watermark is unavailable",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let bytes = serde_json::to_vec(watermark)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > WATERMARK_BYTES {
+            return Err(io::Error::other(
+                "Diagnostics retention watermark exceeds its bound",
+            ));
+        }
+        let temporary = self.directory.join("retention.json.tmp");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other(
+                "Diagnostics retention replacement is unavailable",
+            ));
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(temporary, path)?;
+        // The rename itself must be durable before any receipt is unlinked.
+        File::open(&self.directory)?.sync_all()
+    }
+    fn prune(&mut self, now: u64, incoming: u64, force_watermark: bool) -> io::Result<()> {
+        let cutoff = now.saturating_sub(self.policy.horizon_ms);
+        let mut bytes = self
+            .archives
+            .iter()
+            .try_fold(self.current.bytes, |bytes, segment| {
+                bytes
+                    .checked_add(segment.bytes)
+                    .ok_or_else(|| io::Error::other("Diagnostics byte count overflow"))
+            })?;
+        let mut remove = BTreeSet::new();
+        let mut watermark = self.watermark.clone();
+        for segment in &self.archives {
+            if segment.timestamps.expired(cutoff) {
+                remove.insert(segment.index);
+                bytes -= segment.bytes;
+                if let Some(last) = segment.timestamps.last {
+                    watermark.expired_through_ms = Some(
+                        watermark
+                            .expired_through_ms
+                            .map_or(last, |old| old.max(last)),
+                    );
+                }
+            }
+        }
+        let budget = self.policy.receipt_budget()?.saturating_sub(incoming);
+        for segment in &self.archives {
+            if bytes <= budget {
+                break;
+            }
+            if remove.insert(segment.index) {
+                bytes -= segment.bytes;
+                watermark
+                    .capacity_loss
+                    .get_or_insert_with(CapacityLoss::default)
+                    .include(segment);
+            }
+        }
+        if bytes > budget {
+            return Err(io::Error::other(
+                "Diagnostics current segment exceeds its retention budget",
+            ));
+        }
+        if force_watermark || !remove.is_empty() {
+            // Persist possible loss before unlinking. A crash can overstate a
+            // gap, but cannot silently erase its only coverage receipt.
+            self.save_watermark(&watermark)?;
+            self.watermark = watermark;
+            for index in &remove {
+                fs::remove_file(Segment::path(&self.directory, *index))?;
+            }
+            self.archives
+                .retain(|segment| !remove.contains(&segment.index));
+        }
+        Ok(())
     }
     fn append(&mut self, record: &Record) -> io::Result<()> {
         let mut bytes = serde_json::to_vec(record)?;
         bytes.push(b'\n');
-        if bytes.len() > 4096 {
+        let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if bytes.len() > 4096 || length > self.policy.segment_bytes {
             return Err(io::Error::other("Diagnostics record exceeds its bound"));
         }
-        if self.bytes + u64::try_from(bytes.len()).unwrap_or(u64::MAX) > self.limit {
-            let oldest = self.directory.join("runtime.jsonl.2");
-            match fs::remove_file(&oldest) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            let previous = self.directory.join("runtime.jsonl.1");
-            if previous.try_exists()? {
-                fs::rename(&previous, oldest)?;
-            }
-            fs::rename(self.directory.join("runtime.jsonl"), previous)?;
-            self.file = Self::file(&self.directory)?;
-            self.bytes = 0;
+        if self.current.bytes > 0
+            && (self.current.bytes + length > self.policy.segment_bytes
+                || self
+                    .current
+                    .timestamps
+                    .expired(record.timestamp_ms.saturating_sub(self.policy.horizon_ms)))
+        {
+            self.rotate()?;
         }
+        self.prune(record.timestamp_ms, length, false)?;
         self.file.write_all(&bytes)?;
-        self.bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        self.current.bytes += length;
+        self.current.timestamps.observe(record.timestamp_ms);
         Ok(())
     }
 }
@@ -479,7 +811,10 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use crate::protocol::{InputMode, MainInputContext, RuntimeCommand, RuntimeRequest};
-    use crate::runtime::diagnostics::{Diagnostics, Event, Record, Trace, Writer, command_kind};
+    use crate::runtime::diagnostics::{
+        Diagnostics, Event, Record, RetentionPolicy, RetentionWatermark, Trace, WATERMARK_BYTES,
+        Writer, command_kind,
+    };
     use std::{
         fs,
         os::unix::fs::{PermissionsExt, symlink},
@@ -502,8 +837,199 @@ mod tests {
         }
     }
 
+    fn receipts(directory: &std::path::Path) -> Vec<Record> {
+        let mut records = Vec::new();
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "runtime.jsonl" || name.starts_with("runtime.jsonl."))
+            {
+                continue;
+            }
+            for line in fs::read_to_string(path).unwrap().lines() {
+                records.push(serde_json::from_str::<Record>(line).unwrap());
+            }
+        }
+        records.sort_unstable_by_key(|record| record.request_id);
+        records
+    }
+
+    fn watermark(directory: &std::path::Path) -> RetentionWatermark {
+        serde_json::from_slice(&fs::read(directory.join("retention.json")).unwrap()).unwrap()
+    }
+
+    fn policy(receipt_budget: u64) -> RetentionPolicy {
+        RetentionPolicy {
+            segment_bytes: 600,
+            max_total_bytes: 2 * WATERMARK_BYTES + receipt_budget,
+            ..RetentionPolicy::default()
+        }
+    }
+
     #[test]
-    fn private_native_files_rotate_with_a_fixed_retention_bound() {
+    fn in_horizon_receipts_survive_more_than_three_native_segments() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("diagnostics");
+        let mut writer = Writer::open(directory.clone(), 600).unwrap();
+        for sequence in 0..50 {
+            let mut receipt = record(sequence);
+            receipt.timestamp_ms = 1_000_000 + u64::from(sequence);
+            writer.append(&receipt).unwrap();
+        }
+        drop(writer);
+        let retained = receipts(&directory);
+        assert_eq!(
+            retained
+                .iter()
+                .map(|record| record.request_id)
+                .collect::<Vec<_>>(),
+            (0..50).collect::<Vec<_>>(),
+            "Size rotation must retain the full recent audit interval"
+        );
+    }
+
+    #[test]
+    fn expired_segments_leave_before_capacity_and_startup_reconciles_actual_files() {
+        const HOUR: u64 = 60 * 60 * 1000;
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("diagnostics");
+        let now = 72 * HOUR;
+        let old = now - 49 * HOUR;
+        let mut writer = Writer::open_at(directory.clone(), policy(1800), old).unwrap();
+        for sequence in 0..6 {
+            let mut receipt = record(sequence);
+            receipt.timestamp_ms = old + u64::from(sequence);
+            writer.append(&receipt).unwrap();
+        }
+        let mut recent = record(6);
+        recent.timestamp_ms = now;
+        writer.append(&recent).unwrap();
+        assert_eq!(
+            receipts(&directory)
+                .iter()
+                .map(|record| record.request_id)
+                .collect::<Vec<_>>(),
+            [6]
+        );
+        let retained = watermark(&directory);
+        assert_eq!(retained.expired_through_ms, Some(old + 5));
+        assert!(
+            retained.capacity_loss.is_none(),
+            "Expiry must free space before evicting young receipts"
+        );
+        drop(writer);
+        let writer = Writer::open_at(directory.clone(), policy(1800), now + 49 * HOUR).unwrap();
+        assert!(
+            receipts(&directory).is_empty(),
+            "A quiet active segment must expire on reopening too"
+        );
+        assert_eq!(watermark(&directory).expired_through_ms, Some(now));
+        drop(writer);
+    }
+
+    #[test]
+    fn capacity_eviction_reports_its_interval_separately_from_channel_overflow() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("diagnostics");
+        let retention = policy(1800);
+        let mut writer = Writer::open_at(directory.clone(), retention, 1_000_000).unwrap();
+        for sequence in 0..50 {
+            let mut receipt = record(sequence);
+            receipt.timestamp_ms = 1_000_000 + u64::from(sequence);
+            writer.append(&receipt).unwrap();
+        }
+        let records = receipts(&directory);
+        assert!(records.len() < 50);
+        assert_eq!(records.last().unwrap().request_id, 49);
+        assert!(records.iter().all(|record| record.dropped_before == 0));
+        let retained = watermark(&directory);
+        let loss = retained.capacity_loss.as_ref().unwrap();
+        assert_eq!(loss.first_timestamp_ms, Some(1_000_000));
+        assert_eq!(loss.last_timestamp_ms, Some(records[0].timestamp_ms - 1));
+        assert!(!loss.unknown_timestamps);
+        assert!(loss.bytes > 0 && loss.segments > 0);
+        assert!(retained.expired_through_ms.is_none());
+        let total: u64 = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(total <= retention.max_total_bytes);
+        drop(writer);
+        let writer = Writer::open_at(directory.clone(), retention, 1_000_050).unwrap();
+        assert_eq!(
+            watermark(&directory),
+            retained,
+            "Reopening must preserve the historical capacity gap"
+        );
+        assert_eq!(receipts(&directory).len(), records.len());
+        drop(writer);
+    }
+
+    #[test]
+    fn legacy_rotations_reopen_without_discarding_receipts_and_remain_private() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("diagnostics");
+        fs::create_dir(&directory).unwrap();
+        for (name, sequence) in [
+            ("runtime.jsonl.2", 0),
+            ("runtime.jsonl.1", 1),
+            ("runtime.jsonl", 2),
+        ] {
+            let mut bytes = serde_json::to_vec(&record(sequence)).unwrap();
+            bytes.push(b'\n');
+            fs::write(directory.join(name), bytes).unwrap();
+        }
+        let mut writer = Writer::open_at(directory.clone(), policy(12_000), 1234).unwrap();
+        for sequence in 3..20 {
+            writer.append(&record(sequence)).unwrap();
+        }
+        drop(writer);
+        assert_eq!(
+            receipts(&directory)
+                .iter()
+                .map(|record| record.request_id)
+                .collect::<Vec<_>>(),
+            (0..20).collect::<Vec<_>>()
+        );
+        assert!(
+            watermark(&directory).prior_history_unknown,
+            "Legacy retained files cannot establish coverage before their first receipt"
+        );
+        for entry in fs::read_dir(&directory).unwrap() {
+            assert_eq!(
+                entry.unwrap().metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let writer = Writer::open_at(directory.clone(), policy(12_000), 1234).unwrap();
+        assert_eq!(receipts(&directory).len(), 20);
+        drop(writer);
+    }
+
+    #[test]
+    fn clock_rollback_does_not_expire_fresh_or_future_dated_segments() {
+        const HOUR: u64 = 60 * 60 * 1000;
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("diagnostics");
+        let mut writer = Writer::open_at(directory.clone(), policy(12_000), 72 * HOUR).unwrap();
+        for sequence in 0..20 {
+            let mut receipt = record(sequence);
+            receipt.timestamp_ms =
+                if sequence < 10 { 72 * HOUR } else { 12 * HOUR } + u64::from(sequence);
+            writer.append(&receipt).unwrap();
+        }
+        drop(writer);
+        let writer = Writer::open_at(directory.clone(), policy(12_000), 12 * HOUR + 20).unwrap();
+        assert_eq!(receipts(&directory).len(), 20);
+        let retained = watermark(&directory);
+        assert!(retained.expired_through_ms.is_none() && retained.capacity_loss.is_none());
+        drop(writer);
+    }
+
+    #[test]
+    fn native_segments_and_retention_metadata_remain_private_and_bounded() {
         let state = tempfile::tempdir().unwrap();
         let directory = state.path().join("diagnostics");
         let mut writer = Writer::open(directory.clone(), 600).unwrap();
@@ -519,22 +1045,29 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect::<Vec<_>>();
-        assert_eq!(paths.len(), 4);
+        assert!(paths.len() > 4);
         let mut retained = Vec::new();
         for path in paths {
             let metadata = fs::metadata(&path).unwrap();
             assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-            assert!(metadata.len() <= 600);
             if path.file_name().is_some_and(|name| name == "writer.lock") {
                 continue;
             }
+            if path
+                .file_name()
+                .is_some_and(|name| name == "retention.json")
+            {
+                assert!(metadata.len() <= WATERMARK_BYTES);
+                continue;
+            }
+            assert!(metadata.len() <= 600);
             for line in fs::read_to_string(path).unwrap().lines() {
                 retained.push(serde_json::from_str::<Record>(line).unwrap().request_id);
             }
         }
         retained.sort_unstable();
         assert_eq!(retained.last(), Some(&49));
-        assert!(retained.len() < 50);
+        assert_eq!(retained.len(), 50);
         assert!(retained.windows(2).all(|pair| pair[1] == pair[0] + 1));
     }
 
@@ -556,6 +1089,67 @@ mod tests {
         symlink(elsewhere.path(), &linked).unwrap();
         assert!(Writer::open(linked, 600).is_err());
         assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn retention_watermark_and_atomic_replacement_refuse_symlink_targets() {
+        let state = tempfile::tempdir().unwrap();
+        let target = state.path().join("unrelated");
+        fs::write(&target, "Preserve unrelated contents").unwrap();
+        let directory = state.path().join("diagnostics");
+        fs::create_dir(&directory).unwrap();
+        symlink(&target, directory.join("retention.json")).unwrap();
+        assert!(Writer::open_at(directory.clone(), policy(1800), 1234).is_err());
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "Preserve unrelated contents"
+        );
+        fs::remove_file(directory.join("retention.json")).unwrap();
+        let mut writer = Writer::open_at(directory.clone(), policy(1800), 1234).unwrap();
+        for sequence in 0..3 {
+            writer.append(&record(sequence)).unwrap();
+        }
+        symlink(&target, directory.join("retention.json.tmp")).unwrap();
+        let mut recent = record(3);
+        recent.timestamp_ms += 49 * 60 * 60 * 1000;
+        assert!(writer.append(&recent).is_err());
+        assert_eq!(
+            receipts(&directory).len(),
+            3,
+            "A failed coverage receipt must not delete the protected log segments"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "Preserve unrelated contents"
+        );
+    }
+
+    #[test]
+    fn uncertain_timestamp_coverage_survives_expiry_and_is_reported_if_capacity_evicts_it() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("diagnostics");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("runtime.jsonl.1");
+        fs::write(&path, "fixture_private_truncated_record\n").unwrap();
+        let mut writer =
+            Writer::open_at(directory.clone(), policy(600), 72 * 60 * 60 * 1000).unwrap();
+        assert!(
+            path.exists(),
+            "Unknown timestamps cannot establish that a segment expired"
+        );
+        assert!(watermark(&directory).prior_history_unknown);
+        for sequence in 0..12 {
+            let mut recent = record(sequence);
+            recent.timestamp_ms = 72 * 60 * 60 * 1000 + u64::from(sequence);
+            writer.append(&recent).unwrap();
+        }
+        let retained = watermark(&directory);
+        assert!(retained.capacity_loss.unwrap().unknown_timestamps);
+        assert!(
+            !fs::read_to_string(directory.join("retention.json"))
+                .unwrap()
+                .contains("fixture_private_truncated_record")
+        );
     }
 
     #[tokio::test]
@@ -628,17 +1222,10 @@ mod tests {
         drop(retired);
         replacement.join().unwrap();
         fs2::FileExt::try_lock_exclusive(&other).unwrap();
-        let mut retained = Vec::new();
-        for entry in fs::read_dir(&directory).unwrap() {
-            let path = entry.unwrap().path();
-            if path.file_name().is_some_and(|name| name == "writer.lock") {
-                continue;
-            }
-            for line in fs::read_to_string(path).unwrap().lines() {
-                retained.push(serde_json::from_str::<Record>(line).unwrap().request_id);
-            }
-        }
-        retained.sort_unstable();
+        let retained = receipts(&directory)
+            .iter()
+            .map(|record| record.request_id)
+            .collect::<Vec<_>>();
         assert_eq!(retained.last(), Some(&99));
         assert!(retained.windows(2).all(|pair| pair[1] == pair[0] + 1));
     }
