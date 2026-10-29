@@ -683,6 +683,21 @@ pub struct TaskOutcome {
     pub summary: String,
     pub sources: Vec<SourceRef>,
     pub state: TaskOutcomeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub reconciliation: Option<TaskInputReconciliation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct TaskInputReceipt {
+    pub request_id: String,
+    pub submission_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct TaskInputReconciliation {
+    pub original: TaskInputReceipt,
+    pub recovery_inputs: Vec<TaskInputReceipt>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]

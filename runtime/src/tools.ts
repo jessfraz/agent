@@ -242,7 +242,9 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
   ] });
   const record = defineTool({ name: "record_task", description: "Save verified progress and the next actor/check or concrete resolution evidence.",
     parameters: Type.Object({ task_id: Type.Optional(Type.String()), summary: Type.String(), state: taskState,
-      sources: Type.Optional(Type.Array(source)) }),
+      sources: Type.Optional(Type.Array(source)),
+      reconciles_input: Type.Optional(Type.String({ minLength: 1,
+        description: "Exact unanswered input request ID reconciled by this recovery turn. Verify prior effects first; this does not resolve ongoing work." })) }),
     async execute(args, api) {
       const execution = executions.get(api.conversationId.toString());
       const task = args.task_id === undefined
@@ -256,7 +258,8 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         throw new TaskError("The next check must be an ISO timestamp or null");
       }
       return output(await tasks.record(task.id, args, { conversation_id: api.conversationId.toString(),
-        call_id: api.callId, settled: api.conversationId === ROOT_CONVERSATION_ID || execution.role === "triage" }));
+        call_id: api.callId, native_task_id: api.taskId,
+        settled: api.conversationId === ROOT_CONVERSATION_ID || execution.role === "triage" }));
     } });
   const searchModes = { semantic: "semantic", keyword: "keyword" } satisfies Record<SearchMode, SearchMode>;
   const searchTask = defineTool({ name: "search_tasks", description: "Find related tasks and imported conversations before starting new work. Semantic search is the default; use keyword for literal identifiers, paths or errors. Read matching originals before continuing them.",

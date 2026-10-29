@@ -43,9 +43,11 @@ export async function openJobActor(job: ScheduledJob, tasks: TaskStore, call: Ho
   return undefined;
 }
 
-async function requireReconciledTask(session: Harness, tasks: TaskStore, id: string): Promise<void> {
-  if (!await session.commit((tx) => tasks.canReleaseIn(tx, id), BACKGROUND_CONTEXT)) {
-    throw new TaskError("The scheduled turn stopped without an answer; reconcile and resolve its existing task before this occurrence can settle");
+async function requireReconciledTask(session: Harness, tasks: TaskStore, sources: SourceJournal, id: string, requestId: string): Promise<void> {
+  const conversation = await tasks.conversation((await tasks.get(id)).conversation_id);
+  if (!await session.commit(async (tx) => await tasks.canSettleScheduledIn(tx, id, conversation.id) &&
+      (await tasks.canReleaseIn(tx, id) || await sources.reconcilesIn(tx, id, conversation.id, requestId)), BACKGROUND_CONTEXT)) {
+    throw new TaskError("The scheduled turn stopped without an answer; resolve its task or explicitly reconcile its exact input in a successful recovery turn before this occurrence can settle");
   }
 }
 
@@ -65,7 +67,7 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
   try {
     let submission = await session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
     if (submission?.status === "done") return;
-    if (submission?.status === "unanswered") { await requireReconciledTask(session, tasks, id); return; }
+    if (submission?.status === "unanswered") { await requireReconciledTask(session, tasks, sources, id, occurrence.id); return; }
     const previousOutcome = (await sources.events({ provider: "task_outcomes", thread_id: id, limit: 1 }))[0]?.key;
     // A restored native input can progress only after its real worker binds.
     // Allocation confirmation and the worker's run_task connection are separate.
@@ -91,7 +93,7 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
         const native = await session.submission(submission.id, BACKGROUND_CONTEXT);
         if (native === undefined) throw new TaskError("The scheduled job's admitted Pi input is unavailable");
         const result = await native.wait(withAbortSignal(signal, BACKGROUND_CONTEXT));
-        if (result.type === "input" && result.status === "unanswered") { await requireReconciledTask(session, tasks, id); return; }
+        if (result.type === "input" && result.status === "unanswered") { await requireReconciledTask(session, tasks, sources, id, occurrence.id); return; }
         if (result.type !== "input" || result.status !== "done") throw new TaskError("The scheduled turn did not complete; inspect its existing task");
         return;
       }

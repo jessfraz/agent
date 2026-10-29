@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Type } from "typebox";
 import { defineDoc, defineExtension, defineTool, ROOT_CONVERSATION_ID, type Conversation,
-  type Extension, type Harness, type Tx, type ToolExecutionResult } from "@earendil-works/pi-durable";
+  type ConversationId, type Extension, type Harness, type Tx, type ToolExecutionResult } from "@earendil-works/pi-durable";
 import type { SourceBatch } from "./generated/SourceBatch.js";
 import type { SourceCheckpoint } from "./generated/SourceCheckpoint.js";
 import type { SourceEvent } from "./generated/SourceEvent.js";
@@ -61,6 +61,26 @@ export class SourceJournal {
     const previous = journal.sources.find((state) => sameSource(state.source, OUTCOMES));
     const state = { ...outcomeState(), checked_at: Date.now() };
     if (previous === undefined) journal.sources.push(state); else Object.assign(previous, state);
+  }
+  /** Check the exact successful recovery without changing the unanswered native input. */
+  async reconcilesIn(tx: Tx, taskId: string, conversationId: ConversationId, requestId: string): Promise<boolean> {
+    const original = await tx.submissionByRequest(conversationId, requestId);
+    if (original?.type !== "input" || original.status !== "unanswered") return false;
+    const journal = await tx.doc(Sources);
+    for (const { outcome } of journal.events) {
+      const receipt = outcome?.reconciliation;
+      if (outcome?.task_id !== taskId || outcome.conversation_id !== conversationId.toString() ||
+          outcome.entry_id === null || outcome.tool_call_id === null || receipt === undefined ||
+          receipt.original.request_id !== requestId || receipt.original.submission_id !== original.id.toString() ||
+          receipt.recovery_inputs.length === 0) continue;
+      let done = true;
+      for (const input of receipt.recovery_inputs) {
+        const recovery = await tx.submissionByRequest(conversationId, input.request_id);
+        if (recovery?.type !== "input" || recovery.status !== "done" || recovery.id.toString() !== input.submission_id) { done = false; break; }
+      }
+      if (done) return true;
+    }
+    return false;
   }
   async publishedIn(tx: Tx, outcome: TaskOutcome, parent: boolean): Promise<void> {
     if (!parent && (outcome.state.state === "progress" || outcome.state.state === "failed")) return;

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { AttachmentStore, validateInput } from "./attachments.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { AssistantEntry, defineDoc, GenerationTask, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID, type Conversation, type ConversationId, type Cursor, type EntryRecord, type Extension, type Harness, type Tx } from "@earendil-works/pi-durable";
+import { AssistantEntry, defineDoc, GenerationTask, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID, ToolTask, type Conversation, type ConversationId, type Cursor, type EntryRecord, type Extension, type Harness, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
 import type { CoordinatorEnvironment } from "./environment.js";
 import { ConversationModels, DEFAULT_MODEL, ModelError, modelFailureMessage, savedHost, savedModel } from "./models.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
@@ -13,6 +13,8 @@ import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import type { SourceRef } from "./generated/SourceRef.js";
 import type { SourceEvent } from "./generated/SourceEvent.js";
 import type { TaskOutcome } from "./generated/TaskOutcome.js";
+import type { TaskInputReconciliation } from "./generated/TaskInputReconciliation.js";
+import type { TaskInputReceipt } from "./generated/TaskInputReceipt.js";
 import type { TaskState } from "./generated/TaskState.js";
 import type { TaskRecord } from "./generated/TaskRecord.js";
 import type { JobRunReceipt } from "./generated/JobRunReceipt.js";
@@ -180,10 +182,29 @@ export class TaskStore {
     } while (cursor !== undefined);
     throw new TaskError("Task outcome model provenance is unavailable");
   }
-  async record(id: string, input: { summary: string; state: TaskState; sources?: SourceRef[] },
-    provenance: { conversation_id: string; call_id: string; settled: boolean }): Promise<TaskRecord> {
+  async record(id: string, input: { summary: string; state: TaskState; sources?: SourceRef[]; reconciles_input?: string },
+    provenance: { conversation_id: string; call_id: string; settled: boolean; native_task_id?: NativeTaskId }): Promise<TaskRecord> {
     this.assertSource(provenance.conversation_id);
-    const origin = await this.origin(await this.conversation(provenance.conversation_id), provenance.call_id);
+    const conversation = await this.conversation(provenance.conversation_id);
+    const origin = await this.origin(conversation, provenance.call_id);
+    // Native reads stay outside the mutation line. The live run is checked again
+    // inside the outcome commit so a stale tool invocation cannot attest recovery.
+    const run = input.reconciles_input === undefined ? undefined
+      : (await this.session.snapshot(LiveDoc, conversation.id, BACKGROUND_CONTEXT))?.run;
+    const recoveryInputs: TaskInputReceipt[] = [];
+    if (input.reconciles_input !== undefined) {
+      if (run === undefined || run.taskId !== origin.byTaskId || run.inputs.length === 0 || this.outcomes === undefined) {
+        throw new TaskError("Reconciliation must belong to the current native recovery turn");
+      }
+      for (const id of run.inputs) {
+        const native = await this.session.submission(id, BACKGROUND_CONTEXT);
+        const record = await native?.status(BACKGROUND_CONTEXT);
+        if (record?.type !== "input" || record.status !== "placed" || record.conversationId !== conversation.id || record.requestId === undefined) {
+          throw new TaskError("Reconciliation requires identified inputs in the current native recovery turn");
+        }
+        recoveryInputs.push({ request_id: record.requestId, submission_id: record.id.toString() });
+      }
+    }
     await this.session.commit(async (tx) => {
       this.assertSource(provenance.conversation_id);
       const index = await tx.doc(Tasks);
@@ -191,10 +212,28 @@ export class TaskStore {
       const task = index.tasks.find((task) => task.id === id);
       if (task === undefined) throw new TaskError("Unknown task");
       task.agents ??= [];
+      let reconciliation: TaskInputReconciliation | undefined;
+      if (input.reconciles_input !== undefined) {
+        const current = (await tx.doc(LiveDoc, conversation.id)).run;
+        const invocation = provenance.native_task_id === undefined ? undefined : await tx.task(provenance.native_task_id);
+        if (task.conversation_id !== provenance.conversation_id || run === undefined || current === undefined || current.taskId !== origin.byTaskId ||
+            current.inputs.length !== run.inputs.length || current.inputs.some((id, index) => id !== run.inputs[index]) ||
+            invocation?.kind !== ToolTask.definition.name || invocation.owner !== current.taskId || invocation.conversationId !== conversation.id ||
+            invocation.state.status !== "running" || invocation.abortRequested) {
+          throw new TaskError("Only the task's current native recovery turn can reconcile its input");
+        }
+        const original = await tx.submissionByRequest(conversation.id, input.reconciles_input);
+        if (original?.type !== "input" || original.status !== "unanswered" || run.inputs.includes(original.id)) {
+          throw new TaskError("Reconciliation requires this task's exact unanswered input request ID");
+        }
+        reconciliation = { original: { request_id: input.reconciles_input, submission_id: original.id.toString() }, recovery_inputs: recoveryInputs };
+      }
       if (input.state.state === "resolved" && !this.canResolve(task)) throw new TaskError("Wait for unfinished task agents before resolving the task");
       task.summary = input.summary.slice(-4000); task.state = input.state; task.updated_at = Date.now();
       for (const source of input.sources ?? []) if (!task.sources.some((saved) => related(saved, source))) task.sources.push(source);
-      await this.outcomes?.recordIn(tx, this.outcome(task, provenance.conversation_id, origin.id.toString(), provenance.call_id), provenance.settled);
+      const outcome = this.outcome(task, provenance.conversation_id, origin.id.toString(), provenance.call_id);
+      if (reconciliation !== undefined) outcome.reconciliation = reconciliation;
+      await this.outcomes?.recordIn(tx, outcome, provenance.settled);
     }, BACKGROUND_CONTEXT);
     return this.get(id);
   }
@@ -234,9 +273,19 @@ export class TaskStore {
     const index = await tx.doc(Tasks);
     const task = index.tasks.find((item) => item.id === id);
     if (task === undefined) return false;
+    return this.quiescent(task) && task.state.state === "resolved";
+  }
+  private quiescent(task: TaskRecord): boolean {
     task.agents ??= [];
-    return task.state.state === "resolved" && task.pending.length === 0 && !this.isRunning(id) &&
+    return task.pending.length === 0 && !this.isRunning(task.id) &&
       (task.worker.state === "unassigned" || task.worker.state === "bound") && this.canResolve(task);
+  }
+  /** Scheduled settlement also waits for native inputs, independently of resource cleanup. */
+  async canSettleScheduledIn(tx: Tx, id: string, conversationId: ConversationId): Promise<boolean> {
+    const task = (await tx.doc(Tasks)).tasks.find((item) => item.id === id);
+    return task !== undefined && this.quiescent(task) &&
+      (await tx.doc(LiveDoc, conversationId)).run === undefined &&
+      (await tx.doc(InboxDoc, conversationId)).items.every((item) => item.mode === "write");
   }
   async conversation(id: string): Promise<Conversation> {
     const imported = await this.histories?.conversation(id);

@@ -66,12 +66,15 @@ test("resource allocation intent and consumers precede the host effect and survi
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("unsettled child consumers and other hosts hold resources; retiring blocks reuse before native removal", async () => {
+test("waiting tasks, unsettled child consumers and other hosts hold resources; retiring blocks reuse before native removal", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-resource-")); let app = await open(directory);
   try {
     const task = await app.tasks.create({ title: "Review", outcome: "Verify the change" });
     const request: WorktreeAllocation = { host_id: hostId, task_id: task.id, allocation_id: randomUUID(), repository: identity.primary, branch: "review" };
     await app.resources.allocate(request, async () => ({ type: "resource", report: { type: "observed", record: ready(request) } }));
+    await app.tasks.update(task.id, (saved) => { saved.state = { state: "waiting", actor: "Upstream check", next_check: null }; });
+    await app.resources.collect(hostId, async () => { throw new Error("A waiting task must retain its worktree"); });
+    assert.deepEqual((await app.resources.list())[0]?.consumers, [task.id]);
     const childId = randomUUID();
     await app.tasks.createAgent(task.id, { id: childId, title: "Review", outcome: "Review change", input: "Inspect change", inputId: randomUUID() });
     await app.tasks.update(task.id, (saved) => { saved.state = { state: "resolved", evidence: "Parent finished" }; });

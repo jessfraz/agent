@@ -14,6 +14,7 @@ import { BackgroundScheduler } from "../src/background.js";
 import { openJobActor, runScheduled } from "../src/scheduled.js";
 import type { ScheduledOccurrence } from "../src/generated/ScheduledOccurrence.js";
 import type { HostCall } from "../src/tasks.js";
+import { createAppTools } from "../src/tools.js";
 import { DAY, FakeClock, exampleJob, planned, pump } from "./fixtures/background-runtime.js";
 import { openScheduled, scheduledOccurrence } from "./fixtures/scheduled-runtime.js";
 
@@ -50,110 +51,206 @@ test("scheduled work uses the existing task actor, current guidance and exact na
   }
 });
 
-test("same-task reconciliation releases an unanswered scheduled occurrence after reopen without replaying its effect", { timeout: 15_000 }, async () => {
-  const directory = await mkdtemp(join(tmpdir(), "agent-scheduled-reconcile-")), clock = new FakeClock();
-  let app = await openScheduled(directory, "original", clock), worker: Promise<unknown> | undefined;
-  const controller = new AbortController(), effectPath = join(directory, "effect.txt");
-  let first: ScheduledOccurrence | undefined, release = () => {};
-  const background = () => {
-    const current = app;
-    return new BackgroundScheduler(current.session, current.registry, current.tasks, {
-      plan: async (cadence, after, now) => planned(cadence, after, now),
-      refreshSources: async () => {}, collectResources: async () => {},
-      runJob: async (occurrence, signal, actor) => { first ??= occurrence; await runScheduled(occurrence, signal, current, actor); },
-    });
-  };
-  const hostCall: HostCall = async (command) => {
-    if (command.type === "exec" && command.program === "perform-effect") {
-      app.commands.push(command); await appendFile(effectPath, "performed once\n");
-      return { type: "process", exit_code: 0, stdout: "Effect recorded", stderr: "", truncated: false };
+for (const scenario of ["absent", "unknown", "wrong", "failed", "foreign"]) {
+  test(`recovery with ${scenario} receipt cannot settle an unanswered scheduled input`, { timeout: 10_000 }, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-scheduled-receipt-")), app = await openScheduled(directory);
+    const controller = new AbortController();
+    let worker: Promise<unknown> | undefined;
+    try {
+      app.faux.setResponses([() => { throw new Error("The original generation failed before any tool"); }]);
+      const admission = runScheduled(scheduledOccurrence, controller.signal, app);
+      const blocked = assert.rejects(admission, /scheduled turn/);
+      await pump(async () => (await app.tasks.list())[0]?.worker.state === "bound");
+      const task = (await app.tasks.list())[0]; assert.ok(task);
+      worker = app.worker(task.id, controller); await assert.rejects(worker, /did not complete/); await blocked;
+      if (scenario === "wrong") {
+        await app.tasks.enqueue(task.id, "An independent request.", "other-unanswered", undefined, "follow_up");
+        await app.tasks.dispatch(task.id, await app.tasks.workerHost(task.id), app.call);
+        app.faux.setResponses([() => { throw new Error("The independent request also failed before tools"); }]);
+        worker = app.worker(task.id, controller); await assert.rejects(worker, /did not complete/);
+      }
+      app.faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("record_task", {
+          summary: "Reviewed the earlier failure.",
+          ...(scenario === "foreign" ? { task_id: task.id } : {}),
+          state: { state: "waiting", actor: "Upstream check", next_check: null },
+          ...(scenario === "absent" ? {} : { reconciles_input: scenario === "wrong" ? "other-unanswered"
+            : scenario === "unknown" ? "unknown-request" : scheduledOccurrence.id }),
+        }), { stopReason: "toolUse" }),
+        (context) => {
+          if (scenario === "unknown" || scenario === "foreign") assert.ok(context.messages.some((message) => message.role === "toolResult" && message.isError));
+          if (scenario === "failed") throw new Error("The recovery failed after claiming reconciliation");
+          return fauxAssistantMessage("The later request finished.");
+        },
+      ]);
+      if (scenario === "foreign") {
+        const root = await app.session.root(BACKGROUND_CONTEXT);
+        const unbind = app.executions.bind(root.id.toString(), { cwd: "/workspace/example", hosts: [], call: app.call });
+        try {
+          await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [createAppTools(app.tasks, app.executions).main] }, BACKGROUND_CONTEXT);
+          const submission = await root.submit({ type: "input", content: "Review another conversation's failure.", requestId: "foreign-recovery" }, BACKGROUND_CONTEXT);
+          assert.equal((await submission.wait(BACKGROUND_CONTEXT)).status, "done");
+        } finally { unbind(); }
+      } else {
+        await app.tasks.enqueue(task.id, "Review the previous failure.", "recovery", undefined, "follow_up");
+        await app.tasks.dispatch(task.id, await app.tasks.workerHost(task.id), app.call);
+        worker = app.worker(task.id, controller);
+        if (scenario === "failed") await assert.rejects(worker, /did not complete/); else await worker;
+      }
+      await assert.rejects(runScheduled(scheduledOccurrence, controller.signal, app, task.id), /scheduled turn/);
+      const claimed = (await app.sources.events({ provider: "task_outcomes", thread_id: task.id, limit: 100 }))
+        .find((event) => event.outcome?.reconciliation !== undefined)?.outcome;
+      assert.equal(claimed !== undefined, scenario === "failed" || scenario === "wrong");
+      if (claimed?.tool_call_id !== null && claimed?.tool_call_id !== undefined) {
+        await assert.rejects(app.tasks.record(task.id, { summary: "Stale invocation", state: { state: "open" },
+          reconciles_input: scheduledOccurrence.id }, { conversation_id: task.conversation_id,
+          call_id: claimed.tool_call_id, settled: false }), /current native recovery turn/);
+      }
+    } finally {
+      controller.abort(); await worker?.catch(() => {});
+      await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
     }
-    if (command.type === "exec" && command.program === "verify-effect") {
-      app.commands.push(command);
-      return { type: "process", exit_code: 0, stdout: await readFile(effectPath, "utf8"), stderr: "", truncated: false };
-    }
-    return app.call(command);
-  };
-  let scheduler = background();
-  try {
-    let started = () => {}; const streaming = new Promise<void>((resolve) => { started = resolve; });
-    app.faux.setResponses([
-      fauxAssistantMessage(fauxToolCall("exec", { program: "perform-effect", args: [] }), { stopReason: "toolUse" }),
-      async (_context, options) => {
-        const signal = options?.signal; assert.ok(signal); started();
-        await new Promise<void>((resolve) => { if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true }); });
-        return fauxAssistantMessage("Discarded after interruption");
-      },
-    ]);
-    await scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: [exampleJob()] });
-    await pump(async () => (await scheduler.getJob("example-review")).schedules[0]?.next_at !== null);
-    clock.advance(DAY);
-    await pump(async () => (await app.tasks.list())[0]?.worker.state === "bound");
-    const task = (await app.tasks.list())[0]; assert.ok(task); assert.ok(first); const occurrence = first;
-    const conversation = await app.tasks.conversation(task.conversation_id);
-    worker = app.worker(task.id, controller, hostCall);
-    const failedWorker = assert.rejects(worker, /did not complete/);
-    await streaming; assert.equal(await readFile(effectPath, "utf8"), "performed once\n");
-    await conversation.abort(BACKGROUND_CONTEXT); await failedWorker;
-    const original = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
-    assert.ok(original); assert.equal(original.status, "unanswered");
-    await pump(async () => (await scheduler.status()).errors.some((error) => /scheduled turn/.test(error.message)));
-    await assert.rejects(runScheduled(occurrence, controller.signal, app, task.id), /scheduled turn/);
-    clock.advance(DAY);
-    await pump(async () => (await scheduler.status()).pending === 2);
-    assert.equal((await app.tasks.list()).length, 1, "The unanswered occurrence retains its serial job lane");
+  });
+}
 
-    await app.tasks.enqueue(task.id, "Verify the original effect before resolving this same task.", "reconcile-effect", undefined, "follow_up");
-    await app.tasks.dispatch(task.id, await app.tasks.workerHost(task.id), app.call);
-    let reconciled = () => {}; const resolving = new Promise<void>((resolve) => { reconciled = resolve; });
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    app.faux.setResponses([
-      fauxAssistantMessage(fauxToolCall("exec", { program: "verify-effect", args: [] }), { stopReason: "toolUse" }),
-      (context) => {
-        assert.ok(context.messages.some((message) => message.role === "toolResult" &&
-          message.content.some((part) => part.type === "text" && part.text.includes("performed once"))));
-        return fauxAssistantMessage(fauxToolCall("record_task", { summary: "Verified the original effect occurred once.",
-          state: { state: "resolved", evidence: "Read back the original effect receipt; no replay is needed." } }), { stopReason: "toolUse" });
-      },
-      async () => { reconciled(); await gate; return fauxAssistantMessage("The original effect is verified and this task is reconciled."); },
-    ]);
-    worker = app.worker(task.id, controller, hostCall); await resolving;
-    assert.equal((await app.tasks.get(task.id)).state.state, "resolved");
-    assert.equal(app.tasks.isRunning(task.id), true);
-    await assert.rejects(runScheduled(occurrence, controller.signal, app, task.id), /scheduled turn/);
-    release(); await worker;
-    const owningHost = await app.tasks.workerHost(task.id);
-    await assert.rejects(app.tasks.dispatch(task.id, owningHost, async () => ({ type: "creation_uncertain", session_id: "session:22222222-2222-4222-8222-222222222222" })), /needs reconciliation/);
-    assert.equal((await app.tasks.get(task.id)).worker.state, "resume_uncertain");
-    await assert.rejects(runScheduled(occurrence, controller.signal, app, task.id), /scheduled turn/);
-    await app.tasks.dispatch(task.id, owningHost, async (command) => {
-      assert.equal(command.type, "on_node");
-      if (command.type !== "on_node") throw new Error("Reconcile the existing worker allocation");
-      assert.equal(command.command.type, "inspect_worker");
-      return { type: "worker_presence", presence: { state: "present", running: true } };
-    });
-    await app.session.close(BACKGROUND_CONTEXT); app = await openScheduled(directory, "restored", clock); scheduler = background();
-    await scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: [exampleJob()] });
-    await runScheduled(occurrence, controller.signal, app, task.id);
-    clock.advance(3_600_000);
-    await pump(async () => (await app.tasks.get(task.id)).pending.length > 0);
-    app.faux.setResponses([fauxAssistantMessage("The next queued review completed.")]);
-    worker = app.worker(task.id, controller, hostCall); await worker;
-    await pump(async () => (await scheduler.status()).pending === 0);
-    assert.deepEqual((await scheduler.status()).errors, []);
-    assert.equal(await readFile(effectPath, "utf8"), "performed once\n");
-    assert.equal((await app.tasks.list()).length, 1);
-    const restored = await app.tasks.conversation((await app.tasks.get(task.id)).conversation_id);
-    const retained = await app.session.commit((tx) => tx.submissionByRequest(restored.id, occurrence.id), BACKGROUND_CONTEXT);
-    assert.equal(retained?.id, original.id); assert.equal(retained?.status, "unanswered");
-    const page = await restored.entries({}, 100, undefined, BACKGROUND_CONTEXT);
-    assert.equal(page.items.filter((entry) => UserEntry.is(entry)).length, 3, "The next occurrence joins the retained original input and explicit reconciliation follow-up");
-    assert.equal(app.commands.filter((command) => command.type === "exec" && command.program === "perform-effect").length, 0);
-  } finally {
-    release(); controller.abort(); await worker?.catch(() => {});
-    await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
-  }
-});
+for (const recoveredState of ["waiting", "resolved"]) {
+  test(recoveredState === "waiting"
+    ? "explicit recovery settles an unanswered occurrence after reopen while its task still waits, without replaying its effect"
+    : "legacy resolved recovery settles an unanswered occurrence after reopen without a receipt or repeated effect", { timeout: 15_000 }, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-scheduled-reconcile-")), clock = new FakeClock();
+    let app = await openScheduled(directory, "original", clock), worker: Promise<unknown> | undefined;
+    const controller = new AbortController(), effectPath = join(directory, "effect.txt");
+    let first: ScheduledOccurrence | undefined, release = () => {}, allowVerification = () => {}, allowFollowup = () => {};
+    const background = () => {
+      const current = app;
+      return new BackgroundScheduler(current.session, current.registry, current.tasks, {
+        plan: async (cadence, after, now) => planned(cadence, after, now),
+        refreshSources: async () => {}, collectResources: async () => {},
+        runJob: async (occurrence, signal, actor) => { first ??= occurrence; await runScheduled(occurrence, signal, current, actor); },
+      });
+    };
+    const hostCall: HostCall = async (command) => {
+      if (command.type === "exec" && command.program === "perform-effect") {
+        app.commands.push(command); await appendFile(effectPath, "performed once\n");
+        return { type: "process", exit_code: 0, stdout: "Effect recorded", stderr: "", truncated: false };
+      }
+      if (command.type === "exec" && command.program === "verify-effect") {
+        app.commands.push(command);
+        return { type: "process", exit_code: 0, stdout: await readFile(effectPath, "utf8"), stderr: "", truncated: false };
+      }
+      return app.call(command);
+    };
+    let scheduler = background();
+    try {
+      let started = () => {}; const streaming = new Promise<void>((resolve) => { started = resolve; });
+      app.faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("exec", { program: "perform-effect", args: [] }), { stopReason: "toolUse" }),
+        async (_context, options) => {
+          const signal = options?.signal; assert.ok(signal); started();
+          await new Promise<void>((resolve) => { if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true }); });
+          return fauxAssistantMessage("Discarded after interruption");
+        },
+      ]);
+      await scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: [exampleJob()] });
+      await pump(async () => (await scheduler.getJob("example-review")).schedules[0]?.next_at !== null);
+      clock.advance(DAY);
+      await pump(async () => (await app.tasks.list())[0]?.worker.state === "bound");
+      const task = (await app.tasks.list())[0]; assert.ok(task); assert.ok(first); const occurrence = first;
+      const conversation = await app.tasks.conversation(task.conversation_id);
+      worker = app.worker(task.id, controller, hostCall);
+      const failedWorker = assert.rejects(worker, /did not complete/);
+      await streaming; assert.equal(await readFile(effectPath, "utf8"), "performed once\n");
+      await conversation.abort(BACKGROUND_CONTEXT); await failedWorker;
+      const original = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
+      assert.ok(original); assert.equal(original.status, "unanswered");
+      await pump(async () => (await scheduler.status()).errors.some((error) => /scheduled turn/.test(error.message)));
+      await assert.rejects(runScheduled(occurrence, controller.signal, app, task.id), /scheduled turn/);
+      clock.advance(DAY);
+      await pump(async () => (await scheduler.status()).pending === 2);
+      assert.equal((await app.tasks.list()).length, 1, "The unanswered occurrence retains its serial job lane");
+
+      await app.tasks.enqueue(task.id, "Verify the original effect before resolving this same task.", "reconcile-effect", undefined, "follow_up");
+      await app.tasks.dispatch(task.id, await app.tasks.workerHost(task.id), app.call);
+      let reconciled = () => {}; const resolving = new Promise<void>((resolve) => { reconciled = resolve; });
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let verifying = () => {}; const verification = new Promise<void>((resolve) => { verifying = resolve; });
+      const verificationGate = new Promise<void>((resolve) => { allowVerification = resolve; });
+      app.faux.setResponses([
+        async () => { verifying(); await verificationGate;
+          return fauxAssistantMessage(fauxToolCall("exec", { program: "verify-effect", args: [] }), { stopReason: "toolUse" }); },
+        (context) => {
+          assert.ok(context.messages.some((message) => message.role === "toolResult" &&
+            message.content.some((part) => part.type === "text" && part.text.includes("performed once"))));
+          return fauxAssistantMessage(fauxToolCall("record_task", { summary: "Verified the original effect occurred once.",
+            ...(recoveredState === "waiting" ? { reconciles_input: occurrence.id } : {}),
+            state: recoveredState === "waiting" ? { state: "waiting", actor: "Upstream check", next_check: null }
+              : { state: "resolved", evidence: "Read back the original effect receipt; no replay is needed." } }), { stopReason: "toolUse" });
+        },
+        async () => { reconciled(); await gate; return fauxAssistantMessage("The original effect is verified and this task is reconciled."); },
+      ]);
+      worker = app.worker(task.id, controller, hostCall); await verification;
+      await conversation.submit({ type: "input", content: "Keep the existing upstream wait after verifying the effect.",
+        requestId: "recovery-steering", whenBusy: "steer" }, BACKGROUND_CONTEXT);
+      allowVerification(); await resolving;
+      assert.equal((await app.tasks.get(task.id)).state.state, recoveredState);
+      assert.equal(app.tasks.isRunning(task.id), true);
+      await assert.rejects(runScheduled(occurrence, controller.signal, app, task.id), /scheduled turn/);
+      release(); await worker;
+      const receipt = (await app.sources.events({ provider: "task_outcomes", thread_id: task.id, limit: 100 }))
+        .find((event) => event.outcome?.reconciliation !== undefined)?.outcome?.reconciliation;
+      assert.equal(await app.session.commit((tx) => app.tasks.canReleaseIn(tx, task.id), BACKGROUND_CONTEXT), recoveredState === "resolved",
+        "Resource release still requires task resolution");
+      // A native follow-up can outlive the application worker; it still owns the
+      // conversation until it and its queued input finish.
+      let following = () => {}; const followingStarted = new Promise<void>((resolve) => { following = resolve; });
+      const followupGate = new Promise<void>((resolve) => { allowFollowup = resolve; });
+      app.faux.setResponses([async () => { following(); await followupGate; return fauxAssistantMessage("Checked the follow-up."); },
+        fauxAssistantMessage("Checked the queued follow-up.")]);
+      const followup = await conversation.submit({ type: "input", content: "Review the upstream check.", requestId: "native-followup" }, BACKGROUND_CONTEXT);
+      await followingStarted;
+      const queued = await conversation.submit({ type: "input", content: "Retain the upstream wait.", requestId: "queued-followup", whenBusy: "followUp" }, BACKGROUND_CONTEXT);
+      assert.equal(app.tasks.isRunning(task.id), false);
+      assert.equal((await queued.status(BACKGROUND_CONTEXT)).status, "queued");
+      await assert.rejects(runScheduled(occurrence, controller.signal, app, task.id), /scheduled turn/);
+      allowFollowup(); await followup.wait(BACKGROUND_CONTEXT); await queued.wait(BACKGROUND_CONTEXT);
+      const owningHost = await app.tasks.workerHost(task.id);
+      await assert.rejects(app.tasks.dispatch(task.id, owningHost, async () => ({ type: "creation_uncertain", session_id: "session:22222222-2222-4222-8222-222222222222" })), /needs reconciliation/);
+      assert.equal((await app.tasks.get(task.id)).worker.state, "resume_uncertain");
+      await assert.rejects(runScheduled(occurrence, controller.signal, app, task.id), /scheduled turn/);
+      await app.tasks.dispatch(task.id, owningHost, async (command) => {
+        assert.equal(command.type, "on_node");
+        if (command.type !== "on_node") throw new Error("Reconcile the existing worker allocation");
+        assert.equal(command.command.type, "inspect_worker");
+        return { type: "worker_presence", presence: { state: "present", running: true } };
+      });
+      await app.session.close(BACKGROUND_CONTEXT); app = await openScheduled(directory, "restored", clock); scheduler = background();
+      await scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: [exampleJob()] });
+      await runScheduled(occurrence, controller.signal, app, task.id);
+      assert.equal((await app.tasks.get(task.id)).state.state, recoveredState);
+      if (recoveredState === "waiting") {
+        assert.equal(receipt?.original.submission_id, original.id.toString());
+        assert.deepEqual(receipt?.recovery_inputs.map((input) => input.request_id), ["reconcile-effect", "recovery-steering"]);
+      } else assert.equal(receipt, undefined);
+      clock.advance(3_600_000);
+      await pump(async () => (await app.tasks.get(task.id)).pending.length > 0);
+      app.faux.setResponses([fauxAssistantMessage("The next queued review completed.")]);
+      worker = app.worker(task.id, controller, hostCall); await worker;
+      await pump(async () => (await scheduler.status()).pending === 0);
+      assert.deepEqual((await scheduler.status()).errors, []);
+      assert.equal(await readFile(effectPath, "utf8"), "performed once\n");
+      assert.equal((await app.tasks.list()).length, 1);
+      const restored = await app.tasks.conversation((await app.tasks.get(task.id)).conversation_id);
+      const retained = await app.session.commit((tx) => tx.submissionByRequest(restored.id, occurrence.id), BACKGROUND_CONTEXT);
+      assert.equal(retained?.id, original.id); assert.equal(retained?.status, "unanswered");
+      const page = await restored.entries({}, 100, undefined, BACKGROUND_CONTEXT);
+      assert.equal(page.items.filter((entry) => UserEntry.is(entry)).length, 6, "The next occurrence joins the original input, explicit recovery, steering and native follow-ups");
+      assert.equal(app.commands.filter((command) => command.type === "exec" && command.program === "perform-effect").length, 0);
+    } finally {
+      release(); allowVerification(); allowFollowup(); controller.abort(); await worker?.catch(() => {});
+      await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
+    }
+  });
+}
 
 test("SIGKILL after scheduled input placement restores its actor without duplicating task, input or host work", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-scheduled-kill-"));
