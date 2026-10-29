@@ -36,7 +36,10 @@ impl EmbeddingSpace {
         let descriptor =
             format!("qwen3-embedding-0.6b:{MODEL_REVISION}:{MODEL_DIGEST}:1024:last:l2:1");
         Self {
-            id: format!("sha256:{:x}", Sha256::digest(descriptor.as_bytes())),
+            id: format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(descriptor.as_bytes()))
+            ),
             model_revision: MODEL_REVISION.into(),
             model_digest: MODEL_DIGEST.into(),
             dimensions: 1024,

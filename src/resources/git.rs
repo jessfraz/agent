@@ -535,7 +535,7 @@ impl GitBackend {
             resource_id: record.id,
             identity: identity.clone(),
             path: path_text(&path)?,
-            fingerprint: format!("{:x}", Sha256::digest(result.stdout.as_bytes())),
+            fingerprint: hex::encode(Sha256::digest(result.stdout.as_bytes())),
         };
         record.state = ResourceState::Retiring {
             identity,
@@ -597,7 +597,7 @@ impl GitBackend {
         );
         let bytes = private_file(Path::new(&plan.path), 256 * 1024)?;
         ensure!(
-            format!("{:x}", Sha256::digest(&bytes)) == plan.fingerprint,
+            hex::encode(Sha256::digest(&bytes)) == plan.fingerprint,
             "Reviewed cleanup plan changed; preserving worktree"
         );
         let reviewed: GuardedPlan = serde_json::from_slice(&bytes)?;

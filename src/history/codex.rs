@@ -487,7 +487,7 @@ impl CodexHistory {
             order,
             assets.iter().map(|asset| &asset.sha256).collect::<Vec<_>>(),
         ))?);
-        let version = format!("{:x}", hash.finalize());
+        let version = hex::encode(hash.finalize());
         for asset in &mut assets {
             asset.version = version.clone();
         }
@@ -634,7 +634,7 @@ impl CodexHistory {
             current.len() == metadata.len() && current.modified()? == metadata.modified()?,
             "History asset changed while its digest was read"
         );
-        let sha256 = format!("{:x}", hash.finalize());
+        let sha256 = hex::encode(hash.finalize());
         let locator = path
             .to_str()
             .context("History asset path is not UTF-8")?
@@ -960,7 +960,7 @@ fn flatten(turns: Vec<NativeTurn>) -> Vec<NativeEntry> {
         .collect()
 }
 fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 fn excerpt(text: &str, maximum: usize) -> String {
     let end = text

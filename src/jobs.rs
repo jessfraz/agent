@@ -443,7 +443,7 @@ pub fn load(directories: &[PathBuf]) -> Result<Vec<ScheduledJob>> {
             !job.title.trim().is_empty(),
             "A scheduled job title is required"
         );
-        job.revision = format!("{:x}", Sha256::digest(serde_json::to_vec(&job)?));
+        job.revision = hex::encode(Sha256::digest(serde_json::to_vec(&job)?));
         if raw.enabled {
             jobs.push(job);
         }

@@ -43,7 +43,7 @@ impl ContextStore {
             let instructions = snapshot.text;
             sources.extend(snapshot.sources);
             repositories.push(ContextRepository {
-                id: format!("context-{:x}", Sha256::digest(root.as_bytes())),
+                id: format!("context-{}", hex::encode(Sha256::digest(root.as_bytes()))),
                 root,
                 instructions,
             });

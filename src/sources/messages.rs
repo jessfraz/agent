@@ -461,10 +461,8 @@ impl MessagesSource {
                     }
                     .to_owned();
                     let text = serde_json::to_string(&message)?;
-                    let version = format!(
-                        "{:x}",
-                        Sha256::digest(serde_json::to_vec(&(&title, &text))?)
-                    );
+                    let version =
+                        hex::encode(Sha256::digest(serde_json::to_vec(&(&title, &text))?));
                     events.push(SourceEvent {
                         id: message.id,
                         version,

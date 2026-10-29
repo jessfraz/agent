@@ -212,7 +212,11 @@ impl GitHubSource {
                     digest.update((part.len() as u64).to_be_bytes());
                     digest.update(part.as_bytes());
                 }
-                let version = format!("{}:{:x}", notification.updated_at, digest.finalize());
+                let version = format!(
+                    "{}:{}",
+                    notification.updated_at,
+                    hex::encode(digest.finalize())
+                );
                 Some(SourceEvent {
                     id: notification.id.clone(),
                     version,

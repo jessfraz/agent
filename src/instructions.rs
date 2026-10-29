@@ -93,7 +93,7 @@ fn source(path: &Path, contents: &str) -> Result<GuidanceSource> {
             .to_str()
             .context("Guidance path is not UTF-8")?
             .to_owned(),
-        sha256: format!("{:x}", Sha256::digest(contents.as_bytes())),
+        sha256: hex::encode(Sha256::digest(contents.as_bytes())),
     })
 }
 
@@ -142,6 +142,28 @@ mod tests {
         assert!(updated.contains("Second version."));
         assert!(!updated.contains("First version."));
         assert!(project(&workspace).unwrap().is_empty());
+    }
+
+    #[test]
+    fn guidance_receipts_keep_fixed_lowercase_zero_padded_sha256() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("global.md");
+        for (contents, expected) in [
+            (
+                "abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                "286",
+                "00328ce57bbc14b33bd6695bc8eb32cdf2fb5f3a7d89ec14a42825e15d39df60",
+            ),
+        ] {
+            fs::write(&path, contents).unwrap();
+            let snapshot = global_snapshot(&path).unwrap();
+            assert_eq!(snapshot.text, contents);
+            assert_eq!(snapshot.sources.len(), 1);
+            assert_eq!(snapshot.sources[0].sha256, expected);
+        }
     }
 
     #[test]

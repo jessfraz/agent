@@ -90,7 +90,7 @@ where
         "Attachment filename must be at most {MAX_ATTACHMENT_NAME_BYTES} UTF-8 bytes"
     );
     use sha2::{Digest, Sha256};
-    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let sha256 = hex::encode(Sha256::digest(&bytes));
     let id = uuid::Uuid::new_v4().to_string();
     let size_bytes = u32::try_from(bytes.len())?;
     let mut offset = 0;
@@ -352,7 +352,7 @@ fn write_chunk(
             digest.update(&chunk[..count]);
         }
         ensure!(
-            format!("{:x}", digest.finalize()) == attachment.sha256,
+            hex::encode(digest.finalize()) == attachment.sha256,
             "Attachment checksum does not match its receipt"
         );
         if path != &final_path {
@@ -391,8 +391,62 @@ mod tests {
             name: "metadata.json".into(),
             media_type: "application/json".into(),
             size_bytes: bytes.len().try_into().unwrap(),
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: hex::encode(Sha256::digest(bytes)),
         }
+    }
+
+    #[tokio::test]
+    async fn fixed_sha256_receipt_survives_upload_and_durable_cache_replay() {
+        let source = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let path = source.path().join("receipt.txt");
+        let bytes = b"286";
+        let expected = "00328ce57bbc14b33bd6695bc8eb32cdf2fb5f3a7d89ec14a42825e15d39df60";
+        fs::write(&path, bytes).unwrap();
+        let receipt = upload_file(&path, |request| {
+            let AttachmentRequest::Upload {
+                id,
+                name,
+                media_type,
+                size_bytes,
+                offset,
+                data_base64,
+                complete,
+            } = request
+            else {
+                panic!("Unexpected request")
+            };
+            assert_eq!(STANDARD.decode(&data_base64).unwrap(), bytes);
+            assert!(complete);
+            let attachment = AttachmentRef {
+                id,
+                name,
+                media_type,
+                size_bytes,
+                sha256: expected.into(),
+            };
+            let HostResult::AttachmentWritten {
+                next_offset,
+                path: Some(stored),
+            } = write_chunk(cache.path(), &attachment, offset, &data_base64, complete).unwrap()
+            else {
+                panic!("Missing durable attachment")
+            };
+            assert_eq!(fs::read(stored).unwrap(), bytes);
+            std::future::ready(Ok(AttachmentResponse::Uploaded {
+                next_offset,
+                attachment: Some(attachment),
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(receipt.sha256, expected);
+        let saved: AttachmentRef = serde_json::from_slice(
+            &fs::read(cache.path().join(&receipt.id).join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved, receipt);
+        write_chunk(cache.path(), &saved, 0, &STANDARD.encode(bytes), true).unwrap();
     }
 
     #[tokio::test]
@@ -401,7 +455,7 @@ mod tests {
         let path = directory.path().join("report.md");
         let bytes = vec![b'x'; ATTACHMENT_CHUNK_BYTES as usize + 7];
         fs::write(&path, &bytes).unwrap();
-        let expected_hash = format!("{:x}", Sha256::digest(&bytes));
+        let expected_hash = hex::encode(Sha256::digest(&bytes));
         let mut received = Vec::new();
         let receipt = upload_file(&path, |request| {
             let AttachmentRequest::Upload {

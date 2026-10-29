@@ -4304,7 +4304,7 @@ mod tests {
                     name,
                     media_type,
                     size_bytes,
-                    sha256: format!("{:x}", Sha256::digest(&uploaded)),
+                    sha256: hex::encode(Sha256::digest(&uploaded)),
                 });
                 let event = RuntimeEventKind::Attachment {
                     response: AttachmentResponse::Uploaded {
