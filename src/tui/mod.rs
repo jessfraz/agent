@@ -374,39 +374,45 @@ impl Message {
     }
     fn cached(&mut self) -> &mut CachedText {
         self.rendered.get_or_insert_with(|| {
-            let mut lines = Vec::new();
             if let MessageKind::Tool { status, .. } = &self.kind {
-                lines.push(Line::styled(
-                    format!(
-                        "{} {}",
-                        match status {
-                            ToolStatus::Running => "•",
-                            ToolStatus::Finished => "✓",
-                            ToolStatus::Failed => "✗",
-                        },
-                        markdown::plain(&self.text)
+                return CachedText::new(vec![
+                    Line::styled(
+                        format!(
+                            "{} {}",
+                            match status {
+                                ToolStatus::Running => "•",
+                                ToolStatus::Finished => "✓",
+                                ToolStatus::Failed => "✗",
+                            },
+                            markdown::plain(&self.text)
+                        ),
+                        Style::default().fg(Color::DarkGray),
                     ),
-                    Style::default().fg(Color::DarkGray),
-                ));
-                lines.push(Line::default());
-            } else {
-                append(&mut lines, self.role, &self.text);
-                if let MessageKind::Input { mode, delivery, .. } = &self.kind {
-                    let label = match (mode, delivery) {
-                        (_, InputDelivery::Submitting) => "You · sending",
-                        (InputMode::Steer, InputDelivery::Waiting) => "You · steering, waiting",
-                        (InputMode::FollowUp, InputDelivery::Waiting) => "You · queued",
-                        (_, InputDelivery::Placed { .. }) => "You",
-                    };
-                    lines[0] = Line::styled(
-                        label,
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    );
-                }
+                    Line::default(),
+                ]);
             }
-            CachedText::new(lines)
+            let label = if let MessageKind::Input { mode, delivery, .. } = &self.kind {
+                match (mode, delivery) {
+                    (_, InputDelivery::Submitting) => "You · sending",
+                    (InputMode::Steer, InputDelivery::Waiting) => "You · steering, waiting",
+                    (InputMode::FollowUp, InputDelivery::Waiting) => "You · queued",
+                    (_, InputDelivery::Placed { .. }) => "You",
+                }
+            } else {
+                self.role.label()
+            };
+            let header = Line::styled(
+                label,
+                Style::default()
+                    .fg(self.role.color())
+                    .add_modifier(Modifier::BOLD),
+            );
+            let style = if matches!(self.role, Role::Thinking | Role::Tool | Role::Commentary) {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            CachedText::markdown(header, &self.text, style)
         })
     }
     fn append(&mut self, text: &str) {
@@ -1482,25 +1488,6 @@ pub fn help_text() -> String {
             .join("\n")
     )
 }
-fn append(lines: &mut Vec<Line<'static>>, role: Role, text: &str) {
-    lines.push(Line::styled(
-        role.label(),
-        Style::default()
-            .fg(role.color())
-            .add_modifier(Modifier::BOLD),
-    ));
-    let rendered = markdown::render(text);
-    if matches!(role, Role::Thinking | Role::Tool | Role::Commentary) {
-        lines.extend(
-            rendered
-                .into_iter()
-                .map(|line| line.style(Style::default().fg(Color::DarkGray))),
-        );
-    } else {
-        lines.extend(rendered);
-    }
-    lines.push(Line::default());
-}
 
 fn run(
     screen: &mut Screen,
@@ -1595,6 +1582,43 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect()
     }
+    #[test]
+    fn live_and_reopened_tables_share_cached_width_aware_layout() {
+        let text = "| Item | Detail |\n| :--- | ---: |\n| **Board** | ready now |\n| 界界 | pending work |";
+        let mut live = state();
+        live.event(RuntimeEventKind::Answer {
+            conversation_id: "main".into(),
+            entry_id: Some("table".into()),
+            text: text.into(),
+        });
+        let mut reopened = state();
+        reopened.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: vec![HistoryMessage {
+                entry_id: "table".into(),
+                role: HistoryRole::Final,
+                text: text.into(),
+                continuation: false,
+                final_chunk: true,
+                tool: None,
+            }],
+            next_cursor: None,
+            page_complete: true,
+        });
+        for width in [48, 18, 32, 48] {
+            let actual = rendered(&mut live, width, 30);
+            assert_eq!(actual, rendered(&mut reopened, width, 30), "width {width}");
+            assert!(actual.contains('│'));
+            assert!(!actual.contains('|'));
+            let before = live.layout_work;
+            assert_eq!(actual, rendered(&mut live, width, 30));
+            assert_eq!(live.layout_work.parsed_messages, before.parsed_messages);
+            assert_eq!(live.layout_work.measured_messages, before.measured_messages);
+        }
+        assert_eq!(live.layout_work.parsed_messages, 1);
+        assert_eq!(reopened.layout_work.parsed_messages, 1);
+    }
+
     #[test]
     fn scrolling_and_live_updates_reuse_saved_layout_and_resize_only_reflows_it() {
         let mut view = state();

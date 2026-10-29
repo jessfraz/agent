@@ -72,6 +72,7 @@ test("main and worker tools find older substantive context beside a newer shallo
     const decisionEntry = entries.find((entry) => entry.data.item.id === decision.id); assert.ok(decisionEntry);
     const worker = await tasks.create({ title: "Retrieval check", outcome: "Inspect retained evidence", model: fixtureModel });
     const root = await session.root(BACKGROUND_CONTEXT);
+    await retrieval.sync(call);
     for (const role of ["main", "worker"]) {
       const conversation = role === "main" ? root : await tasks.conversation(worker.conversation_id);
       const unbind = executions.bind(conversation.id.toString(), { cwd: "/example/project", hosts: [], call,
@@ -226,4 +227,66 @@ test("automatic context reads published keyword matches while a native corpus up
     const complete = await retrieval.search("Connector", [], 8, call, true);
     assert.equal(complete.candidates.length, 2, "Full semantic search retains newly published corpus results");
   } finally { release(); await syncing; retrieval.close(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("semantic reads after reopen bypass an owned full catchup and retain incremental updates", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-search-owned-catchup-"));
+  const open = async () => {
+    const models = createModels();
+    const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+      { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
+    const history = new HistoryStore(session), tasks = new TaskStore(session, new ConversationModels(models)); tasks.useHistory(history);
+    return { session, history, tasks, retrieval: new Retrieval(session, history, tasks, join(directory, "search.sqlite")) };
+  };
+  const embedding: HostCall = async (command) => {
+    assert.ok(command.type === "embed");
+    return { type: "embeddings", batch: { space, vectors: command.texts.map((text) => command.purpose === "query" || text.includes("automobile") ? [1, 0, 0] : [0, 1, 0]) } };
+  };
+  let app = await open(), closed = false;
+  let release = () => {}, entered = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; }), started = new Promise<void>((resolve) => { entered = resolve; });
+  let catchup: Promise<void> | undefined, query: Promise<Awaited<ReturnType<Retrieval["search"]>>> | undefined;
+  try {
+    const saved = await app.history.import(batch("retained-vehicle", 1, [item("old", "Published automobile specification", 1)]));
+    await app.retrieval.sync(embedding);
+    await app.history.import(batch("pending-cooking", 2, [item("new", "Unpublished chocolate cake instructions", 1)]));
+    app.retrieval.close(); await app.session.close(BACKGROUND_CONTEXT); closed = true;
+    app = await open(); closed = false;
+    const owned: HostCall = async (command) => {
+      if (command.type === "embed" && command.purpose === "document") { entered(); await held; }
+      return embedding(command);
+    };
+    catchup = app.retrieval.sync(owned, true); await started;
+    let returned = false;
+    const read: HostCall = async (command) => { assert.ok(command.type === "embed" && command.purpose === "query", "The query must not take over corpus work"); return embedding(command); };
+    query = app.retrieval.search("car wheel repair", [], 8, read, false).then((result) => { returned = true; return result; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(returned, true, "A semantic query must return the published index while the owned full reconcile is held");
+    const published = await query;
+    assert.equal(published.candidates[0]?.conversation_id, saved.conversation.conversation_id, "Dense retrieval must retain vocabulary-mismatch matches");
+    assert.ok(published.gaps.length > 0, "In-flight catchup must remain explicit partial coverage");
+    release(); await catchup;
+    const caughtUp = await app.retrieval.search("car wheel repair", [], 8, embedding, false);
+    assert.equal(caughtUp.candidates.length, 2, "The existing owner must still publish its completed catchup");
+    assert.deepEqual(caughtUp.gaps, []);
+    const conversation = await app.tasks.conversation(saved.conversation.conversation_id);
+    await conversation.submit({ type: "write", entry: { kind: "fixture.current", model: [{ role: "user", content: "Current automobile steering context", timestamp: 3 }] } }, BACKGROUND_CONTEXT);
+    const current = await app.retrieval.search("car wheel repair", [], 8, embedding, false);
+    assert.ok(current.candidates.some((candidate) => candidate.matches.some((match) => match.text === "Current automobile steering context")), "Normal incremental commits must still become searchable");
+    await app.history.import(batch("cold-unindexed", 3, [item("cold", "Unindexed sourdough recipe", 1)]));
+    app.retrieval.close(); await app.session.close(BACKGROUND_CONTEXT); closed = true;
+    app = await open(); closed = false;
+    let documentCalls = 0;
+    const cold = await app.retrieval.search("car wheel repair", [], 8, async (command) => {
+      if (command.type === "embed" && command.purpose === "document") documentCalls += 1;
+      return embedding(command);
+    }, false);
+    assert.equal(documentCalls, 0, "A cold semantic read must not initiate full inventory reconciliation");
+    assert.equal(cold.candidates[0]?.conversation_id, saved.conversation.conversation_id);
+    assert.ok(cold.gaps.length > 0, "An unreconciled restart cannot claim complete coverage");
+  } finally {
+    release(); await Promise.allSettled([catchup, query]);
+    if (!closed) { app.retrieval.close(); await app.session.close(BACKGROUND_CONTEXT); }
+    await rm(directory, { recursive: true, force: true });
+  }
 });

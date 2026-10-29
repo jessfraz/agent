@@ -1,14 +1,39 @@
 //! Retain native text layout, then render only paragraphs intersecting the viewport.
 
+use crate::tui::markdown;
 use ratatui::{
     Frame,
     buffer::Buffer,
     layout::Rect,
+    style::Style,
     text::Line,
     widgets::{Paragraph, Widget, Wrap},
 };
 
+struct MarkdownBody {
+    header: Line<'static>,
+    content: markdown::Document,
+    style: Style,
+}
+
+impl MarkdownBody {
+    fn paragraphs(&self, width: u16) -> Vec<Paragraph<'static>> {
+        std::iter::once(self.header.clone())
+            .chain(self.content.lines(width).into_iter().map(|line| {
+                if self.style == Style::default() {
+                    line
+                } else {
+                    line.style(self.style)
+                }
+            }))
+            .chain(std::iter::once(Line::default()))
+            .map(|line| Paragraph::new(line).wrap(Wrap { trim: false }))
+            .collect()
+    }
+}
+
 pub(super) struct CachedText {
+    markdown: Option<MarkdownBody>,
     paragraphs: Vec<Paragraph<'static>>,
     row_ends: Vec<usize>,
     width: Option<u16>,
@@ -17,10 +42,32 @@ pub(super) struct CachedText {
 impl CachedText {
     pub(super) fn new(lines: Vec<Line<'static>>) -> Self {
         Self {
+            markdown: None,
             paragraphs: lines
                 .into_iter()
                 .map(|line| Paragraph::new(line).wrap(Wrap { trim: false }))
                 .collect(),
+            row_ends: Vec::new(),
+            width: None,
+        }
+    }
+
+    pub(super) fn markdown(header: Line<'static>, source: &str, style: Style) -> Self {
+        let body = MarkdownBody {
+            header,
+            content: markdown::Document::parse(source),
+            style,
+        };
+        let (markdown, paragraphs) = if body.content.has_tables() {
+            (Some(body), Vec::new())
+        } else {
+            // Ordinary prose retains its native widgets through resize, as before.
+            let paragraphs = body.paragraphs(u16::MAX);
+            (None, paragraphs)
+        };
+        Self {
+            markdown,
+            paragraphs,
             row_ends: Vec::new(),
             width: None,
         }
@@ -33,6 +80,9 @@ impl CachedText {
 
     pub(super) fn layout(&mut self, width: u16) -> usize {
         if self.width != Some(width) {
+            if let Some(body) = &self.markdown {
+                self.paragraphs = body.paragraphs(width);
+            }
             self.row_ends.clear();
             let mut total = 0;
             for paragraph in &self.paragraphs {

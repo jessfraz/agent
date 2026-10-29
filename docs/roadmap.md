@@ -9,12 +9,12 @@ recovery; [history](history.md) describes import and retrieval.
   verify real searches. Missing files stay explicit gaps.
 - [ ] Verify chat admission, steering, interruption, reopening and scrolling
   against a large live corpus while background work runs.
-- [ ] Ship private lifecycle logs, `/machines`, local usage-reset times and
+- [x] Ship private lifecycle logs, `/machines`, local usage-reset times and
   countdowns, and the remaining viewport correction.
 
 ## Inputs and automation
 
-- [ ] Ship hosted web search and page retrieval with source links for supported
+- [x] Ship hosted web search and page retrieval with source links for supported
   OpenAI models. The existing ChatGPT login has passed an isolated search,
   open-page and find-in-page check. Other providers need their own integration.
 - [ ] Chrome browser tool as the last fallback after APIs and CLIs; reuse the

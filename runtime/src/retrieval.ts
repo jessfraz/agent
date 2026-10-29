@@ -12,6 +12,7 @@ export class Retrieval {
   private readonly dirty = new Map<string, string>();
   private readonly unsubscribe: () => void;
   private syncing = Promise.resolve();
+  private pendingSyncs = 0;
   constructor(session: Harness, private readonly histories: HistoryStore, private readonly tasks: TaskStore, private readonly path: string) {
     this.unsubscribe = session.subscribeCommits((publication) => {
       for (const change of publication.changes) if (change.type === "entry") {
@@ -29,27 +30,35 @@ export class Retrieval {
       return result.batch;
     };
   }
+  private queue(action: () => Promise<void>): Promise<void> {
+    this.pendingSyncs += 1;
+    const operation = this.syncing.then(action).finally(() => { this.pendingSyncs -= 1; });
+    this.syncing = operation.catch(() => {}); return operation;
+  }
+  private async changed(call: HostCall): Promise<void> {
+    const index = this.open(), embed = this.embed(call);
+    for (const [id, queued] of [...this.dirty]) {
+      const checkpoint = index.checkpoint(id);
+      if (checkpoint?.watermark === queued && !checkpoint.dirty) {
+        if (this.dirty.get(id) === queued) this.dirty.delete(id);
+        continue;
+      }
+      const conversation = await this.tasks.conversation(id);
+      const tail = await conversation.entries({ order: "descending" }, 1, undefined, BACKGROUND_CONTEXT);
+      const watermark = tail.items[0]?.id.toString() ?? "empty";
+      await index.upsert(id, watermark, this.tasks.records(id), embed);
+      if (this.dirty.get(id) === watermark) this.dirty.delete(id);
+    }
+  }
+  /** Full catchup keeps the explicit import request's host-call ownership. */
   sync(call: HostCall, all = false): Promise<void> {
-    const operation = this.syncing.then(async () => {
-      const index = this.open(); const embed = this.embed(call);
+    return this.queue(async () => {
       if (!this.ready || all) {
-        await index.reconcile(this.histories.inventory(), (id) => this.tasks.records(id), embed);
+        await this.open().reconcile(this.histories.inventory(), (id) => this.tasks.records(id), this.embed(call));
         this.ready = true;
       }
-      for (const [id, queued] of [...this.dirty]) {
-        const checkpoint = index.checkpoint(id);
-        if (checkpoint?.watermark === queued && !checkpoint.dirty) {
-          if (this.dirty.get(id) === queued) this.dirty.delete(id);
-          continue;
-        }
-        const conversation = await this.tasks.conversation(id);
-        const tail = await conversation.entries({ order: "descending" }, 1, undefined, BACKGROUND_CONTEXT);
-        const watermark = tail.items[0]?.id.toString() ?? "empty";
-        await index.upsert(id, watermark, this.tasks.records(id), embed);
-        if (this.dirty.get(id) === watermark) this.dirty.delete(id);
-      }
+      await this.changed(call);
     });
-    this.syncing = operation.catch(() => {}); return operation;
   }
   /** Automatic context must not hold user admission behind corpus catchup. */
   async snapshot(query: string, sources: string[], limit: number): Promise<SearchResult> {
@@ -63,10 +72,15 @@ export class Retrieval {
   }
   async search(query: string, sources: string[], limit: number, call: HostCall, importing = false, mode: SearchMode = "semantic"): Promise<SearchResult> {
     const gaps: string[] = [];
-    if (!importing) {
-      try { await this.sync(call); }
+    // Reads can refresh their own observed commits, but never enqueue behind
+    // an owned corpus catchup or turn a cold process into a full-index owner.
+    if (!importing && this.pendingSyncs === 0 && this.dirty.size > 0) {
+      try { await this.queue(() => this.changed(call)); }
       catch (error) { gaps.push(error instanceof Error ? error.message : "History indexing is unavailable"); }
-    } else gaps.push("Codex history import and indexing are in progress");
+    }
+    if (importing) gaps.push("Codex history import and indexing are in progress");
+    else if (this.pendingSyncs > 0) gaps.push("History indexing is in progress; results use the published index");
+    else if (!this.ready) gaps.push("History index freshness is unverified; results use the published index");
     try {
       const result = await this.open().search(query, this.embed(call), sources, limit, mode);
       return { candidates: result.candidates, gaps: [...gaps, ...result.gaps] };

@@ -186,7 +186,7 @@ test("real bridge confines malformed host replies to their matching operation", 
     assert.equal(frames.some((frame) => frame.id === 2 && frame.event.type === "done"), false);
     send(2, { type: "host_reply", call_id: second.call_id, result: { type: "embeddings", batch: { space, vectors: [[1, 0, 0]] } } });
     await event(2, "done"); const healthy = await event(2, "saved_matches"); assert.ok(healthy.type === "saved_matches");
-    assert.deepEqual(healthy.gaps, []);
+    assert.deepEqual(healthy.gaps, ["History index freshness is unverified; results use the published index"]);
     assert.equal(JSON.stringify(frames).includes("private payload must not enter diagnostics"), false);
     child.stdin.end(); assert.equal(await closed, 0, errors);
     assert.equal(errors.includes("private payload must not enter diagnostics"), false);

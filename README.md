@@ -52,10 +52,10 @@ The TUI reopens the saved main conversation with `agent` and reconnects to
 ongoing work. `/exit` or Ctrl+C detaches main chat while that work continues;
 reopen it to follow or steer the same execution. `/history` reads older pages.
 
-The terminal UI renders Markdown and shows the model, reasoning, directory and
-live activity. Enter steers, Tab queues a separate FIFO turn, Shift+Enter inserts
-a newline, and Esc stops. Press `?` in an empty editor or use `/help` for the
-current commands and shortcuts. `/model`, `/reasoning` and `/fast` control this
+The terminal UI renders Markdown, including tables, and shows the model,
+reasoning, directory and live activity. Enter steers, Tab queues a separate FIFO
+turn, Shift+Enter inserts a newline, and Esc stops. Press `?` in an empty editor
+or use `/help` for commands and shortcuts. `/model`, `/reasoning` and `/fast` control this
 conversation; `/status` shows its settings, connection and available plan usage.
 Reset times use the client's local timezone and include a countdown.
 `/machines` shows connected hosts, hardware capacity and recent load samples.

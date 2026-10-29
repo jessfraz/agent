@@ -110,6 +110,8 @@ each entry's identity and provenance.
 Startup reconciliation compares conversation tails with saved watermarks, so
 missed notifications cannot permanently hide a conversation. Internal feed
 judgment transcripts are retained in Pi but are not retrieval candidates.
+Search reads published results while an owned import catches up; it reports
+incomplete coverage rather than waiting for a full corpus rebuild.
 
 Keep useful user/assistant text and bounded meaningful tool content searchable.
 Respect message boundaries and retain entry/asset provenance for every chunk.
