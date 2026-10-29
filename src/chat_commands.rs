@@ -1,11 +1,11 @@
 //! Local chat controls. Clap owns parsing and the command list shown in help.
 
 use crate::{
-    jobs::JobId,
+    jobs::{JobId, ScheduleId},
     models::{ModelProvider, Reasoning},
     protocol::{ConversationChange, FastMode, RuntimeCommand, TaskId},
 };
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use std::ops::Range;
 
 #[derive(Clone, Debug)]
@@ -14,6 +14,29 @@ pub struct Completion {
     pub text: String,
     pub label: String,
     pub description: String,
+}
+
+/// CLI and slash commands share selection parsing and request identity creation.
+#[derive(Args, Clone, Debug, PartialEq, Eq)]
+pub struct JobRunArgs {
+    #[arg(value_name = "JOB_ID", value_parser = parse_job_id)]
+    pub job_id: JobId,
+    #[arg(long = "schedule", value_name = "SCHEDULE_ID", value_parser = parse_schedule_id)]
+    pub schedule_id: Option<ScheduleId>,
+}
+
+impl JobRunArgs {
+    pub fn request(&self) -> RuntimeCommand {
+        self.request_with_id(uuid::Uuid::new_v4().to_string())
+    }
+
+    pub fn request_with_id(&self, request_id: String) -> RuntimeCommand {
+        RuntimeCommand::RunJob {
+            job_id: self.job_id.clone(),
+            schedule_id: self.schedule_id.clone(),
+            request_id,
+        }
+    }
 }
 
 /// Complete only command names and static positional values owned by Clap.
@@ -108,6 +131,8 @@ pub enum ChatCommand {
         #[arg(value_name = "JOB_ID", value_parser = parse_job_id)]
         id: Option<JobId>,
     },
+    /// Run an applied job now, choosing a schedule when it has several.
+    RunJob(JobRunArgs),
     /// Show available models, or choose [provider/]model.
     Model {
         #[arg(value_name = "MODEL")]
@@ -154,6 +179,10 @@ struct Input {
 
 fn parse_job_id(value: &str) -> Result<JobId, String> {
     JobId::try_from(value.to_owned()).map_err(|error| error.to_string())
+}
+
+fn parse_schedule_id(value: &str) -> Result<ScheduleId, String> {
+    ScheduleId::try_from(value.to_owned()).map_err(|error| error.to_string())
 }
 
 impl ChatCommand {
@@ -204,6 +233,7 @@ impl ChatCommand {
 
     pub fn jobs(&self) -> Option<RuntimeCommand> {
         match self {
+            Self::RunJob(args) => Some(args.request()),
             Self::Jobs { id: None } => Some(RuntimeCommand::ListJobs),
             Self::Jobs { id: Some(job_id) } => Some(RuntimeCommand::ReadJob {
                 job_id: job_id.clone(),
@@ -250,6 +280,47 @@ mod tests {
         models::ModelProvider,
         protocol::{ConversationChange, FastMode, RuntimeCommand},
     };
+
+    #[test]
+    fn manual_job_controls_share_typed_selection_and_keep_job_inspection_unambiguous() {
+        let command = ChatCommand::parse("/run-job Daily_Review.v2 --schedule Morning.v1")
+            .unwrap()
+            .unwrap();
+        let Some(RuntimeCommand::RunJob {
+            job_id,
+            schedule_id: Some(schedule_id),
+            request_id,
+        }) = command.jobs()
+        else {
+            panic!("Manual job control must produce the shared admission request");
+        };
+        assert_eq!(job_id.as_str(), "Daily_Review.v2");
+        assert_eq!(schedule_id.as_str(), "Morning.v1");
+        assert!(uuid::Uuid::parse_str(&request_id).is_ok());
+        assert!(command.settings(None).is_none());
+        assert!(matches!(
+            ChatCommand::parse("/run-job daily-review")
+                .unwrap()
+                .unwrap()
+                .jobs(),
+            Some(RuntimeCommand::RunJob {
+                schedule_id: None,
+                ..
+            })
+        ));
+        assert!(
+            matches!(ChatCommand::parse("/jobs run").unwrap().unwrap().jobs(),
+            Some(RuntimeCommand::ReadJob { job_id }) if job_id.as_str() == "run")
+        );
+        for invalid in [
+            "/run-job",
+            "/run-job daily extra",
+            "/run-job daily --schedule",
+            "/run-job daily --schedule invalid\u{0007}",
+        ] {
+            assert!(ChatCommand::parse(invalid).unwrap().is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn job_controls_produce_typed_requests_and_reject_invalid_ids() {
@@ -355,9 +426,15 @@ mod tests {
     fn help_uses_the_actual_parser_and_control_requests_never_create_chat_input() {
         for (usage, _) in command_help() {
             let name = usage.split_whitespace().next().unwrap();
-            if name != "/feedback" {
-                assert!(ChatCommand::parse(name).unwrap().is_ok(), "{name}");
-            }
+            let invocation = match name {
+                "/feedback" => "/feedback explain the failure",
+                "/run-job" => "/run-job daily-review",
+                other => other,
+            };
+            assert!(
+                ChatCommand::parse(invocation).unwrap().is_ok(),
+                "{invocation}"
+            );
         }
         let command = ChatCommand::Fast { mode: None }.settings(None).unwrap();
         assert!(matches!(

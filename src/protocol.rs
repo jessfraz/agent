@@ -237,6 +237,11 @@ pub enum RuntimeCommand {
     ReadJob {
         job_id: crate::jobs::JobId,
     },
+    RunJob {
+        job_id: crate::jobs::JobId,
+        schedule_id: Option<crate::jobs::ScheduleId>,
+        request_id: String,
+    },
     ConfigureCoordinator {
         bootstrap: CoordinatorBootstrap,
     },
@@ -588,6 +593,9 @@ pub struct TaskRecord {
     pub summary: String,
     #[serde(default)]
     pub model: Option<ModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub scheduled_run: Option<crate::background::JobRunReceipt>,
     pub state: TaskState,
     pub worker: WorkerState,
     pub sources: Vec<SourceRef>,
@@ -847,6 +855,9 @@ pub struct RuntimeEvent {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEventKind {
+    JobRun {
+        run: crate::background::JobRunReceipt,
+    },
     JobsSynced {
         report: crate::background::JobSyncReport,
     },

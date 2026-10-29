@@ -21,7 +21,7 @@ import { Retrieval } from "./retrieval.js";
 import { FeedbackStore } from "./feedback.js";
 import { FeedbackDispatcher } from "./feedback-dispatch.js";
 import { createGuidance } from "./guidance.js";
-import { createAppTools, Executions, HostRequests } from "./tools.js";
+import { createAppTools, createJobTools, Executions, HostRequests } from "./tools.js";
 import { createSourceTools, SourceJournal } from "./sources.js";
 import { createResourceTools, ResourceStore } from "./resources.js";
 import { activity, history } from "./transcript.js";
@@ -81,7 +81,9 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
   return hostRequests.call(backgroundOwner, command);
 }
 
-async function openApplication() {
+type Application = TriageApplication & { stopPlacements(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore;
+  histories: HistoryStore; catalog: ConversationCatalog; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler };
+async function openApplication(): Promise<Application> {
   const database = await openNodeSqliteDatabase(join(state, "session.sqlite"));
   await database.exec("PRAGMA synchronous = FULL");
   const storage = await SqliteStorage.open(database);
@@ -117,7 +119,7 @@ async function openApplication() {
     }
   });
   const core = { stopPlacements, harness, tasks, environment, executions, tools, sources, sourceTools, resources, resourceTools, histories, catalog, importer, retrieval, guidance, feedback, repairs };
-  const background = new BackgroundScheduler(harness, registry, {
+  const background = new BackgroundScheduler(harness, registry, tasks, {
     async plan(cadence, after, now) {
       const result = await backgroundCall({ type: "background", request: { type: "plan", cadence, after, now } });
       if (result.type !== "background" || result.response.type !== "plan") throw new TaskError("The Rust background planner is unavailable");
@@ -133,7 +135,7 @@ async function openApplication() {
         for (const read of result.response.reads) await sources.admit(read.batch, read.expected_checkpoint);
         cursor = result.response.cursor;
       } while (cursor !== null);
-      if (backgroundOwner !== undefined) await triageSources(core, backgroundOwner, { type: "triage_sources", instructions: "", model: settings.model, cwd: "/", hosts: [] });
+      if (backgroundOwner !== undefined) await triageSources(await app(), backgroundOwner, { type: "triage_sources", instructions: "", model: settings.model, cwd: "/", hosts: [] });
     },
     async collectResources() {
       const available = await environment.environment();
@@ -144,7 +146,8 @@ async function openApplication() {
     },
     async runJob(occurrence, signal) { await runScheduled(occurrence, signal, { session: harness, tasks, sources, environment, executions, call: backgroundCall }); },
   });
-  return { ...core, background };
+  const jobTools = createJobTools(background, executions); registry.install(jobTools);
+  return { ...core, background, jobTools };
 }
 let application: ReturnType<typeof openApplication> | undefined;
 function app(): ReturnType<typeof openApplication> { return application ??= openApplication(); }
@@ -186,9 +189,9 @@ function searchFor(application: Awaited<ReturnType<typeof openApplication>>, id:
 }
 type TriageApplication = { sources: SourceJournal; environment: CoordinatorEnvironment; executions: Executions;
   tools: ReturnType<typeof createAppTools>; sourceTools: ReturnType<typeof createSourceTools>; resourceTools: ReturnType<typeof createResourceTools>;
-  guidance: ReturnType<typeof createGuidance>; retrieval: Retrieval; importer: CodexImporter };
+  guidance: ReturnType<typeof createGuidance>; jobTools: ReturnType<typeof createJobTools>; retrieval: Retrieval; importer: CodexImporter };
 async function triageSources(application: TriageApplication, id: number, command: Extract<RuntimeCommand, { type: "triage_sources" }>): Promise<void> {
-  const { sources, environment, executions, tools, sourceTools, resourceTools, guidance } = application;
+  const { sources, environment, executions, tools, sourceTools, resourceTools, guidance, jobTools } = application;
   if (!await sources.hasWork()) return;
   const hosts = await environment.hosts(command.cwd, null, command.hosts);
   const default_host = await environment.defaultHost(hosts);
@@ -197,7 +200,7 @@ async function triageSources(application: TriageApplication, id: number, command
   await sources.triage({ ...command, hosts }, (conversation, model) => executions.bind(conversation.id.toString(), {
     model, cwd: command.cwd, hosts, default_host, role: "triage", search, call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
     notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
-  }), [guidance, tools.host, tools.main, sourceTools, resourceTools]);
+  }), [guidance, tools.host, tools.main, sourceTools, resourceTools, jobTools]);
 }
 async function interrupt(id: number): Promise<void> {
   interrupted.add(id);
@@ -302,6 +305,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
       case "job_status": emit(id, { type: "job_status", status: await (await app()).background.status() }); break;
       case "list_jobs": emit(id, { type: "scheduled_jobs", jobs: await (await app()).background.listJobs() }); break;
       case "read_job": emit(id, { type: "scheduled_job", job: await (await app()).background.getJob(command.job_id) }); break;
+      case "run_job": emit(id, { type: "job_run", run: await (await app()).background.runJob(command) }); break;
       case "configure_coordinator":
         await (await app()).environment.configure(command.bootstrap); emit(id, { type: "configured" }); break;
       case "register_node":
@@ -561,7 +565,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
           if (interrupted.has(id)) { emit(id, { type: "interrupted" }); return; }
           if (command.model !== null) await inference.preflight(command.model);
           const application = await app();
-          const { harness, tasks, environment, executions, tools, sourceTools, resourceTools, guidance } = application;
+          const { harness, tasks, environment, executions, tools, sourceTools, resourceTools, guidance, jobTools } = application;
           const root = await harness.root(BACKGROUND_CONTEXT);
           if (command.model !== null) await inference.configure(root, command.model, {});
           let selected = await inference.legacy(root, await environment.model(null));
@@ -592,7 +596,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
               JSON.stringify({ default_host_id: default_host?.host_id ?? null, origin_host_id: command.origin_host_id, project_cwd: command.cwd,
                 hosts: hosts.map((host) => ({ host_id: host.host_id, name: host.name, cwd: host.cwd })) });
             selected = await inference.configureCurrent(root, selected, {
-              instructions: (await environment.instructions(command.instructions)) + relatedContext + hostsContext, cwd: command.cwd, extensions: [guidance, tools.host, tools.main, sourceTools, resourceTools] });
+              instructions: (await environment.instructions(command.instructions)) + relatedContext + hostsContext, cwd: command.cwd, extensions: [guidance, tools.host, tools.main, sourceTools, resourceTools, jobTools] });
             executions.setModel(root.id.toString(), selected);
             if (interrupted.has(id)) { await interrupts.get(id); return; }
             submissionAttempted = true;

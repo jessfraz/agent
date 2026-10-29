@@ -18,7 +18,7 @@ use std::{
 
 use agent_cli::{
     background::BackgroundSettings,
-    chat_commands::ChatCommand,
+    chat_commands::{ChatCommand, JobRunArgs},
     config::{self, ClientConfig},
     context::ContextStore,
     discovery,
@@ -287,6 +287,8 @@ enum ResourcesAction {
 
 #[derive(Subcommand)]
 enum JobsAction {
+    /// Run an applied job now, choosing a schedule when it has several.
+    Run(JobRunArgs),
     /// Validate the complete job catalog and preview upcoming occurrences.
     Check {
         #[arg(long = "directory")]
@@ -620,6 +622,7 @@ async fn main() -> Result<()> {
         Action::Logout => RuntimeCommand::Logout,
         Action::Sources => RuntimeCommand::SourceStates,
         Action::Jobs { command } => match command {
+            JobsAction::Run(args) => args.request(),
             JobsAction::Sync { directories } => {
                 ensure!(
                     coordinator.is_none(),
@@ -3367,6 +3370,7 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
             }
         }
         event @ (RuntimeEventKind::JobsSynced { .. }
+        | RuntimeEventKind::JobRun { .. }
         | RuntimeEventKind::ScheduledJobs { .. }
         | RuntimeEventKind::ScheduledJob { .. }) => {
             if let Some(text) = agent_cli::job_view::event(event) {

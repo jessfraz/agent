@@ -15,6 +15,10 @@ import type { ScheduledOccurrence } from "./generated/ScheduledOccurrence.js";
 import type { ScheduledJobStatus } from "./generated/ScheduledJobStatus.js";
 import type { JobSchedule } from "./generated/JobSchedule.js";
 import type { JobSyncReport } from "./generated/JobSyncReport.js";
+import type { JobRunReceipt } from "./generated/JobRunReceipt.js";
+import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
+import { TaskError, TaskStore } from "./tasks.js";
+import { scheduledTaskId } from "./scheduled.js";
 
 type Trigger = { key: BackgroundTriggerKey; generation: number; revision: string;
   task: NativeTaskId<null> | null; cursor: number | null; last: number | null; next: number | null; enabled: boolean;
@@ -58,7 +62,7 @@ function revision(job: ScheduledJob, schedule: JobSchedule): string {
 /** Sources and jobs share this single native Pi state machine and its durable timer. */
 export class BackgroundScheduler {
   private readonly task: NativeTask;
-  constructor(private readonly session: Harness, registry: Registry, callbacks: BackgroundCallbacks) {
+  constructor(private readonly session: Harness, registry: Registry, private readonly tasks: TaskStore, callbacks: BackgroundCallbacks) {
     this.task = defineTask<BackgroundTaskInput, BackgroundCheckpoint, null>({
       name: "agent.background", version: 1,
       initial: (input) => input.type === "trigger" ? { phase: "tick", cursor: null } : { phase: "execute", attempt: 0 },
@@ -109,7 +113,8 @@ export class BackgroundScheduler {
             switch (input.work.type) {
               case "sources": await callbacks.refreshSources(runtime.signal); break;
               case "resources": await callbacks.collectResources(runtime.signal); break;
-              case "job": await callbacks.runJob(input.work.occurrence, runtime.signal); break;
+              case "job":
+              case "manual_job": await callbacks.runJob(input.work.occurrence, runtime.signal); break;
             }
           } catch (error) {
             if (runtime.signal.aborted) throw error;
@@ -153,7 +158,8 @@ export class BackgroundScheduler {
     const lane = state.lanes.find((item) => item.id === identity);
     if (lane === undefined) throw new Error("Background admission lost its serial lane");
     if (lane.active === null) { lane.active = await this.createWorkIn(tx, work); return; }
-    const previous = lane.pending.findIndex((item) => same(item.key, work.key));
+    if (work.work.type === "manual_job") { lane.pending.push(work); return; }
+    const previous = lane.pending.findIndex((item) => item.work.type !== "manual_job" && same(item.key, work.key));
     if (previous < 0) lane.pending.push(work); else lane.pending[previous] = work;
   }
   async start(settings: BackgroundSettings): Promise<BackgroundStatus> {
@@ -162,6 +168,41 @@ export class BackgroundScheduler {
     if (settings.jobs !== null) await this.syncJobs(settings.jobs);
     this.session.resume();
     return this.status();
+  }
+  async runJob(request: Extract<RuntimeCommand, { type: "run_job" }>): Promise<JobRunReceipt> {
+    if (request.request_id.trim().length === 0 || request.request_id.length > 128) throw new TaskError("A job run needs a stable request identity");
+    const occurrenceId = "manual:" + request.request_id, id = scheduledTaskId(occurrenceId);
+    await this.session.root(BACKGROUND_CONTEXT);
+    const result = await this.session.commit(async (tx) => {
+      // Replay must work after the source file was edited or removed.
+      const previous = await this.tasks.findIn(tx, id);
+      if (previous !== undefined) {
+        const receipt = previous.scheduled_run;
+        if (receipt === undefined || receipt === null || receipt.request_id !== request.request_id || receipt.job_id !== request.job_id ||
+            (request.schedule_id !== null && receipt.schedule_id !== request.schedule_id)) {
+          throw new TaskError("This job run request identity already belongs to another selection");
+        }
+        return { receipt: { ...receipt }, native: undefined };
+      }
+      const state = await tx.doc(State), job = state.jobs.find((job) => job.id === request.job_id);
+      if (job === undefined) throw new TaskError("Unknown scheduled job; list jobs to choose its readable ID");
+      const schedule = request.schedule_id === null
+        ? job.schedules.length === 1 ? job.schedules[0] : undefined
+        : job.schedules.find((schedule) => schedule.id === request.schedule_id);
+      if (schedule === undefined) throw new TaskError(request.schedule_id === null
+        ? `Choose a schedule for ${job.id}: ${job.schedules.map((schedule) => schedule.id).join(", ")}`
+        : `Unknown schedule for ${job.id}; choose ${job.schedules.map((schedule) => schedule.id).join(", ")}`);
+      const receipt: JobRunReceipt = { request_id: request.request_id, task_id: id, job_id: job.id,
+        schedule_id: schedule.id, revision: job.revision, admitted_at: Date.now() };
+      const created = await this.tasks.createIn(tx, { id, title: job.title, outcome: job.prompt, model: job.model,
+        sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }], scheduled_run: receipt });
+      await this.enqueueIn(tx, state, { key: { type: "job", job_id: job.id, schedule_id: schedule.id },
+        work: { type: "manual_job", occurrence: { id: occurrenceId, job, schedule_id: schedule.id, scheduled_at: receipt.admitted_at } } });
+      return { receipt, native: created.native };
+    }, BACKGROUND_CONTEXT);
+    if (result.native !== undefined) this.tasks.rememberConversation(result.native);
+    this.session.resume();
+    return result.receipt;
   }
   private async replaceIn(tx: Tx, state: State, key: BackgroundTriggerKey, revision: string,
     cadence: BackgroundCadence, job: ScheduledJob | null): Promise<NativeTaskId<null> | null> {

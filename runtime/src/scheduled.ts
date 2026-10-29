@@ -8,7 +8,7 @@ import { TaskError, TaskStore, type HostCall } from "./tasks.js";
 import { Executions } from "./tools.js";
 
 /** A stable UUID keeps the ordinary task API authoritative across replay. */
-function taskId(occurrence: string): string {
+export function scheduledTaskId(occurrence: string): string {
   const bytes = createHash("sha256").update(occurrence).digest();
   bytes[6] = (bytes[6]! & 0x0f) | 0x40; bytes[8] = (bytes[8]! & 0x3f) | 0x80;
   const hex = bytes.toString("hex", 0, 16);
@@ -28,7 +28,7 @@ export function occurrencePrompt(occurrence: ScheduledOccurrence): string {
 export async function runScheduled(occurrence: ScheduledOccurrence, signal: AbortSignal,
   services: { session: Harness; tasks: TaskStore; sources: SourceJournal; environment: CoordinatorEnvironment; executions: Executions; call: HostCall }): Promise<void> {
   const { session, tasks, sources, environment, executions, call } = services;
-  const id = taskId(occurrence.id);
+  const id = scheduledTaskId(occurrence.id);
   const task = await tasks.create({ id, title: occurrence.job.title,
     outcome: occurrence.job.prompt, model: occurrence.job.model,
     sources: [{ provider: "scheduled_jobs", account: "local", thread_id: occurrence.job.id }] });

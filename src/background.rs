@@ -120,6 +120,17 @@ pub struct JobSyncReport {
     pub unchanged: u32,
 }
 
+/// Durable admission of one requested run, independent of its execution result.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+pub struct JobRunReceipt {
+    pub request_id: String,
+    pub task_id: crate::protocol::TaskId,
+    pub job_id: jobs::JobId,
+    pub schedule_id: jobs::ScheduleId,
+    pub revision: String,
+    pub admitted_at: UtcMillis,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackgroundTriggerKey {
@@ -145,6 +156,9 @@ pub enum BackgroundWork {
     Sources,
     Resources,
     Job {
+        occurrence: Box<ScheduledOccurrence>,
+    },
+    ManualJob {
         occurrence: Box<ScheduledOccurrence>,
     },
 }

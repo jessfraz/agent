@@ -170,6 +170,8 @@ agent jobs check --next 5
 agent jobs sync
 agent jobs list
 agent jobs get daily-review
+agent jobs run daily-review
+agent jobs run daily-review --schedule morning
 ```
 
 `check` and `sync` also accept repeated `--directory PATH` arguments. Check
@@ -180,6 +182,14 @@ removed schedules stop admitting work. Missing directories, invalid TOML or
 duplicate IDs leave the applied catalog intact. An existing empty directory
 can intentionally remove all jobs. Source timers are outside job sync's scope.
 `/jobs` and `/jobs ID` use the same read requests and presentation as list/get.
+
+`run` queues the applied job now with its saved prompt and model. A job with
+one schedule selects it automatically; a job with several requires
+`--schedule ID`. `/run-job JOB [--schedule ID]` uses the same admission path.
+The response identifies the durable task; admission does not mean completion.
+Manual runs serialize with the job's scheduled runs without changing its next
+occurrence or any source timer. Each explicit request creates a run, including
+when that job already has work queued. Inspect it with `agent tasks read ID`.
 
 Startup applies valid configured directories; validation errors retain the
 applied catalog and are reported in the coordinator log. Without configured

@@ -1977,6 +1977,36 @@
         {
           "type": "object",
           "properties": {
+            "job_id": {
+              "$ref": "#/$defs/JobId"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "schedule_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ScheduleId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "run_job"
+            }
+          },
+          "required": [
+            "type",
+            "job_id",
+            "request_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "bootstrap": {
               "$ref": "#/$defs/CoordinatorBootstrap"
             },

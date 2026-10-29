@@ -9,9 +9,10 @@ use std::{
 };
 
 use agent_cli::{
-    background::{BackgroundStatus, JobSyncReport, ScheduledJobStatus},
+    background::{BackgroundStatus, JobRunReceipt, JobSyncReport, ScheduledJobStatus},
     jobs::{JobId, ScheduleId, TimezoneId, UtcMillis},
-    protocol::{RuntimeCommand, RuntimeEventKind},
+    native::{self, NativeRequest, Operation},
+    protocol::{InputMode, RuntimeCommand, RuntimeEventKind, TaskRecord},
 };
 use serde::{Deserialize, Serialize};
 
@@ -198,6 +199,16 @@ impl Fixture {
     }
 
     fn status(&self) -> BackgroundStatus {
+        self.rpc(RuntimeCommand::JobStatus)
+            .into_iter()
+            .find_map(|event| match event {
+                RuntimeEventKind::JobStatus { status } => Some(status),
+                _ => None,
+            })
+            .expect("Status must return its durable background state")
+    }
+
+    fn rpc(&self, command: RuntimeCommand) -> Vec<RuntimeEventKind> {
         let mut stream = UnixStream::connect(self.state.join("agent.sock")).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -205,9 +216,10 @@ impl Fixture {
         stream
             .set_write_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        serde_json::to_writer(&mut stream, &RuntimeCommand::JobStatus).unwrap();
+        serde_json::to_writer(&mut stream, &command).unwrap();
         stream.write_all(b"\n").unwrap();
         let mut reader = BufReader::new(stream);
+        let mut events = Vec::new();
         loop {
             let mut line = String::new();
             assert_ne!(
@@ -215,13 +227,26 @@ impl Fixture {
                 0,
                 "Status stream ended without a response"
             );
-            match serde_json::from_str::<RuntimeEventKind>(&line).unwrap() {
-                RuntimeEventKind::JobStatus { status } => return status,
-                RuntimeEventKind::Failure { message, .. } => panic!("Status failed: {message}"),
-                RuntimeEventKind::Done => panic!("Status completed without a response"),
-                _ => {}
+            let event = serde_json::from_str::<RuntimeEventKind>(&line).unwrap();
+            if matches!(event, RuntimeEventKind::Done) {
+                return events;
             }
+            events.push(event);
         }
+    }
+
+    fn tasks(&self) -> Vec<TaskRecord> {
+        self.events(&["tasks", "list"])
+            .into_iter()
+            .find_map(|event| match event {
+                RuntimeEventKind::Tasks { tasks } => Some(tasks),
+                _ => None,
+            })
+            .expect("Tasks must return the ordinary task inventory")
+    }
+
+    fn run(&self, args: &[&str]) -> JobRunReceipt {
+        admitted_run(self.events(args))
     }
 
     fn start(&self) -> Server {
@@ -294,6 +319,223 @@ fn definition(prompt: &str, hour: u8) -> String {
     format!(
         "id = \"{JOB_ID}\"\nprompt = {prompt:?}\nmodel = \"fixture\"\nreasoning_effort = \"medium\"\ntimezone = \"UTC\"\n\n[[schedules]]\nid = \"Morning.v1\"\nrecurrence = \"DTSTART:20990101T{hour:02}0000Z\\nRRULE:FREQ=DAILY;BYHOUR={hour};BYMINUTE=0;BYSECOND=0\"\n"
     )
+}
+
+fn admitted_run(events: Vec<RuntimeEventKind>) -> JobRunReceipt {
+    events
+        .into_iter()
+        .find_map(|event| match event {
+            RuntimeEventKind::JobRun { run } => Some(run),
+            _ => None,
+        })
+        .expect("Manual run must return its durable admission receipt")
+}
+
+fn replay(run: &JobRunReceipt, schedule_id: Option<&str>) -> RuntimeCommand {
+    RuntimeCommand::RunJob {
+        job_id: run.job_id.clone(),
+        schedule_id: schedule_id.map(|id| ScheduleId::try_from(id.to_owned()).unwrap()),
+        request_id: run.request_id.clone(),
+    }
+}
+
+#[test]
+fn manual_job_runs_admit_durably_without_moving_timers_and_reject_invalid_selection() {
+    let fixture = Fixture::new();
+    let mut server = fixture.start();
+    let file = fixture.jobs.join("review.toml");
+    let original = definition("Review the saved evidence without contacting providers.", 9);
+    fs::write(&file, &original).unwrap();
+    fixture.sync();
+    let before = fixture.planned();
+    assert!(fixture.tasks().is_empty());
+    for invalid in [
+        vec!["jobs", "run", ""],
+        vec!["jobs", "run", "Missing.v1"],
+        vec!["jobs", "run", JOB_ID, "--schedule", ""],
+        vec!["jobs", "run", JOB_ID, "--schedule", "Missing.v1"],
+    ] {
+        let output = fixture.cli(&invalid);
+        assert!(
+            !output.status.success(),
+            "Invalid selection was accepted: {invalid:?}"
+        );
+        assert!(
+            fixture.tasks().is_empty(),
+            "Invalid selection admitted a task: {invalid:?}"
+        );
+    }
+    let first = fixture.run(&["jobs", "run", JOB_ID]);
+    assert_eq!(first.job_id.as_str(), JOB_ID);
+    assert_eq!(first.schedule_id.as_str(), "Morning.v1");
+    assert_eq!(first.revision, before.job.revision);
+    assert_eq!(
+        fixture.get().schedules[0].next_at,
+        before.schedules[0].next_at
+    );
+    let tasks = fixture.tasks();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].id, first.task_id);
+    assert_eq!(tasks[0].scheduled_run.as_ref(), Some(&first));
+    assert_eq!(tasks[0].model, Some(before.job.model.clone()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if fixture.tasks()[0]
+            .pending
+            .iter()
+            .any(|input| input.id == format!("manual:{}", first.request_id))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "The lane's first run must retain input when its execution host is unavailable; status: {:?}; schedules: {:?}",
+            fixture.status(),
+            fixture.get().schedules,
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let multiple = format!(
+        "{original}\n[[schedules]]\nid = \"Evening.v1\"\nfocus = \"Prepare evidence\"\nprompt = \"Return the supported findings to the owning task.\"\nrecurrence = \"DTSTART:20990101T170000Z\\nRRULE:FREQ=DAILY;BYHOUR=17;BYMINUTE=0;BYSECOND=0\"\n"
+    );
+    fs::write(&file, multiple).unwrap();
+    fixture.sync();
+    let scheduled = fixture.planned();
+    let output = fixture.cli(&["jobs", "run", JOB_ID]);
+    assert!(
+        !output.status.success(),
+        "Multiple schedules require an explicit selection"
+    );
+    assert_eq!(fixture.tasks().len(), 1);
+
+    let second = fixture.run(&["jobs", "run", JOB_ID, "--schedule", "Evening.v1"]);
+    let third = fixture.run(&["chat", "/run-job Daily_Review.v2 --schedule Morning.v1"]);
+    assert_eq!(second.schedule_id.as_str(), "Evening.v1");
+    assert_eq!(third.schedule_id.as_str(), "Morning.v1");
+    assert_ne!(first.task_id, second.task_id);
+    assert_ne!(second.task_id, third.task_id);
+    assert_eq!(
+        fixture.tasks().len(),
+        3,
+        "Explicit runs remain separate queued requests"
+    );
+    let current = fixture.get();
+    let schedule_state = |job: &ScheduledJobStatus| {
+        job.schedules
+            .iter()
+            .map(|schedule| {
+                (
+                    schedule.schedule_id.clone(),
+                    schedule.next_at,
+                    schedule.last_at,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(schedule_state(&current), schedule_state(&scheduled));
+
+    assert_eq!(
+        admitted_run(fixture.rpc(replay(&first, None))),
+        first,
+        "An earlier default selection must replay its original receipt after another schedule is added"
+    );
+    for conflict in [
+        replay(&first, Some("Evening.v1")),
+        RuntimeCommand::RunJob {
+            job_id: JobId::try_from("Other.v1".to_owned()).unwrap(),
+            schedule_id: None,
+            request_id: first.request_id.clone(),
+        },
+        RuntimeCommand::RunJob {
+            job_id: first.job_id.clone(),
+            schedule_id: Some(first.schedule_id.clone()),
+            request_id: String::new(),
+        },
+    ] {
+        assert!(
+            fixture
+                .rpc(conflict)
+                .iter()
+                .any(|event| matches!(event, RuntimeEventKind::Failure { .. })),
+            "A conflicting or empty request identity must fail before admission"
+        );
+        assert_eq!(fixture.tasks().len(), 3);
+    }
+    server.stop();
+    server = fixture.start();
+    assert_eq!(admitted_run(fixture.rpc(replay(&first, None))), first);
+    assert_eq!(
+        fixture.tasks().len(),
+        3,
+        "Restart must not duplicate a manually admitted task"
+    );
+    let read = fixture.events(&["tasks", "read", &first.task_id.to_string()]);
+    assert!(
+        read.iter()
+            .any(|event| matches!(event, RuntimeEventKind::Task { task, .. }
+        if task.id == first.task_id && task.scheduled_run.as_ref() == Some(&first)))
+    );
+
+    fs::remove_file(&file).unwrap();
+    fixture.sync();
+    assert_eq!(
+        admitted_run(fixture.rpc(replay(&first, None))),
+        first,
+        "The task receipt survives removal of its source job"
+    );
+    assert!(!fixture.cli(&["jobs", "run", JOB_ID]).status.success());
+    assert_eq!(fixture.tasks().len(), 3);
+    assert!(!fixture.directory.path().join("external-calls").exists());
+    server.stop();
+}
+
+#[test]
+fn native_job_input_replay_reaches_one_durable_admission_after_restart() {
+    let fixture = Fixture::new();
+    let mut server = fixture.start();
+    fs::write(
+        fixture.jobs.join("review.toml"),
+        definition("Review the saved fixture evidence.", 9),
+    )
+    .unwrap();
+    fixture.sync();
+    let input_id = uuid::Uuid::new_v4().to_string();
+    let produce = |text: &str| {
+        let Operation::Runtime(command) = native::prepare(NativeRequest::Submit {
+            input_id: input_id.clone(),
+            text: text.to_owned(),
+            mode: InputMode::Steer,
+        })
+        .unwrap() else {
+            panic!("Native manual control must reach the job controller");
+        };
+        *command
+    };
+    let control = "/run-job Daily_Review.v2";
+    let first = admitted_run(fixture.rpc(produce(control)));
+    assert_eq!(first.request_id, format!("native-job:{input_id}"));
+    assert_eq!(admitted_run(fixture.rpc(produce(control))), first);
+    assert_eq!(
+        fixture.tasks().len(),
+        1,
+        "Retrying the same native Submit must not create another manual run"
+    );
+    assert!(
+        fixture
+            .rpc(produce("/run-job Daily_Review.v2 --schedule Different.v1"))
+            .iter()
+            .any(|event| matches!(event, RuntimeEventKind::Failure { .. }))
+    );
+    assert_eq!(fixture.tasks().len(), 1);
+    server.stop();
+    server = fixture.start();
+    assert_eq!(admitted_run(fixture.rpc(produce(control))), first);
+    let tasks = fixture.tasks();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].scheduled_run.as_ref(), Some(&first));
+    assert!(!fixture.directory.path().join("external-calls").exists());
+    server.stop();
 }
 
 #[test]

@@ -13,6 +13,7 @@ import type { SourceEvent } from "./generated/SourceEvent.js";
 import type { TaskOutcome } from "./generated/TaskOutcome.js";
 import type { TaskState } from "./generated/TaskState.js";
 import type { TaskRecord } from "./generated/TaskRecord.js";
+import type { JobRunReceipt } from "./generated/JobRunReceipt.js";
 import type { TaskAgentRecord } from "./generated/TaskAgentRecord.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { WorkerRef } from "./generated/WorkerRef.js";
@@ -31,6 +32,7 @@ export type HostCall = (command: HostCommand) => Promise<HostResult>;
 export type SearchQuery = (query: string, sourceRefs: string[], limit: number, mode?: SearchMode) => Promise<SearchResult>;
 export function sourceReference(source: SourceRef): string { return JSON.stringify([source.provider, source.account, source.thread_id]); }
 type TaskIndex = { tasks: TaskRecord[] };
+type TaskCreate = { id?: string; title: string; outcome: string; sources?: SourceRef[]; model?: ModelSelection; scheduled_run?: JobRunReceipt };
 type WorkerInput = Extract<RuntimeCommand, { type: "run_task" }>;
 export type WorkerSession = {
   signal: AbortSignal;
@@ -375,23 +377,31 @@ export class TaskStore {
       cursor = page.next;
     } while (cursor !== undefined);
   }
-  async create(input: { id?: string; title: string; outcome: string; sources?: SourceRef[]; model?: ModelSelection }): Promise<TaskRecord> {
+  async findIn(tx: Tx, id: string): Promise<TaskRecord | undefined> {
+    const task = (await tx.doc(Tasks)).tasks.find((task) => task.id === id);
+    return task === undefined ? undefined : this.savedTask(task);
+  }
+  /** Creation can share the admission commit with durable background work. */
+  async createIn(tx: Tx, input: TaskCreate): Promise<{ id: TaskRecord["id"]; native?: ConversationId }> {
     const id = input.id ?? randomUUID();
     if (input.title.trim().length === 0 || input.outcome.trim().length === 0) throw new TaskError("Task title and outcome are required");
-    const native = await this.session.commit(async (tx) => {
-      const index = await tx.doc(Tasks);
-      if (index.tasks.some((task) => task.id === id)) return;
-      const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
-      index.tasks.push({
-        id, model: input.model ?? null, conversation_id: conversation.id.toString(), title: input.title.trim(), outcome: input.outcome.trim(),
-        summary: "", state: { state: "open" }, worker: { state: "unassigned" },
-        sources: input.sources ?? [], pending: [], agents: [], updated_at: Date.now(),
-      });
-      return conversation.id;
-    }, BACKGROUND_CONTEXT);
-    if (native !== undefined) this.nativeIds.set(native.toString(), native);
-    return this.get(id);
+    const index = await tx.doc(Tasks), previous = index.tasks.find((task) => task.id === id);
+    if (previous !== undefined) return { id: previous.id };
+    const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
+    const task: TaskRecord = { id, model: input.model ?? null, conversation_id: conversation.id.toString(), title: input.title.trim(), outcome: input.outcome.trim(),
+      summary: "", state: { state: "open" }, worker: { state: "unassigned" }, sources: input.sources ?? [], pending: [], agents: [], updated_at: Date.now(),
+      ...(input.scheduled_run === undefined ? {} : { scheduled_run: input.scheduled_run }) };
+    index.tasks.push(task);
+    return { id, native: conversation.id };
   }
+  async create(input: TaskCreate): Promise<TaskRecord> {
+    const result = await this.session.commit((tx) => this.createIn(tx, input), BACKGROUND_CONTEXT);
+    if (result.native !== undefined) this.rememberConversation(result.native);
+    // Existing records contain nested Chord drafts during the commit. Return
+    // the committed view so callers never retain a settled overlay.
+    return this.get(result.id);
+  }
+  rememberConversation(id: ConversationId): void { this.nativeIds.set(id.toString(), id); }
   async updateIn(tx: Tx, id: string, change: (task: TaskRecord) => void): Promise<void> {
     const index = await tx.doc(Tasks);
     const task = index.tasks.find((task) => task.id === id);

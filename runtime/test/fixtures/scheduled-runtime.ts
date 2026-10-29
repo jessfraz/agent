@@ -55,10 +55,10 @@ export async function openScheduled(directory: string, guidanceVersion = "origin
     const task = await tasks.get(taskId);
     if (task.worker.state !== "bound") throw new Error("The scheduled fixture has no bound worker");
     return tasks.run({ type: "run_task", task_id: task.id, allocation_id: task.worker.allocation_id, binding: task.worker.binding,
-      model: fixtureModel, cwd: scheduledOccurrence.job.cwd, instructions: "", interactive: false },
+      model: fixtureModel, cwd: task.worker.host.cwd, instructions: "", interactive: false },
     (conversation, host, model) => executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [host], role: "worker", model, call }),
     () => {}, [guidance, tools.host, tools.worker], call, undefined,
     { signal: controller.signal, async ready() {}, answer() {}, idle() {} });
   }
-  return { session, tasks, sources, environment, call, commands, faux, executions, worker };
+  return { session, tasks, sources, environment, call, commands, faux, executions, worker, registry };
 }

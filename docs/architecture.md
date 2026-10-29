@@ -299,6 +299,13 @@ publication lifecycle. External effects retain their existing reconciliation
 requirements. Migrating hosted schedules requires separate coverage and cutover
 verification; history import does not enable them.
 
+Manual job requests enter the same serialized job lane. Admission atomically
+creates the ordinary task record, admitted work and a receipt in that record.
+A stable request ID returns the original receipt after retries or restart,
+including after a catalog edit. Explicit manual runs remain separate queued
+requests; they do not move recurring deadlines or coalesce with scheduled
+occurrences. Native controls retain their submitted input identity on retries.
+
 ### Cross-host recovery
 
 Cross-host recovery needs replicated conversation/event data, one fenced writer

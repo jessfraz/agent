@@ -135,6 +135,11 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                         }));
                     }
                 };
+                if let ChatCommand::RunJob(args) = &control {
+                    return Ok(Operation::Runtime(Box::new(
+                        args.request_with_id(format!("native-job:{input_id}")),
+                    )));
+                }
                 if let Some(command) = control.jobs().or_else(|| control.settings(None)) {
                     return Ok(Operation::Runtime(Box::new(command)));
                 }
@@ -158,7 +163,8 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                         input_id, message: "This phone client stays on the main conversation. Saved conversation viewing with /resume is available in the TUI.".into(),
                     })),
                     ChatCommand::Status | ChatCommand::Model { .. } | ChatCommand::Fast { .. }
-                    | ChatCommand::Reasoning { .. } | ChatCommand::Jobs { .. } => anyhow::bail!("The shared control handler did not accept this request"),
+                    | ChatCommand::Reasoning { .. } | ChatCommand::Jobs { .. }
+                    | ChatCommand::RunJob(_) => anyhow::bail!("The shared control handler did not accept this request"),
                 }
             } else {
                 RuntimeCommand::MainInput {
@@ -283,6 +289,40 @@ mod tests {
         native::{NativeRequest, Operation, prepare},
         protocol::{InputMode, RuntimeCommand},
     };
+    #[test]
+    fn manual_job_controls_reuse_native_input_identity_across_retries() {
+        let input_id = uuid::Uuid::new_v4().to_string();
+        let request = || NativeRequest::Submit {
+            input_id: input_id.clone(),
+            text: "/run-job Daily_Review.v2 --schedule Morning.v1".into(),
+            mode: InputMode::Steer,
+        };
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let Operation::Runtime(command) = prepare(request()).unwrap() else {
+                panic!("Manual control must reach the shared job controller");
+            };
+            let RuntimeCommand::RunJob {
+                job_id,
+                schedule_id: Some(schedule_id),
+                request_id,
+            } = *command
+            else {
+                panic!("Manual control must produce a typed job admission");
+            };
+            assert_eq!(job_id.as_str(), "Daily_Review.v2");
+            assert_eq!(schedule_id.as_str(), "Morning.v1");
+            ids.push(request_id);
+        }
+        assert_eq!(
+            ids,
+            [
+                format!("native-job:{input_id}"),
+                format!("native-job:{input_id}")
+            ]
+        );
+    }
+
     #[test]
     fn native_envelope_is_consumed_by_the_real_transport_and_bounds_are_enforced() {
         let id = uuid::Uuid::new_v4().to_string();

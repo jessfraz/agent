@@ -10,6 +10,7 @@ import type { OccurrencePlan } from "../../src/generated/OccurrencePlan.js";
 import type { ScheduledJob } from "../../src/generated/ScheduledJob.js";
 import type { ScheduledOccurrence } from "../../src/generated/ScheduledOccurrence.js";
 import { fixtureModel } from "../model.js";
+import { TaskStore } from "../../src/tasks.js";
 
 export const DAY = 86_400_000;
 export const START = Date.UTC(2027, 0, 1, 9);
@@ -62,7 +63,8 @@ export async function openBackground(directory: string, clock: FakeClock, overri
   const registry = createRegistry();
   const session = await Harness.open(await SqliteStorage.open(database), { models: createModels(), registry,
     now: clock.now, setTimer: clock.setTimer, identity: { attribution: null } }, BACKGROUND_CONTEXT);
-  const scheduler = new BackgroundScheduler(session, registry, {
+  const tasks = new TaskStore(session);
+  const scheduler = new BackgroundScheduler(session, registry, tasks, {
     plan: async (cadence, after, now) => planned(cadence, after, now),
     refreshSources: async () => { await session.commit(async (tx) => { (await tx.doc(Receipts)).sources += 1; }, BACKGROUND_CONTEXT); },
     collectResources: async () => { await session.commit(async (tx) => { (await tx.doc(Receipts)).resources += 1; }, BACKGROUND_CONTEXT); },
@@ -72,5 +74,5 @@ export async function openBackground(directory: string, clock: FakeClock, overri
     }, BACKGROUND_CONTEXT); },
     ...overrides,
   });
-  return { session, scheduler, receipts: () => session.snapshot(Receipts, BACKGROUND_CONTEXT) };
+  return { session, scheduler, tasks, registry, receipts: () => session.snapshot(Receipts, BACKGROUND_CONTEXT) };
 }

@@ -12,6 +12,7 @@ import type { SearchMode } from "./generated/SearchMode.js";
 import type { DelegationDecision } from "./generated/DelegationDecision.js";
 import type { InputMode } from "./generated/InputMode.js";
 import { TaskError, TaskStore, type HostCall, type SearchQuery } from "./tasks.js";
+import type { BackgroundScheduler } from "./background.js";
 
 export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; default_host?: WorkerHost | null; call: HostCall; role?: "worker" | "triage";
   search?: SearchQuery;
@@ -141,6 +142,35 @@ export class HostRequests {
       pending.reject(new TaskError("The execution request ended before the host operation completed"));
     }
   }
+}
+
+/** Job definitions stay in the scheduler; tools only expose its typed control API. */
+export function createJobTools(jobs: BackgroundScheduler, executions: Executions): Extension {
+  function control(id: string): void {
+    const execution = executions.get(id);
+    if (execution.role === "worker" || (id !== ROOT_CONVERSATION_ID.toString() && execution.role !== "triage")) {
+      throw new TaskError("Job control belongs to the main conversation or coordinator triage");
+    }
+  }
+  return defineExtension({ name: "job-control", tools: [
+    defineTool({ name: "list_jobs", replay: "safe", description: "List configured jobs by readable ID, schedule IDs, next times and errors. Read one job for its full instructions.",
+      parameters: Type.Object({}), async execute(_args, api) {
+        control(api.conversationId.toString());
+        return output((await jobs.listJobs()).map(({ job, schedules }) => ({ id: job.id, title: job.title,
+          schedules: schedules.map((schedule) => ({ id: schedule.schedule_id, next_at: schedule.next_at, error: schedule.error })) })));
+      } }),
+    defineTool({ name: "read_job", replay: "safe", description: "Read one configured job's full instructions, model, schedules and current timing.",
+      parameters: Type.Object({ job_id: Type.String({ minLength: 1 }) }), async execute(args, api) {
+        control(api.conversationId.toString()); return output(await jobs.getJob(args.job_id));
+      } }),
+    defineTool({ name: "run_job", replay: "safe", description: "Admit one immediate run of a configured job and return its durable task ID. Choose a schedule when the job has several. Read the task to follow progress; admission is not completion.",
+      parameters: Type.Object({ job_id: Type.String({ minLength: 1 }), schedule_id: Type.Optional(Type.String({ minLength: 1 })) }),
+      async execute(args, api, context) {
+        control(api.conversationId.toString());
+        const request_id = await api.memo("job_run_request", randomUUID(), context);
+        return output(await jobs.runJob({ type: "run_job", job_id: args.job_id, schedule_id: args.schedule_id ?? null, request_id }));
+      } }),
+  ] });
 }
 
 export function createAppTools(tasks: TaskStore, executions: Executions): {

@@ -106,6 +106,10 @@ pub fn get(status: &ScheduledJobStatus) -> String {
 
 pub fn event(event: &RuntimeEventKind) -> Option<String> {
     match event {
+        RuntimeEventKind::JobRun { run } => Some(format!(
+            "Queued job {} (schedule {}). Task: {}",
+            run.job_id, run.schedule_id, run.task_id
+        )),
         RuntimeEventKind::ScheduledJobs { jobs } => Some(list(jobs)),
         RuntimeEventKind::ScheduledJob { job } => Some(get(job)),
         RuntimeEventKind::JobsSynced { report } => Some(format!(

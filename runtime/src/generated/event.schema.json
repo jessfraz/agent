@@ -1991,6 +1991,38 @@
     "JobId": {
       "type": "string"
     },
+    "JobRunReceipt": {
+      "description": "Durable admission of one requested run, independent of its execution result.",
+      "type": "object",
+      "properties": {
+        "admitted_at": {
+          "$ref": "#/$defs/UtcMillis"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "schedule_id": {
+          "$ref": "#/$defs/ScheduleId"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        }
+      },
+      "required": [
+        "request_id",
+        "task_id",
+        "job_id",
+        "schedule_id",
+        "revision",
+        "admitted_at"
+      ]
+    },
     "JobSchedule": {
       "type": "object",
       "properties": {
@@ -2633,6 +2665,22 @@
     },
     "RuntimeEventKind": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "run": {
+              "$ref": "#/$defs/JobRunReceipt"
+            },
+            "type": {
+              "type": "string",
+              "const": "job_run"
+            }
+          },
+          "required": [
+            "type",
+            "run"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -4046,6 +4094,16 @@
           "items": {
             "$ref": "#/$defs/TaskInput"
           }
+        },
+        "scheduled_run": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobRunReceipt"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "sources": {
           "type": "array",
