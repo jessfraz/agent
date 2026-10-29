@@ -626,41 +626,45 @@ mod tests {
 
     const FIXTURE: &str = r#"
       import { createInterface } from 'node:readline';
-      import { writeFileSync } from 'node:fs';
+      import { renameSync, writeFileSync } from 'node:fs';
       import { join } from 'node:path';
       const emit = (id,event) => process.stdout.write(JSON.stringify({version:1,id,event})+'\n');
       const finish = id => { emit(id,{type:'auth_status',status:{state:'signed_out'}}); emit(id,{type:'done'}); };
+      const publish = (name, value) => {
+        const path = join(process.argv[2],name), temporary = path+'.'+process.pid+'.tmp';
+        writeFileSync(temporary,value); renameSync(temporary,path);
+      };
       createInterface({input:process.stdin}).on('line', line => {
         const {id,command}=JSON.parse(line);
-        writeFileSync(join(process.argv[2],'admitted'),'yes');
+        publish('admitted','yes');
         if(command.type==='login') {
-          writeFileSync(join(process.argv[2],'login-id'),String(id));
+          publish('login-id',String(id));
           setTimeout(() => {
             emit(id,{type:'notice',task_id:'22222222-2222-4222-8222-222222222222',text:'Synthetic task completed.'});
-            writeFileSync(join(process.argv[2],'completed'),'yes'); finish(id);
+            publish('completed','yes'); finish(id);
           },60);
         } else if(typeof command.target==='string') {
-          writeFileSync(join(process.argv[2],'callback.json'),JSON.stringify({id,target:command.target}));
+          publish('callback.json',JSON.stringify({id,target:command.target}));
         } else if(command.type==='run_task'&&command.interactive) {
           emit(id,{type:'task_ready',conversation_id:'persisted-task',title:'Interactive fixture'});
           emit(id,{type:'worker_idle'});
         } else if(command.type==='chat') {
           emit(id,{type:'notice',task_id:null,text:'Chat ready'});
         } else if(command.type==='submit_input') {
-          writeFileSync(join(process.argv[2],'input-'+command.input_id+'.json'),JSON.stringify({id,input:command.input,mode:command.mode}));
+          publish('input-'+command.input_id+'.json',JSON.stringify({id,input:command.input,mode:command.mode}));
           emit(id,{type:'input_accepted',input_id:command.input_id});
         } else if(command.type==='interrupt') {
           finish(id);
         } else if(command.type==='worker_input') {
-          writeFileSync(join(process.argv[2],'worker-input.json'),JSON.stringify({id,input:command.input}));
+          publish('worker-input.json',JSON.stringify({id,input:command.input}));
           emit(id,{type:'answer',conversation_id:'persisted-task',text:command.input}); emit(id,{type:'worker_idle'});
         } else if(command.type==='detach_worker') {
-          writeFileSync(join(process.argv[2],'worker-detached'),String(id)); emit(id,{type:'done'});
+          publish('worker-detached',String(id)); emit(id,{type:'done'});
         } else if(command.type==='run_task'||command.type==='logout') {
           emit(id,{type:'host_call',call_id:'11111111-1111-4111-8111-111111111111',command:{
             type:'exec',program:'node',args:['--eval','process.stdout.write("synthetic\\n")'],cwd:'/',timeout_seconds:60}});
         } else if(command.type==='host_reply') {
-          writeFileSync(join(process.argv[2],'reply.json'),JSON.stringify(command.result)); finish(id);
+          publish('reply.json',JSON.stringify(command.result)); finish(id);
         } else if(command.type==='list_tasks') { process.exit(0); }
         else { finish(id); }
       });
@@ -867,7 +871,11 @@ mod tests {
         use crate::native::{NativeEvent, NativeRequest};
         use base64::{Engine, engine::general_purpose::STANDARD};
         let directory = tempfile::tempdir().unwrap();
-        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/dist/src/bridge.js");
+        let script = std::env::var_os("AGENT_RUNTIME_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/dist/src/bridge.js")
+            });
         let service = Running::start_script(directory, script, ShutdownReason::Requested).await;
         let bytes = vec![b'a'; ATTACHMENT_CHUNK_BYTES as usize + 11];
         let source = service.directory.path().join("upload.txt");
