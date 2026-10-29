@@ -22,11 +22,17 @@ use uuid::Uuid;
 
 use crate::runtime::FrameReader;
 
-/// This is the attached Chrome instance's default profile, not a profile copy.
+/// Selects an existing Chrome profile. Pairing credentials arrive through the
+/// helper environment and never enter these serialized helper arguments.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserConfig {
     pub user_data_dir: Option<PathBuf>,
+    pub profile_dir_name: Option<String>,
+    // Optional credential launcher prefix, e.g. ["with-credentials", "browser", "--"].
+    // It wraps only the browser helper, so unavailable browser credentials do
+    // not prevent the rest of Agent from starting.
+    pub credential_command: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -175,7 +181,18 @@ impl Process {
             helper.is_file(),
             "Browser runtime is missing; update Agent on this host"
         );
-        let mut child = Command::new("node")
+        let mut command = if let Some((program, arguments)) = config
+            .credential_command
+            .as_deref()
+            .and_then(|command| command.split_first())
+        {
+            let mut command = Command::new(program);
+            command.args(arguments).arg("node");
+            command
+        } else {
+            Command::new("node")
+        };
+        let mut child = command
             .arg(helper)
             .arg(serde_json::to_string(config)?)
             .stdin(Stdio::piped())
@@ -303,7 +320,7 @@ impl BrowserHost {
             }
             let Some(config) = &self.config else {
                 return Ok(BrowserResponse::Failed { session_id: request.session_id,
-                    message: "Chrome is not configured on this host. Add a [browser] section to its private Agent configuration, then enable Chrome's remote debugging connection.".into() });
+                    message: "Chrome is not configured on this host. Add a [browser] section to its private Agent configuration and pair the Playwright extension in its existing Chrome profile.".into() });
             };
             let runtime = self
                 .runtime
@@ -396,6 +413,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 const {user_data_dir: directory} = JSON.parse(process.argv[2]);
 writeFileSync(join(directory, 'pid'), String(process.pid));
+writeFileSync(join(directory, 'wrapper'), process.env.AGENT_BROWSER_FIXTURE_WRAPPER ?? '');
 const input = createInterface({input:process.stdin});
 input.on('line', async line => {
   const request = JSON.parse(line);
@@ -420,6 +438,8 @@ input.on('close', () => { writeFileSync(join(directory, 'closed'), 'closed'); })
             &directory.join("bridge.js"),
             Some(BrowserConfig {
                 user_data_dir: Some(directory.to_owned()),
+                profile_dir_name: None,
+                credential_command: None,
             }),
         )
     }
@@ -446,6 +466,49 @@ input.on('close', () => { writeFileSync(join(directory, 'closed'), 'closed'); })
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn browser_credentials_wrap_only_the_owned_helper() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut host = host(directory.path()).await;
+        host.config.as_mut().unwrap().credential_command = Some(vec![
+            "env".into(),
+            "AGENT_BROWSER_FIXTURE_WRAPPER=wrapped".into(),
+        ]);
+        let owner = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let (_stop, cancelled) = watch::channel(false);
+        assert!(matches!(
+            host.execute(
+                request(
+                    owner,
+                    session,
+                    "open",
+                    BrowserAction::Open {
+                        url: "about:blank".into()
+                    }
+                ),
+                cancelled.clone()
+            )
+            .await,
+            BrowserResponse::Ready { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(directory.path().join("wrapper"))
+                .await
+                .unwrap(),
+            "wrapped"
+        );
+        assert!(matches!(
+            host.execute(
+                request(owner, session, "release", BrowserAction::Release),
+                cancelled
+            )
+            .await,
+            BrowserResponse::Closed { .. }
+        ));
+        wait_for(&directory.path().join("closed")).await;
     }
 
     #[tokio::test]

@@ -120,40 +120,53 @@ configuration:
 
 ```toml
 [browser]
+# Existing profile directory name. Default is "Default".
+# profile_dir_name = "Profile 1"
+# Optional credential launcher prefix; secrets enter only the browser helper.
+# credential_command = ["with-credentials", "browser", "--"]
 # Optional: an existing Chrome instance's user-data root, not a copied profile.
 # user_data_dir = "/example/chrome-data"
 ```
 
-Restart that host's Agent service after changing its configuration. In Chrome
-144 or newer, open `chrome://inspect/#remote-debugging` and enable remote
-debugging for that browser instance. Chrome asks for connection consent when
-Agent first uses it. The packaged server runs locally; no debugging port needs
-to be exposed to other machines. Agent does not launch or replace personal
-Chrome, install extensions, or export its cookies.
+Install the official [Playwright extension](https://chromewebstore.google.com/detail/playwright/mmlmfjhmonkocbjadbfplnigmagldckm)
+in that existing Chrome profile. Its status page displays a profile-specific
+`PLAYWRIGHT_MCP_EXTENSION_TOKEN`. Provide that token to Agent's service through
+its private credential environment, directly or through `credential_command`,
+then restart the service. Keep the token in a secret manager and out of Agent
+configuration, launcher arguments, repository files, and the Nix store.
+Installation and pairing are one-time setup; fresh tasks and service or
+browser restarts reuse the token without another connection approval click.
+Upstream opens a temporary Chrome connector URL containing the token. Agent
+discards its output and closes that connector after pairing.
 
-Automatic connection uses **Chrome's default profile**, as determined by
-Chrome, for the selected instance. It cannot choose a secondary named profile
-or infer an account from the active window. `user_data_dir` selects an existing
-browser instance's data root, not `Profile 1` inside it. Confirm the website's
-account before taking an account-specific action. Chrome's native connection
-consent exposes that profile's browser state to the local server; the adapter's
-tool allowlist is not a process sandbox.
+Agent connects to installed Chrome and the selected existing profile. Chrome
+for Testing is a disposable test fixture, never a production fallback. Native
+remote debugging and an exposed debugging port are unnecessary. The connector
+can start installed Chrome with that same profile when it is closed.
+
+`profile_dir_name` selects the final directory component shown by Chrome's
+profile path, such as `Default` or `Profile 1`. `user_data_dir` selects the
+existing browser's data root, not the profile directory inside it. The token
+must belong to that exact profile. Confirm the website's account before an
+account-specific action. Browser state remains local; the adapter's action
+allowlist is not a process sandbox.
 
 Ask Agent to use Chrome on a named machine when necessary. `browser_open`
-creates an owned background tab. `browser_status` inspects the live connection;
+creates an owned tab. `browser_status` inspects the live connection;
 `browser_action` navigates, reads accessibility snapshots, fills forms, selects
-options by displayed text, clicks, presses keys and handles dialogs. Native
-page IDs prevent user tab reordering from retargeting an action. Only owned
-tabs and popups attributed to their actions reach the model. Delayed popups
-outside that action's observation window remain unowned.
+options by displayed text, clicks, presses keys and handles dialogs. Handles
+refer to exact live Page objects; tab reordering cannot retarget an action.
+Only owned tabs and popups from those pages reach the model. Other pages
+dragged into the task's group remain unowned. Moving an owned page out drops
+its handle and preserves the page.
 
 Clicks, form input, and key presses bring their owned tab to the front. Reading
 snapshots leaves the foreground tab alone.
 
 Disposable tabs close when the turn finishes. `retain_tab` preserves a needed
 draft or result for the user; `browser_release` closes remaining owned tabs and
-disconnects while Chrome keeps running. The upstream server can retain its
-final open page; a retained tab is reported as incomplete cleanup.
+disconnects while Chrome keeps running. Retained results survive disconnect
+and leave the task's tab group.
 
 After interruption or connection loss, Agent retains uncertain operations and
 inspects their outcome before repeating them. A browser or host restart
@@ -163,10 +176,10 @@ to continue, preserving tabs whose ownership cannot be verified.
 The first version uses accessibility snapshots. Canvas-only interfaces,
 screenshots sent to the model, uploads and downloads need additional support.
 Chrome settings, desktop applications and general desktop control are outside
-these tools. Usage statistics and URL-based performance lookups are disabled.
+these tools. No arbitrary JavaScript tool is exposed to the model.
 
-See the upstream [Chrome connection documentation](https://developer.chrome.com/docs/devtools/agents/get-started/configuration#connect-to-an-existing-browser-session)
-for Chrome's own prerequisites and consent flow.
+See the upstream [extension setup](https://github.com/microsoft/playwright/blob/main/packages/extension/README.md)
+for installation, profile selection and token pairing.
 
 `/feedback <description>` saves private diagnostics and starts a background
 repair worker on the originating machine. A repair started inside Rex uses a

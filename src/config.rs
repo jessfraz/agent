@@ -227,6 +227,31 @@ fn validate(config: &mut ClientConfig) -> Result<()> {
     {
         *path = context_repository_path(path, home.as_deref())?;
     }
+    if let Some(profile) = config
+        .browser
+        .as_ref()
+        .and_then(|browser| browser.profile_dir_name.as_ref())
+    {
+        ensure!(
+            !profile.is_empty()
+                && profile != "."
+                && profile != ".."
+                && !profile.contains(['/', '\\'])
+                && !profile.chars().any(char::is_control),
+            "Chrome profile must be a directory name such as Default or Profile 1"
+        );
+    }
+    if let Some(command) = config
+        .browser
+        .as_ref()
+        .and_then(|browser| browser.credential_command.as_ref())
+    {
+        ensure!(
+            command.first().is_some_and(|program| !program.is_empty())
+                && command.iter().all(|argument| !argument.contains('\0')),
+            "Browser credential command requires an executable and valid arguments"
+        );
+    }
     for repository in &mut config.context_repositories {
         *repository = context_repository_path(repository, home.as_deref())?;
     }

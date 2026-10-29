@@ -37,8 +37,14 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'runtime/package-lock.json') }}-
       - name: Validate workflows
         run: nix develop --command actionlint
+      - name: Prepare runtime
+        run: nix develop --command make runtime
+      - name: Install pinned test browser
+        run: nix develop --command node runtime/node_modules/playwright-core/cli.js install --no-shell chromium
+      - name: Prepare verified browser extension fixture
+        run: nix develop --command node runtime/dist/test/fixtures/prepare-browser.js "$RUNNER_TEMP"
       - name: Check Rust and runtime
-        run: nix develop --command make runtime check
+        run: nix develop --command make check
       - name: Check generated bindings
         run: git diff --exit-code
       - name: Evaluate flake

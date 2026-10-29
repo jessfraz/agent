@@ -87,7 +87,7 @@
       pkgs = import nixpkgs {inherit system;};
     in {
       default = pkgs.mkShell {
-        packages = with pkgs; [cargo rustc rustfmt clippy nodejs_26 pkg-config git lsof actionlint];
+        packages = with pkgs; [cargo rustc rustfmt clippy nodejs_26 pkg-config git lsof actionlint unzip];
         AGENT_LLAMA_SERVER = "${pkgs.llama-cpp}/bin/llama-server";
         AGENT_EMBEDDING_MODEL = self.packages.${system}.embeddingModel;
         AGENT_SQLITE_VEC = "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
