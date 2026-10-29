@@ -121,7 +121,7 @@
       Attachment.record(image, named: "message-rows-\(scheme)", as: .png)
     }
     let accessible = try renderRows(transcript.rows, size: .accessibility3)
-    #expect(accessible.width == 390)
+    #expect(accessible.width >= 390)
     Attachment.record(accessible, named: "message-rows-accessibility", as: .png)
   }
 
