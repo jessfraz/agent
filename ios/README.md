@@ -24,10 +24,39 @@ there is no new HTTP endpoint, public listener or phone-side model credential.
    are intentionally unsupported. Transport binds an active point-to-point
    interface's Tailscale IPv4 source address and has no plain-LAN fallback.
 
-The Xcode app target is a development shell, not an App Store distribution
-setup. Device signing, VPN routing, system network permissions and background
+Device signing, VPN routing, system network permissions and background
 transitions need validation on a real phone. A macOS Swift package build does
 not establish iOS compatibility or on-device security.
+
+## Install on an iPhone
+
+For a direct development install, sign in to the intended developer account in
+Xcode Settings, connect the phone, and choose it as the `Agent` scheme's run
+destination. Select the team under Signing & Capabilities and use a unique
+bundle identifier. Enable Developer Mode on the phone if Xcode requests it,
+then Run. Tailscale and coordinator authorization are still required.
+
+For private beta updates, use internal TestFlight:
+
+1. Create an App Store Connect app with the same bundle identifier and archive
+   the `Agent` scheme for a physical iOS destination using the intended team.
+2. Distribute the archive as **TestFlight Internal Only**. The included
+   `TestFlightExport.plist` also uploads a signed archive in internal-only mode;
+   it cannot be distributed through external TestFlight or the App Store.
+3. Add the intended App Store Connect user to an internal testing group and
+   assign the processed build. Install Apple's TestFlight app on the phone,
+   accept access to Agent and enable Automatic Updates.
+4. For automatic delivery, set up an Xcode Cloud workflow for `Agent` in Xcode,
+   connect the repository, test before archiving, and add an internal TestFlight
+   distribution action for the group. Repository access and signing stay in
+   Apple's account setup; no signing keys belong in this repository.
+
+An App Store version does not need to be published for internal beta testing.
+TestFlight builds expire after 90 days, so this is a development beta channel.
+See Apple's [internal testing](https://developer.apple.com/help/app-store-connect/test-a-beta-version/add-internal-testers/)
+and [Xcode Cloud delivery](https://developer.apple.com/documentation/xcode/distributing-your-xcode-cloud-builds-through-testflight)
+instructions. Account agreements and signing must be ready before delivery;
+an unsigned simulator build does not establish that readiness.
 
 ## Behavior and data
 
@@ -35,6 +64,10 @@ not establish iOS compatibility or on-device security.
   commentary, durable notices and compaction state use native views. Markdown
   and code parsing happen outside SwiftUI bodies. Rendering and incoming pages
   are bounded; display truncation does not alter coordinator history.
+- Startup reads a bounded recent page. Older history is cursor-paged through
+  **Load earlier messages**; the phone never downloads the whole conversation
+  before it becomes usable. At most 500 rows and 4 MiB of display text remain
+  in memory. The coordinator retains the full history.
 - Slash parsing and execution use the shared Rust command parser and backend
   handlers. The phone menu lists only supported controls. `/resume` remains a
   TUI-only saved-conversation view; it never starts work from this app.
@@ -65,5 +98,20 @@ Rust owns the native wire types. The existing bindings exporter generates
 `Generated.swift` and schema-covering fixtures, decoded and reserialized by
 Rust's actual serde implementation. Swift tests consume those fixtures and
 exercise real loopback framing, outbox reconciliation, composer admission and
-owned connection cleanup. Runtime tests exercise the actual Pi/bridge with
+owned connection cleanup. Rendering tests capture the production message rows
+in light and dark appearance using invented content. To retain these images,
+pass `--attachments-path /absolute/existing/directory` to `swift test`.
+`bash ios/scripts/check.sh` runs strict Swift lint, macOS tests, the unsigned
+app build, package tests on iOS and app-hosted rendering tests. It requires an
+installed compatible iOS runtime and cleans up only its own simulator.
+The `Agent` scheme's hosted tests also check that accessibility text sizes
+expand the message layout. History preparation benchmarks exercise the real
+`Transcript` and rich-text parser with invented content. After one warmup, five
+iterations produce median CI gates: 20 ms for the first 20-entry page, 250 ms for
+26 older pages reaching the 500-row window, and 500 ms for 102 streamed chunks
+(about 5 KiB). Test attachments retain every sample and budget. These limits
+leave headroom for CI variation and catch substantial regressions; they exclude
+network latency, decoding, SwiftUI drawing and device frame pacing. Ordering,
+memory bounds and durable identity are also asserted.
+Runtime tests exercise the actual Pi/bridge with
 synthetic external model responses and host effects, never real accounts.

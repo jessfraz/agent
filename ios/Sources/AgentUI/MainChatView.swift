@@ -5,6 +5,7 @@ public struct MainChatView: View {
   @State private var model = ChatModel()
   @State private var settings = false
   @State private var followsLatest = true
+  @State private var userScrolling = false
   @AppStorage("coordinatorAddress") private var host = ""
   @AppStorage("coordinatorPort") private var port = "43187"
   @Environment(\.scenePhase) private var scenePhase
@@ -88,13 +89,18 @@ public struct MainChatView: View {
           }
           Color.clear.frame(height: 1).id("latest")
         }
-        .padding().frame(maxWidth: 840).frame(maxWidth: .infinity)
+        .padding().frame(maxWidth: 720).frame(maxWidth: .infinity)
       }
       .defaultScrollAnchor(.bottom, for: .initialOffset)
+      .onScrollPhaseChange { _, phase in
+        userScrolling = phase == .interacting || phase == .decelerating
+      }
       .onScrollGeometryChange(for: Bool.self) { geometry in
         geometry.contentOffset.y + geometry.containerSize.height >= geometry.contentSize.height - 60
       } action: { _, atBottom in
-        followsLatest = atBottom
+        // New content changes geometry too. Only a person's scroll should
+        // turn off following; initial history must still land at the latest row.
+        if userScrolling || atBottom { followsLatest = atBottom }
       }
       .onChange(of: model.revision) { _, _ in
         if followsLatest { scroll.scrollTo("latest", anchor: .bottom) }
@@ -202,58 +208,102 @@ public struct MainChatView: View {
   }
 }
 
-private struct MessageRow: View {
+struct MessageRow: View {
   let model: RowModel
   let retry: (String) -> Void
   let restore: (String) -> Void
   @State private var expanded = false
+  @Environment(\.dynamicTypeSize) private var typeSize
+  @ScaledMetric(relativeTo: .callout) private var toolIconSize = 20
+
+  init(model: RowModel, retry: @escaping (String) -> Void, restore: @escaping (String) -> Void) {
+    self.model = model
+    self.retry = retry
+    self.restore = restore
+  }
 
   var body: some View {
+    VStack(alignment: isUser ? .trailing : .leading, spacing: 8) {
+      content
+        .padding(isUser ? 14 : 0)
+        .background(
+          isUser ? AnyShapeStyle(Color.accentColor.opacity(0.12)) : AnyShapeStyle(.clear),
+          in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+        )
+        .frame(
+          maxWidth: isUser && !typeSize.isAccessibilitySize ? 520 : .infinity,
+          alignment: isUser ? .trailing : .leading)
+      if let delivery = model.row.delivery {
+        Label(delivery.rawValue, systemImage: delivery.symbol)
+          .font(.caption.weight(.medium)).foregroundStyle(.primary)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+      if model.row.delivery == .uncertain, let id = model.row.inputID {
+        Button {
+          retry(id)
+        } label: {
+          Label("Check / retry", systemImage: "arrow.clockwise")
+            .lineLimit(nil).fixedSize(horizontal: false, vertical: true).frame(minHeight: 44)
+        }
+        .font(.callout).buttonStyle(.bordered)
+        .accessibilityHint(
+          "Checks the original message ID and retries without creating another message.")
+      }
+      if model.row.delivery == .rejected, let id = model.row.inputID {
+        Button {
+          restore(id)
+        } label: {
+          Label("Restore to composer", systemImage: "arrow.uturn.backward")
+            .lineLimit(nil).fixedSize(horizontal: false, vertical: true).frame(minHeight: 44)
+        }.font(.callout).buttonStyle(.bordered)
+      }
+    }
+    .padding(.leading, isUser && !typeSize.isAccessibilitySize ? 32 : 0)
+    .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+    .accessibilityElement(children: .contain).accessibilityLabel(title)
+    .contextMenu {
+      ShareLink(item: model.row.text) { Label("Share text", systemImage: "square.and.arrow.up") }
+    }
+  }
+  private var isUser: Bool { model.row.role == .user }
+  private var showsHeader: Bool {
+    switch model.row.role {
+    case .commentary, .partialAnswer, .notice: true
+    case .user, .assistant, .final, .thinking, .tool: false
+    }
+  }
+  private var content: some View {
     VStack(alignment: .leading, spacing: 8) {
-      HStack {
+      if showsHeader {
         Label(title, systemImage: symbol).font(.caption.weight(.semibold)).foregroundStyle(
           .secondary)
-        Spacer()
-        if let delivery = model.row.delivery {
-          Text(delivery.rawValue).font(.caption).foregroundStyle(
-            delivery == .uncertain || delivery == .rejected ? .orange : .secondary)
-        }
       }
       if let tool = model.row.tool {
         HStack {
-          if tool.status == .running {
-            ProgressView().controlSize(.small)
-          } else {
-            Image(systemName: tool.status == .failed ? "xmark.circle" : "checkmark.circle")
-              .foregroundStyle(tool.status == .failed ? .red : .secondary)
+          Group {
+            if tool.status == .running {
+              ProgressView().controlSize(.small)
+            } else {
+              Image(systemName: tool.status == .failed ? "xmark.circle" : "checkmark.circle")
+                .foregroundStyle(tool.status == .failed ? .red : .secondary)
+            }
           }
+          .frame(width: toolIconSize, height: toolIconSize).accessibilityHidden(true)
           Text(tool.name).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
-          Text(tool.status.rawValue.capitalized).font(.caption).foregroundStyle(.secondary)
+          Text(tool.status.rawValue.capitalized).font(.caption.weight(.medium))
         }
         .accessibilityElement(children: .combine)
       } else if model.row.role == .thinking {
-        DisclosureGroup("Reasoning", isExpanded: $expanded) {
+        DisclosureGroup(isExpanded: $expanded) {
           RichMessage(blocks: model.row.blocks).foregroundStyle(.secondary)
+        } label: {
+          Label("Reasoning", systemImage: "sparkle").font(.callout)
+            .frame(minHeight: 44)
         }
       } else {
-        RichMessage(blocks: model.row.blocks)
+        RichMessage(
+          blocks: model.row.blocks, textStyle: model.row.role == .commentary ? .callout : .body)
       }
-      if model.row.delivery == .uncertain, let id = model.row.inputID {
-        Button("Check / retry same message", systemImage: "arrow.clockwise") { retry(id) }.font(
-          .callout)
-      }
-      if model.row.delivery == .rejected, let id = model.row.inputID {
-        Button("Restore to composer", systemImage: "arrow.uturn.backward") { restore(id) }.font(
-          .callout)
-      }
-    }
-    .padding(model.row.role == .user ? 14 : 0)
-    .background(
-      model.row.role == .user ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear),
-      in: RoundedRectangle(cornerRadius: 18)
-    )
-    .contextMenu {
-      ShareLink(item: model.row.text) { Label("Share text", systemImage: "square.and.arrow.up") }
     }
   }
   private var title: String {
@@ -278,21 +328,37 @@ private struct MessageRow: View {
   }
 }
 
+extension Delivery {
+  fileprivate var symbol: String {
+    switch self {
+    case .sending: "clock"
+    case .saved: "checkmark.circle"
+    case .uncertain: "questionmark.circle"
+    case .rejected: "exclamationmark.triangle"
+    }
+  }
+}
+
 private struct RichMessage: View {
   let blocks: [RichBlock]
+  var textStyle: Font = .body
+  @ScaledMetric(relativeTo: .body) private var leading = 3
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
       ForEach(blocks.indices, id: \.self) { index in
         switch blocks[index] {
-        case .prose(let text): Text(text).font(.body).textSelection(.enabled)
+        case .prose(let text):
+          Text(text).font(textStyle).lineSpacing(leading).textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
         case .heading(let text, let level):
           Text(text).font(level <= 2 ? .title3 : .headline).accessibilityAddTraits(.isHeader)
             .textSelection(.enabled)
         case .quote(let text):
-          HStack {
-            RoundedRectangle(cornerRadius: 2).fill(.secondary).frame(width: 3)
-            Text(text).foregroundStyle(.secondary).textSelection(.enabled)
-          }
+          Text(text).font(textStyle).lineSpacing(leading).textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true).padding(.leading, 12)
+            .overlay(alignment: .leading) {
+              RoundedRectangle(cornerRadius: 2).fill(.secondary).frame(width: 3)
+            }
         case .divider: Divider()
         case .code(let code, let language):
           VStack(alignment: .leading, spacing: 8) {
@@ -319,6 +385,5 @@ private struct RichMessage: View {
         }
       }
     }
-    .frame(maxWidth: .infinity, alignment: .leading)
   }
 }
