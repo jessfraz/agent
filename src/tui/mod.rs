@@ -61,6 +61,7 @@ enum HistoryLoad {
 pub enum ObservationState {
     Connecting,
     Connected,
+    Reconnecting,
     Disconnected,
 }
 
@@ -69,6 +70,7 @@ enum Update {
     Status(TuiInfo),
     Working(bool),
     Observation(ObservationState),
+    InputUncertain(String),
     Draft(tokio::sync::oneshot::Sender<ComposerInput>),
     Info(tokio::sync::oneshot::Sender<TuiInfo>),
     Notice(String),
@@ -92,6 +94,7 @@ enum Update {
 
 enum HistoryUpdate {
     Begin(uuid::Uuid),
+    Reconcile(uuid::Uuid),
     Page {
         id: uuid::Uuid,
         events: Vec<RuntimeEventKind>,
@@ -153,8 +156,18 @@ impl TuiHandle {
         self.send(Update::Event(Box::new(event)))
     }
     pub fn begin_history_replay(&self) -> Result<HistoryReplay> {
+        self.history_replay(false)
+    }
+    pub fn begin_history_reconciliation(&self) -> Result<HistoryReplay> {
+        self.history_replay(true)
+    }
+    fn history_replay(&self, reconcile: bool) -> Result<HistoryReplay> {
         let id = uuid::Uuid::new_v4();
-        self.send(Update::HistoryReplay(HistoryUpdate::Begin(id)))?;
+        self.send(Update::HistoryReplay(if reconcile {
+            HistoryUpdate::Reconcile(id)
+        } else {
+            HistoryUpdate::Begin(id)
+        }))?;
         Ok(HistoryReplay {
             sender: self.sender.clone(),
             id,
@@ -185,6 +198,9 @@ impl TuiHandle {
     }
     pub fn observation(&self, state: ObservationState) -> Result<()> {
         self.send(Update::Observation(state))
+    }
+    pub fn input_uncertain(&self, input_id: String) -> Result<()> {
+        self.send(Update::InputUncertain(input_id))
     }
     pub async fn draft(&self) -> Result<String> {
         Ok(self.composer_draft().await?.text)
@@ -391,6 +407,7 @@ impl AttachmentLabel {
 
 enum InputDelivery {
     Submitting,
+    Uncertain,
     Waiting,
     Placed { entry_id: String },
 }
@@ -413,6 +430,11 @@ struct HistoryEntry {
     id: String,
     whole: bool,
     blocks: Vec<(Role, usize)>,
+}
+
+struct HistoryAnchor {
+    position: usize,
+    entry_id: Option<String>,
 }
 impl HistoryEntry {
     fn block(&mut self, role: Role, continuation: bool) -> usize {
@@ -570,6 +592,7 @@ impl Message {
             let label = if let MessageKind::Input { mode, delivery, .. } = &self.kind {
                 match (mode, delivery) {
                     (_, InputDelivery::Submitting) => "You · sending",
+                    (_, InputDelivery::Uncertain) => "You · delivery unconfirmed; not resent",
                     (InputMode::Steer, InputDelivery::Waiting) => "You · steering, waiting",
                     (InputMode::FollowUp, InputDelivery::Waiting) => "You · queued",
                     (_, InputDelivery::Placed { .. }) => "You",
@@ -644,6 +667,7 @@ struct State {
     loading_history: Option<HistoryLoad>,
     more_history: bool,
     history_replay: Option<uuid::Uuid>,
+    history_reconciliation: Option<HistoryAnchor>,
     picker: Option<ConversationPicker>,
     help_open: bool,
     help_scroll: usize,
@@ -685,6 +709,7 @@ impl State {
             loading_history: None,
             more_history: false,
             history_replay: None,
+            history_reconciliation: None,
             picker: None,
             help_open: false,
             help_scroll: 0,
@@ -955,6 +980,26 @@ impl State {
             }
         }
     }
+    fn reset_observed_activity(&mut self) {
+        // Every attach starts a fresh activity snapshot. Only anonymous,
+        // uncommitted previews are replaced; canonical history remains owned.
+        let pending = std::mem::take(&mut self.unbound_thinking);
+        self.thinking = None;
+        self.compacting = false;
+        for index in (0..self.messages.len()).rev() {
+            if self.messages[index].id.is_none()
+                && matches!(self.messages[index].kind, MessageKind::Thinking(id) if pending.contains(&id))
+            {
+                self.messages.remove(index);
+                if let Some(offset) = &mut self.history_offset
+                    && index < *offset
+                {
+                    *offset -= 1;
+                }
+                self.invalidate(index);
+            }
+        }
+    }
     fn pending_input(&mut self, input_id: String, text: String, mode: InputMode) {
         if self.messages.iter().any(|message| matches!(&message.kind, MessageKind::Input { input_id: id, .. } if id == &input_id)) { return; }
         self.push(Role::User, text);
@@ -965,6 +1010,20 @@ impl State {
                 mode,
                 delivery: InputDelivery::Submitting,
             };
+        }
+    }
+    fn input_uncertain(&mut self, input_id: &str) {
+        if let Some(index) = self.messages.iter().position(|message| {
+            matches!(&message.kind, MessageKind::Input {
+                input_id: id, delivery: InputDelivery::Submitting, ..
+            } if id == input_id)
+        }) {
+            if let MessageKind::Input { delivery, .. } = &mut self.messages[index].kind {
+                *delivery = InputDelivery::Uncertain;
+            }
+            self.messages[index].rendered = None;
+            self.invalidate(index);
+            self.changed = true;
         }
     }
     fn tool(&mut self, call_id: String, name: String, status: ToolStatus) {
@@ -1052,6 +1111,7 @@ impl State {
     fn event(&mut self, event: RuntimeEventKind) {
         match event {
             RuntimeEventKind::ConversationReady { conversation, model, cwd, working } => {
+                self.reset_observed_activity();
                 self.info = TuiInfo { title: conversation.title, model: Some(model), cwd };
                 self.worker = false;
                 self.output.banner.ready();
@@ -1192,17 +1252,38 @@ impl State {
                 self.working(false);
             }
             RuntimeEventKind::InputAccepted { input_id } => {
-                if let Some(index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Input { input_id: id, delivery: InputDelivery::Submitting, .. } if id == &input_id)) {
+                if let Some(index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Input { input_id: id, delivery: InputDelivery::Submitting | InputDelivery::Uncertain, .. } if id == &input_id)) {
                     if let MessageKind::Input { delivery, .. } = &mut self.messages[index].kind { *delivery = InputDelivery::Waiting; }
                     self.messages[index].rendered = None;
                     self.invalidate(index);
                 }
             }
             RuntimeEventKind::InputPlaced { input_id, entry_id } => {
-                if let Some(index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Input { input_id: id, .. } if id == &input_id)) {
+                if let Some(mut index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Input { input_id: id, .. } if id == &input_id)) {
+                    if self.messages.iter().enumerate().any(|(other, message)|
+                        other != index && message.id.as_ref() == Some(&entry_id) && message.role == Role::User)
+                    {
+                        // A reconnect history page may beat its placement receipt.
+                        // The exact native ID merges the complete local preview at
+                        // the canonical position, without comparing user text.
+                        let mut preview = self.messages.remove(index);
+                        if let Some(offset) = &mut self.history_offset { *offset = offset.saturating_sub(usize::from(index < *offset)); }
+                        let first = self.messages.iter().position(|message| message.id.as_ref() == Some(&entry_id) && message.role == Role::User).unwrap_or(index.min(self.messages.len()));
+                        self.invalidate(index.min(first));
+                        for other in (first..self.messages.len()).rev() {
+                            if self.messages[other].id.as_ref() == Some(&entry_id) && self.messages[other].role == Role::User {
+                                if self.messages[other].output == CellOutput::Printed { preview.output = CellOutput::Printed; }
+                                self.messages.remove(other);
+                                if let Some(offset) = &mut self.history_offset { *offset = offset.saturating_sub(usize::from(other < *offset)); }
+                            }
+                        }
+                        index = first;
+                        self.messages.insert(index, preview);
+                        if let Some(offset) = &mut self.history_offset { *offset += usize::from(index <= *offset); }
+                    }
                     let message = &mut self.messages[index];
                     message.id = Some(entry_id.clone());
-                    message.output = CellOutput::Ready;
+                    if message.output != CellOutput::Printed { message.output = CellOutput::Ready; }
                     if let MessageKind::Input { delivery, .. } = &mut message.kind
                         && !matches!(delivery, InputDelivery::Placed { .. }) {
                         *delivery = InputDelivery::Placed { entry_id: entry_id.clone() };
@@ -1220,14 +1301,18 @@ impl State {
                         MessageKind::Input { delivery: InputDelivery::Placed { entry_id }, .. } =>
                             format!("Saved entry: {entry_id}\nThe input is already present in this conversation."),
                         MessageKind::Input { delivery, .. } => format!("Last delivery receipt: {}.\n\nPending input:\n> {}",
-                            if matches!(delivery, InputDelivery::Submitting) { "sending" } else { "accepted, awaiting placement" },
+                            match delivery {
+                                InputDelivery::Submitting => "sending",
+                                InputDelivery::Uncertain => "unconfirmed; not resent",
+                                _ => "accepted, awaiting placement",
+                            },
                             saved.text.replace('\n', "\n> ")),
                         _ => "No local delivery receipt is available for this input.".into(),
                     }
                 });
                 let text = self.error_context(format!("Input rejected: {input_id}\n\n{message}\n\n{receipt}"));
                 if let Some(index) = pending
-                    && matches!(self.messages[index].kind, MessageKind::Input { delivery: InputDelivery::Submitting | InputDelivery::Waiting, .. }) {
+                    && matches!(self.messages[index].kind, MessageKind::Input { delivery: InputDelivery::Submitting | InputDelivery::Uncertain | InputDelivery::Waiting, .. }) {
                     self.messages.remove(index);
                     self.invalidate(index);
                 }
@@ -1242,6 +1327,8 @@ impl State {
             "Closing"
         } else if self.observation == Some(ObservationState::Disconnected) {
             "Disconnected"
+        } else if self.observation == Some(ObservationState::Reconnecting) {
+            "Reconnecting"
         } else if self.observation == Some(ObservationState::Connecting)
             || self.info.model.is_none()
         {
@@ -1266,12 +1353,20 @@ impl State {
     fn history_update(&mut self, update: HistoryUpdate) {
         match update {
             HistoryUpdate::Begin(id) => self.begin_history_replay(id),
+            HistoryUpdate::Reconcile(id) => {
+                self.begin_history_replay(id);
+                self.history_reconciliation = Some(HistoryAnchor {
+                    position: self.messages.len(),
+                    entry_id: None,
+                });
+            }
             HistoryUpdate::Page { id, events } => self.history_replay_page(id, events),
             HistoryUpdate::End { id, complete } => self.end_history_replay(id, complete),
         }
     }
     fn begin_history_replay(&mut self, id: uuid::Uuid) {
         self.history_replay = Some(id);
+        self.history_reconciliation = None;
         self.changed = true;
     }
     fn choose_conversation(
@@ -1290,12 +1385,33 @@ impl State {
         if self.history_replay != Some(id) {
             return;
         }
-        self.history_offset = Some(0);
+        self.history_offset = Some(self.history_reconciliation.as_ref().map_or(0, |anchor| {
+            anchor
+                .entry_id
+                .as_ref()
+                .and_then(|id| {
+                    self.messages
+                        .iter()
+                        .position(|message| message.id.as_ref() == Some(id))
+                })
+                .unwrap_or(anchor.position.min(self.messages.len()))
+        }));
         self.history_entry = None;
+        let first_entry = events.iter().find_map(|event| match event {
+            RuntimeEventKind::History { messages, .. } => {
+                messages.first().map(|message| message.entry_id.clone())
+            }
+            _ => None,
+        });
         for event in events {
             if matches!(event, RuntimeEventKind::History { .. }) {
                 self.event(event);
             }
+        }
+        if let Some(anchor) = &mut self.history_reconciliation
+            && let Some(first_entry) = first_entry
+        {
+            anchor.entry_id = Some(first_entry);
         }
     }
     fn end_history_replay(&mut self, id: uuid::Uuid, complete: bool) {
@@ -1303,6 +1419,7 @@ impl State {
             return;
         }
         self.history_replay = None;
+        self.history_reconciliation = None;
         self.finish_history_page();
         if !complete {
             self.push(
@@ -1900,7 +2017,9 @@ impl State {
                 Style::default().fg(
                     if self.observation == Some(ObservationState::Disconnected) {
                         Color::Red
-                    } else if self.interrupting {
+                    } else if self.observation == Some(ObservationState::Reconnecting)
+                        || self.interrupting
+                    {
                         Color::Yellow
                     } else if self.working || self.compacting || self.info.model.is_none() {
                         Color::Cyan
@@ -2111,6 +2230,7 @@ fn run(
                     let _ = sender.send(state.info.clone());
                 }
                 Ok(Update::Notice(text)) => state.push(Role::Notice, text),
+                Ok(Update::InputUncertain(input_id)) => state.input_uncertain(&input_id),
                 Ok(Update::RestoreInput(input)) => {
                     state.restore_composer(input);
                     state.push(Role::Notice, "Unsent input returned to the draft.".into());
@@ -2165,7 +2285,7 @@ mod tests {
     use crate::{
         models::{ModelSelection, Reasoning},
         protocol::{HistoryMessage, HistoryRole, ModelActivity, RuntimeEventKind},
-        tui::{State, TuiInfo, TuiInput},
+        tui::{InputDelivery, MessageKind, State, TuiInfo, TuiInput},
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend};
@@ -2737,6 +2857,174 @@ mod tests {
         }
         assert_eq!(view.editor.lines().join("\n"), "An unfinished correction");
         assert!(!view.working);
+    }
+
+    #[test]
+    fn reconnecting_is_ephemeral_and_preserves_the_composer_and_pending_input() {
+        use crate::{protocol::InputMode, tui::ObservationState};
+        let mut view = state();
+        view.editor.insert_str("An unfinished correction");
+        view.pending_input(
+            "offline-input".into(),
+            "Queued context".into(),
+            InputMode::FollowUp,
+        );
+        let rows = view.messages.len();
+        view.observation = Some(ObservationState::Reconnecting);
+        view.event(RuntimeEventKind::ConversationState { working: true });
+        assert_eq!(view.status(), "Reconnecting");
+        assert!(rendered(&mut view, 130, 35).contains("Reconnecting"));
+        assert_eq!(view.messages.len(), rows);
+        assert_eq!(view.composer_draft().text, "An unfinished correction");
+        view.observation = Some(ObservationState::Connected);
+        view.event(RuntimeEventKind::ConversationState { working: false });
+        let recovered = rendered(&mut view, 130, 35);
+        assert!(!recovered.contains("Reconnecting"));
+        assert_eq!(view.messages.len(), rows);
+        assert_eq!(view.composer_draft().text, "An unfinished correction");
+    }
+
+    #[test]
+    fn uncertain_input_uses_authoritative_receipts_without_replacing_the_editor() {
+        let mut view = state();
+        view.editor.insert_str("An unfinished correction");
+        view.pending_input(
+            "pending".into(),
+            "Context".into(),
+            crate::protocol::InputMode::Steer,
+        );
+        view.input_uncertain("pending");
+        assert!(rendered(&mut view, 130, 35).contains("delivery unconfirmed; not resent"));
+        view.event(RuntimeEventKind::InputAccepted {
+            input_id: "pending".into(),
+        });
+        assert!(rendered(&mut view, 130, 35).contains("steering, waiting"));
+        view.event(RuntimeEventKind::InputPlaced {
+            input_id: "pending".into(),
+            entry_id: "native".into(),
+        });
+        view.input_uncertain("pending");
+        assert!(!rendered(&mut view, 130, 35).contains("unconfirmed"));
+        assert_eq!(view.composer_draft().text, "An unfinished correction");
+    }
+
+    #[test]
+    fn history_before_placement_merges_the_exact_native_entry_at_its_saved_position() {
+        let mut view = state();
+        view.editor.insert_str("An unfinished correction");
+        view.pending_input(
+            "pending".into(),
+            "Same context".into(),
+            crate::protocol::InputMode::Steer,
+        );
+        let replay = uuid::Uuid::new_v4();
+        view.begin_history_replay(replay);
+        view.history_replay_page(
+            replay,
+            vec![RuntimeEventKind::History {
+                conversation_id: "saved".into(),
+                messages: vec![
+                    HistoryMessage {
+                        entry_id: "unrelated".into(),
+                        role: HistoryRole::User,
+                        text: "Same context".into(),
+                        continuation: false,
+                        final_chunk: true,
+                        tool: None,
+                        attachments: None,
+                    },
+                    HistoryMessage {
+                        entry_id: "native".into(),
+                        role: HistoryRole::User,
+                        text: "Same context".into(),
+                        continuation: false,
+                        final_chunk: true,
+                        tool: None,
+                        attachments: None,
+                    },
+                    HistoryMessage {
+                        entry_id: "answer".into(),
+                        role: HistoryRole::Final,
+                        text: "A saved response".into(),
+                        continuation: false,
+                        final_chunk: true,
+                        tool: None,
+                        attachments: None,
+                    },
+                ],
+                next_cursor: None,
+                page_complete: true,
+            }],
+        );
+        assert_eq!(view.messages.len(), 4);
+        view.event(RuntimeEventKind::InputPlaced {
+            input_id: "pending".into(),
+            entry_id: "native".into(),
+        });
+        view.end_history_replay(replay, true);
+        assert_eq!(view.messages.len(), 3);
+        assert_eq!(
+            view.messages
+                .iter()
+                .filter(|message| message.text == "Same context")
+                .count(),
+            2
+        );
+        assert_eq!(
+            view.messages
+                .iter()
+                .map(|message| message.id.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("unrelated"), Some("native"), Some("answer")]
+        );
+        assert!(
+            matches!(&view.messages[1].kind, MessageKind::Input { delivery: InputDelivery::Placed { entry_id }, .. } if entry_id == "native")
+        );
+        assert_eq!(view.composer_draft().text, "An unfinished correction");
+    }
+
+    #[test]
+    fn reconnect_backfill_keeps_a_disjoint_newest_page_after_the_retained_history() {
+        let mut view = state();
+        let saved = |index| HistoryMessage {
+            entry_id: format!("user-{index:02}"),
+            role: HistoryRole::User,
+            text: format!("Input {index:02}"),
+            continuation: false,
+            final_chunk: true,
+            tool: None,
+            attachments: None,
+        };
+        for index in 1..=2 {
+            view.event(RuntimeEventKind::Message {
+                message: saved(index),
+            });
+        }
+        let replay = uuid::Uuid::new_v4();
+        view.history_update(crate::tui::HistoryUpdate::Reconcile(replay));
+        for range in [21..=40, 1..=20] {
+            view.history_replay_page(
+                replay,
+                vec![RuntimeEventKind::History {
+                    conversation_id: "saved".into(),
+                    messages: range.map(saved).collect(),
+                    next_cursor: Some("older".into()),
+                    page_complete: true,
+                }],
+            );
+        }
+        view.end_history_replay(replay, true);
+        assert_eq!(
+            view.messages
+                .iter()
+                .map(|message| message.text.clone())
+                .collect::<Vec<_>>(),
+            (1..=40)
+                .map(|index| format!("Input {index:02}"))
+                .collect::<Vec<_>>()
+        );
+        view.input(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(view.composer_draft().text, "Input 40");
     }
 
     #[test]

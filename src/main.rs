@@ -1110,6 +1110,9 @@ struct ChatStart {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum UiRecoveryOwner {
     Main,
+    Conversation {
+        conversation_id: String,
+    },
     Task {
         task_id: TaskId,
         agent_id: Option<String>,
@@ -1146,6 +1149,45 @@ async fn preserve_ui_recovery(
         },
     )
     .map(Some)
+}
+
+async fn preserve_observed_recovery(directory: &Path, ui: &UiSession) -> Result<Vec<PathBuf>> {
+    let mut drafts = ui.drafts.clone();
+    if let Some(id) = &ui.conversation_id {
+        drafts.insert(id.clone(), ui.handle.composer_draft().await?);
+    }
+    let mut queued = HashMap::<String, Vec<QueuedInput>>::new();
+    for input in &ui.pending_admissions {
+        if input.retained()? {
+            queued
+                .entry(input.conversation_id.clone())
+                .or_default()
+                .push(QueuedInput {
+                    id: input.id.clone(),
+                    input: input.input()?,
+                    mode: input.mode,
+                });
+        }
+    }
+    for id in queued.keys() {
+        drafts.entry(id.clone()).or_default();
+    }
+    let mut paths = Vec::new();
+    for (conversation_id, draft) in drafts {
+        let queued_inputs = queued.remove(&conversation_id).unwrap_or_default();
+        if draft.is_empty() && queued_inputs.is_empty() {
+            continue;
+        }
+        paths.push(write_ui_recovery(
+            directory,
+            &UiRecovery {
+                owner: UiRecoveryOwner::Conversation { conversation_id },
+                draft,
+                queued_inputs,
+            },
+        )?);
+    }
+    Ok(paths)
 }
 
 fn write_ui_recovery(directory: &Path, recovery: &UiRecovery) -> Result<PathBuf> {
@@ -1197,6 +1239,7 @@ struct UiSession {
     interrupts: HashMap<String, tokio::sync::watch::Receiver<bool>>,
     drafts: HashMap<String, ComposerInput>,
     view: Option<chat_view::View>,
+    observer_ready: bool,
     history: Option<chat_history::Job>,
     initial_replay: Option<agent_cli::tui::HistoryReplay>,
     initial_history: Vec<RuntimeEventKind>,
@@ -1223,6 +1266,7 @@ impl UiSession {
             interrupts: HashMap::new(),
             drafts: HashMap::new(),
             view: None,
+            observer_ready: false,
             history: None,
             initial_replay: None,
             initial_history: Vec::new(),
@@ -1291,9 +1335,31 @@ impl UiSession {
         if let RuntimeEventKind::InputPlaced { input_id, .. } = &event {
             self.placed_input(input_id);
         }
+        if matches!(event, RuntimeEventKind::ConversationReady { .. }) {
+            if self.observer_ready
+                && let Some(view) = &self.view
+            {
+                let replay = self.handle.begin_history_reconciliation()?;
+                self.history = Some(view.replay(replay));
+            }
+            self.observer_ready = true;
+        }
         self.handle.event(event)?;
+        self.reconcile_inputs()?;
         if let Some(view) = &self.view {
             self.handle.observation(view.state())?;
+        }
+        Ok(())
+    }
+    fn reconcile_inputs(&self) -> Result<()> {
+        if let (Some(view), Some(selected)) = (&self.view, &self.selected) {
+            let mut ids = Vec::new();
+            for input in &self.pending_admissions {
+                if input.conversation_id == selected.conversation_id && input.retained()? {
+                    ids.push(input.id.clone());
+                }
+            }
+            view.reconcile(ids);
         }
         Ok(())
     }
@@ -1313,7 +1379,17 @@ impl UiSession {
         // Detaching cannot discard an input still waiting for observation or
         // its write receipt. The coordinator owns work after durable admission;
         // its model generation may continue after this terminal closes.
+        let mut readiness = self.view.as_ref().map(|view| view.ready.clone());
         loop {
+            if self.view.as_ref().is_some_and(|view| {
+                matches!(
+                    view.state(),
+                    agent_cli::tui::ObservationState::Reconnecting
+                        | agent_cli::tui::ObservationState::Disconnected
+                )
+            }) {
+                return Ok(());
+            }
             let mut waiting = false;
             for input in &self.pending_admissions {
                 waiting |= matches!(
@@ -1324,11 +1400,18 @@ impl UiSession {
             if !waiting {
                 return Ok(());
             }
-            let (token, event) = self
-                .view_events
-                .recv()
-                .await
-                .context("Input admission disconnected before it could be confirmed")?;
+            let next = tokio::select! {
+                next = self.view_events.recv() => next,
+                _ = async {
+                    if let Some(ready) = &mut readiness {
+                        let _ = ready.changed().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => continue,
+            };
+            let (token, event) =
+                next.context("Input admission disconnected before it could be confirmed")?;
             let failure = match &event {
                 RuntimeEventKind::Failure { message, .. } => Some(message.clone()),
                 _ => None,
@@ -1402,6 +1485,7 @@ fn selected_input(
     }
     let token = view.token;
     let mut ready = view.ready.clone();
+    let retry = view.retry.clone();
     let interrupt = ui.interrupts.get(&conversation_id).cloned();
     let admission = Arc::new(chat_admission::Admission::new(conversation_id, input, mode));
     ui.pending_admissions
@@ -1409,15 +1493,18 @@ fn selected_input(
     ui.handle
         .pending_composer(admission.id.clone(), &admission.input()?, admission.mode)?;
     ui.pending_admissions.push(admission.clone());
+    ui.reconcile_inputs()?;
     let sender = ui.view_sender.clone();
+    let handle = ui.handle.clone();
     let config = client.config.clone();
     let coordinator = client.coordinator.map(str::to_owned);
     let script = client.script.to_owned();
     let directory = client.directory.to_owned();
     while ui.admissions.try_join_next().is_some() {}
     ui.admissions.spawn(async move {
+        loop {
         let result: std::result::Result<(), chat_view::ViewError> = async {
-            if ready.wait_for(|ready| *ready != agent_cli::tui::ObservationState::Connecting).await.is_err()
+            if ready.wait_for(|ready| matches!(ready, agent_cli::tui::ObservationState::Connected | agent_cli::tui::ObservationState::Disconnected)).await.is_err()
                 || chat_view::observation(&ready) != agent_cli::tui::ObservationState::Connected
             {
                 if admission.stage()? == chat_admission::Stage::Canceled {
@@ -1437,7 +1524,7 @@ fn selected_input(
             if admission.stage()? == chat_admission::Stage::Canceled {
                 return Ok(());
             }
-            if let Some(mut interrupted) = interrupt
+            if let Some(mut interrupted) = interrupt.clone()
                 && interrupted.wait_for(|stopped| *stopped).await.is_err()
             {
                 if admission.stage()? == chat_admission::Stage::Canceled {
@@ -1487,6 +1574,20 @@ fn selected_input(
             .await
         }
         .await;
+        if matches!(result, Err(chat_view::ViewError::Coordinator(_))) && ready.has_changed().is_ok() {
+            let _ = ready.borrow_and_update();
+            let _ = retry.try_send(());
+            // A claimed write is uncertain. Reattach reconciles its original ID;
+            // only inputs that never claimed a write may resume automatically.
+            if matches!(admission.stage(), Ok(chat_admission::Stage::Waiting)) {
+                if ready.changed().await.is_ok() { continue; }
+            } else {
+                if matches!(admission.uncertain(), Ok(true)) {
+                    let _ = handle.input_uncertain(admission.id.clone());
+                }
+                return;
+            }
+        }
         if let Err(error) = result {
             let event = error.event(&admission.conversation_id);
             if matches!(admission.stage(), Ok(chat_admission::Stage::Waiting)) {
@@ -1498,6 +1599,8 @@ fn selected_input(
             } else {
                 let _ = sender.send((token, event));
             }
+        }
+        return;
         }
     });
     Ok(())
@@ -2478,6 +2581,7 @@ async fn chat_tui(
     } else {
         None
     };
+    let observed_recovery = preserve_observed_recovery(directory, &ui).await;
     ui.close_view().await;
     finish_controls(&mut ui.controls).await;
     let stopped = guard.stop().await;
@@ -2492,7 +2596,18 @@ async fn chat_tui(
         Some(Err(error)) => Err(error),
         _ => Ok(()),
     };
-    result.and(stopped).and(retained)
+    if let Ok(paths) = &observed_recovery {
+        for path in paths {
+            eprintln!(
+                "Pending input saved privately to {}. It will not be replayed automatically.",
+                path.display()
+            );
+        }
+    }
+    result
+        .and(stopped)
+        .and(retained)
+        .and(observed_recovery.map(|_| ()))
 }
 
 async fn exchange(
@@ -2503,15 +2618,22 @@ async fn exchange(
     command: RuntimeCommand,
 ) -> Result<Vec<RuntimeEventKind>> {
     let feedback = matches!(&command, RuntimeCommand::Feedback { .. });
-    let mut wire = connection(config, coordinator, script, directory, false).await?;
-    write_command(&mut *wire.writer, &command).await?;
+    let mut wire = connection(config, coordinator, script, directory, false)
+        .await
+        .map_err(chat_view::ViewError::transport)?;
+    write_command(&mut *wire.writer, &command)
+        .await
+        .map_err(chat_view::ViewError::read)?;
     let mut reader = FrameReader::new(BufReader::new(wire.reader));
     let mut events = Vec::new();
     loop {
         let frame = reader
             .next_frame()
-            .await?
-            .context("Coordinator disconnected")?;
+            .await
+            .map_err(chat_view::ViewError::read)?
+            .ok_or_else(|| {
+                chat_view::ViewError::transport(anyhow::anyhow!("Coordinator disconnected"))
+            })?;
         let event = decode_coordinator_event(&frame)?;
         acknowledge_feedback_event(directory, &command, &event)?;
         match event {

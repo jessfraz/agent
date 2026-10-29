@@ -2,16 +2,43 @@
 
 use crate::{ClientContext, UiSession, connection, exchange, write_command};
 use agent_cli::{
+    config::ClientConfig,
     protocol::{ErrorCode, RuntimeCommand, RuntimeEventKind, SavedConversation},
     runtime::{FrameReader, decode_coordinator_event},
-    tui::{ObservationState, TuiInfo},
+    tui::{HistoryReplay, ObservationState, TuiInfo},
 };
 use anyhow::{Context, Result};
-use tokio::{io::BufReader, task::JoinHandle};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::{
+    io::BufReader,
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
+
+struct Target {
+    config: ClientConfig,
+    coordinator: Option<String>,
+    script: PathBuf,
+    directory: PathBuf,
+    conversation_id: String,
+}
+impl Target {
+    fn client(&self) -> ClientContext<'_> {
+        ClientContext {
+            config: &self.config,
+            coordinator: self.coordinator.as_deref(),
+            script: &self.script,
+            directory: &self.directory,
+        }
+    }
+}
 
 pub(crate) struct View {
     pub(crate) token: uuid::Uuid,
     pub(crate) ready: tokio::sync::watch::Receiver<ObservationState>,
+    target: Arc<Target>,
+    input_ids: watch::Sender<Vec<String>>,
+    pub(crate) retry: mpsc::Sender<()>,
     task: JoinHandle<()>,
 }
 impl Drop for View {
@@ -20,6 +47,17 @@ impl Drop for View {
     }
 }
 impl View {
+    pub(crate) fn reconcile(&self, ids: Vec<String>) {
+        self.input_ids.send_replace(ids);
+    }
+    pub(crate) fn replay(&self, replay: HistoryReplay) -> crate::chat_history::Job {
+        crate::chat_history::Job::start(
+            self.target.client(),
+            self.target.conversation_id.clone(),
+            crate::chat_history::Start::Recent,
+            replay,
+        )
+    }
     pub(crate) fn state(&self) -> ObservationState {
         observation(&self.ready)
     }
@@ -39,17 +77,35 @@ pub(crate) fn observation(
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum ViewError {
     Coordinator(anyhow::Error),
     Internal(anyhow::Error),
 }
 impl From<anyhow::Error> for ViewError {
     fn from(error: anyhow::Error) -> Self {
-        Self::Internal(error)
+        match error.downcast::<Self>() {
+            Ok(error) => error,
+            Err(error) => Self::Internal(error),
+        }
     }
 }
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Coordinator(error) | Self::Internal(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+impl std::error::Error for ViewError {}
 impl ViewError {
-    fn read(error: anyhow::Error) -> Self {
+    pub(crate) fn transport(error: anyhow::Error) -> anyhow::Error {
+        Self::Coordinator(error).into()
+    }
+    pub(crate) fn is_transport(error: &anyhow::Error) -> bool {
+        matches!(error.downcast_ref::<Self>(), Some(Self::Coordinator(_)))
+    }
+    pub(crate) fn read(error: anyhow::Error) -> Self {
         if error.is::<std::io::Error>() {
             Self::Coordinator(error)
         } else {
@@ -203,6 +259,7 @@ pub(crate) async fn open(
         })?;
     }
     ui.handle.observation(ObservationState::Connecting)?;
+    ui.observer_ready = false;
     if let Some(draft) = ui
         .drafts
         .get(&item.conversation_id)
@@ -220,6 +277,8 @@ pub(crate) async fn open(
                 ui.handle.event(RuntimeEventKind::InputAccepted {
                     input_id: input.id.clone(),
                 })?;
+            } else if input.stage()? == crate::chat_admission::Stage::Uncertain {
+                ui.handle.input_uncertain(input.id.clone())?;
             }
         }
     }
@@ -236,16 +295,28 @@ pub(crate) async fn open(
     ui.selected = Some(item.clone());
     let token = uuid::Uuid::new_v4();
     let sender = ui.view_sender.clone();
-    let config = client.config.clone();
-    let coordinator = client.coordinator.map(str::to_owned);
-    let script = client.script.to_owned();
-    let directory = client.directory.to_owned();
+    let target = Arc::new(Target {
+        config: client.config.clone(),
+        coordinator: client.coordinator.map(str::to_owned),
+        script: client.script.to_owned(),
+        directory: client.directory.to_owned(),
+        conversation_id: item.conversation_id.clone(),
+    });
+    let observer = target.clone();
+    let (input_ids, pending_inputs) = watch::channel(input_ids);
+    let (retry, mut retries) = mpsc::channel(1);
+    let handle = ui.handle.clone();
     let task = tokio::spawn(async move {
         let mut ready = Some(ready);
-        let result: std::result::Result<(), ViewError> = async {
-            let mut wire = connection(&config, coordinator.as_deref(), &script, &directory, false)
+        let mut delay = Duration::ZERO;
+        loop {
+            while retries.try_recv().is_ok() {}
+            let result: std::result::Result<(), ViewError> = async {
+            let client = observer.client();
+            let mut wire = connection(client.config, client.coordinator, client.script, client.directory, false)
                 .await
                 .map_err(ViewError::Coordinator)?;
+            let input_ids = pending_inputs.borrow().clone();
             write_command(
                 &mut *wire.writer,
                 &RuntimeCommand::AttachConversation {
@@ -256,40 +327,66 @@ pub(crate) async fn open(
             .await
             .map_err(ViewError::read)?;
             let mut reader = FrameReader::new(BufReader::new(wire.reader));
-            while let Some(frame) = reader.next_frame().await.map_err(ViewError::read)? {
+            loop {
+                let frame = tokio::select! {
+                    frame = reader.next_frame() => frame.map_err(ViewError::read)?,
+                    _ = retries.recv() => return Err(ViewError::Coordinator(anyhow::anyhow!("The input connection needs to reattach"))),
+                };
+                let Some(frame) = frame else { return Err(ViewError::Coordinator(anyhow::anyhow!("The conversation observation connection closed"))); };
                 let event = decode_coordinator_event(&frame).map_err(ViewError::Internal)?;
                 if matches!(event, RuntimeEventKind::HostCall { .. }) {
                     return Err(ViewError::Internal(anyhow::anyhow!(
                         "An observing terminal cannot own execution effects"
                     )));
                 }
-                if matches!(event, RuntimeEventKind::ConversationReady { .. })
-                    && let Some(ready) = ready.take()
-                {
-                    let _ = ready.send(());
+                if matches!(event, RuntimeEventKind::ConversationReady { .. }) {
+                    if let Some(ready) = ready.take() { let _ = ready.send(()); }
+                    delay = Duration::ZERO;
                     let _ = connected.send(ObservationState::Connected);
+                    let _ = handle.observation(ObservationState::Connected);
                 }
-                if matches!(event, RuntimeEventKind::Done) {
-                    return Ok(());
+                if matches!(event, RuntimeEventKind::Done | RuntimeEventKind::Failure { code: ErrorCode::CoordinatorUnavailable | ErrorCode::Internal, .. }) {
+                    return Err(ViewError::Coordinator(anyhow::anyhow!("The coordinator observation stopped")));
                 }
+                let failed = matches!(event, RuntimeEventKind::Failure { .. });
                 if sender.send((token, event)).is_err() {
                     return Ok(());
                 }
+                if failed { return Ok(()); }
             }
-            Err(ViewError::Coordinator(anyhow::anyhow!(
-                "The conversation observation connection closed."
-            )))
         }
         .await;
-        let _ = connected.send(ObservationState::Disconnected);
-        if let Err(error) = result {
-            let _ = sender.send((token, error.event(&item.conversation_id)));
+            match result {
+                Err(ViewError::Coordinator(_)) => {
+                    let _ = connected.send(ObservationState::Reconnecting);
+                    if handle.observation(ObservationState::Reconnecting).is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = if delay.is_zero() {
+                        Duration::from_secs(1)
+                    } else {
+                        (delay * 2).min(Duration::from_secs(8))
+                    };
+                }
+                result => {
+                    if let Err(error) = result {
+                        let _ = sender.send((token, error.event(&item.conversation_id)));
+                    }
+                    break;
+                }
+            }
         }
+        let _ = connected.send(ObservationState::Disconnected);
+        let _ = handle.observation(ObservationState::Disconnected);
         let _ = sender.send((token, RuntimeEventKind::Done));
     });
     ui.view = Some(View {
         token,
         ready: readiness,
+        target,
+        input_ids,
+        retry,
         task,
     });
     Ok(())

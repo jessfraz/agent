@@ -90,6 +90,11 @@ for plain output or `agent --json chat` for protocol events.
 Reopen the CLI after updating it to load presentation changes. Detaching an
 older client preserves server-owned work and saved history.
 
+Temporary connection loss shows `Reconnecting` until the same chat reattaches.
+Drafts and queued inputs stay in place; saved input IDs reconcile delivery.
+An unconfirmed write is never resent automatically. Exiting during an outage
+saves pending input under the local state directory.
+
 Drag files into the terminal composer to attach them. Complete shell-escaped
 file paths become attachment chips; ordinary text stays in the prompt. Up to
 eight files of 16 MiB each are copied before transfer. Backspace in an empty

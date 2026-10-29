@@ -11,6 +11,7 @@ use std::sync::Mutex;
 pub(crate) enum Stage {
     Waiting,
     Sending,
+    Uncertain,
     Accepted,
     Placed,
     Rejected,
@@ -79,6 +80,17 @@ impl Admission {
         *stage = Stage::Canceled;
         Ok(true)
     }
+    pub(crate) fn uncertain(&self) -> Result<bool> {
+        let mut stage = self
+            .stage
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Input admission state is unavailable"))?;
+        if *stage != Stage::Sending {
+            return Ok(false);
+        }
+        *stage = Stage::Uncertain;
+        Ok(true)
+    }
     pub(crate) fn observe(&self, event: &RuntimeEventKind) -> Result<()> {
         let next = match event {
             RuntimeEventKind::InputAccepted { input_id } if input_id == &self.id => {
@@ -106,7 +118,7 @@ impl Admission {
     pub(crate) fn retained(&self) -> Result<bool> {
         Ok(matches!(
             self.stage()?,
-            Stage::Waiting | Stage::Sending | Stage::Accepted
+            Stage::Waiting | Stage::Sending | Stage::Uncertain | Stage::Accepted
         ))
     }
 }
@@ -166,5 +178,30 @@ mod tests {
             .unwrap();
         assert_eq!(sending.stage().unwrap(), Stage::Placed);
         assert!(!sending.retained().unwrap());
+    }
+    #[test]
+    fn uncertain_writes_remain_reconcilable_and_cannot_be_resent_or_canceled_as_unsent() {
+        let input = Admission::new("saved".into(), "context".into(), InputMode::Steer);
+        assert!(!input.uncertain().unwrap());
+        assert!(input.sending().unwrap());
+        assert!(input.uncertain().unwrap());
+        assert!(input.retained().unwrap());
+        assert!(!input.sending().unwrap());
+        assert!(!input.cancel_waiting().unwrap());
+        input
+            .observe(&RuntimeEventKind::InputAccepted {
+                input_id: input.id.clone(),
+            })
+            .unwrap();
+        assert_eq!(input.stage().unwrap(), Stage::Accepted);
+        assert!(!input.uncertain().unwrap());
+        input
+            .observe(&RuntimeEventKind::InputPlaced {
+                input_id: input.id.clone(),
+                entry_id: "native-entry".into(),
+            })
+            .unwrap();
+        assert_eq!(input.stage().unwrap(), Stage::Placed);
+        assert!(!input.retained().unwrap());
     }
 }

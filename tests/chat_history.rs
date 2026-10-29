@@ -49,140 +49,336 @@ async fn chief_retains_unsent_early_inputs_when_its_initial_settings_fail() {
 }
 
 #[tokio::test]
-async fn disconnected_observer_retains_draft_and_reconciles_accepted_input_on_same_chat_resume() {
-    observer_disconnect(true).await;
+async fn disconnected_chief_reconnects_and_reconciles_accepted_input_without_resending() {
+    observer_recovery(RecoveryCase::AcceptedChief).await;
 }
 
 #[tokio::test]
-async fn failed_attach_returns_waiting_input_to_draft_without_admitting_it() {
-    observer_disconnect(false).await;
+async fn failed_worker_attach_reconnects_and_delivers_proven_unsent_input_once() {
+    observer_recovery(RecoveryCase::WaitingWorker).await;
 }
 
-async fn observer_disconnect(after_admission: bool) {
-    use agent_cli::protocol::SavedConversation;
+#[tokio::test]
+async fn uncertain_worker_input_is_not_replayed_after_automatic_reconnect() {
+    observer_recovery(RecoveryCase::UncertainWorker).await;
+}
+
+#[tokio::test]
+async fn permanent_observer_domain_failure_stays_an_error_without_retrying() {
+    observer_recovery(RecoveryCase::PermanentChief).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryCase {
+    AcceptedChief,
+    WaitingWorker,
+    UncertainWorker,
+    PermanentChief,
+}
+impl RecoveryCase {
+    fn summary(self) -> agent_cli::protocol::SavedConversation {
+        let worker = matches!(self, Self::WaitingWorker | Self::UncertainWorker);
+        agent_cli::protocol::SavedConversation {
+            conversation_id: if worker {
+                "saved-worker"
+            } else {
+                "saved-chief"
+            }
+            .into(),
+            title: if worker {
+                "Synthetic worker"
+            } else {
+                "Main agent"
+            }
+            .into(),
+            updated_at: None,
+            task_id: worker.then(|| "33333333-3333-4333-8333-333333333333".parse().unwrap()),
+            agent_id: None,
+            host: worker.then(|| "Synthetic machine".into()),
+            source_thread_id: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ObservedInput {
+    id: String,
+    text: String,
+    mode: agent_cli::protocol::InputMode,
+    placed: bool,
+}
+
+async fn write_events(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    events: impl IntoIterator<Item = RuntimeEventKind>,
+) {
+    let mut bytes = Vec::new();
+    for event in events {
+        serde_json::to_writer(&mut bytes, &event).unwrap();
+        bytes.push(b'\n');
+    }
+    writer.write_all(&bytes).await.unwrap();
+}
+
+#[derive(Clone)]
+struct RecoveryEndpoint {
+    disconnect: Arc<tokio::sync::Semaphore>,
+    recover: Arc<tokio::sync::Semaphore>,
+    lose_receipt: Arc<tokio::sync::Semaphore>,
+    attached: Arc<AtomicUsize>,
+    inputs: Arc<tokio::sync::Mutex<Vec<ObservedInput>>>,
+    queried: Arc<tokio::sync::Mutex<Vec<Vec<String>>>>,
+}
+
+async fn recovery_connection(
+    socket: tokio::net::UnixStream,
+    case: RecoveryCase,
+    endpoint: RecoveryEndpoint,
+) {
+    let RecoveryEndpoint {
+        disconnect,
+        recover,
+        lose_receipt,
+        attached,
+        inputs,
+        queried,
+    } = endpoint;
+    let (reader, mut writer) = socket.into_split();
+    let mut reader = FrameReader::new(BufReader::new(reader));
+    let Some(bytes) = reader.next_frame().await.unwrap() else {
+        return;
+    };
+    let command: RuntimeCommand = serde_json::from_slice(&bytes).unwrap();
+    let summary = case.summary();
+    let events = match command {
+        RuntimeCommand::ConversationSettings { .. } => {
+            vec![RuntimeEventKind::ConversationSettings {
+                settings: ConversationSettings {
+                    conversation_id: "saved-chief".into(),
+                    task_id: None,
+                    agent_id: None,
+                    model: ModelSelection::default(),
+                    catalog: vec![],
+                },
+            }]
+        }
+        RuntimeCommand::ListConversations { query, .. } => {
+            assert_eq!(query, summary.conversation_id);
+            vec![RuntimeEventKind::Conversations {
+                items: vec![summary],
+                next_cursor: None,
+            }]
+        }
+        RuntimeCommand::AttachConversation {
+            conversation_id,
+            input_ids,
+        } => {
+            if conversation_id == "saved-chief" && summary.conversation_id == "saved-worker" {
+                write_events(
+                    &mut writer,
+                    [RuntimeEventKind::ConversationReady {
+                        conversation: RecoveryCase::AcceptedChief.summary(),
+                        model: ModelSelection::default(),
+                        cwd: "/example".into(),
+                        working: false,
+                    }],
+                )
+                .await;
+                assert!(reader.next_frame().await.unwrap().is_none());
+                return;
+            }
+            assert_eq!(conversation_id, summary.conversation_id);
+            let index = attached.fetch_add(1, Ordering::SeqCst);
+            queried.lock().await.push(input_ids.clone());
+            if case == RecoveryCase::PermanentChief {
+                disconnect.acquire().await.unwrap().forget();
+                write_events(
+                    &mut writer,
+                    [
+                        RuntimeEventKind::Failure {
+                            code: agent_cli::protocol::ErrorCode::InvalidRequest,
+                            message: "Synthetic saved conversation was removed.".into(),
+                        },
+                        RuntimeEventKind::Done,
+                    ],
+                )
+                .await;
+                return;
+            }
+            if index == 0 && case == RecoveryCase::WaitingWorker {
+                disconnect.acquire().await.unwrap().forget();
+                return;
+            }
+            if index > 0 {
+                recover.acquire().await.unwrap().forget();
+            }
+            write_events(
+                &mut writer,
+                [RuntimeEventKind::ConversationReady {
+                    conversation: summary,
+                    model: ModelSelection::default(),
+                    cwd: "/example".into(),
+                    working: index == 0,
+                }],
+            )
+            .await;
+            if index == 0 {
+                disconnect.acquire().await.unwrap().forget();
+                if case == RecoveryCase::UncertainWorker {
+                    writer.write_all(b"{\"type\":\"message\"").await.unwrap();
+                }
+            } else {
+                let known = inputs.lock().await;
+                let mut receipts = Vec::new();
+                for input in known
+                    .iter()
+                    .filter(|input| input.placed && input_ids.contains(&input.id))
+                {
+                    receipts.push(RuntimeEventKind::InputAccepted {
+                        input_id: input.id.clone(),
+                    });
+                    receipts.push(RuntimeEventKind::InputPlaced {
+                        input_id: input.id.clone(),
+                        entry_id: format!("native-{}", input.id),
+                    });
+                }
+                drop(known);
+                receipts.push(RuntimeEventKind::Message {
+                    message: HistoryMessage {
+                        entry_id: "recovered-answer".into(),
+                        role: HistoryRole::Final,
+                        text: "Automatic recovery is ready.".into(),
+                        continuation: false,
+                        final_chunk: true,
+                        tool: None,
+                        attachments: None,
+                    },
+                });
+                write_events(&mut writer, receipts).await;
+                assert!(reader.next_frame().await.unwrap().is_none());
+            }
+            return;
+        }
+        RuntimeCommand::ReadConversation {
+            conversation_id, ..
+        } => {
+            if conversation_id == "saved-chief" && summary.conversation_id == "saved-worker" {
+                write_events(
+                    &mut writer,
+                    [
+                        RuntimeEventKind::History {
+                            conversation_id,
+                            messages: vec![],
+                            next_cursor: None,
+                            page_complete: true,
+                        },
+                        RuntimeEventKind::Done,
+                    ],
+                )
+                .await;
+                return;
+            }
+            assert_eq!(conversation_id, summary.conversation_id);
+            let messages = inputs
+                .lock()
+                .await
+                .iter()
+                .filter(|input| input.placed)
+                .map(|input| HistoryMessage {
+                    entry_id: format!("native-{}", input.id),
+                    role: HistoryRole::User,
+                    text: input.text.clone(),
+                    continuation: false,
+                    final_chunk: true,
+                    tool: None,
+                    attachments: None,
+                })
+                .collect();
+            vec![RuntimeEventKind::History {
+                conversation_id,
+                messages,
+                next_cursor: None,
+                page_complete: true,
+            }]
+        }
+        RuntimeCommand::ConversationInput {
+            conversation_id,
+            input_id,
+            input,
+            mode,
+            ..
+        } => {
+            assert_eq!(conversation_id, summary.conversation_id);
+            let initial = input == "One owned execution";
+            let unknown = case == RecoveryCase::UncertainWorker && initial;
+            let mut known = inputs.lock().await;
+            assert!(
+                known.iter().all(|existing| existing.id != input_id),
+                "A reconnect must never resend an already written input identity"
+            );
+            known.push(ObservedInput {
+                id: input_id.clone(),
+                text: input,
+                mode,
+                placed: !unknown,
+            });
+            drop(known);
+            if unknown {
+                lose_receipt.acquire().await.unwrap().forget();
+                return;
+            }
+            let mut receipts = vec![RuntimeEventKind::InputAccepted {
+                input_id: input_id.clone(),
+            }];
+            // The first chief input is durable, but its view misses placement.
+            if !initial || case != RecoveryCase::AcceptedChief {
+                receipts.push(RuntimeEventKind::InputPlaced {
+                    entry_id: format!("native-{input_id}"),
+                    input_id,
+                });
+            }
+            receipts
+        }
+        other => panic!("Observer recovery unexpectedly requested {other:?}"),
+    };
+    write_events(
+        &mut writer,
+        events.into_iter().chain([RuntimeEventKind::Done]),
+    )
+    .await;
+}
+
+async fn observer_recovery(case: RecoveryCase) {
+    use agent_cli::protocol::InputMode;
     let directory = tempfile::tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let config = directory.path().join("config.toml");
     fs::write(&config, "").unwrap();
     let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();
     let disconnect = Arc::new(tokio::sync::Semaphore::new(0));
+    let recover = Arc::new(tokio::sync::Semaphore::new(0));
+    let lose_receipt = Arc::new(tokio::sync::Semaphore::new(0));
     let attached = Arc::new(AtomicUsize::new(0));
-    let inputs = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
-    let (server_disconnect, server_attached, server_inputs) =
-        (disconnect.clone(), attached.clone(), inputs.clone());
+    let inputs = Arc::new(tokio::sync::Mutex::new(Vec::<ObservedInput>::new()));
+    let queried = Arc::new(tokio::sync::Mutex::new(Vec::<Vec<String>>::new()));
+    let fixture = RecoveryEndpoint {
+        disconnect: disconnect.clone(),
+        recover: recover.clone(),
+        lose_receipt: lose_receipt.clone(),
+        attached: attached.clone(),
+        inputs: inputs.clone(),
+        queried: queried.clone(),
+    };
     let server = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
         loop {
-            let (socket, _) = listener.accept().await.unwrap();
-            let (disconnect, attached, inputs) = (
-                server_disconnect.clone(),
-                server_attached.clone(),
-                server_inputs.clone(),
-            );
-            tokio::spawn(async move {
-                let (reader, mut writer) = socket.into_split();
-                let mut reader = FrameReader::new(BufReader::new(reader));
-                let Some(bytes) = reader.next_frame().await.unwrap() else {
-                    return;
-                };
-                let command: RuntimeCommand = serde_json::from_slice(&bytes).unwrap();
-                let summary = SavedConversation {
-                    conversation_id: "saved-chief".into(),
-                    title: "Main agent".into(),
-                    updated_at: None,
-                    task_id: None,
-                    agent_id: None,
-                    host: None,
-                    source_thread_id: None,
-                };
-                let events = match command {
-                    RuntimeCommand::ConversationSettings { .. } => {
-                        vec![RuntimeEventKind::ConversationSettings {
-                            settings: ConversationSettings {
-                                conversation_id: summary.conversation_id,
-                                task_id: None,
-                                agent_id: None,
-                                model: ModelSelection::default(),
-                                catalog: vec![],
-                            },
-                        }]
-                    }
-                    RuntimeCommand::AttachConversation {
-                        conversation_id,
-                        input_ids,
-                    } => {
-                        assert_eq!(conversation_id, summary.conversation_id);
-                        let index = attached.fetch_add(1, Ordering::SeqCst);
-                        if index == 0 && !after_admission {
-                            disconnect.acquire().await.unwrap().forget();
-                            return;
-                        }
-                        let mut events = vec![RuntimeEventKind::ConversationReady {
-                            conversation: summary,
-                            model: ModelSelection::default(),
-                            cwd: "/example".into(),
-                            working: index == 0,
-                        }];
-                        if index > 0 {
-                            assert_eq!(input_ids, *inputs.lock().await);
-                            for input_id in input_ids {
-                                events.push(RuntimeEventKind::InputPlaced {
-                                    input_id,
-                                    entry_id: "saved-input".into(),
-                                });
-                            }
-                        }
-                        for event in events {
-                            let mut bytes = serde_json::to_vec(&event).unwrap();
-                            bytes.push(b'\n');
-                            writer.write_all(&bytes).await.unwrap();
-                        }
-                        if index == 0 {
-                            disconnect.acquire().await.unwrap().forget();
-                        } else {
-                            assert!(reader.next_frame().await.unwrap().is_none());
-                        }
-                        return;
-                    }
-                    RuntimeCommand::ReadConversation {
-                        conversation_id, ..
-                    } => {
-                        vec![RuntimeEventKind::History {
-                            conversation_id,
-                            messages: vec![],
-                            next_cursor: None,
-                            page_complete: true,
-                        }]
-                    }
-                    RuntimeCommand::ListConversations { query, .. } => {
-                        assert_eq!(query, summary.conversation_id);
-                        vec![RuntimeEventKind::Conversations {
-                            items: vec![summary],
-                            next_cursor: None,
-                        }]
-                    }
-                    RuntimeCommand::ConversationInput {
-                        conversation_id,
-                        input_id,
-                        input,
-                        ..
-                    } => {
-                        assert_eq!(conversation_id, summary.conversation_id);
-                        assert_eq!(input, "One owned execution");
-                        inputs.lock().await.push(input_id.clone());
-                        vec![RuntimeEventKind::InputAccepted { input_id }]
-                    }
-                    RuntimeCommand::Watch => {
-                        let _ = reader.next_frame().await;
-                        return;
-                    }
-                    other => panic!("Observer recovery unexpectedly requested {other:?}"),
-                };
-                for event in events.into_iter().chain([RuntimeEventKind::Done]) {
-                    let mut bytes = serde_json::to_vec(&event).unwrap();
-                    bytes.push(b'\n');
-                    writer.write_all(&bytes).await.unwrap();
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (socket, _) = accepted.unwrap();
+                    connections.spawn(recovery_connection(socket, case, fixture.clone()));
                 }
-            });
+                finished = connections.join_next(), if !connections.is_empty() => { finished.unwrap().unwrap(); }
+            }
         }
     });
     let binary =
@@ -191,14 +387,21 @@ async fn observer_disconnect(after_admission: bool) {
         .parent()
         .unwrap()
         .join("examples/terminal-fixture");
-    let mut child = Command::new(fixture)
+    let mut command = Command::new(fixture);
+    command
         .arg(binary)
         .arg("--state-dir")
         .arg(directory.path())
         .arg("--config")
         .arg(config)
-        .arg("chat")
-        // Keep footer geometry independent of Cargo/Nix's build directory.
+        .arg("chat");
+    if matches!(
+        case,
+        RecoveryCase::WaitingWorker | RecoveryCase::UncertainWorker
+    ) {
+        command.arg("/resume saved-worker");
+    }
+    let mut child = command
         .current_dir("/")
         .env("TERM", "xterm-256color")
         .env("AGENT_TEST_TERMINAL_REPLY", "1")
@@ -212,9 +415,57 @@ async fn observer_disconnect(after_admission: bool) {
     let mut output = child.stdout.take().unwrap();
     let mut bytes = Vec::new();
     read_terminal_until(&mut output, &mut bytes, "Message the agent").await;
-    if after_admission {
+    if matches!(
+        case,
+        RecoveryCase::WaitingWorker | RecoveryCase::UncertainWorker
+    ) {
+        timeout(Duration::from_secs(3), async {
+            while attached.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // The socket can attach while the renderer still applies the previous
+        // chief view's reset. Type only after this target owns the terminal.
+        read_terminal_observation(
+            &mut output,
+            &mut bytes,
+            "the selected worker title",
+            |bytes| terminal_title(bytes).starts_with("Synthetic worker |"),
+        )
+        .await;
+    }
+    if case == RecoveryCase::PermanentChief {
+        input
+            .write_all(b"\x1b[200~A retained draft\x1b[201~")
+            .await
+            .unwrap();
+        read_terminal_until(&mut output, &mut bytes, "A retained draft").await;
+        disconnect.add_permits(1);
+        read_terminal_until(
+            &mut output,
+            &mut bytes,
+            "Synthetic saved conversation was removed.",
+        )
+        .await;
+        assert!(!terminal_text(&bytes).contains("Reconnecting"));
+        assert!(terminal_text(&bytes).contains("A retained draft"));
+        close_observer(child, &mut input, &mut output, &mut bytes).await;
+        assert_eq!(attached.load(Ordering::SeqCst), 1);
+        assert!(inputs.lock().await.is_empty());
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        return;
+    }
+    if case != RecoveryCase::WaitingWorker {
         read_terminal_until(&mut output, &mut bytes, "Working").await;
-        input.write_all(b"One owned execution\r").await.unwrap();
+    }
+    input.write_all(b"One owned execution\r").await.unwrap();
+    if case == RecoveryCase::WaitingWorker {
+        read_terminal_until(&mut output, &mut bytes, "You · sending").await;
+        assert!(inputs.lock().await.is_empty());
+    } else {
         timeout(Duration::from_secs(3), async {
             while inputs.lock().await.is_empty() {
                 tokio::task::yield_now().await;
@@ -223,44 +474,30 @@ async fn observer_disconnect(after_admission: bool) {
         .await
         .unwrap();
     }
+    if case == RecoveryCase::AcceptedChief {
+        read_terminal_until(&mut output, &mut bytes, "You · steering, waiting").await;
+    }
     input
         .write_all(b"\x1b[200~A retained draft\x1b[201~")
         .await
         .unwrap();
     read_terminal_until(&mut output, &mut bytes, "A retained draft").await;
-    if !after_admission {
-        input.write_all(b"\r").await.unwrap();
-        // A PTY write does not mean the CLI has processed Enter. Keep the
-        // observer open until the input is visibly waiting for attachment.
-        read_terminal_until(&mut output, &mut bytes, "You · sending").await;
-    }
     disconnect.add_permits(1);
-    read_terminal_until(
-        &mut output,
-        &mut bytes,
-        if after_admission {
-            "Coordinator connection lost"
-        } else {
-            "The conversation view did not attach"
-        },
-    )
-    .await;
-    read_terminal_until(&mut output, &mut bytes, "Disconnected").await;
-    assert!(!terminal_text(&bytes).contains("Code: internal"));
-    if after_admission {
-        input.write_all(b"\r").await.unwrap();
+    if case == RecoveryCase::UncertainWorker {
+        lose_receipt.add_permits(1);
     }
-    read_terminal_until(
-        &mut output,
-        &mut bytes,
-        "Unsent input returned to the draft.",
-    )
-    .await;
-    assert_eq!(inputs.lock().await.len(), usize::from(after_admission));
-    // Replace the unsent draft with an explicit reconnect command. Reattaching
-    // must reconcile the accepted identity, never submit its text again.
+    read_terminal_until(&mut output, &mut bytes, "Reconnecting").await;
+    assert!(!terminal_text(&bytes).contains("Code: internal"));
+    assert!(terminal_text(&bytes).contains("A retained draft"));
     input.write_all(&[0x7f; 16]).await.unwrap();
-    input.write_all(b"/resume saved-chief\r").await.unwrap();
+    input.write_all(b"Offline correction\r").await.unwrap();
+    input.write_all(b"Separate queued turn\t").await.unwrap();
+    read_terminal_until(&mut output, &mut bytes, "Separate queued turn").await;
+    input
+        .write_all(b"\x1b[200~A retained draft\x1b[201~")
+        .await
+        .unwrap();
+    read_terminal_until(&mut output, &mut bytes, "A retained draft").await;
     timeout(Duration::from_secs(3), async {
         while attached.load(Ordering::SeqCst) < 2 {
             tokio::task::yield_now().await;
@@ -268,20 +505,116 @@ async fn observer_disconnect(after_admission: bool) {
     })
     .await
     .unwrap();
-    read_terminal_until(&mut output, &mut bytes, "Ready").await;
-    assert_eq!(inputs.lock().await.len(), usize::from(after_admission));
+    assert_eq!(
+        inputs.lock().await.len(),
+        usize::from(case != RecoveryCase::WaitingWorker)
+    );
+    recover.add_permits(1);
+    read_terminal_until(&mut output, &mut bytes, "Automatic recovery is ready.").await;
+    timeout(Duration::from_secs(3), async {
+        while inputs.lock().await.len() < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let observed = inputs.lock().await;
+    assert_eq!(observed.len(), 3);
+    for (text, mode) in [
+        ("One owned execution", InputMode::Steer),
+        ("Offline correction", InputMode::Steer),
+        ("Separate queued turn", InputMode::FollowUp),
+    ] {
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|input| input.text == text && input.mode == mode)
+                .count(),
+            1,
+            "Unexpected native inputs: {observed:?}"
+        );
+    }
+    if case != RecoveryCase::WaitingWorker {
+        assert!(
+            queried.lock().await[1].contains(&observed[0].id),
+            "Reattach must reconcile the original written input identity"
+        );
+    }
+    drop(observed);
+    read_terminal_until(&mut output, &mut bytes, "A retained draft").await;
+    let recovered = terminal_history_text(&bytes);
+    assert!(
+        !recovered.contains("Reconnecting"),
+        "Recovery progress must never become a saved transcript row: {recovered}"
+    );
+    if case != RecoveryCase::UncertainWorker {
+        assert!(!recovered.contains("Coordinator connection lost"));
+    }
+    assert!(!recovered.contains("Unsent input returned to the draft"));
+    assert_eq!(attached.load(Ordering::SeqCst), 2);
+    // Readback of the next native input proves the editor draft survived,
+    // independently of incremental terminal repaint boundaries.
+    input.write_all(b"\r").await.unwrap();
+    timeout(Duration::from_secs(3), async {
+        while inputs.lock().await.len() < 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let observed = inputs.lock().await;
+    assert_eq!(observed.len(), 4);
+    assert_eq!(observed[3].text, "A retained draft");
+    assert_eq!(observed[3].mode, InputMode::Steer);
+    drop(observed);
+    close_observer(child, &mut input, &mut output, &mut bytes).await;
+    assert_eq!(
+        inputs.lock().await.len(),
+        4,
+        "Closing the client cannot replay uncertain or accepted input"
+    );
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+async fn close_observer(
+    child: tokio::process::Child,
+    input: &mut tokio::process::ChildStdin,
+    output: &mut tokio::process::ChildStdout,
+    bytes: &mut Vec<u8>,
+) {
     input.write_all(b"\x03").await.unwrap();
-    let exited = timeout(Duration::from_secs(3), child.wait_with_output())
-        .await
-        .unwrap()
-        .unwrap();
+    let exited = timeout(Duration::from_secs(3), async {
+        use tokio::io::AsyncReadExt;
+        let (exited, drained) = tokio::join!(child.wait_with_output(), output.read_to_end(bytes));
+        drained.unwrap();
+        exited.unwrap()
+    })
+    .await
+    .unwrap();
     assert!(
         exited.status.success(),
         "{}",
         String::from_utf8_lossy(&exited.stderr)
     );
-    server.abort();
-    let _ = server.await;
+}
+
+fn terminal_history_text(bytes: &[u8]) -> String {
+    let mut terminal = vt100::Parser::new(
+        std::num::NonZeroU16::new(32).unwrap(),
+        std::num::NonZeroU16::new(100).unwrap(),
+        1_000,
+    );
+    terminal.process(bytes);
+    let mut formatted = String::new();
+    terminal
+        .screen()
+        .write_contents_formatted_basic(
+            &mut formatted,
+            vt100::capture::BasicFormattedCaptureRange::Full(&mut Default::default()),
+        )
+        .unwrap();
+    vt100::capture::basic_formatted_to_plain(&formatted).collect()
 }
 
 async fn read_terminal_until(
@@ -289,19 +622,48 @@ async fn read_terminal_until(
     bytes: &mut Vec<u8>,
     expected: &str,
 ) {
-    use tokio::io::AsyncReadExt;
-    timeout(Duration::from_secs(3), async {
-        let mut chunk = [0; 4096];
-        let expected = expected
-            .chars()
-            .filter(|ch| !ch.is_whitespace())
-            .collect::<String>();
-        while !terminal_text(bytes)
+    let needle = expected
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    read_terminal_observation(output, bytes, expected, |bytes| {
+        terminal_text(bytes)
             .chars()
             .filter(|ch| !ch.is_whitespace())
             .collect::<String>()
-            .contains(&expected)
-        {
+            .contains(&needle)
+    })
+    .await;
+}
+
+fn terminal_title(bytes: &[u8]) -> String {
+    #[derive(Default)]
+    struct Title(String);
+    impl vt100::Callbacks for Title {
+        fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+            self.0 = String::from_utf8(title.to_vec()).unwrap();
+        }
+    }
+    let mut terminal = vt100::Parser::new_with_callbacks(
+        std::num::NonZeroU16::new(32).unwrap(),
+        std::num::NonZeroU16::new(100).unwrap(),
+        0,
+        Title::default(),
+    );
+    terminal.process(bytes);
+    terminal.callbacks().0.clone()
+}
+
+async fn read_terminal_observation(
+    output: &mut tokio::process::ChildStdout,
+    bytes: &mut Vec<u8>,
+    expected: &str,
+    observed: impl Fn(&[u8]) -> bool,
+) {
+    use tokio::io::AsyncReadExt;
+    timeout(Duration::from_secs(3), async {
+        let mut chunk = [0; 4096];
+        while !observed(bytes) {
             let count = output.read(&mut chunk).await.unwrap();
             assert!(
                 count > 0,

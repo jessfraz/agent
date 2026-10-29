@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 
 pub(crate) enum Start {
     AfterAttach(tokio::sync::oneshot::Receiver<()>),
+    Recent,
     Older(String),
 }
 
@@ -33,6 +34,7 @@ impl Job {
         Self {
             task: tokio::spawn(async move {
                 let mut cursor = match start {
+                    Start::Recent => None,
                     Start::AfterAttach(ready) => {
                         ready
                             .await
@@ -43,7 +45,7 @@ impl Job {
                 };
                 let mut seen: HashSet<String> = cursor.iter().cloned().collect();
                 loop {
-                    let events = exchange(
+                    let events = match exchange(
                         &config,
                         coordinator.as_deref(),
                         &script,
@@ -53,7 +55,15 @@ impl Job {
                             cursor: cursor.clone(),
                         },
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(events) => events,
+                        Err(error) if crate::chat_view::ViewError::is_transport(&error) => {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let mut complete = false;
                     for event in &events {
                         match event {

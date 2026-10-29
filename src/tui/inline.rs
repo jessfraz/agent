@@ -1878,4 +1878,126 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn late_placement_receipt_does_not_print_an_already_replayed_input_twice() {
+        for flush_before_receipt in [false, true] {
+            let mut state = state();
+            let mut terminal = terminal();
+            state.pending_input(
+                "pending".into(),
+                "One native user message".into(),
+                InputMode::Steer,
+            );
+            let id = uuid::Uuid::new_v4();
+            state.begin_history_replay(id);
+            state.history_replay_page(
+                id,
+                vec![RuntimeEventKind::History {
+                    conversation_id: "saved".into(),
+                    messages: vec![message(
+                        "native-user",
+                        HistoryRole::User,
+                        "One native user message",
+                        false,
+                        true,
+                    )],
+                    next_cursor: None,
+                    page_complete: true,
+                }],
+            );
+            state.end_history_replay(id, true);
+            if flush_before_receipt {
+                draw_inline(&mut state, &mut terminal);
+                assert_eq!(state.messages[0].output, CellOutput::Printed);
+            }
+            state.event(RuntimeEventKind::InputPlaced {
+                input_id: "pending".into(),
+                entry_id: "native-user".into(),
+            });
+            assert_eq!(state.messages.len(), 1);
+            draw_inline(&mut state, &mut terminal);
+            assert_eq!(
+                output(&terminal).matches("One native user message").count(),
+                1
+            );
+            assert_eq!(state.messages[0].output, CellOutput::Printed);
+        }
+    }
+
+    #[test]
+    fn reattach_activity_snapshot_replaces_anonymous_thinking_and_keeps_committed_rows() {
+        let mut state = state();
+        let mut terminal = terminal();
+        state.event(RuntimeEventKind::History {
+            conversation_id: "saved".into(),
+            messages: vec![message(
+                "completed",
+                HistoryRole::Thinking,
+                "Completed reasoning",
+                false,
+                true,
+            )],
+            next_cursor: None,
+            page_complete: true,
+        });
+        draw_inline(&mut state, &mut terminal);
+        state.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Thinking {
+                text: "Current reasoning prefix".into(),
+            },
+        });
+        state.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Compaction {
+                active: true,
+                failed: false,
+            },
+        });
+        state.event(RuntimeEventKind::ConversationReady {
+            conversation: crate::protocol::SavedConversation {
+                conversation_id: "saved".into(),
+                title: "Main agent".into(),
+                updated_at: None,
+                task_id: None,
+                agent_id: None,
+                host: None,
+                source_thread_id: None,
+            },
+            model: ModelSelection::default(),
+            cwd: "/workspace".into(),
+            working: true,
+        });
+        state.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Thinking {
+                text: "Current reasoning prefix".into(),
+            },
+        });
+        state.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Thinking {
+                text: " and suffix".into(),
+            },
+        });
+        state.event(RuntimeEventKind::Message {
+            message: message("current", HistoryRole::Final, "Current answer", false, true),
+        });
+        state.event(RuntimeEventKind::History {
+            conversation_id: "saved".into(),
+            messages: vec![message(
+                "current",
+                HistoryRole::Thinking,
+                "Current reasoning prefix and suffix",
+                false,
+                true,
+            )],
+            next_cursor: None,
+            page_complete: true,
+        });
+        state.event(RuntimeEventKind::ConversationState { working: false });
+        draw_inline(&mut state, &mut terminal);
+        let rendered = output(&terminal);
+        assert_eq!(rendered.matches("Completed reasoning").count(), 1);
+        assert_eq!(rendered.matches("Current reasoning prefix").count(), 1);
+        assert!(rendered.contains("Current reasoning prefix and suffix"));
+        assert!(!state.compacting);
+    }
 }
