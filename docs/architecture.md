@@ -257,6 +257,12 @@ repositories; each retains its own native identity and cleanup result. Native
 worktree metadata also carries a private ownership marker. Allocation becomes
 ready only after submodules initialize.
 
+Scheduled jobs and source polling run once on the coordinator. Each worker
+requests collection for its own host during maintenance. The main agent's
+`collect_worktrees` tool checks all recorded resource hosts; the CLI's
+`agent resources collect` checks only the invoking host. All use the same
+collector and ownership records.
+
 Before collection, all parent/child consumers must be finished. The owning
 host checks actual Git topology, branch, process activity and merge evidence.
 The installed guarded `git cleanup` helper prepares a plan outside the target;
