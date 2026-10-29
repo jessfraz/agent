@@ -476,6 +476,7 @@ async fn coordinator_decode_failure_reports_safe_metadata_without_private_values
 #[tokio::test]
 async fn exact_resume_renders_history_without_fetching_fuzzy_catalog_pages() {
     use agent_cli::protocol::{RuntimeEventKind, SavedConversation};
+    use tokio::io::AsyncReadExt;
     let directory = tempfile::tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let config = directory.path().join("config.toml");
@@ -626,7 +627,6 @@ async fn exact_resume_renders_history_without_fetching_fuzzy_catalog_pages() {
     let mut output = child.stdout.take().unwrap();
     let mut bytes = Vec::new();
     timeout(Duration::from_secs(10), async {
-        use tokio::io::AsyncReadExt;
         let mut chunk = [0; 4096];
         loop {
             let count = output.read(&mut chunk).await.unwrap();
@@ -646,13 +646,20 @@ async fn exact_resume_renders_history_without_fetching_fuzzy_catalog_pages() {
         .write_all(b"/exit\r")
         .await
         .unwrap();
-    let exited = timeout(Duration::from_secs(5), child.wait_with_output())
-        .await
-        .unwrap()
-        .unwrap();
+    let exited = timeout(Duration::from_secs(5), async {
+        // The PTY carries both CLI stdout and stderr. Keep draining its taken
+        // output through exit so rendering cannot block the terminal driver.
+        let (exited, drained) =
+            tokio::join!(child.wait_with_output(), output.read_to_end(&mut bytes));
+        drained.unwrap();
+        exited.unwrap()
+    })
+    .await
+    .unwrap();
     assert!(
         exited.status.success(),
-        "{}",
+        "PTY: {}\nFixture stderr: {}",
+        terminal_text(&bytes),
         String::from_utf8_lossy(&exited.stderr)
     );
     server.abort();

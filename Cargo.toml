@@ -16,6 +16,7 @@ path = "src/bin/export_protocol.rs"
 [[example]]
 name = "terminal-fixture"
 path = "examples/terminal_fixture.rs"
+test = true
 
 [dependencies]
 anyhow = "1"

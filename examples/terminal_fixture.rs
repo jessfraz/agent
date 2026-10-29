@@ -5,6 +5,7 @@ use std::{
     io::{self, Read, Write},
     os::{fd::FromRawFd, unix::process::CommandExt},
     process::{Command, ExitCode},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -41,8 +42,8 @@ fn main() -> Result<ExitCode> {
     // forkpty transferred this descriptor to the parent. Closing the master's
     // final handle also hangs up the test CLI if its driver is terminated.
     let mut output = unsafe { File::from_raw_fd(master) };
-    let mut input = output.try_clone()?;
-    let mut replies = output.try_clone()?;
+    let mut input = InputWriter(Arc::new(Mutex::new(output.try_clone()?)));
+    let mut replies = input.clone();
     let mut cursor = std::env::var_os("AGENT_TEST_TERMINAL_REPLY")
         .is_some()
         .then(CursorReport::default);
@@ -81,6 +82,29 @@ fn main() -> Result<ExitCode> {
     Ok(ExitCode::from(u8::try_from(code)?))
 }
 
+/// Keyboard chunks and cursor reports share one byte stream. Keep complete
+/// writes together, including any partial-write retries on the PTY master.
+#[derive(Clone)]
+struct InputWriter(Arc<Mutex<File>>);
+impl InputWriter {
+    fn locked(&self) -> io::Result<MutexGuard<'_, File>> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("PTY input writer is unavailable"))
+    }
+}
+impl Write for InputWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.locked()?.write(bytes)
+    }
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.locked()?.write_all(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.locked()?.flush()
+    }
+}
+
 /// The test PTY starts at the origin. Reply to cursor queries and track explicit
 /// CUP moves, including frames split across reads. This is a terminal-protocol
 /// fixture, not an emulator; normal fixture runs continue forwarding unchanged.
@@ -104,7 +128,9 @@ impl CursorReport {
                     }
                 } else if (0x40..=0x7e).contains(byte) {
                     if self.sequence == b"\x1b[6n" {
-                        write!(replies, "\x1b[{};{}R", self.row.max(1), self.column.max(1))?;
+                        replies.write_all(
+                            format!("\x1b[{};{}R", self.row.max(1), self.column.max(1)).as_bytes(),
+                        )?;
                         replies.flush()?;
                     } else if matches!(*byte, b'H' | b'f') {
                         let arguments = &self.sequence[2..self.sequence.len() - 1];
@@ -122,5 +148,40 @@ impl CursorReport {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_report_remains_a_complete_terminal_frame_when_keyboard_input_arrives() {
+        struct KeyboardWriter {
+            bytes: Vec<u8>,
+            typed: bool,
+        }
+        impl Write for KeyboardWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                if !self.typed {
+                    self.typed = true;
+                    self.bytes.extend_from_slice(b"/exit\r");
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = KeyboardWriter {
+            bytes: Vec::new(),
+            typed: false,
+        };
+        let mut cursor = CursorReport::default();
+        cursor.observe(b"\x1b[12;34H\x1b[6", &mut writer).unwrap();
+        assert!(writer.bytes.is_empty());
+        cursor.observe(b"n", &mut writer).unwrap();
+        assert_eq!(writer.bytes, b"\x1b[12;34R/exit\r");
     }
 }
