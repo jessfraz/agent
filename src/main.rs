@@ -239,6 +239,9 @@ enum ImportAction {
         /// Restrict import to these registered host IDs or names.
         #[arg(long = "host")]
         hosts: Vec<String>,
+        /// Prefer this registered host for indexing; compute falls back locally.
+        #[arg(long, value_name = "NAME_OR_ID", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        embedding_host: Option<String>,
     },
     Status,
 }
@@ -673,7 +676,13 @@ async fn main() -> Result<()> {
             },
         },
         Action::Import { command } => match command {
-            ImportAction::Codex { hosts } => RuntimeCommand::ImportCodex { hosts },
+            ImportAction::Codex {
+                hosts,
+                embedding_host,
+            } => RuntimeCommand::ImportCodex {
+                hosts,
+                embedding_host,
+            },
             ImportAction::Status => RuntimeCommand::ImportStatus,
         },
         Action::History { command } => match command {
@@ -4359,7 +4368,24 @@ mod tests {
         .unwrap();
         assert!(parsed.no_tui);
         assert!(
-            matches!(parsed.command, Some(Action::Import { command: crate::ImportAction::Codex { hosts } }) if hosts == ["desktop", "laptop"])
+            matches!(parsed.command, Some(Action::Import { command: crate::ImportAction::Codex { hosts, embedding_host: None } }) if hosts == ["desktop", "laptop"])
+        );
+        let parsed = Arguments::try_parse_from([
+            "agent",
+            "import",
+            "codex",
+            "--host",
+            "archive",
+            "--embedding-host",
+            "workstation",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Some(Action::Import {
+            command: crate::ImportAction::Codex { hosts, embedding_host: Some(host) }
+        }) if hosts == ["archive"] && host == "workstation"));
+        assert!(
+            Arguments::try_parse_from(["agent", "import", "codex", "--embedding-host", ""])
+                .is_err()
         );
         let parsed = Arguments::try_parse_from([
             "agent",

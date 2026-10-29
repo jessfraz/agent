@@ -393,9 +393,21 @@ async function handle(request: RuntimeRequest): Promise<void> {
       case "read_feedback": emit(id, { type: "feedback", bundle: await (await app()).feedback.read(command.id) }); break;
       case "import_codex": {
         const application = await app(); const available = await application.environment.environment();
+        const selected = command.embedding_host?.normalize("NFKC").trim().toLocaleLowerCase();
+        const embeddingHost = selected === undefined ? undefined : available.nodes.find((node) =>
+          node.host_id.toLocaleLowerCase() === selected || node.name.normalize("NFKC").trim().toLocaleLowerCase() === selected);
+        if (selected !== undefined && embeddingHost === undefined) throw new EnvironmentError("Choose a registered embedding host by name or ID.");
+        const call: HostCall = (operation) => hostRequests.call(id, operation);
+        const indexCall: HostCall = async (operation) => {
+          if (operation.type !== "embed" || embeddingHost === undefined || !application.environment.isConnected(embeddingHost.host_id)) return call(operation);
+          const result = await call({ type: "on_node", host_id: embeddingHost.host_id, command: operation });
+          // Embedding is pure compute. A failed worker reply can be retried
+          // locally; returned vectors still undergo normal index validation.
+          return result.type === "failed" ? call(operation) : result;
+        };
         await application.importer.run(available.nodes, available.online_host_ids, command.hosts,
-          (operation) => hostRequests.call(id, operation), (progress) => emit(id, { type: "import_progress", progress }),
-          () => application.retrieval.sync((operation) => hostRequests.call(id, operation), true));
+          call, (progress) => emit(id, { type: "import_progress", progress }),
+          () => application.retrieval.sync(indexCall, true));
         break;
       }
       case "import_status": emit(id, { type: "import_progress", progress: await (await app()).importer.status() }); break;

@@ -3204,6 +3204,12 @@
         {
           "type": "object",
           "properties": {
+            "embedding_host": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "hosts": {
               "type": "array",
               "items": {

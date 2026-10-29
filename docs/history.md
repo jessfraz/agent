@@ -6,6 +6,7 @@ find related history; import does not create work or revive old instructions.
 ```sh
 agent import codex                  # all registered online hosts
 agent import codex --host desktop   # one announced host name
+agent import codex --embedding-host workstation  # indexing compute only
 agent import status
 agent history search "fabrication files"
 agent history search "ERR_SURFACE_413" --mode keyword
@@ -25,6 +26,11 @@ attachment retries block the other work. Interrupted or failed final indexing
 resumes from the retained corpus before the next fresh import. Explicit
 `--host` selection starts a fresh walk of those hosts when no import is active.
 Concurrent commands join the running import; closing its CLI leaves it running.
+`--embedding-host` accepts an announced name or native host ID. Source reads and
+the Pi/search databases stay with their existing owners. Indexing uses that
+worker while connected, falls back to coordinator compute when unavailable,
+and uses the worker again after it returns. Vector-space validation remains
+unchanged. The option applies to a new import, not an already running one.
 A native thread maps to one conversation across hosts; each item version is
 saved once. Neither importing nor
 searching opens Rex sessions. Opening a historical conversation adopts it into

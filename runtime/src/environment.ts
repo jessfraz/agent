@@ -61,6 +61,7 @@ export class CoordinatorEnvironment {
     await this.session.commit(async (tx) => upsert(await tx.doc(State), node), BACKGROUND_CONTEXT);
   }
   setConnected(hostIds: readonly string[]): void { this.connected = new Set(hostIds); }
+  isConnected(hostId: string): boolean { return this.connected.has(hostId); }
   async environment(call?: HostCall): Promise<Extract<RuntimeEventKind, { type: "environment" }>> {
     const unavailable: string[] = [];
     if (call !== undefined) {

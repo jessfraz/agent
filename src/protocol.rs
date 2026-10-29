@@ -407,6 +407,9 @@ pub enum RuntimeCommand {
     },
     ImportCodex {
         hosts: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        embedding_host: Option<String>,
     },
     ImportStatus,
     SearchHistory {
@@ -1283,6 +1286,29 @@ mod tests {
         HistoryMessage, HistoryRole, RuntimeCommand, RuntimeEventKind, SearchMode, ToolHistory,
         ToolStatus,
     };
+
+    #[test]
+    fn import_embedding_host_is_optional_and_round_trips() {
+        let old: RuntimeCommand =
+            serde_json::from_str(r#"{"type":"import_codex","hosts":[]}"#).unwrap();
+        assert!(matches!(
+            old,
+            RuntimeCommand::ImportCodex {
+                embedding_host: None,
+                ..
+            }
+        ));
+        let command = RuntimeCommand::ImportCodex {
+            hosts: vec!["archive".into()],
+            embedding_host: Some("workstation".into()),
+        };
+        let decoded: RuntimeCommand =
+            serde_json::from_slice(&serde_json::to_vec(&command).unwrap()).unwrap();
+        assert!(
+            matches!(decoded, RuntimeCommand::ImportCodex { hosts, embedding_host: Some(host) }
+            if hosts == ["archive"] && host == "workstation")
+        );
+    }
 
     #[test]
     fn history_page_completion_is_additive_for_older_wire_messages() {
