@@ -1188,6 +1188,7 @@ struct UiSession {
     selected: Option<SavedConversation>,
     admissions: tokio::task::JoinSet<()>,
     pending_admissions: Vec<Arc<chat_admission::Admission>>,
+    interrupts: HashMap<String, tokio::sync::watch::Receiver<bool>>,
     drafts: HashMap<String, String>,
     view: Option<chat_view::View>,
     history: Option<chat_history::Job>,
@@ -1213,6 +1214,7 @@ impl UiSession {
             selected: None,
             admissions: tokio::task::JoinSet::new(),
             pending_admissions: Vec::new(),
+            interrupts: HashMap::new(),
             drafts: HashMap::new(),
             view: None,
             history: None,
@@ -1390,6 +1392,7 @@ fn selected_input(
         .context("Conversation view is unavailable")?;
     let token = view.token;
     let mut ready = view.ready.clone();
+    let interrupt = ui.interrupts.get(&conversation_id).cloned();
     let admission = Arc::new(chat_admission::Admission::new(conversation_id, text, mode));
     ui.pending_admissions
         .retain(|input| !matches!(input.retained(), Ok(false)));
@@ -1411,6 +1414,18 @@ fn selected_input(
                 bail!("The conversation view did not attach");
             }
             if admission.stage()? == chat_admission::Stage::Canceled {
+                return Ok(());
+            }
+            if let Some(mut interrupted) = interrupt
+                && interrupted.wait_for(|stopped| *stopped).await.is_err()
+            {
+                if admission.stage()? == chat_admission::Stage::Canceled {
+                    return Ok(());
+                }
+                let _ = sender.send((token, RuntimeEventKind::InputRejected {
+                    input_id: admission.id.clone(),
+                    message: "The previous interruption could not be confirmed. This input remains unsent; reconnect before sending it again.".into(),
+                }));
                 return Ok(());
             }
             let context = match chat_command(String::new(), None, &cwd).await? {
@@ -1480,6 +1495,10 @@ async fn selected_interrupt(client: ClientContext<'_>, ui: &mut UiSession) -> Re
         ui.handle
             .set_draft(ui.drafts.get(&conversation_id).cloned().unwrap_or_default())?;
     }
+    // The stop and later input use independent connections. Retain their
+    // conversation order so a delayed stop cannot abort the next request.
+    let (stopped, receipt) = tokio::sync::watch::channel(false);
+    let previous = ui.interrupts.insert(conversation_id.clone(), receipt);
     let command = RuntimeCommand::ConversationInterrupt { conversation_id };
     let config = client.config.clone();
     let coordinator = client.coordinator.map(str::to_owned);
@@ -1487,7 +1506,11 @@ async fn selected_interrupt(client: ClientContext<'_>, ui: &mut UiSession) -> Re
     let directory = client.directory.to_owned();
     let sender = ui.view_sender.clone();
     let token = ui.view.as_ref().map(|view| view.token);
-    ui.controls.spawn(async move {
+    // Switching views cancels local reads, not this already requested stop.
+    ui.admissions.spawn(async move {
+        if let Some(mut previous) = previous {
+            let _ = previous.wait_for(|stopped| *stopped).await;
+        }
         match exchange(
             &config,
             coordinator.as_deref(),
@@ -1503,6 +1526,7 @@ async fn selected_interrupt(client: ClientContext<'_>, ui: &mut UiSession) -> Re
                         let _ = sender.send((token, event));
                     }
                 }
+                let _ = stopped.send(true);
             }
             Err(error) => {
                 if let Some(token) = token {

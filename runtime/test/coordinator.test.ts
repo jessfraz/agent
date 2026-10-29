@@ -401,9 +401,11 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     replayed.child.stdin.write("/exit\r"); assert.equal(await replayed.exited, 0, replayed.errors());
     assert.equal(actor.child.exitCode, null, "Closing a view must not stop its independently owned worker");
 
-    for (const navigation of ["resume", "interrupt"]) {
+    for (const navigation of ["resume", "interrupt", "failed-interrupt"]) {
       const attachGate = join(directory, "attach-" + navigation);
-      const waiting = start(1, [], undefined, { AGENT_TEST_ATTACH_GATE: attachGate }, false, true,
+      const interruptGate = join(directory, "before-restored-input-" + navigation), interrupting = navigation !== "resume";
+      const waiting = start(1, [], undefined, { AGENT_TEST_ATTACH_GATE: attachGate,
+        ...(interrupting ? { AGENT_TEST_INTERRUPT_GATE: interruptGate } : {}) }, false, true,
         process.env.AGENT_TEST_ADMISSION_BINARY ?? binary);
       await until(async () => stat(attachGate + ".entered").then(() => true, () => false));
       const unsent = "fixture-not-admitted-" + navigation;
@@ -422,11 +424,37 @@ test("real CLI, coordinator and worker retain main history across an offline lap
       await until(async () => waiting.output().slice(restoredAt).includes(unsent),
         "A proven-unsent message must return to its own conversation's visible draft");
       const admitted = "fixture-after-canceled-" + navigation, answer = "The restored draft was sent deliberately after " + navigation + ".";
-      await script(admitted, [{ text: answer }]);
+      const action = join(directory, "restored-input-" + navigation);
+      await script(admitted, [...(interrupting ? [held(action)] : []), { text: answer }]);
       // Replace the restored draft explicitly. It must not have been silently
       // redirected to the selected task or sent when the old view became ready.
       waiting.child.stdin.write("\u0001\u000b" + admitted + "\r");
-      await until(async () => (await mainHistory()).messages.some((message) => message.text === answer));
+      if (interrupting) {
+        await until(async () => stat(interruptGate + ".entered").then(() => true, () => false));
+        await until(async () => waiting.output().includes(admitted));
+        const unrelated = "fixture-worker-during-" + navigation, unrelatedAnswer = "The other conversation remains independent of " + navigation + ".";
+        await script(unrelated, [{ text: unrelatedAnswer }]); actor.child.stdin.write(unrelated + "\n");
+        await until(async () => events(actor.output()).some((event) => event.type === "answer" && event.text === unrelatedAnswer));
+        // Keep the previous interrupt outstanding while the next input is
+        // already visible. Its independently owned admission must wait too.
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        assert.equal(await stat(action + ".started").then(() => true, () => false), false,
+          "A new input overtook its conversation's pending interrupt receipt");
+        if (navigation === "failed-interrupt") await writeFile(interruptGate + ".fail", "Fail before forwarding the native interrupt.");
+        await writeFile(interruptGate + ".release", "Finish the earlier interrupt before admitting the next input.");
+        if (navigation === "failed-interrupt") {
+          await until(async () => waiting.output().includes("interruption could not be confirmed"));
+          assert.equal((await mainHistory()).messages.some((message) => message.text === admitted), false);
+          waiting.child.stdin.write("\u0001\u000b/exit\r"); assert.equal(await waiting.exited, 0, waiting.errors());
+          continue;
+        }
+        await until(async () => stat(action + ".started").then(() => true, () => false));
+        await writeFile(action + ".release", "Complete the new input after the earlier interrupt.");
+      }
+      await until(async () => {
+        assert.equal(waiting.child.exitCode, null, "The restored view exited: " + waiting.output().slice(-8000));
+        return (await mainHistory()).messages.some((message) => message.text === answer);
+      }, "The restored draft must be delivered after " + navigation, () => waiting.output().slice(-12000));
       const newRequests = (await readFile(queue + ".requests", "utf8")).slice(before.length);
       assert.equal(newRequests.includes(unsent), false, "A canceled pre-Ready input must never be admitted later");
       assert.equal((await mainHistory()).messages.some((message) => message.text === unsent), false);

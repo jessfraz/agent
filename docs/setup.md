@@ -75,6 +75,9 @@ status. Enter steers active work; Tab queues a separate follow-up turn. Queued
 messages run in FIFO order. Esc stops, and Shift+Enter or Alt+Enter inserts a
 newline. Press `?` in an empty editor or use `/help` for commands and shortcuts,
 generated from the same definitions used to parse them.
+Input sent after Esc waits for that conversation's stop receipt; editing and
+other chats stay responsive. If stopping cannot be confirmed, the input stays
+unsent for recovery.
 Pi's compaction shows as **Compacting context**; current instructions reload
 before the next model round.
 Select transcript text with the terminal's normal copy/paste controls;

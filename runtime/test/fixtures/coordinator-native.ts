@@ -25,7 +25,8 @@ if (process.env.AGENT_TEST_NATIVE === "ssh") {
   socket.pipe(process.stdout);
   const gate = process.env.AGENT_TEST_HISTORY_GATE;
   const attachGate = process.env.AGENT_TEST_ATTACH_GATE;
-  if (gate === undefined && attachGate === undefined) process.stdin.pipe(socket);
+  const interruptGate = process.env.AGENT_TEST_INTERRUPT_GATE;
+  if (gate === undefined && attachGate === undefined && interruptGate === undefined) process.stdin.pipe(socket);
   else {
     let first = true;
     for await (const line of createInterface({ input: process.stdin })) {
@@ -37,6 +38,13 @@ if (process.env.AGENT_TEST_NATIVE === "ssh") {
       if (attachGate !== undefined && first && object(command) && command.type === "attach_conversation" && !existsSync(attachGate + ".entered")) {
         writeFileSync(attachGate + ".entered", "Observation has not yet been admitted.");
         while (!existsSync(attachGate + ".release")) await setTimeout(10);
+      }
+      if (interruptGate !== undefined && object(command) && command.type === "conversation_interrupt") {
+        writeFileSync(interruptGate + ".entered", "The previous interrupt has not reached the coordinator.");
+        while (!existsSync(interruptGate + ".release")) await setTimeout(10);
+        if (existsSync(interruptGate + ".fail")) {
+          socket.destroy(); process.stdin.destroy(); process.stdout.end(); break;
+        }
       }
       first = false;
       socket.write(line + "\n");
