@@ -461,7 +461,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                 event = call.events.recv() => {
                     let event = event.context("Coordinator closed before completing the request")?;
                     if let RuntimeEventKind::HostCall { call_id, command } = &event {
-                        if !attached || matches!(**command, HostCommand::ReadContext { .. } | HostCommand::SearchContext { .. } | HostCommand::ReloadGuidance | HostCommand::Embed { .. }) {
+                        if !attached || matches!(**command, HostCommand::OnNode { .. } | HostCommand::ReadContext { .. } | HostCommand::SearchContext { .. } | HostCommand::ReloadGuidance | HostCommand::Embed { .. }) {
                             let (cancel, cancelled) = tokio::sync::watch::channel(false);
                             cancellations.insert(call_id.clone(), cancel);
                             let broker = broker.clone(); let command = (**command).clone(); let call_id = call_id.clone();

@@ -18,6 +18,7 @@ import { TaskError, TaskStore, type HostCall, type SearchQuery } from "./tasks.j
 import type { BackgroundScheduler } from "./background.js";
 
 export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; default_host?: WorkerHost | null; call: HostCall; role?: "worker" | "triage";
+  origin_host_id?: string | null; connectedHosts?: () => Promise<WorkerHost[]>;
   search?: SearchQuery;
   project?: () => Promise<HostResult>;
   notify?: (task: string | null, text: string) => void };
@@ -56,6 +57,11 @@ export class Executions {
     const execution = this.attached.get(id);
     if (execution === undefined) throw new TaskError("The execution client is disconnected; attach the task to continue");
     return execution;
+  }
+  async hosts(id: string): Promise<WorkerHost[]> {
+    const execution = this.get(id);
+    execution.hosts = await execution.connectedHosts?.() ?? execution.hosts;
+    return execution.hosts;
   }
   search(id: string): SearchQuery | undefined { return this.attached.get(id)?.search; }
   model(id: string): ModelSelection | undefined { return this.attached.get(id)?.model; }
@@ -187,13 +193,13 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         const prepared = await tasks.openAttachment(args.id, executions.get(api.conversationId.toString()).call);
         return { output: typeof prepared.content === "string" ? [{ type: "text", text: prepared.content }] : prepared.content };
       } }),
-    defineTool({ name: "exec", description: "Run a program and literal arguments. Main defaults to the coordinator; name a connected host for other machines. Workers use their owning host.",
+    defineTool({ name: "exec", description: "Run a program and literal arguments. Main defaults to the coordinator; workers default to their owning host. Name a connected host for another machine.",
       parameters: Type.Object({ program: Type.String({ minLength: 1 }), args: Type.Array(Type.String()),
         cwd: Type.Optional(Type.String()), host: Type.Optional(Type.String()), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 65535 })) }),
       async execute(args, api) {
         const execution = executions.get(api.conversationId.toString());
-        if (args.host !== undefined && execution.role === "worker") throw new TaskError("Task commands run on their owning host.");
-        const chosen = args.host === undefined ? undefined : execution.hosts.find((host) => host.host_id === args.host || host.name === args.host);
+        const hosts = await executions.hosts(api.conversationId.toString());
+        const chosen = args.host === undefined ? undefined : hosts.find((host) => host.host_id === args.host || host.name === args.host);
         if (args.host !== undefined && chosen === undefined) throw new TaskError("Choose a connected worker host.");
         const command: HostCommand = { type: "exec", program: args.program, args: args.args,
           cwd: args.cwd ?? chosen?.cwd ?? execution.default_host?.cwd ?? execution.cwd, timeout_seconds: args.timeout_seconds ?? 900 };

@@ -29,6 +29,11 @@ export function createGuidance(executions: Executions): Extension {
       const project = await (execution.project?.() ?? execution.call({ type: "project_guidance", cwd: execution.cwd }));
       if (project.type !== "project_guidance") throw readFailure(project, "Project");
       const parts: string[] = [];
+      const hosts = await executions.hosts(id);
+      parts.push("Connected worker hosts: " + JSON.stringify({
+        default_host_id: execution.default_host?.host_id ?? null, origin_host_id: execution.origin_host_id ?? null,
+        project_cwd: execution.cwd, hosts: hosts.map((host) => ({ host_id: host.host_id, name: host.name, cwd: host.cwd })),
+      }));
       if (shared.global.text.trim()) parts.push(`# Global instructions\n\n${shared.global.text}`);
       for (const repository of shared.context_repositories) {
         parts.push(`# Context repository ${repository.id}: ${repository.root}\n\n${repository.instructions}`);

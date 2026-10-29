@@ -90,10 +90,12 @@ requires a live connection.
 
 The coordinator runs unqualified main/triage effects locally. Work targeted at
 a registered machine travels down that worker's existing connection and uses
-its local Rex socket. Task effects remain attached to their owning worker.
-Disconnects never silently move an effect onto the coordinator. Connection
-generations prevent an old connection's cleanup from removing its replacement;
-an unanswered effect is uncertain and is not replayed automatically.
+its local Rex socket. Unqualified task effects stay on the owning worker.
+Main, workers and child agents see the connected host registry; an explicit
+`exec` host uses the same coordinator routing without moving task or resource
+ownership. Disconnects never silently move an effect onto the coordinator.
+Connection generations prevent an old connection's cleanup from removing its
+replacement; an unanswered effect is uncertain and is not replayed automatically.
 
 Coordinator TOML owns model defaults, source choices and context repositories.
 Clients send their project directory and scoped instructions, without loading

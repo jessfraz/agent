@@ -111,7 +111,11 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     const old = (await tasks()).find((task) => task.title === "fixture-initial-worker"); assert.ok(old?.worker.state === "bound");
     const original = old.worker, launch = sessions(join(homes[1]!, "rex.json")).find((session) => session.session_id === original.binding.session_id); assert.ok(launch);
     const run = () => start(1, launch.command.slice(1), undefined, { REX_SESSION: launch.session_id, REX_BLOCK: launch.block_id }, true);
-    await script("fixture-initial-worker", [{ text: "Sapphire laptop measurement retained." }]);
+    await script("fixture-initial-worker", [exec,
+      { tool: "exec", args: { program: process.execPath, args: effect, host: coordinator } },
+      { tool: "exec", args: { program: process.execPath, args: effect, host: "laptop" } },
+      { tool: "exec", args: { program: process.execPath, args: effect, host: "missing-host" } },
+      { text: "Sapphire laptop measurement retained." }]);
     let actor = run(); await until(async () => events(actor.output()).some((event) => event.type === "worker_idle"));
     const initialWorker = events(actor.output());
     const readyIndex = initialWorker.findIndex((event) => event.type === "task_ready");
@@ -151,11 +155,18 @@ test("real CLI, coordinator and worker retain main history across an offline lap
       const task = all.find((task) => task.title === title); assert.ok(task?.worker.state === "bound"); assert.equal(task.worker.binding.host_id, coordinator);
     }
     assert.equal(sessions(join(homes[1]!, "rex.json")).length, 2, "Continuing the original task must not create another Rex session");
-    for (const [index, host, count] of [[0, coordinator, 3], [1, laptop, 1]] satisfies [number, string, number][]) {
+    for (const [index, host, count] of [[0, coordinator, 4], [1, laptop, 3]] satisfies [number, string, number][]) {
       const effects: unknown[] = (await readFile(join(homes[index]!, "effects"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-      assert.deepEqual(effects, Array.from({ length: count }, () => ({ host, cwd: homes[index] })));
+      assert.deepEqual(effects, Array.from({ length: count }, () => ({ host, cwd: homes[index] })),
+        "Explicit worker commands must reach their registered host while ordinary commands keep the task's owning host");
     }
     const requests: unknown[] = (await readFile(queue + ".requests", "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const workerRequest = requests.find((request) => request !== null && typeof request === "object" &&
+      "key" in request && request.key === "fixture-initial-worker");
+    assert.ok(workerRequest !== null && typeof workerRequest === "object" && "body" in workerRequest);
+    const workerContext = JSON.stringify(workerRequest.body);
+    assert.ok(workerContext.includes("Connected worker hosts:") && workerContext.includes(coordinator) && workerContext.includes(laptop),
+      "The worker's first model request must describe the same connected host registry used for explicit commands");
     let readEvidence = false;
     for (const request of requests) {
       if (request === null || typeof request !== "object" || !("key" in request) || request.key !== "fixture-offline-main") continue;

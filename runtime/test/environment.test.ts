@@ -356,20 +356,30 @@ test("native model tools route main execution explicitly and expose coordinator 
     const task = await app.tasks.create({ title: "Context worker", outcome: "Use shared context", model: fixtureModel });
     const host = hosts[0]; assert.ok(host);
     await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
-    await app.tasks.enqueue(task.id, "Check context without changing execution hosts.");
+    await app.tasks.enqueue(task.id, "Use another connected host without moving this task.");
     const saved = await app.tasks.get(task.id); if (saved.worker.state !== "bound") throw new Error("Expected binding");
     app.faux.setResponses([
       fauxAssistantMessage(fauxToolCall("exec", { program: "pwd", args: [], host: laptop.name }), { stopReason: "toolUse" }),
+      () => {
+        app.environment.setConnected([coordinator.host_id]);
+        return fauxAssistantMessage(fauxToolCall("exec", { program: "pwd", args: [], host: laptop.host_id }), { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage(fauxToolCall("exec", { program: "pwd", args: [] }), { stopReason: "toolUse" }),
       fauxAssistantMessage(fauxToolCall("read_context", { repository_id: "operations", path: "context/preferences.md" }), { stopReason: "toolUse" }),
       fauxAssistantMessage(fauxToolCall("search_context", { repository_id: "unknown", query: "secret" }), { stopReason: "toolUse" }),
       fauxAssistantMessage("Shared context checked."),
     ]);
     await app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id, binding,
       instructions: "Project instructions.", model: fixtureModel, cwd: host.cwd }, (conversation) => app.executions.bind(conversation.id.toString(), {
-        role: "worker", cwd: host.cwd, hosts: [host], call,
+        role: "worker", cwd: host.cwd, hosts: [host], default_host: host,
+        connectedHosts: () => app.environment.hosts(host.cwd, host.host_id ?? null, [host]), call,
       }), () => {}, [app.tools.host, app.tools.worker]);
-    assert.deepEqual(commands, [{ type: "read_context", repository_id: "operations", path: "context/preferences.md", offset: 0, limit: 64000 }]);
-    assert.match(await app.tasks.history(task.id), /Task commands run on their owning host/);
+    assert.deepEqual(commands, [
+      { type: "on_node", host_id: laptop.host_id, command: { type: "exec", program: "pwd", args: [], cwd: laptop.home_directory, timeout_seconds: 900 } },
+      { type: "exec", program: "pwd", args: [], cwd: host.cwd, timeout_seconds: 900 },
+      { type: "read_context", repository_id: "operations", path: "context/preferences.md", offset: 0, limit: 64000 },
+    ]);
+    assert.match(await app.tasks.history(task.id), /Choose a connected worker host/);
     assert.match(await app.tasks.history(task.id), /Unknown coordinator context repository/);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

@@ -209,7 +209,8 @@ async function triageSources(application: TriageApplication, id: number, command
   const search = (query: string, refs: string[], limit: number, mode: SearchMode = "semantic") => application.retrieval.search(query, refs, limit,
     (operation) => hostRequests.call(id, operation), application.importer.isRunning(), mode);
   await sources.triage({ ...command, hosts }, (conversation, model) => executions.bind(conversation.id.toString(), {
-    model, cwd: command.cwd, hosts, default_host, role: "triage", search, call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
+    model, cwd: command.cwd, hosts, default_host, connectedHosts: () => environment.hosts(command.cwd, null, command.hosts),
+    role: "triage", search, call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
     notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
   }), toolsets.triage);
 }
@@ -496,7 +497,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
       }
       case "run_task": {
         const application = await app();
-        const { tasks, executions, toolsets } = application;
+        const { tasks, executions, toolsets, environment } = application;
         let stop: (() => Promise<void>) | undefined;
         try {
         const worker = workers.get(id);
@@ -509,7 +510,9 @@ async function handle(request: RuntimeRequest): Promise<void> {
             task_id: command.task_id, agent_id: command.agent_id ?? null, model, catalog: [] } });
         };
         const answer = await tasks.run(command, (conversation, host, model) => executions.bind(conversation.id.toString(), {
-          model, cwd: host.cwd, hosts: [host], role: "worker", search: searchFor(application, id), call: (operation) => hostRequests.call(id, operation),
+          model, cwd: host.cwd, hosts: [host], default_host: host, origin_host_id: host.host_id ?? null,
+          connectedHosts: () => environment.hosts(host.cwd, host.host_id ?? null, [host]),
+          role: "worker", search: searchFor(application, id), call: (operation) => hostRequests.call(id, operation),
         }), (task, text) => emit(id, { type: "notice", task_id: task.id, text: `${task.title}: ${text}` }),
         command.agent_id === undefined ? toolsets.worker : toolsets.agent, (operation) => hostRequests.call(id, operation), (selected) => inference.preflight(selected),
         worker === undefined ? undefined : {
@@ -623,7 +626,8 @@ async function handle(request: RuntimeRequest): Promise<void> {
           await root.waitForIdle(BACKGROUND_CONTEXT);
           if (interrupted.has(id)) { await interrupts.get(id); return; }
           const release = executions.bind(root.id.toString(), {
-            model: selected, cwd: command.cwd, hosts, default_host, search: searchFor(application, id),
+            model: selected, cwd: command.cwd, hosts, default_host, origin_host_id: command.origin_host_id,
+            connectedHosts: () => environment.hosts(command.cwd, command.origin_host_id, command.hosts), search: searchFor(application, id),
             project: () => hostRequests.call(id, command.origin_host_id === null
               ? { type: "project_guidance", cwd: command.cwd }
               : { type: "on_node", host_id: command.origin_host_id, command: { type: "project_guidance", cwd: command.cwd } }), call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
@@ -638,11 +642,8 @@ async function handle(request: RuntimeRequest): Promise<void> {
             if (interrupted.has(id)) { await interrupts.get(id); return; }
             const relatedContext = related.matches.length === 0 && related.gaps.length === 0 ? "" : "\n\nRelated saved conversations and retrieval coverage (read and reuse matching work):\n" +
               JSON.stringify(related);
-            const hostsContext = "\n\nConnected worker hosts: " +
-              JSON.stringify({ default_host_id: default_host?.host_id ?? null, origin_host_id: command.origin_host_id, project_cwd: command.cwd,
-                hosts: hosts.map((host) => ({ host_id: host.host_id, name: host.name, cwd: host.cwd })) });
             selected = await inference.configureCurrent(root, selected, {
-              instructions: (await environment.instructions(command.instructions)) + relatedContext + hostsContext, cwd: command.cwd, extensions: toolsets.main });
+              instructions: (await environment.instructions(command.instructions)) + relatedContext, cwd: command.cwd, extensions: toolsets.main });
             executions.setModel(root.id.toString(), selected);
             if (interrupted.has(id)) { await interrupts.get(id); return; }
             const prepared = await application.attachments.input(command.input, command.attachments, executions.get(root.id.toString()).call);
