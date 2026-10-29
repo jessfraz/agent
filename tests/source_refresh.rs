@@ -82,7 +82,7 @@ case "$cursor" in
     page-*) page="${cursor#page-}" ;;
     *) exit 1 ;;
 esac
-exec /bin/cat "$1/$page.json"
+exec cat "$1/$page.json"
 "#,
     )
     .unwrap();
