@@ -14,6 +14,8 @@ recovery; [history](history.md) describes import and retrieval.
 
 ## Inputs and automation
 
+- [ ] `/goal` for persistent objectives, visible progress, pause/resume and
+  completion tied to a verified outcome.
 - [x] Ship hosted web search and page retrieval with source links for supported
   OpenAI models. The existing ChatGPT login has passed an isolated search,
   open-page and find-in-page check. Other providers need their own integration.
