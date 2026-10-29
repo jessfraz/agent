@@ -17,7 +17,9 @@ import type { HistoryThread } from "../src/generated/HistoryThread.js";
 import type { ImportProgress } from "../src/generated/ImportProgress.js";
 import { HistoryStore, ImportedItemEntry } from "../src/history.js";
 import { CodexImporter } from "../src/importer.js";
-import type { HostCall } from "../src/tasks.js";
+import { ConversationModels } from "../src/models.js";
+import { Retrieval } from "../src/retrieval.js";
+import { TaskStore, type HostCall } from "../src/tasks.js";
 import { transcript } from "../src/transcript.js";
 
 function node(host_id: string): AgentNode {
@@ -53,7 +55,7 @@ async function open(directory: string) {
   const assets = join(directory, "assets"), histories = new HistoryStore(session, assets);
   const importer = new CodexImporter(session, histories, assets);
   let indexes = 0;
-  return { session, histories, importer, assets, faux, indexCount: () => indexes,
+  return { session, histories, importer, assets, models, faux, indexCount: () => indexes,
     run: (producer: Producer, nodes = [coordinator]) => importer.run(nodes, nodes.map((node) => node.host_id), [], native(producer), () => {}, async () => { indexes += 1; }) };
 }
 async function originals(app: Awaited<ReturnType<typeof open>>, id: string) {
@@ -64,10 +66,11 @@ async function originals(app: Awaited<ReturnType<typeof open>>, id: string) {
 }
 async function stoppedDuringIndexing(directory: string, producer: Producer) {
   const previous = await open(directory);
-  let release = () => {}, entered = () => {};
+  let release = () => {}, entered = () => {}, indexes = 0;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const began = new Promise<void>((resolve) => { entered = resolve; });
   const pending = previous.importer.run([coordinator], [coordinator.host_id], [], native(producer), () => {}, async () => {
+    if (++indexes === 1) return;
     entered(); await gate; throw new Error("Previous indexing owner stopped");
   });
   void pending.catch(() => {});
@@ -81,6 +84,104 @@ async function stoppedDuringIndexing(directory: string, producer: Producer) {
   await previous.session.close(BACKGROUND_CONTEXT);
   return { app: await open(directory), progress, settle: async () => { release(); await pending.catch(() => {}); } };
 }
+
+test("retained text is searchable before the first source page while final catchup includes new text", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-importer-prewalk-search-")); const app = await open(directory);
+  const tasks = new TaskStore(app.session, new ConversationModels(app.models)); tasks.useHistory(app.histories);
+  const retrieval = new Retrieval(app.session, app.histories, tasks, join(directory, "search.sqlite"));
+  let release = () => {}, entered = () => {}, indexes = 0;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const began = new Promise<void>((resolve) => { entered = resolve; });
+  const source = thread("retained-before-walk");
+  const embedding: HostCall = async (command) => {
+    if (command.type !== "embed") throw new Error("Index catchup must not start workers or model turns");
+    return { type: "embeddings", batch: { space: { id: "synthetic-import-search", model_revision: "fixture", model_digest: "fixture",
+      dimensions: 3, pooling: "last", normalization: "l2", instruction_version: 1 }, vectors: command.texts.map(() => [1, 0, 0]) } };
+  };
+  let pending: Promise<ImportProgress> | undefined;
+  try {
+    const retained = item("retained-zirconia"); retained.text = "Zirconia connector dimensions";
+    retained.data = { type: "userMessage", text: retained.text };
+    const saved = await app.histories.import({ host_id: coordinator.host_id, thread: source, items: [retained],
+      next_cursor: "remaining-text", complete: false, gaps: [] });
+    assert.deepEqual((await retrieval.snapshot("zirconia", [], 8)).candidates, []);
+    pending = app.importer.run([coordinator], [coordinator.host_id], [], native(async (_host, request) => {
+      if (request.type === "list") {
+        if (!request.archived) { entered(); await gate; }
+        return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+      }
+      if (request.type !== "read") throw new Error("No media is present");
+      assert.equal(request.cursor, "remaining-text");
+      const added = item("new-sapphire"); added.text = "Sapphire connector verification";
+      added.data = { type: "userMessage", text: added.text };
+      return page(source, [added]);
+    }), () => {}, async () => { indexes += 1; await retrieval.sync(embedding, true); });
+    await began;
+    assert.equal(indexes, 1, "Retained corpus indexing must finish before the first source inventory page");
+    assert.equal((await retrieval.snapshot("zirconia", [], 8)).candidates[0]?.conversation_id, saved.conversation.conversation_id);
+    assert.equal(app.importer.isRunning(), true);
+    release();
+    assert.equal((await pending).phase, "complete"); assert.equal(indexes, 2);
+    assert.equal((await retrieval.snapshot("sapphire", [], 8)).candidates[0]?.conversation_id, saved.conversation.conversation_id);
+    assert.equal((await originals(app, source.id)).entries.length, 2); assert.equal(app.faux.state.callCount, 0);
+  } finally {
+    release(); await pending?.catch(() => {}); retrieval.close();
+    await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("interrupted prewalk indexing still resumes the source walk and its unread text cursor", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-importer-prewalk-resume-")); const previous = await open(directory);
+  let app = previous, closed = false, release = () => {}, entered = () => {}, oldSourceCalls = 0;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const began = new Promise<void>((resolve) => { entered = resolve; });
+  const source = thread("unread-source"); let pending: Promise<ImportProgress> | undefined;
+  try {
+    await previous.histories.import({ host_id: coordinator.host_id, thread: source, items: [item("before-stop")],
+      next_cursor: "unread-page", gaps: [], complete: false });
+    pending = previous.importer.run([coordinator], [coordinator.host_id], [], native(() => {
+      oldSourceCalls += 1; throw new Error("The old owner must still be indexing");
+    }), () => {}, async () => { entered(); await gate; throw new Error("Previous owner stopped during prewalk indexing"); });
+    void pending.catch(() => {});
+    await began;
+    assert.equal(oldSourceCalls, 0, "Prewalk indexing must precede source reads");
+    assert.equal((await previous.importer.status()).phase, "discovering", "Only postwalk indexing can skip source discovery on resume");
+    await previous.session.close(BACKGROUND_CONTEXT); closed = true; app = await open(directory);
+    assert.equal((await app.importer.status()).phase, "partial");
+    let reads = 0;
+    const resumed = await app.run((_host, request) => {
+      if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+      if (request.type !== "read") throw new Error("No media is present");
+      reads += 1; assert.equal(request.cursor, "unread-page"); return page(source, [item("after-stop")]);
+    });
+    assert.equal(resumed.phase, "complete"); assert.equal(reads, 1); assert.equal(app.indexCount(), 2);
+    assert.deepEqual((await originals(app, source.id)).entries.map((entry) => entry.data.item.id), ["before-stop", "after-stop"]);
+    assert.equal(app.faux.state.callCount, 0);
+  } finally {
+    if (!closed) await previous.session.close(BACKGROUND_CONTEXT);
+    release(); await pending?.catch(() => {});
+    if (app !== previous) await app.session.close(BACKGROUND_CONTEXT);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("prewalk indexing failure stays visible during source reads and final success clears only that failure", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-importer-prewalk-failure-")); const app = await open(directory);
+  const source = thread("missing-media"); let indexes = 0, reads = 0;
+  try {
+    const result = await app.importer.run([coordinator], [coordinator.host_id], [], native(async (_host, request) => {
+      assert.equal((await app.importer.status()).gaps[0], "Search indexing before source import: Synthetic initial index failure");
+      if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+      if (request.type !== "read") throw new Error("No transferable media is present");
+      reads += 1;
+      return { ...page(source, [item("retained-with-missing-media")]), complete: false,
+        gaps: [{ code: "missing", item_id: "retained-with-missing-media", message: "A referenced media asset is unavailable" }] };
+    }), () => {}, async () => { if (++indexes === 1) throw new Error("Synthetic initial index failure"); });
+    assert.equal(indexes, 2); assert.equal(reads, 1); assert.equal(result.phase, "partial"); assert.equal(result.gap_count, 1);
+    assert.deepEqual(result.gaps, ["missing-media: A referenced media asset is unavailable"]);
+    assert.equal((await originals(app, source.id)).entries.length, 1); assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
 
 test("the orchestrator imports active and archived history from both hosts without Rex sessions, model calls or duplicate entries", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-importer-native-")); const app = await open(directory);
@@ -104,7 +205,7 @@ test("the orchestrator imports active and archived history from both hosts witho
     assert.equal((await app.histories.get(fork.id))?.thread.forked_from_id, shared.id);
     const repeated = await app.run(producer, [coordinator, laptop]);
     assert.equal(repeated.phase, "complete"); assert.equal(repeated.threads_unchanged, 4); assert.equal(repeated.items_added, 0); assert.equal(reads, 4);
-    assert.equal(app.indexCount(), 2);
+    assert.equal(app.indexCount(), 4);
     for (const source of [shared, old, fork]) {
       const saved = await originals(app, source.id); assert.equal(saved.entries.length, 1);
       assert.ok(saved.entries.every((entry) => entry.model === undefined));
@@ -185,7 +286,7 @@ test("a concurrent rerun attaches to the existing native walk instead of startin
     const first = app.run(producer); await began; assert.equal(app.importer.isRunning(), true);
     const second = app.run(producer); release();
     const results = await Promise.all([first, second]); assert.deepEqual(results[0], results[1]);
-    assert.equal(results[0]?.phase, "complete"); assert.equal(inventories, 2); assert.equal(reads, 1); assert.equal(app.indexCount(), 1);
+    assert.equal(results[0]?.phase, "complete"); assert.equal(inventories, 2); assert.equal(reads, 1); assert.equal(app.indexCount(), 2);
     assert.equal((await originals(app, source.id)).entries.length, 1); assert.equal(app.faux.state.callCount, 0);
     assert.equal(app.importer.isRunning(), false);
   } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
@@ -283,7 +384,7 @@ test("explicit host selection starts a new native walk instead of claiming an in
     assert.equal(indexes, 0); assert.deepEqual(hosts, []);
     const result = await app.importer.run([coordinator, laptop], [coordinator.host_id, laptop.host_id], [laptop.name], call, () => {}, async () => { indexes += 1; });
     assert.equal(result.phase, "complete"); assert.equal(result.items_added, 0); assert.equal(result.items_unchanged, 1);
-    assert.deepEqual(hosts, [laptop.host_id, laptop.host_id, laptop.host_id]); assert.equal(indexes, 1);
+    assert.deepEqual(hosts, [laptop.host_id, laptop.host_id, laptop.host_id]); assert.equal(indexes, 2);
     assert.equal(app.faux.state.callCount, 0);
   } finally { await stopped.settle(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -317,10 +418,10 @@ test("a failed index keeps source progress across reopen and clears resolved ind
     assert.deepEqual(repeated.gaps.slice(1), failed.gaps.slice(1));
     const recovered = await app.importer.run([], [], [], forbidden, () => {}, async () => { indexes += 1; });
     assert.deepEqual(recovered, { ...failed, gap_count: 2, gaps: failed.gaps.slice(1) });
-    assert.equal(sourceCalls, 0); assert.equal(indexes, 3);
+    assert.equal(sourceCalls, 0); assert.equal(indexes, 4);
     assert.deepEqual((await originals(app, source.id)).entries.map((entry) => entry.data.item.id), ["retained"]);
     const fresh = await app.run(producer);
-    assert.equal(fresh.items_added, 0); assert.equal(fresh.items_unchanged, 1); assert.equal(app.indexCount(), 1);
+    assert.equal(fresh.items_added, 0); assert.equal(fresh.items_unchanged, 1); assert.equal(app.indexCount(), 2);
     assert.equal(app.faux.state.callCount, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

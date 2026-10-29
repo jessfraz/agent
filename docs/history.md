@@ -14,8 +14,10 @@ agent history open CONVERSATION_ID
 ```
 
 Run import again to catch up. Completed reliable source versions are skipped;
-partial reads resume their committed cursor. Interrupted or failed indexing
-resumes from the retained corpus before the next fresh import. Explicit
+partial reads resume their committed cursor. Retained text is indexed before
+source scanning and again afterward, so attachment retries do not hold existing
+conversations out of search. Interrupted or failed final indexing resumes from
+the retained corpus before the next fresh import. Explicit
 `--host` selection starts a fresh walk of those hosts when no import is active.
 Concurrent commands join the running import; closing its CLI leaves it running.
 The same native thread

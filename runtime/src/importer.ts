@@ -79,6 +79,16 @@ export class CodexImporter {
   }
   private async walk(nodes: AgentNode[], online: string[], call: HostCall, index: () => Promise<void>): Promise<ImportProgress> {
     const progress = initial(); await this.publish(progress);
+    // Publish retained text before a large source walk. This is not a saved
+    // postwalk indexing checkpoint: an interrupted owner must still read sources.
+    let indexingGap: string | undefined;
+    try { await index(); } catch (error) { indexingGap = `Search indexing before source import: ${message(error)}`; }
+    const publish = () => {
+      const snapshot = { ...progress, gaps: [...progress.gaps] };
+      if (indexingGap !== undefined) addGap(snapshot, indexingGap);
+      return this.publish(snapshot);
+    };
+    if (indexingGap !== undefined) await publish();
     for (const node of nodes) {
       progress.host_id = node.host_id;
       if (!online.includes(node.host_id)) { addGap(progress, `${node.name}: host is offline`); continue; }
@@ -92,7 +102,7 @@ export class CodexImporter {
               progress.threads_seen += 1; progress.phase = "importing";
               try { await this.thread(node.host_id, thread, progress, call); }
               catch (error) { addGap(progress, `${node.name}: ${thread.id}: ${message(error)}`); }
-              await this.publish(progress);
+              await publish();
             }
             cursor = page.next_cursor;
             if (cursor !== null) { if (cursors.has(cursor)) throw new Error("History inventory repeated a cursor"); cursors.add(cursor); }
