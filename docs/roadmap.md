@@ -80,18 +80,18 @@ recovery; [history](history.md) describes import and retrieval.
 
 ## Reuse upstream
 
-The pinned Pi Durable package already supplies the foundation. These are
-integration opportunities, not claims that the corresponding app UI exists.
+Verified against Pi Durable 1.4.0 and Agent's current source. Source integration
+and deployment are tracked separately above.
 
-| Upstream capability | Application use |
-| --- | --- |
-| Durable conversations, submissions and task checkpoints | Already used for history and execution; retain their native identities. |
-| Steering, follow-ups, abort and compaction | Already used; keep transport and UI behavior aligned with them. |
-| Durable sleeps and wake notifications | Use for scheduled work rather than another scheduler. |
-| Typed telemetry and usage totals | Wire native phases and metrics into diagnostics and status. |
-| Image readers and preparation workers | Reuse for image attachments; the app still owns file transfer. |
-| Forks, child tasks and task graphs | Use for branching and richer session controls. |
-| Deferred tool search and code mode | Evaluate if they reduce tool-context size or round trips. Tool search is not conversation search. |
+| Upstream capability | Status | Application use and remaining work |
+| --- | --- | --- |
+| Durable conversations, submissions and task checkpoints | In use | Native Harness, SQLite storage and checkpointed documents own history and execution. |
+| Steering, follow-ups, abort and compaction | In use | Native input modes, abort and compaction events drive chat. |
+| Durable sleeps and wake notifications | In use | Sources, resources and jobs share Pi's persisted sleeps and scheduler. |
+| Typed telemetry and usage totals | Partial | Pi records usage, but Agent does not expose its totals or install a telemetry adapter. Wire these into diagnostics and status. |
+| Image readers and preparation workers | Partial | Pi's Photon worker prepares attached images. Agent owns transfer, storage and host file tools; reuse image-aware reads when extending those tools. |
+| Forks, child tasks and task graphs | Partial | Pi executes native model/tool task trees. Agent delegates use separate conversations; forks and graph views are not integrated. Evaluate native ownership while preserving delegates' durable lifetimes and Rex bindings. |
+| Deferred tool search and code mode | Not enabled | Benchmark upstream extensions against the current role-specific toolsets; adopt when they reduce total tokens or round trips. Tool search is separate from conversation search. |
 
 See [Pi Durable](https://github.com/earendil-works/pi/tree/main/packages/durable)
 and [Pi telemetry](https://github.com/earendil-works/pi/tree/main/packages/telemetry).
