@@ -48,9 +48,11 @@ recovery; [history](history.md) describes import and retrieval.
 - [ ] End-to-end loop-closing tests and model evals: incoming reply → relevant
   existing task → resumed worker → action → verified outcome. Cover unrelated
   noise, malicious source instructions, duplicate events and source failures.
-- [ ] Performance benchmarks for startup, input admission, first visible
-  activity, steering/stop, long-history scrolling, search and import contention.
-  Separate application delay from model latency; track CPU, RAM and token use.
+- [x] CLI startup and retained-history first-render benchmarks, with paired
+  baseline comparisons and a separate CI regression gate.
+- [ ] Benchmarks for input admission, first visible activity, steering/stop,
+  long-history scrolling, search and import contention. Separate application
+  delay from model latency; track CPU, RAM and token use.
 - [x] Nightly operational log review through scheduled jobs, with coordinator
   collection, retained summaries and explicit coverage gaps.
 - [ ] Dreams and Dreams evals: inspect private logs nightly and propose useful
