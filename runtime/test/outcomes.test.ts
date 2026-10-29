@@ -40,6 +40,7 @@ async function open(directory: string) {
   const session = await Harness.open(await SqliteStorage.open(database), { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(session, new ConversationModels(models)); const executions = new Executions(); const sources = new SourceJournal(session, tasks);
   const tools = createAppTools(tasks, executions); const sourceTools = createSourceTools(sources, executions);
+  const notices: string[] = [];
   registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker); registry.install(tools.agent); registry.install(tools.legacy);
   registry.install(sourceTools.main); registry.install(sourceTools.worker);
   async function prepare(title = "Example task") {
@@ -55,9 +56,9 @@ async function open(directory: string) {
   async function run(command: Extract<RuntimeCommand, { type: "run_task" }>) {
     return tasks.run(command, (conversation) => executions.bind(conversation.id.toString(), {
       cwd: host.cwd, hosts: [host], role: "worker", call: async () => ({ type: "written" }),
-    }), () => {}, [tools.host, command.agent_id === undefined ? tools.worker : tools.agent, sourceTools.worker]);
+    }), (_task, text) => notices.push(text), [tools.host, command.agent_id === undefined ? tools.worker : tools.agent, sourceTools.worker]);
   }
-  return { session, tasks, executions, sources, tools, sourceTools, faux, prepare, run };
+  return { session, tasks, executions, sources, tools, sourceTools, faux, notices, prepare, run };
 }
 
 test("published task resolution and waiting outcomes preserve provenance and remain quiet after reopening", async () => {
@@ -100,7 +101,7 @@ test("published task resolution and waiting outcomes preserve provenance and rem
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("an empty final answer preserves the recorded waiting brief for durable due follow-up", async () => {
+test("an empty final stays silent live and after reopening while preserving its due follow-up", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-outcomes-")); let app = await open(directory);
   try {
     const command = await app.prepare("Collect remote diagnostics");
@@ -111,6 +112,9 @@ test("an empty final answer preserves the recorded waiting brief for durable due
       fauxAssistantMessage(""),
     ]);
     await app.run(command);
+    assert.deepEqual(app.notices, []);
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    assert.equal((await root.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.filter((entry) => entry.kind === "agent.notice").length, 0);
     assert.equal((await app.tasks.get(command.task_id)).summary, summary);
     assert.deepEqual((await app.tasks.get(command.task_id)).state, state);
     const outcomes = await app.sources.events({ provider: "task_outcomes", thread_id: command.task_id });
@@ -122,6 +126,9 @@ test("an empty final answer preserves the recorded waiting brief for durable due
     assert.equal(await app.sources.hasWork(), true);
     await app.run(command);
     assert.equal((await app.tasks.get(command.task_id)).summary, summary);
+    assert.deepEqual(app.notices, []);
+    const reopenedRoot = await app.session.root(BACKGROUND_CONTEXT);
+    assert.equal((await reopenedRoot.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.filter((entry) => entry.kind === "agent.notice").length, 0);
     assert.equal(app.faux.state.callCount, 0, "Recovered history must retain the brief without another model turn");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

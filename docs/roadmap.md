@@ -56,7 +56,8 @@ recovery; [history](history.md) describes import and retrieval.
   Track recall, wrong-thread selection and latency.
 - [ ] End-to-end loop-closing tests and model evals: incoming reply → relevant
   existing task → resumed worker → action → verified outcome. Cover unrelated
-  noise, malicious source instructions, duplicate events and source failures.
+  noise, exchanges already handled by the user, malicious source instructions,
+  duplicate events and source failures.
 - [x] CLI startup and retained-history first-render benchmarks, with paired
   baseline comparisons and a separate CI regression gate.
 - [ ] Benchmarks for input admission, first visible activity, steering/stop,

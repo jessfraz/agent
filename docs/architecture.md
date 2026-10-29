@@ -219,6 +219,9 @@ the conversation carries forward.
 Sources exist to advance work. Take useful authorized actions and surface a
 concrete result, recommendation or necessary decision. Otherwise stay quiet:
 no inbox recaps, Slack summaries or "nothing to do" updates.
+Worker final text is forwarded to the main conversation. Quiet background work
+records task state and returns an empty final; it creates no main-chat notice,
+including after recovery. Requested results still return normally.
 
 Task outcomes are a built-in source, admitted in the same transaction as task
 changes. They retain conversation, entry and tool-call provenance. Unfinished
