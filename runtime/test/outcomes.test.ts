@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
@@ -39,7 +40,7 @@ async function open(directory: string) {
   const session = await Harness.open(await SqliteStorage.open(database), { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(session, new ConversationModels(models)); const executions = new Executions(); const sources = new SourceJournal(session, tasks);
   const tools = createAppTools(tasks, executions); const sourceTools = createSourceTools(sources, executions);
-  registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker); registry.install(sourceTools);
+  registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker); registry.install(sourceTools.main); registry.install(sourceTools.worker);
   async function prepare(title = "Example task") {
     const task = await tasks.create({ title, model: fixtureModel, outcome: "Verify the requested outcome",
       sources: [{ provider: "mail", account: "alpha", thread_id: "example-thread" }] });
@@ -53,7 +54,7 @@ async function open(directory: string) {
   async function run(command: Extract<RuntimeCommand, { type: "run_task" }>) {
     return tasks.run(command, (conversation) => executions.bind(conversation.id.toString(), {
       cwd: host.cwd, hosts: [host], role: "worker", call: async () => ({ type: "written" }),
-    }), () => {}, [tools.host, tools.worker, sourceTools]);
+    }), () => {}, [tools.host, tools.worker, sourceTools.worker]);
   }
   return { session, tasks, executions, sources, tools, sourceTools, faux, prepare, run };
 }
@@ -181,7 +182,7 @@ test("a due coordinator handoff collects remote evidence and continues the same 
         assert.equal(operation.task_id, command.task_id); assert.deepEqual(operation.binding, binding);
         return { type: "written" };
       },
-    }), [app.tools.host, app.tools.main, app.sourceTools]);
+    }), [app.tools.host, app.tools.main, app.sourceTools.main]);
     const continued = await app.tasks.get(command.task_id);
     assert.deepEqual(calls.map((operation) => operation.type), ["on_node", "resume_worker"]);
     assert.equal((await app.tasks.list()).length, 1);
@@ -237,6 +238,56 @@ test("active progress defers source triage and linking the finished event does n
   } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("workers are offered source reads without coordinator decisions and stale source calls remain guarded", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-outcomes-")); const app = await open(directory);
+  try {
+    await app.sources.admit({ source: { provider: "mail", account: "alpha" }, checkpoint: null, coverage: { status: "complete" },
+      events: [{ id: "original", version: "v1", source: { provider: "mail", account: "alpha", thread_id: "original-thread" },
+        title: "Original evidence", text: "Keep this exact source available to its worker." }] }, null);
+    const original = (await app.sources.events({ provider: "mail", pending: true }))[0]; assert.ok(original);
+    const command = await app.prepare("Inspect source evidence");
+    let offered: string[] = [];
+    app.faux.setResponses([
+      (input) => {
+        offered = getCurrentTools(input.messages).map((tool) => tool.name);
+        return fauxAssistantMessage(fauxToolCall("read_source_events", { keys: [original.key] }), { stopReason: "toolUse" });
+      },
+      (input) => {
+        assert.ok(input.messages.some((message) => message.role === "toolResult" &&
+          message.content.some((part) => part.type === "text" && part.text.includes(original.event.text) && part.text.includes(original.key))));
+        return fauxAssistantMessage("The original source is available for this task.");
+      },
+    ]);
+    await app.run(command);
+    assert.ok(offered.includes("read_source_events"));
+    assert.deepEqual(offered.filter((name) => ["link_source_events", "dismiss_source_events", "notify"].includes(name)), []);
+    assert.equal((await app.sources.events({ keys: [original.key] }))[0]?.decision, null);
+    // An older saved worker can still name the coordinator extension.
+    // Its tool definitions must retain their execution guards.
+    await app.tasks.enqueue(command.task_id, "Continue using an older saved tool selection.");
+    app.faux.setResponses([
+      fauxAssistantMessage([
+        fauxToolCall("link_source_events", { keys: [original.key], task_id: command.task_id }),
+        fauxToolCall("dismiss_source_events", { keys: [original.key], reason: "A worker must not decide this" }),
+        fauxToolCall("notify", { keys: [original.key], task_id: command.task_id, text: "A worker must not publish this" }),
+      ], { stopReason: "toolUse" }),
+      fauxAssistantMessage("The source decisions still belong to the coordinator."),
+    ]);
+    let notices = 0;
+    await app.tasks.run(command, (conversation) => app.executions.bind(conversation.id.toString(), {
+      cwd: host.cwd, hosts: [host], role: "worker", call: async () => ({ type: "written" }), notify: () => { notices += 1; },
+    }), () => {}, [app.tools.host, app.tools.worker, app.sourceTools.main]);
+    const conversation = await app.tasks.conversation((await app.tasks.get(command.task_id)).conversation_id);
+    const entries = await conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT);
+    const denied = entries.items.flatMap((entry) => entry.model?.flatMap((message) => message.role === "toolResult" &&
+      ["link_source_events", "dismiss_source_events", "notify"].includes(message.toolName) ? [message] : []) ?? []);
+    assert.equal(denied.length, 3); assert.ok(denied.every((message) => message.isError));
+    assert.ok(denied.every((message) => message.content.some((part) => part.type === "text" && part.text.includes("Source decisions belong to the coordinator"))));
+    assert.equal(notices, 0);
+    assert.equal((await app.sources.events({ keys: [original.key] }))[0]?.decision, null);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("coordinator follow-through consumes an incomplete outcome without generating another source loop", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-outcomes-")); const app = await open(directory);
   try {
@@ -251,7 +302,7 @@ test("coordinator follow-through consumes an incomplete outcome without generati
     ]);
     await app.sources.triage(triage, (conversation) => app.executions.bind(conversation.id.toString(), {
       cwd: host.cwd, hosts: [host], role: "triage", call: async () => { throw new Error("No duplicate worker should be spawned"); },
-    }), [app.tools.main, app.sourceTools]);
+    }), [app.tools.main, app.sourceTools.main]);
     assert.equal(await app.sources.hasWork(), false);
     const calls = app.faux.state.callCount;
     await app.sources.triage(triage, () => () => {}, []);

@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { createRegistry, Harness, UserEntry } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { TaskStore } from "../src/tasks.js";
@@ -40,13 +41,13 @@ async function open(directory: string) {
   const session = await Harness.open(storage, { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(session, new ConversationModels(models)); const executions = new Executions(); const sources = new SourceJournal(session, tasks);
   const tools = createAppTools(tasks, executions); const sourceTools = createSourceTools(sources, executions);
-  registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker); registry.install(sourceTools);
+  registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker); registry.install(sourceTools.main);
   const notices: { task: string | null; text: string }[] = [];
   async function triage() {
     return sources.triage(command, (conversation) => executions.bind(conversation.id.toString(), {
       cwd: command.cwd, hosts: [], role: "triage", call: async () => ({ type: "written" }),
       notify: (task, text) => notices.push({ task, text }),
-    }), [tools.host, tools.main, sourceTools]);
+    }), [tools.host, tools.main, sourceTools.main]);
   }
   return { session, tasks, executions, sources, tools, sourceTools, notices, faux, triage };
 }
@@ -117,7 +118,7 @@ test("new source judgments use current model settings and an invalid selection d
     const selected = { ...fixtureModel, provider: "anthropic" } satisfies import("../src/generated/ModelSelection.js").ModelSelection;
     const run = (fast: boolean) => app.sources.triage({ ...command, model: { ...selected, fast } }, (conversation, model) => app.executions.bind(conversation.id.toString(), {
       model, cwd: command.cwd, hosts: [], role: "triage", call: async () => ({ type: "written" }),
-    }), [app.tools.main, app.sourceTools]);
+    }), [app.tools.main, app.sourceTools.main]);
     await assert.rejects(run(true), /Fast mode is unavailable/);
     const second = await app.sources.events({ pending: true }); assert.equal(second.length, 1);
     next.setResponses([
@@ -156,14 +157,19 @@ test("actionable source decisions reach main with exact originals so a later yes
     const keys = (await app.sources.events({ pending: true })).map((record) => record.key);
     const task = await app.tasks.create({ title: "Review possible spam", outcome: "Clean up only the approved messages" });
     const proposal = "Possible spam:\n- Example one\n- Example two\n\nClean these up?";
+    let offered: string[] = [];
     app.faux.setResponses([
-      fauxAssistantMessage(fauxToolCall("link_source_events", { keys, task_id: task.id }), { stopReason: "toolUse" }),
+      (input) => {
+        offered = getCurrentTools(input.messages).map((tool) => tool.name);
+        return fauxAssistantMessage(fauxToolCall("link_source_events", { keys, task_id: task.id }), { stopReason: "toolUse" });
+      },
       fauxAssistantMessage(fauxToolCall("record_task", { task_id: task.id, summary: proposal,
         state: { state: "waiting", actor: "user", next_check: null } }), { stopReason: "toolUse" }),
       fauxAssistantMessage(fauxToolCall("notify", { keys, task_id: task.id, text: proposal }), { stopReason: "toolUse" }),
       fauxAssistantMessage("Decision recorded."),
     ]);
     await app.triage();
+    assert.ok(["read_source_events", "link_source_events", "dismiss_source_events", "notify"].every((name) => offered.includes(name)));
     assert.deepEqual(app.notices, [{ task: task.id, text: proposal }]);
     assert.equal((await app.tasks.get(task.id)).sources.length, 2);
     assert.equal((await app.tasks.get(task.id)).state.state, "waiting");
@@ -176,6 +182,7 @@ test("actionable source decisions reach main with exact originals so a later yes
     assert.equal(notices.flatMap((message) => message.content).some((part) => part.type === "toolCall"), false);
     app.faux.setResponses([
       (input) => {
+        offered = getCurrentTools(input.messages).map((tool) => tool.name);
         assert.ok(input.messages.some((message) => message.role === "assistant" && message.content.some((part) => part.type === "text" && part.text.includes("Clean these up?"))));
         return fauxAssistantMessage(fauxToolCall("read_source_events", { keys }), { stopReason: "toolUse" });
       },
@@ -185,9 +192,10 @@ test("actionable source decisions reach main with exact originals so a later yes
       },
     ]);
     releaseMain = app.executions.bind(root.id.toString(), { cwd: command.cwd, hosts: [], call: async () => ({ type: "written" }) });
-    await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.sourceTools] }, BACKGROUND_CONTEXT);
+    await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.sourceTools.main] }, BACKGROUND_CONTEXT);
     const response = await root.submit({ type: "input", content: "Yes." }, BACKGROUND_CONTEXT);
     assert.equal((await response.wait(BACKGROUND_CONTEXT)).status, "done");
+    assert.ok(["read_source_events", "link_source_events", "dismiss_source_events", "notify"].every((name) => offered.includes(name)));
   } finally { releaseMain?.(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 

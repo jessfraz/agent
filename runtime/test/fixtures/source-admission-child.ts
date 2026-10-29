@@ -18,7 +18,7 @@ const models = createModels(); models.setProvider(faux.provider); const registry
 const session = await Harness.open(await SqliteStorage.open(database), { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
 const tasks = new TaskStore(session, new ConversationModels(models)); const executions = new Executions(); const sources = new SourceJournal(session, tasks);
 const tools = createAppTools(tasks, executions); const sourceTools = createSourceTools(sources, executions);
-registry.install(tools.host); registry.install(tools.main); registry.install(sourceTools);
+registry.install(tools.host); registry.install(tools.main); registry.install(sourceTools.main);
 await sources.admit({ source: { provider: "mail", account: "alpha" }, checkpoint: { value: "a1" }, coverage: { status: "complete" },
   events: [{ id: "original", version: "v1", source: { provider: "mail", account: "alpha", thread_id: "original-thread" },
     title: "Original confirmation", text: "This source must not be lost or resubmitted." },
@@ -32,4 +32,4 @@ faux.setResponses([
 ]);
 await sources.triage({ type: "triage_sources", instructions: "Account for each event.", model: fixtureModel, cwd: "/workspace/example", hosts: [] },
   (conversation) => executions.bind(conversation.id.toString(), { cwd: "/workspace/example", hosts: [], role: "triage", call: async () => ({ type: "written" }) }),
-  [tools.host, tools.main, sourceTools]);
+  [tools.host, tools.main, sourceTools.main]);

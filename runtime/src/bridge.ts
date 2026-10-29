@@ -113,7 +113,8 @@ async function openApplication(): Promise<Application> {
   registry.install(tools.host);
   registry.install(tools.main);
   registry.install(tools.worker);
-  registry.install(sourceTools);
+  registry.install(sourceTools.main);
+  registry.install(sourceTools.worker);
   registry.install(resourceTools);
   registry.install(browserTools);
   const stopPlacements = watchInputPlacements(harness, (conversationId, input_id, entry_id) => {
@@ -204,7 +205,7 @@ async function triageSources(application: TriageApplication, id: number, command
   await sources.triage({ ...command, hosts }, (conversation, model) => executions.bind(conversation.id.toString(), {
     model, cwd: command.cwd, hosts, default_host, role: "triage", search, call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
     notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
-  }), [guidance, tools.host, tools.main, sourceTools, resourceTools, browserTools, jobTools]);
+  }), [guidance, tools.host, tools.main, sourceTools.main, resourceTools, browserTools, jobTools]);
 }
 async function interrupt(id: number): Promise<void> {
   interrupted.add(id);
@@ -468,7 +469,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const answer = await tasks.run(command, (conversation, host, model) => executions.bind(conversation.id.toString(), {
           model, cwd: command.cwd, hosts: [host], role: "worker", search: searchFor(application, id), call: (operation) => hostRequests.call(id, operation),
         }), (task, text) => emit(id, { type: "notice", task_id: task.id, text: `${task.title}: ${text}` }),
-        [guidance, tools.host, tools.worker, sourceTools, resourceTools, browserTools], (operation) => hostRequests.call(id, operation), (selected) => inference.preflight(selected),
+        [guidance, tools.host, tools.worker, sourceTools.worker, resourceTools, browserTools], (operation) => hostRequests.call(id, operation), (selected) => inference.preflight(selected),
         worker === undefined ? undefined : {
           signal: worker.controller.signal,
           async fence() { await interrupt(id); },
@@ -600,7 +601,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
               JSON.stringify({ default_host_id: default_host?.host_id ?? null, origin_host_id: command.origin_host_id, project_cwd: command.cwd,
                 hosts: hosts.map((host) => ({ host_id: host.host_id, name: host.name, cwd: host.cwd })) });
             selected = await inference.configureCurrent(root, selected, {
-              instructions: (await environment.instructions(command.instructions)) + relatedContext + hostsContext, cwd: command.cwd, extensions: [guidance, tools.host, tools.main, sourceTools, resourceTools, browserTools, jobTools] });
+              instructions: (await environment.instructions(command.instructions)) + relatedContext + hostsContext, cwd: command.cwd, extensions: [guidance, tools.host, tools.main, sourceTools.main, resourceTools, browserTools, jobTools] });
             executions.setModel(root.id.toString(), selected);
             if (interrupted.has(id)) { await interrupts.get(id); return; }
             submissionAttempted = true;

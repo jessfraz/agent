@@ -465,7 +465,7 @@ test("native source-triage and unknown conversations stay out of search while hu
   const index = new SearchIndex(":memory:");
   try {
     const sources = new SourceJournal(app.session, app.tasks, app.executions);
-    const sourceTools = createSourceTools(sources, app.executions); app.registry.install(sourceTools);
+    const sourceTools = createSourceTools(sources, app.executions); app.registry.install(sourceTools.main);
     await sources.admit({ source: { provider: "mail", account: "synthetic" }, checkpoint: { value: "one" }, coverage: { status: "complete" },
       events: [{ id: "routine", version: "one", source: { provider: "mail", account: "synthetic", thread_id: "routine" },
         title: "Internal feed signal", text: "noisequantum internal-only source payload. ".repeat(500) }] }, null);
@@ -479,7 +479,7 @@ test("native source-triage and unknown conversations stay out of search while hu
       (conversation) => {
         internal = conversation.id.toString();
         return app.executions.bind(internal, { role: "triage", cwd: host.cwd, hosts: [], call: async () => { throw new Error("No host effect expected"); } });
-      }, [sourceTools]);
+      }, [sourceTools.main]);
     assert.notEqual(internal, "");
     const internalRecords = []; for await (const record of app.tasks.records(internal)) internalRecords.push(record);
     assert.equal(internalRecords.length, 0, "Automatic source work is not a human conversation or continuation target");

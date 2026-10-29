@@ -288,7 +288,7 @@ export class SourceJournal {
 function output(value: unknown): ToolExecutionResult {
   return { output: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value) ?? "" }] };
 }
-export function createSourceTools(journal: SourceJournal, executions: Executions): Extension {
+export function createSourceTools(journal: SourceJournal, executions: Executions): { main: Extension; worker: Extension } {
   function control(id: string) {
     const execution = executions.get(id);
     if (id !== ROOT_CONVERSATION_ID.toString() && execution.role !== "triage") {
@@ -296,13 +296,13 @@ export function createSourceTools(journal: SourceJournal, executions: Executions
     }
     return execution;
   }
-  return defineExtension({ name: "source-tools", tools: [
-    defineTool({ name: "read_source_events", replay: "safe",
-      description: "Read admitted source originals, exact message IDs/versions and task links. Filter by account/thread or event keys before acting on an earlier proposal.",
-      parameters: Type.Object({ keys: Type.Optional(Type.Array(Type.String())), provider: Type.Optional(Type.String()),
-        account: Type.Optional(Type.String()), thread_id: Type.Optional(Type.String()), query: Type.Optional(Type.String()),
-        pending: Type.Optional(Type.Boolean()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })) }),
-      async execute(args) { return output(await journal.events(args)); } }),
+  const read = defineTool({ name: "read_source_events", replay: "safe",
+    description: "Read admitted source originals, exact message IDs/versions and task links. Filter by account/thread or event keys before acting on an earlier proposal.",
+    parameters: Type.Object({ keys: Type.Optional(Type.Array(Type.String())), provider: Type.Optional(Type.String()),
+      account: Type.Optional(Type.String()), thread_id: Type.Optional(Type.String()), query: Type.Optional(Type.String()),
+      pending: Type.Optional(Type.Boolean()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })) }),
+    async execute(args) { return output(await journal.events(args)); } });
+  const main = defineExtension({ name: "source-tools", tools: [read,
     defineTool({ name: "link_source_events", description: "Account for source events by linking them to an existing durable task.",
       parameters: Type.Object({ keys: Type.Array(Type.String(), { minItems: 1 }), task_id: Type.String() }),
       async execute(args, api) {
@@ -324,4 +324,5 @@ export function createSourceTools(journal: SourceJournal, executions: Executions
         return output("Published to the main chat.");
       } }),
   ] });
+  return { main, worker: defineExtension({ name: "worker-source-tools", tools: [read] }) };
 }
