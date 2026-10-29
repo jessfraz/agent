@@ -314,6 +314,212 @@
         }
       ]
     },
+    "BackgroundCadence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "seconds": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "interval"
+            }
+          },
+          "required": [
+            "type",
+            "seconds"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "schedule": {
+              "$ref": "#/$defs/JobSchedule"
+            },
+            "timezone": {
+              "$ref": "#/$defs/TimezoneId"
+            },
+            "type": {
+              "type": "string",
+              "const": "calendar"
+            }
+          },
+          "required": [
+            "type",
+            "schedule",
+            "timezone"
+          ]
+        }
+      ]
+    },
+    "BackgroundError": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/BackgroundTriggerKey"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "message"
+      ]
+    },
+    "BackgroundRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "after": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UtcMillis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "cadence": {
+              "$ref": "#/$defs/BackgroundCadence"
+            },
+            "now": {
+              "$ref": "#/$defs/UtcMillis"
+            },
+            "type": {
+              "type": "string",
+              "const": "plan"
+            }
+          },
+          "required": [
+            "type",
+            "cadence",
+            "now"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "cursor": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SourcePollCursor"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sources": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SourceConfig"
+              }
+            },
+            "states": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SourceState"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "poll_sources"
+            }
+          },
+          "required": [
+            "type",
+            "sources",
+            "states"
+          ]
+        }
+      ]
+    },
+    "BackgroundStatus": {
+      "type": "object",
+      "properties": {
+        "errors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BackgroundError"
+          }
+        },
+        "jobs": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pending": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "triggers": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "jobs",
+        "triggers",
+        "pending",
+        "errors"
+      ]
+    },
+    "BackgroundTriggerKey": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "$ref": "#/$defs/BuiltinTrigger"
+            },
+            "type": {
+              "type": "string",
+              "const": "builtin"
+            }
+          },
+          "required": [
+            "type",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "job_id": {
+              "$ref": "#/$defs/JobId"
+            },
+            "schedule_id": {
+              "$ref": "#/$defs/ScheduleId"
+            },
+            "type": {
+              "type": "string",
+              "const": "job"
+            }
+          },
+          "required": [
+            "type",
+            "job_id",
+            "schedule_id"
+          ]
+        }
+      ]
+    },
+    "BuiltinTrigger": {
+      "type": "string",
+      "enum": [
+        "sources",
+        "resources"
+      ]
+    },
     "CleanupPlan": {
       "type": "object",
       "properties": {
@@ -1131,6 +1337,22 @@
         {
           "type": "object",
           "properties": {
+            "request": {
+              "$ref": "#/$defs/BackgroundRequest"
+            },
+            "type": {
+              "type": "string",
+              "const": "background"
+            }
+          },
+          "required": [
+            "type",
+            "request"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "type": {
               "type": "string",
               "const": "machine_snapshot"
@@ -1724,6 +1946,105 @@
         "follow_up"
       ]
     },
+    "JobId": {
+      "type": "string"
+    },
+    "JobSchedule": {
+      "type": "object",
+      "properties": {
+        "focus": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/ScheduleId"
+        },
+        "prompt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recurrence": {
+          "$ref": "#/$defs/Recurrence"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "recurrence"
+      ]
+    },
+    "JobScheduleStatus": {
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UtcMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UtcMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "schedule_id": {
+          "$ref": "#/$defs/ScheduleId"
+        }
+      },
+      "required": [
+        "schedule_id"
+      ]
+    },
+    "JobSyncReport": {
+      "type": "object",
+      "properties": {
+        "added": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "removed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "unchanged": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "updated": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "added",
+        "updated",
+        "removed",
+        "unchanged"
+      ]
+    },
     "MachineSnapshot": {
       "type": "object",
       "properties": {
@@ -2098,6 +2419,10 @@
         "max"
       ]
     },
+    "Recurrence": {
+      "description": "Canonical DTSTART/RRULE properties, with an explicit timezone and anchor.",
+      "type": "string"
+    },
     "ResourceRecord": {
       "type": "object",
       "properties": {
@@ -2266,6 +2591,73 @@
     },
     "RuntimeEventKind": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "report": {
+              "$ref": "#/$defs/JobSyncReport"
+            },
+            "type": {
+              "type": "string",
+              "const": "jobs_synced"
+            }
+          },
+          "required": [
+            "type",
+            "report"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "$ref": "#/$defs/BackgroundStatus"
+            },
+            "type": {
+              "type": "string",
+              "const": "job_status"
+            }
+          },
+          "required": [
+            "type",
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jobs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ScheduledJobStatus"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "scheduled_jobs"
+            }
+          },
+          "required": [
+            "type",
+            "jobs"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "job": {
+              "$ref": "#/$defs/ScheduledJobStatus"
+            },
+            "type": {
+              "type": "string",
+              "const": "scheduled_job"
+            }
+          },
+          "required": [
+            "type",
+            "job"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -2953,6 +3345,70 @@
         "score"
       ]
     },
+    "ScheduleId": {
+      "type": "string"
+    },
+    "ScheduledJob": {
+      "type": "object",
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelSelection"
+        },
+        "prompt": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "schedules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobSchedule"
+          }
+        },
+        "timezone": {
+          "$ref": "#/$defs/TimezoneId"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "prompt",
+        "model",
+        "timezone",
+        "schedules",
+        "revision",
+        "cwd"
+      ]
+    },
+    "ScheduledJobStatus": {
+      "type": "object",
+      "properties": {
+        "job": {
+          "$ref": "#/$defs/ScheduledJob"
+        },
+        "schedules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobScheduleStatus"
+          }
+        }
+      },
+      "required": [
+        "job",
+        "schedules"
+      ]
+    },
     "SourceCheckpoint": {
       "description": "Opaque to the caller and meaningful only to the matching provider/account.",
       "type": "object",
@@ -3177,6 +3633,23 @@
       "required": [
         "provider",
         "account"
+      ]
+    },
+    "SourcePollCursor": {
+      "type": "object",
+      "properties": {
+        "page": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "source": {
+          "$ref": "#/$defs/SourceKey"
+        }
+      },
+      "required": [
+        "source",
+        "page"
       ]
     },
     "SourceRef": {
@@ -3488,6 +3961,9 @@
         }
       ]
     },
+    "TimezoneId": {
+      "type": "string"
+    },
     "ToolHistory": {
       "type": "object",
       "properties": {
@@ -3607,6 +4083,11 @@
         "codex_unavailable",
         "read_failed"
       ]
+    },
+    "UtcMillis": {
+      "description": "An absolute instant that has the same exact representation in Rust and JS.",
+      "type": "integer",
+      "format": "int64"
     },
     "WorkerHost": {
       "type": "object",

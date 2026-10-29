@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { Type } from "typebox";
-import { defineExtension, defineTool, ROOT_CONVERSATION_ID, type Extension, type ToolExecutionResult } from "@earendil-works/pi-durable";
+import { defineExtension, defineTool, ROOT_CONVERSATION_ID, type Extension, type Harness, type ToolExecutionResult } from "@earendil-works/pi-durable";
 import { DEFAULT_MODEL } from "./models.js";
 import { recordDelegation } from "./delegation.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
@@ -19,9 +20,32 @@ export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost
 /** A conversation can execute only through its currently attached CLI client. */
 export class Executions {
   private readonly attached = new Map<string, Execution>();
+  private readonly recovering = new Map<string, { ready: Promise<void>; attached(): void }>();
+  /** Reserve live native inputs before any API can resume the reopened Harness. */
+  async prepareRecovery(session: Harness): Promise<void> {
+    const inspection = await session.inspect(BACKGROUND_CONTEXT);
+    for (const submission of inspection.submissions) {
+      if (submission.type === "input" && (submission.status === "queued" || submission.status === "placed")) {
+        this.expect(submission.conversationId.toString());
+      }
+    }
+  }
+  expect(id: string): void {
+    if (this.attached.has(id) || this.recovering.has(id)) return;
+    let attached = () => {};
+    const ready = new Promise<void>((resolve) => { attached = resolve; });
+    this.recovering.set(id, { ready, attached });
+  }
+  async ready(id: string, context: Context): Promise<Execution> {
+    const recovering = this.recovering.get(id);
+    if (recovering !== undefined) await awaitWithContext(recovering.ready, context);
+    return this.get(id);
+  }
   bind(id: string, execution: Execution): () => void {
     if (this.attached.has(id)) throw new TaskError("This conversation already has an execution client");
     this.attached.set(id, execution);
+    const recovering = this.recovering.get(id);
+    this.recovering.delete(id); recovering?.attached();
     return () => { if (this.attached.get(id) === execution) this.attached.delete(id); };
   }
   get(id: string): Execution {
@@ -69,6 +93,7 @@ export class HostRequests {
       let operation = command;
       while (operation.type === "on_node") operation = operation.command;
       const timeout = operation.type === "exec" ? operation.timeout_seconds * 1000 + 10_000
+        : operation.type === "background" && operation.request.type === "poll_sources" ? 930_000
         : operation.type === "history" ? 930_000 : operation.type === "embed" ? 330_000
         : operation.type.startsWith("resource_") ? 310_000 : 30_000;
       const timer = setTimeout(() => {

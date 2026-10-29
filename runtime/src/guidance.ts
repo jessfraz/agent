@@ -1,4 +1,5 @@
-import { defineExtension, hook, section, ToolTask, type Extension } from "@earendil-works/pi-durable";
+import type { Context } from "@earendil-works/chord/context";
+import { defineExtension, GenerationTask, hook, section, ToolTask, type Extension } from "@earendil-works/pi-durable";
 import type { HostResult } from "./generated/HostResult.js";
 import type { Execution, Executions } from "./tools.js";
 
@@ -18,46 +19,62 @@ export function createGuidance(executions: Executions): Extension {
     if (states === undefined) { states = new Map(); freshness.set(execution, states); }
     states.set(conversation, status);
   }
+  async function render(id: string, context: Context, missingOnly = false): Promise<string | undefined> {
+    let execution: Execution | undefined;
+    try {
+      execution = await executions.ready(id, context);
+      if (missingOnly && freshness.get(execution)?.has(id)) return undefined;
+      const shared = await execution.call({ type: "reload_guidance" });
+      if (shared.type !== "shared_guidance") throw readFailure(shared, "Shared");
+      const project = await (execution.project?.() ?? execution.call({ type: "project_guidance", cwd: execution.cwd }));
+      if (project.type !== "project_guidance") throw readFailure(project, "Project");
+      const parts: string[] = [];
+      if (shared.global.text.trim()) parts.push(`# Global instructions\n\n${shared.global.text}`);
+      for (const repository of shared.context_repositories) {
+        parts.push(`# Context repository ${repository.id}: ${repository.root}\n\n${repository.instructions}`);
+      }
+      const coveredSources = new Set([...shared.global.sources, ...shared.context_sources].map((source) => source.sha256));
+      const projectAlreadyIncluded = project.snapshot.sources.length > 0
+        && project.snapshot.sources.every((source) => coveredSources.has(source.sha256));
+      if (project.snapshot.text.trim() && !projectAlreadyIncluded) parts.push(project.snapshot.text);
+      if (shared.workflow_policy.trim()) parts.push(`# Agent workflow\n\n${shared.workflow_policy}`);
+      record(execution, id, { fresh: true });
+      return parts.join("\n\n");
+    } catch (error) {
+      if (context.abortSignal?.aborted) throw error;
+      const message = error instanceof Error ? error.message : "The current guidance files could not be read";
+      if (execution !== undefined) record(execution, id, { fresh: false, message });
+      // Pi deliberately retains a section when render throws. Return an
+      // explicit replacement so stale instructions cannot remain in effect.
+      return `Workspace guidance is unavailable: ${message}\nReport the read failure and restore source access before taking actions.`;
+    }
+  }
   return defineExtension({
     name: "workspace_guidance",
-    sections: [section("workspace_guidance", async ({ conversationId }) => {
-      const id = conversationId.toString();
-      let execution: Execution | undefined;
-      try {
-        execution = executions.get(id);
-        const shared = await execution.call({ type: "reload_guidance" });
-        if (shared.type !== "shared_guidance") throw readFailure(shared, "Shared");
-        const project = await (execution.project?.() ?? execution.call({ type: "project_guidance", cwd: execution.cwd }));
-        if (project.type !== "project_guidance") throw readFailure(project, "Project");
-        const parts: string[] = [];
-        if (shared.global.text.trim()) parts.push(`# Global instructions\n\n${shared.global.text}`);
-        for (const repository of shared.context_repositories) {
-          parts.push(`# Context repository ${repository.id}: ${repository.root}\n\n${repository.instructions}`);
-        }
-        const coveredSources = new Set([...shared.global.sources, ...shared.context_sources].map((source) => source.sha256));
-        const projectAlreadyIncluded = project.snapshot.sources.length > 0
-          && project.snapshot.sources.every((source) => coveredSources.has(source.sha256));
-        if (project.snapshot.text.trim() && !projectAlreadyIncluded) parts.push(project.snapshot.text);
-        if (shared.workflow_policy.trim()) parts.push(`# Agent workflow\n\n${shared.workflow_policy}`);
-        record(execution, id, { fresh: true });
-        return parts.join("\n\n");
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "The current guidance files could not be read";
-        if (execution !== undefined) record(execution, id, { fresh: false, message });
-        // Pi deliberately retains a section when render throws. Return an
-        // explicit replacement so stale instructions cannot remain in effect.
-        return `Workspace guidance is unavailable: ${message}\nReport the read failure and restore source access before taking actions.`;
-      }
-    })],
-    hooks: [hook(ToolTask, {
-      beforeTool(_call, api) {
+    sections: [section("workspace_guidance", ({ conversationId }, context) => render(conversationId.toString(), context))],
+    hooks: [hook(GenerationTask, {
+      async beforeRequest(request, api, context) {
+        // Pi can recover at its request checkpoint, after section preparation.
+        // Refresh that replacement client's guidance before resending inference.
+        const text = await render(api.conversationId.toString(), context, true);
+        if (text === undefined) return undefined;
+        return { messages: [...request.messages, { role: "system", content: "",
+          sections: { workspace_guidance: `<workspace_guidance>\n${text}\n</workspace_guidance>` }, timestamp: Date.now() }] };
+      },
+    }), hook(ToolTask, {
+      async beforeTool(_call, api, context) {
         try {
           const id = api.conversationId.toString();
-          const execution = executions.get(id);
+          const execution = await executions.ready(id, context);
           const status = freshness.get(execution)?.get(id);
           if (status?.fresh) return undefined;
-          return { block: status === undefined ? "Workspace guidance has not been refreshed for this execution" : `Workspace guidance is unavailable: ${status.message}` };
-        } catch {
+          // A recovered tool may resume before a new model round. Its old
+          // instructions cannot authorize an effect under a replacement client.
+          return { block: status === undefined
+            ? "Workspace guidance has not been refreshed for this execution; reconsider the tool after loading current instructions"
+            : `Workspace guidance is unavailable: ${status.message}` };
+        } catch (error) {
+          if (context.abortSignal?.aborted) throw error;
           return { block: "The execution client disconnected before workspace guidance could be refreshed" };
         }
       },

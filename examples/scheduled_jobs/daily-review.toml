@@ -1,0 +1,12 @@
+id = "daily-review"
+prompt = "Review recent source changes and related unfinished tasks. Report useful outcomes or needed decisions; otherwise stay quiet."
+model = "gpt-6.1-sol"
+reasoning_effort = "medium"
+timezone = "Europe/London"
+
+[[schedules]]
+id = "morning"
+recurrence = """
+DTSTART;TZID=Europe/London:20260101T090000
+RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=0
+"""

@@ -195,6 +195,7 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             })
         }
         HostCommand::OnNode { .. }
+        | HostCommand::Background { .. }
         | HostCommand::ReadContext { .. }
         | HostCommand::SearchContext { .. } => {
             anyhow::bail!("This operation requires the coordinator's registered host broker")

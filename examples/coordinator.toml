@@ -1,6 +1,8 @@
 # The coordinator owns shared settings, conversations and background intake.
 # Additional context repositories are optional and do not change the chat's cwd.
 context_repositories = []
+# Git-managed job directories. Validate and apply changes with agent jobs sync.
+job_directories = []
 
 # Defaults for new work. Existing tasks keep their saved model selection.
 [model]

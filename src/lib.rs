@@ -13,10 +13,13 @@ pub mod rex;
 pub mod runtime;
 pub mod service;
 
+pub mod background;
 pub mod broker;
 pub mod callback;
 pub mod instructions;
 pub mod intake;
+pub mod job_view;
+pub mod jobs;
 pub mod machines;
 pub mod sources;
 pub mod tailnet;

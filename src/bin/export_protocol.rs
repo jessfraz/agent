@@ -14,6 +14,8 @@ fn main() -> Result<()> {
     let config = Config::from_env().with_out_dir(&output);
     RuntimeRequest::export_all(&config)?;
     RuntimeEvent::export_all(&config)?;
+    agent_cli::background::BackgroundTaskInput::export_all(&config)?;
+    agent_cli::background::BackgroundCheckpoint::export_all(&config)?;
     TaskOutcome::export_all(&config)?;
     DelegationDecision::export_all(&config)?;
     AllocationDecision::export_all(&config)?;

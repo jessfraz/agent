@@ -281,12 +281,18 @@ browser adapter uses Chrome as the final UI fallback, with the selected host's
 normal sign-in state; desktop Computer Use and copied browser profiles are
 outside the design.
 
-Scheduled goals should enter the same source/task follow-through path. Keep
-reviewed definitions short, with typed triggers, explicit timezones and stable
-occurrence identities. Only the coordinator admits an occurrence; retrying or
-copying a definition must not create another run. Retain the applied workflow
-revision for diagnosis. Migrating existing schedules requires its own coverage
-and cutover verification; history import does not enable them.
+Source refreshes, resource collection and scheduled jobs use the same native Pi
+background task definition and its durable sleeps. Rust validates jobs and
+calculates occurrences; Pi owns the timer and atomic admission. Job sync owns
+only job triggers. Replacing a timer fences its generation while retaining
+independently owned admitted work and the original workflow/model snapshot.
+
+Occurrences use stable job and schedule IDs plus the scheduled UTC instant.
+New definitions begin with future ticks; recovery coalesces missed ticks and
+serializes runs of each job. Scheduled inputs use the ordinary task/worker and
+publication lifecycle. External effects retain their existing reconciliation
+requirements. Migrating hosted schedules requires separate coverage and cutover
+verification; history import does not enable them.
 
 ### Cross-host recovery
 

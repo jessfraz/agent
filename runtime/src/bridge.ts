@@ -27,6 +27,9 @@ import type { SearchMode } from "./generated/SearchMode.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { conversationSettings } from "./settings.js";
 import { watchInputPlacements } from "./input_delivery.js";
+import { BackgroundScheduler } from "./background.js";
+import { runScheduled } from "./scheduled.js";
+import type { SourcePollCursor } from "./generated/SourcePollCursor.js";
 
 const VERSION = 1;
 function stateDirectory(): string {
@@ -57,6 +60,13 @@ const hostRequests = new HostRequests((id, call_id, command) => emit(id, { type:
   (id, call_id) => emit(id, { type: "host_cancel", call_id }));
 const inference = new ConversationModels(undefined, auth);
 const models = inference.models;
+let backgroundOwner: number | undefined;
+let backgroundSources = false;
+let stopBackground: (() => void) | undefined;
+function backgroundCall(command: import("./generated/HostCommand.js").HostCommand) {
+  if (backgroundOwner === undefined) throw new TaskError("The coordinator background transport is unavailable");
+  return hostRequests.call(backgroundOwner, command);
+}
 
 async function openApplication() {
   const database = await openNodeSqliteDatabase(join(state, "session.sqlite"));
@@ -74,6 +84,7 @@ async function openApplication() {
   const feedback = new FeedbackStore(state, tasks);
   const repairs = new FeedbackDispatcher(feedback, tasks, environment);
   const executions = new Executions();
+  await executions.prepareRecovery(harness);
   const sources = new SourceJournal(harness, tasks, executions);
   const tools = createAppTools(tasks, executions);
   const guidance = createGuidance(executions); registry.install(guidance);
@@ -91,7 +102,35 @@ async function openApplication() {
       if (conversation.id.toString() === conversationId && !ending.has(id)) emit(id, { type: "input_placed", input_id, entry_id });
     }
   });
-  return { stopPlacements, harness, tasks, environment, executions, tools, sources, sourceTools, resources, resourceTools, histories, importer, retrieval, guidance, feedback, repairs };
+  const core = { stopPlacements, harness, tasks, environment, executions, tools, sources, sourceTools, resources, resourceTools, histories, importer, retrieval, guidance, feedback, repairs };
+  const background = new BackgroundScheduler(harness, registry, {
+    async plan(cadence, after, now) {
+      const result = await backgroundCall({ type: "background", request: { type: "plan", cadence, after, now } });
+      if (result.type !== "background" || result.response.type !== "plan") throw new TaskError("The Rust background planner is unavailable");
+      return result.response.plan;
+    },
+    async refreshSources() {
+      if (!backgroundSources) return;
+      const settings = (await environment.environment()).settings;
+      let cursor: SourcePollCursor | null = null;
+      do {
+        const result = await backgroundCall({ type: "background", request: { type: "poll_sources", sources: settings.sources, states: await sources.states(), cursor } });
+        if (result.type !== "background" || result.response.type !== "sources") throw new TaskError("Background source coverage could not be read");
+        for (const read of result.response.reads) await sources.admit(read.batch, read.expected_checkpoint);
+        cursor = result.response.cursor;
+      } while (cursor !== null);
+      if (backgroundOwner !== undefined) await triageSources(core, backgroundOwner, { type: "triage_sources", instructions: "", model: settings.model, cwd: "/", hosts: [] });
+    },
+    async collectResources() {
+      const available = await environment.environment();
+      const host = await environment.defaultHost(await environment.hosts("/", null, []));
+      if (host?.host_id !== null && host?.host_id !== undefined && available.online_host_ids.includes(host.host_id)) {
+        await resources.collect(host.host_id, backgroundCall);
+      }
+    },
+    async runJob(occurrence, signal) { await runScheduled(occurrence, signal, { session: harness, tasks, sources, environment, executions, call: backgroundCall }); },
+  });
+  return { ...core, background };
 }
 let application: ReturnType<typeof openApplication> | undefined;
 function app(): ReturnType<typeof openApplication> { return application ??= openApplication(); }
@@ -117,6 +156,21 @@ const ending = new Set<number>();
 function searchFor(application: Awaited<ReturnType<typeof openApplication>>, id: number) {
   return (query: string, refs: string[], limit: number, mode: SearchMode = "semantic") => application.retrieval.search(query, refs, limit,
     (command) => hostRequests.call(id, command), application.importer.isRunning(), mode);
+}
+type TriageApplication = { sources: SourceJournal; environment: CoordinatorEnvironment; executions: Executions;
+  tools: ReturnType<typeof createAppTools>; sourceTools: ReturnType<typeof createSourceTools>; resourceTools: ReturnType<typeof createResourceTools>;
+  guidance: ReturnType<typeof createGuidance>; retrieval: Retrieval; importer: CodexImporter };
+async function triageSources(application: TriageApplication, id: number, command: Extract<RuntimeCommand, { type: "triage_sources" }>): Promise<void> {
+  const { sources, environment, executions, tools, sourceTools, resourceTools, guidance } = application;
+  if (!await sources.hasWork()) return;
+  const hosts = await environment.hosts(command.cwd, null, command.hosts);
+  const default_host = await environment.defaultHost(hosts);
+  const search = (query: string, refs: string[], limit: number, mode: SearchMode = "semantic") => application.retrieval.search(query, refs, limit,
+    (operation) => hostRequests.call(id, operation), application.importer.isRunning(), mode);
+  await sources.triage({ ...command, hosts }, (conversation, model) => executions.bind(conversation.id.toString(), {
+    model, cwd: command.cwd, hosts, default_host, role: "triage", search, call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
+    notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
+  }), [guidance, tools.host, tools.main, sourceTools, resourceTools]);
 }
 async function interrupt(id: number): Promise<void> {
   interrupted.add(id);
@@ -171,6 +225,21 @@ async function handle(request: RuntimeRequest): Promise<void> {
   }
   try {
     switch (command.type) {
+      case "run_background": {
+        if (backgroundOwner !== undefined) throw new TaskError("The coordinator already owns background execution");
+        backgroundOwner = id;
+        backgroundSources = command.settings.sources;
+        const stopped = new Promise<void>((resolve) => { stopBackground = resolve; });
+        try {
+          await (await app()).background.start(command.settings);
+          await stopped;
+        } finally { backgroundOwner = undefined; stopBackground = undefined; }
+        break;
+      }
+      case "sync_jobs": emit(id, { type: "jobs_synced", report: await (await app()).background.syncJobs(command.jobs) }); break;
+      case "job_status": emit(id, { type: "job_status", status: await (await app()).background.status() }); break;
+      case "list_jobs": emit(id, { type: "scheduled_jobs", jobs: await (await app()).background.listJobs() }); break;
+      case "read_job": emit(id, { type: "scheduled_job", job: await (await app()).background.getJob(command.job_id) }); break;
       case "configure_coordinator":
         await (await app()).environment.configure(command.bootstrap); emit(id, { type: "configured" }); break;
       case "register_node":
@@ -299,16 +368,8 @@ async function handle(request: RuntimeRequest): Promise<void> {
       }
       case "triage_sources": {
         const application = await app();
-        const { sources, environment, executions, tools, sourceTools, resourceTools, guidance } = application;
-        if (await sources.hasWork()) {
-          const hosts = await environment.hosts(command.cwd, null, command.hosts);
-          const default_host = await environment.defaultHost(hosts);
-          await sources.triage({ ...command, hosts }, (conversation, model) => executions.bind(conversation.id.toString(), {
-            model, cwd: command.cwd, hosts, default_host, role: "triage", search: searchFor(application, id), call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
-            notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
-          }), [guidance, tools.host, tools.main, sourceTools, resourceTools]);
-        }
-        emit(id, { type: "sources", sources: await sources.states() });
+        await triageSources(application, id, command);
+        emit(id, { type: "sources", sources: await application.sources.states() });
         break;
       }
       case "run_task": {
@@ -554,6 +615,7 @@ try {
     const operation = handle(request).finally(() => pending.delete(operation));
     pending.add(operation);
   }
+  stopBackground?.();
   for (const worker of workers.values()) worker.controller.abort();
   await Promise.allSettled(pending);
 } finally {

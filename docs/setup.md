@@ -143,6 +143,50 @@ from the native daemon identity used by agent.
 
 ## Settings and sources
 
+### Scheduled jobs
+
+Keep jobs in Git and configure `job_directories = ["~/automation/scheduled_jobs"]`
+on the coordinator. A job file contains a readable stable `id`, `prompt`,
+`model`, `reasoning_effort`, IANA `timezone`, and one or more `[[schedules]]`,
+each with its own stable `id` and anchored DTSTART/RRULE `recurrence`. See the
+[example job](../examples/scheduled_jobs/daily-review.toml). IDs are unique
+across jobs and within each job's schedules; renames retain their IDs. Optional
+schedule `focus` and `prompt` narrow a pass while retaining the main rules.
+
+After editing or pulling the files:
+
+```sh
+agent jobs check --next 5
+agent jobs sync
+agent jobs list
+agent jobs get daily-review
+```
+
+`check` and `sync` also accept repeated `--directory PATH` arguments. Check
+validates the whole catalog and previews occurrences without applying changes.
+Sync replaces the managed job catalog with that complete validated snapshot:
+unchanged timers retain their deadlines, changed timers are replaced, and
+removed schedules stop admitting work. Missing directories, invalid TOML or
+duplicate IDs leave the applied catalog intact. An existing empty directory
+can intentionally remove all jobs. Source timers are outside job sync's scope.
+`/jobs` and `/jobs ID` use the same read requests and presentation as list/get.
+
+Startup applies valid configured directories; validation errors retain the
+applied catalog and are reported in the coordinator log. Without configured
+directories it retains the last explicitly synced catalog. Jobs start with
+future occurrences;
+restarts coalesce missed ticks and serialize overlapping runs per job. Each
+admission retains its original prompt/model snapshot. Pi wakes the running
+coordinator; offline time is reconciled when it returns. Existing hosted
+automations require a separate verified cutover.
+
+The MVP accepts HOURLY, DAILY and WEEKLY rules with INTERVAL, BYDAY, BYHOUR,
+BYMINUTE, BYSECOND and WKST. DTSTART must agree with the named timezone and
+rule. Nonexistent local occurrences are skipped; repeated local times use the
+first instant. Source polling uses elapsed intervals through the same Pi timer.
+
+### Coordinator settings
+
 The commented [coordinator example](../examples/coordinator.toml) is parsed by
 the same strict configuration loader as the CLI and exercised in tests. The
 [client example](../examples/client.toml) is sufficient for workers and

@@ -51,6 +51,7 @@
         cargoBuildFlags = ["--bin" "agent"];
         nativeBuildInputs = [pkgs.makeWrapper];
         nativeCheckInputs = [pkgs.nodejs_26 pkgs.git pkgs.lsof];
+        AGENT_RUNTIME_PATH = "${runtime}/lib/agent-runtime/dist/src/bridge.js";
         postInstall = ''
           wrapProgram "$out/bin/agent" \
             --set AGENT_RUNTIME_PATH "${runtime}/lib/agent-runtime/dist/src/bridge.js" \

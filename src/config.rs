@@ -21,6 +21,8 @@ pub struct ClientConfig {
     pub model: ModelSelection,
     #[serde(default)]
     pub context_repositories: Vec<PathBuf>,
+    #[serde(default)]
+    pub job_directories: Vec<PathBuf>,
     pub coordinator: Option<String>,
     pub coordinator_program: Option<String>,
     pub tailscale_socket: Option<PathBuf>,
@@ -40,6 +42,7 @@ impl Default for ClientConfig {
             launch: None,
             model: ModelSelection::default(),
             context_repositories: Vec::new(),
+            job_directories: Vec::new(),
             coordinator: None,
             coordinator_program: None,
             tailscale_socket: None,
@@ -61,6 +64,7 @@ fn default_poll_interval() -> u64 {
 pub struct ManagedSettings {
     pub model: Option<ModelSelection>,
     pub context_repositories: Option<Vec<PathBuf>>,
+    pub job_directories: Option<Vec<PathBuf>>,
     pub sources: Option<Vec<SourceConfig>>,
     pub poll_interval_seconds: Option<u64>,
 }
@@ -95,6 +99,9 @@ pub fn apply(path: &Path, settings_path: &Path) -> Result<ApplyResult> {
     }
     if let Some(repositories) = managed.context_repositories {
         config.context_repositories = repositories;
+    }
+    if let Some(directories) = managed.job_directories {
+        config.job_directories = directories;
     }
     if let Some(sources) = managed.sources {
         config.sources = sources;
@@ -214,6 +221,9 @@ fn validate(config: &mut ClientConfig) -> Result<()> {
     let home = dirs::home_dir();
     for repository in &mut config.context_repositories {
         *repository = context_repository_path(repository, home.as_deref())?;
+    }
+    for directory in &mut config.job_directories {
+        *directory = context_repository_path(directory, home.as_deref())?;
     }
     crate::tailnet::PeerPolicy::new(&config.trusted_nodes)?;
     crate::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;

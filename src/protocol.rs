@@ -45,6 +45,9 @@ pub struct AgentNode {
 pub struct CoordinatorBootstrap {
     pub settings: CoordinatorSettings,
     pub node: Option<AgentNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub background: Option<crate::background::BackgroundSettings>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, JsonSchema, TS)]
@@ -192,6 +195,17 @@ pub struct RuntimeRequest {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeCommand {
+    RunBackground {
+        settings: crate::background::BackgroundSettings,
+    },
+    SyncJobs {
+        jobs: Vec<crate::jobs::ScheduledJob>,
+    },
+    JobStatus,
+    ListJobs,
+    ReadJob {
+        job_id: crate::jobs::JobId,
+    },
     ConfigureCoordinator {
         bootstrap: CoordinatorBootstrap,
     },
@@ -575,6 +589,9 @@ pub struct SourceState {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostCommand {
+    Background {
+        request: crate::background::BackgroundRequest,
+    },
     MachineSnapshot,
     ReadUsage {
         expected_email: String,
@@ -670,6 +687,9 @@ pub enum HostCommand {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostResult {
+    Background {
+        response: crate::background::BackgroundResponse,
+    },
     MachineSnapshot {
         snapshot: MachineSnapshot,
     },
@@ -740,6 +760,18 @@ pub struct RuntimeEvent {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEventKind {
+    JobsSynced {
+        report: crate::background::JobSyncReport,
+    },
+    JobStatus {
+        status: crate::background::BackgroundStatus,
+    },
+    ScheduledJobs {
+        jobs: Vec<crate::background::ScheduledJobStatus>,
+    },
+    ScheduledJob {
+        job: crate::background::ScheduledJobStatus,
+    },
     Usage {
         usage: crate::usage::UsageAvailability,
     },

@@ -53,7 +53,8 @@ fn killing_supervisor_preserves_lock_until_pi_child_exits() {
       writeFileSync(join(process.argv[2], 'child-pid'), String(process.pid));
       setInterval(() => {}, 1000);
       createInterface({input:process.stdin}).on('line', line => {
-        const {id}=JSON.parse(line);
+        const {id, command}=JSON.parse(line);
+        if (command.type === 'run_background') return;
         process.stdout.write(JSON.stringify({version:1,id,event:{type:'configured'}})+'\n');
         process.stdout.write(JSON.stringify({version:1,id,event:{type:'done'}})+'\n');
       });

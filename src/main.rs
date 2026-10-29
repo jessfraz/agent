@@ -14,12 +14,13 @@ use std::{
 };
 
 use agent_cli::{
+    background::BackgroundSettings,
     chat_commands::ChatCommand,
     config::{self, ClientConfig},
     context::ContextStore,
     discovery,
     feedback::FeedbackContext,
-    host, instructions, intake,
+    host, instructions, jobs,
     models::{ModelProvider, ModelSelection, Reasoning},
     protocol::{
         AuthStatus, ConversationChange, ConversationSettings, CoordinatorBootstrap,
@@ -84,6 +85,11 @@ enum Action {
     Usage,
     /// Show background source coverage and checkpoints.
     Sources,
+    /// Validate or reconcile Git-managed scheduled jobs, independently of sources.
+    Jobs {
+        #[command(subcommand)]
+        command: JobsAction,
+    },
     /// Show shared settings and registered machines.
     Nodes,
     /// Inspect owned worktrees or collect eligible merged worktrees.
@@ -277,6 +283,26 @@ enum ResourcesAction {
 }
 
 #[derive(Subcommand)]
+enum JobsAction {
+    /// Validate the complete job catalog and preview upcoming occurrences.
+    Check {
+        #[arg(long = "directory")]
+        directories: Vec<PathBuf>,
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u16).range(1..=100))]
+        next: u16,
+    },
+    /// Reconcile the complete catalog; built-in source timers are unaffected.
+    Sync {
+        #[arg(long = "directory")]
+        directories: Vec<PathBuf>,
+    },
+    /// List the applied jobs and their next occurrences.
+    List,
+    /// Show an applied job's prompt, model and schedules.
+    Get { id: String },
+}
+
+#[derive(Subcommand)]
 enum MailAction {
     Accounts,
     Search {
@@ -300,6 +326,35 @@ struct WatchGuard(tokio::task::JoinHandle<()>);
 impl Drop for WatchGuard {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+fn job_directories(config: &ClientConfig, explicit: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    if explicit.is_empty() {
+        ensure!(
+            !config.job_directories.is_empty(),
+            "Configure job_directories or pass --directory; use an empty directory to remove all managed jobs"
+        );
+        return Ok(config.job_directories.clone());
+    }
+    explicit
+        .into_iter()
+        .map(|path| std::path::absolute(path).map_err(Into::into))
+        .collect()
+}
+
+fn startup_jobs(config: &ClientConfig) -> Option<Vec<jobs::ScheduledJob>> {
+    if config.job_directories.is_empty() {
+        return None;
+    }
+    match jobs::load(&config.job_directories) {
+        Ok(jobs) => Some(jobs),
+        Err(error) => {
+            eprintln!(
+                "Scheduled job validation failed; previously applied jobs are retained: {error:#}"
+            );
+            None
+        }
     }
 }
 
@@ -371,6 +426,38 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(config::default_path)?;
             config::initialize(&path, arguments.coordinator.as_deref())?;
             println!("Created {}", path.display());
+            return Ok(());
+        }
+        Action::Jobs {
+            command: JobsAction::Check { directories, next },
+        } => {
+            let config = config::load(arguments.config.as_deref())?;
+            let jobs = jobs::load(&job_directories(&config, directories)?)?;
+            let now = jobs::UtcMillis::now()?;
+            #[derive(serde::Serialize)]
+            struct Preview {
+                job_id: jobs::JobId,
+                schedule_id: jobs::ScheduleId,
+                timezone: jobs::TimezoneId,
+                occurrences: Vec<jobs::UtcMillis>,
+            }
+            let mut previews = Vec::new();
+            for job in jobs {
+                for schedule in &job.schedules {
+                    previews.push(Preview {
+                        job_id: job.id.clone(),
+                        schedule_id: schedule.id.clone(),
+                        timezone: job.timezone.clone(),
+                        occurrences: jobs::preview(
+                            schedule,
+                            &job.timezone,
+                            now,
+                            usize::from(next),
+                        )?,
+                    });
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&previews)?);
             return Ok(());
         }
         Action::Mail { command } => {
@@ -470,18 +557,11 @@ async fn main() -> Result<()> {
                 sources: config.sources.clone(),
             },
             node,
-        };
-        let _sources = if no_sources {
-            None
-        } else {
-            let context = intake::ContextBundle {
-                model: config.model.clone(),
-                cwd: cwd.to_string_lossy().into_owned(),
-            };
-            let state = directory.clone();
-            Some(WatchGuard(tokio::spawn(async move {
-                let _ = intake::run(state, config, context).await;
-            })))
+            background: Some(BackgroundSettings {
+                poll_interval_seconds: u32::try_from(config.poll_interval_seconds)?,
+                sources: !no_sources,
+                jobs: startup_jobs(&config),
+            }),
         };
         return service::serve_configured(
             &script,
@@ -536,6 +616,16 @@ async fn main() -> Result<()> {
         },
         Action::Logout => RuntimeCommand::Logout,
         Action::Sources => RuntimeCommand::SourceStates,
+        Action::Jobs { command } => match command {
+            JobsAction::Sync { directories } => RuntimeCommand::SyncJobs {
+                jobs: jobs::load(&job_directories(&config, directories)?)?,
+            },
+            JobsAction::List => RuntimeCommand::ListJobs,
+            JobsAction::Get { id } => RuntimeCommand::ReadJob {
+                job_id: jobs::JobId::try_from(id)?,
+            },
+            JobsAction::Check { .. } => bail!("Job checks must run locally"),
+        },
         Action::Nodes => RuntimeCommand::Environment { telemetry: false },
         Action::Feedback { command } => RuntimeCommand::ReadFeedback {
             id: match command {
@@ -1350,6 +1440,22 @@ fn local_command_from_ui(
     while ui.controls.try_join_next().is_some() {}
     ui.controls.spawn(async move {
         let changed = async {
+            if let Some(request) = command.jobs() {
+                let events = exchange(
+                    &config,
+                    coordinator.as_deref(),
+                    &script,
+                    &directory,
+                    request,
+                )
+                .await?;
+                for event in events {
+                    if let Some(text) = agent_cli::job_view::event(&event) {
+                        handle.notice(text)?;
+                    }
+                }
+                return Ok(());
+            }
             if matches!(command, ChatCommand::Machines) {
                 let inventory = machine_inventory(ClientContext {
                     config: &config,
@@ -1439,6 +1545,20 @@ async fn local_command_plain(
     cwd: &Path,
     json: bool,
 ) -> Result<()> {
+    if let Some(request) = command.jobs() {
+        for event in exchange(
+            client.config,
+            client.coordinator,
+            client.script,
+            client.directory,
+            request,
+        )
+        .await?
+        {
+            display(&event, json)?;
+        }
+        return Ok(());
+    }
     if matches!(command, ChatCommand::Machines) {
         let inventory = machine_inventory(client).await?;
         if json {
@@ -2721,6 +2841,13 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
                     "{} / {}: {status}",
                     source.source.provider, source.source.account
                 );
+            }
+        }
+        event @ (RuntimeEventKind::JobsSynced { .. }
+        | RuntimeEventKind::ScheduledJobs { .. }
+        | RuntimeEventKind::ScheduledJob { .. }) => {
+            if let Some(text) = agent_cli::job_view::event(event) {
+                println!("{text}");
             }
         }
         RuntimeEventKind::Task { task, history } => println!("{}\n\n{history}", task.title),

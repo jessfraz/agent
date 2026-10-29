@@ -132,6 +132,9 @@ async fn serve_with_transport(
     shutdown: impl Future<Output = Result<()>>,
 ) -> Result<()> {
     // Claim the writer before deciding an old socket is stale.
+    let background = bootstrap
+        .as_ref()
+        .and_then(|value| value.background.clone());
     let owner = Runtime::start(script, state)?;
     let broker = match Broker::with_tailscale(bootstrap.as_ref(), state, daemon.clone()) {
         Ok(broker) => Arc::new(broker),
@@ -182,6 +185,11 @@ async fn serve_with_transport(
         None => None,
     };
     let mut clients = JoinSet::new();
+    let mut background = background.map(|settings| {
+        let runtime = owner.clone();
+        let broker = broker.clone();
+        tokio::spawn(async move { crate::background::run(runtime, broker, settings).await })
+    });
     tokio::pin!(shutdown);
     let result = loop {
         tokio::select! {
@@ -217,6 +225,15 @@ async fn serve_with_transport(
             _ = owner.stopped() => {
                 break Err(anyhow::anyhow!("The Pi runtime stopped; saved work is retained"));
             }
+            result = async {
+                match &mut background {
+                    Some(task) => task.await,
+                    None => pending().await,
+                }
+            } => {
+                background = None;
+                break Err(anyhow::anyhow!("The background transport stopped; saved work is retained: {result:?}"));
+            },
             result = &mut shutdown => break result,
             Some(_) = clients.join_next(), if !clients.is_empty() => {}
         }
@@ -230,6 +247,10 @@ async fn serve_with_transport(
     .await;
     clients.abort_all();
     while clients.join_next().await.is_some() {}
+    if let Some(task) = background {
+        task.abort();
+        let _ = task.await;
+    }
     let runtime = Arc::try_unwrap(owner)
         .map_err(|_| anyhow::anyhow!("A client retained coordinator ownership"))?;
     let closed = runtime.close().await;
@@ -290,6 +311,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         !matches!(
             command,
             RuntimeCommand::ConfigureCoordinator { .. }
+                | RuntimeCommand::RunBackground { .. }
                 | RuntimeCommand::RegisterNode { .. }
                 | RuntimeCommand::SetConnectedNodes { .. }
         ),

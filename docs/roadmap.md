@@ -27,7 +27,7 @@ recovery; [history](history.md) describes import and retrieval.
 - [ ] Drag/paste attachments into chat, transfer them from the originating
   machine, retain them with the conversation, and deliver supported content to
   the selected model.
-- [ ] Scheduled jobs through the existing coordinator background process and
+- [x] Scheduled jobs through the existing coordinator background process and
   task follow-through path. Reuse durable timers; persist occurrence identities
   so restarts and retries cannot run a job twice.
 

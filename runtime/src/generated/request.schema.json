@@ -80,6 +80,81 @@
         "other"
       ]
     },
+    "BackgroundResponse": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "plan": {
+              "$ref": "#/$defs/OccurrencePlan"
+            },
+            "type": {
+              "type": "string",
+              "const": "plan"
+            }
+          },
+          "required": [
+            "type",
+            "plan"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "cursor": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SourcePollCursor"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reads": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SourceRead"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "sources"
+            }
+          },
+          "required": [
+            "type",
+            "reads"
+          ]
+        }
+      ]
+    },
+    "BackgroundSettings": {
+      "type": "object",
+      "properties": {
+        "jobs": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/ScheduledJob"
+          }
+        },
+        "poll_interval_seconds": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "sources": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "poll_interval_seconds",
+        "sources"
+      ]
+    },
     "CleanupPlan": {
       "type": "object",
       "properties": {
@@ -273,6 +348,16 @@
     "CoordinatorBootstrap": {
       "type": "object",
       "properties": {
+        "background": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackgroundSettings"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "node": {
           "anyOf": [
             {
@@ -833,6 +918,22 @@
         {
           "type": "object",
           "properties": {
+            "response": {
+              "$ref": "#/$defs/BackgroundResponse"
+            },
+            "type": {
+              "type": "string",
+              "const": "background"
+            }
+          },
+          "required": [
+            "type",
+            "response"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "snapshot": {
               "$ref": "#/$defs/MachineSnapshot"
             },
@@ -1119,6 +1220,37 @@
         "follow_up"
       ]
     },
+    "JobId": {
+      "type": "string"
+    },
+    "JobSchedule": {
+      "type": "object",
+      "properties": {
+        "focus": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/ScheduleId"
+        },
+        "prompt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recurrence": {
+          "$ref": "#/$defs/Recurrence"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "recurrence"
+      ]
+    },
     "MachineSnapshot": {
       "type": "object",
       "properties": {
@@ -1293,6 +1425,32 @@
         "head"
       ]
     },
+    "OccurrencePlan": {
+      "type": "object",
+      "properties": {
+        "due": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UtcMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UtcMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "OperatingSystem": {
       "type": "string",
       "enum": [
@@ -1382,6 +1540,10 @@
         "xhigh",
         "max"
       ]
+    },
+    "Recurrence": {
+      "description": "Canonical DTSTART/RRULE properties, with an explicit timezone and anchor.",
+      "type": "string"
     },
     "ResourceRecord": {
       "type": "object",
@@ -1617,6 +1779,81 @@
     },
     "RuntimeCommand": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "settings": {
+              "$ref": "#/$defs/BackgroundSettings"
+            },
+            "type": {
+              "type": "string",
+              "const": "run_background"
+            }
+          },
+          "required": [
+            "type",
+            "settings"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jobs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ScheduledJob"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "sync_jobs"
+            }
+          },
+          "required": [
+            "type",
+            "jobs"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "job_status"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "list_jobs"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "job_id": {
+              "$ref": "#/$defs/JobId"
+            },
+            "type": {
+              "type": "string",
+              "const": "read_job"
+            }
+          },
+          "required": [
+            "type",
+            "job_id"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -2376,6 +2613,52 @@
         }
       ]
     },
+    "ScheduleId": {
+      "type": "string"
+    },
+    "ScheduledJob": {
+      "type": "object",
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelSelection"
+        },
+        "prompt": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "schedules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobSchedule"
+          }
+        },
+        "timezone": {
+          "$ref": "#/$defs/TimezoneId"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "prompt",
+        "model",
+        "timezone",
+        "schedules",
+        "revision",
+        "cwd"
+      ]
+    },
     "SearchMode": {
       "type": "string",
       "enum": [
@@ -2668,6 +2951,44 @@
         "account"
       ]
     },
+    "SourcePollCursor": {
+      "type": "object",
+      "properties": {
+        "page": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "source": {
+          "$ref": "#/$defs/SourceKey"
+        }
+      },
+      "required": [
+        "source",
+        "page"
+      ]
+    },
+    "SourceRead": {
+      "type": "object",
+      "properties": {
+        "batch": {
+          "$ref": "#/$defs/SourceBatch"
+        },
+        "expected_checkpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceCheckpoint"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "batch"
+      ]
+    },
     "SourceRef": {
       "type": "object",
       "properties": {
@@ -2690,6 +3011,9 @@
     "TaskId": {
       "type": "string",
       "format": "uuid"
+    },
+    "TimezoneId": {
+      "type": "string"
     },
     "UsageAvailability": {
       "oneOf": [
@@ -2783,6 +3107,11 @@
         "codex_unavailable",
         "read_failed"
       ]
+    },
+    "UtcMillis": {
+      "description": "An absolute instant that has the same exact representation in Rust and JS.",
+      "type": "integer",
+      "format": "int64"
     },
     "WorkerHost": {
       "type": "object",

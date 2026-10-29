@@ -1,6 +1,7 @@
 //! Local chat controls. Clap owns parsing and the command list shown in help.
 
 use crate::{
+    jobs::JobId,
     models::{ModelProvider, Reasoning},
     protocol::{ConversationChange, FastMode, RuntimeCommand, TaskId},
 };
@@ -102,6 +103,11 @@ pub enum ChatCommand {
     Status,
     /// Show machines, capacity and observed load.
     Machines,
+    /// Show scheduled jobs, or inspect one job by its stable ID.
+    Jobs {
+        #[arg(value_name = "JOB_ID", value_parser = parse_job_id)]
+        id: Option<JobId>,
+    },
     /// Show available models, or choose [provider/]model.
     Model {
         #[arg(value_name = "MODEL")]
@@ -138,6 +144,10 @@ pub enum ChatCommand {
 struct Input {
     #[command(subcommand)]
     command: ChatCommand,
+}
+
+fn parse_job_id(value: &str) -> Result<JobId, String> {
+    JobId::try_from(value.to_owned()).map_err(|error| error.to_string())
 }
 
 impl ChatCommand {
@@ -186,6 +196,18 @@ impl ChatCommand {
     }
 }
 
+impl ChatCommand {
+    pub fn jobs(&self) -> Option<RuntimeCommand> {
+        match self {
+            Self::Jobs { id: None } => Some(RuntimeCommand::ListJobs),
+            Self::Jobs { id: Some(job_id) } => Some(RuntimeCommand::ReadJob {
+                job_id: job_id.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Render the same enum metadata that parses the commands, including arguments.
 pub fn command_help() -> Vec<(String, String)> {
     let parser = Input::command();
@@ -219,9 +241,43 @@ pub fn help() -> String {
 mod tests {
     use crate::{
         chat_commands::{ChatCommand, ModelReference, command_help},
+        jobs::JobId,
         models::ModelProvider,
         protocol::{ConversationChange, FastMode, RuntimeCommand},
     };
+
+    #[test]
+    fn job_controls_produce_typed_requests_and_reject_invalid_ids() {
+        let listing = ChatCommand::parse("/jobs").unwrap().unwrap();
+        assert_eq!(listing, ChatCommand::Jobs { id: None });
+        assert!(matches!(listing.jobs(), Some(RuntimeCommand::ListJobs)));
+        assert!(listing.settings(None).is_none());
+
+        let job_id = JobId::try_from("daily-review".to_owned()).unwrap();
+        let detail = ChatCommand::parse("/jobs daily-review").unwrap().unwrap();
+        assert_eq!(
+            detail,
+            ChatCommand::Jobs {
+                id: Some(job_id.clone())
+            }
+        );
+        assert!(matches!(
+            detail.jobs(),
+            Some(RuntimeCommand::ReadJob { job_id: actual }) if actual == job_id
+        ));
+        assert!(ChatCommand::parse("/jobs Daily_Review").unwrap().is_ok());
+        for invalid in ["/jobs daily extra", "/jobs invalid\u{0007}"] {
+            assert!(ChatCommand::parse(invalid).unwrap().is_err(), "{invalid}");
+        }
+        assert!(ChatCommand::Machines.jobs().is_none());
+        assert_eq!(
+            crate::chat_commands::completions("/jo", 3)
+                .into_iter()
+                .map(|item| item.text)
+                .collect::<Vec<_>>(),
+            ["/jobs"]
+        );
+    }
 
     #[test]
     fn local_controls_parse_typed_values_and_keep_namespaced_model_ids() {

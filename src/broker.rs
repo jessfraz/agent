@@ -208,6 +208,9 @@ impl Broker {
     ) -> HostResult {
         let result =
             match command {
+                HostCommand::Background { request } => crate::background::execute(request)
+                    .await
+                    .map(|response| HostResult::Background { response }),
                 HostCommand::ReadUsage { expected_email } => {
                     return HostResult::Usage {
                         usage: crate::usage::account(&expected_email).await,
@@ -257,6 +260,7 @@ impl Broker {
                     if matches!(
                         *command,
                         HostCommand::OnNode { .. }
+                            | HostCommand::Background { .. }
                             | HostCommand::ReloadGuidance
                             | HostCommand::ReadContext { .. }
                             | HostCommand::SearchContext { .. }
