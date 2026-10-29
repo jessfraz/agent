@@ -9,9 +9,12 @@ recovery; [history](history.md) describes import and retrieval.
   verify real searches. Missing files stay explicit gaps.
 - [ ] Verify chat admission, steering, interruption, reopening and scrolling
   against a large live corpus while background work runs.
-- [ ] Pin and activate scheduled-chat reuse, recovery and shared worktree
-  controls through Global Nix; verify chat reuse, failed job lanes and native
-  inventory display live.
+- [x] Pin and activate scheduled-chat reuse, recovery and shared worktree
+  controls through Global Nix. Background, CLI and main-agent collection have
+  passed live checks, preserving active and dirty work.
+- [x] Verify failed scheduled occurrences settle after recovery on their
+  existing tasks, clearing scheduler errors while preserving unresolved work.
+- [ ] Verify chat reuse and native worktree inventory display live.
 - [x] Ship private lifecycle logs, `/machines`, local usage-reset times and
   countdowns, and the remaining viewport correction.
 
