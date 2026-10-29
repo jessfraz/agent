@@ -96,6 +96,53 @@ impl ResourceRecord {
     }
 }
 
+/// Shared inventory presentation for CLI, terminal chat and native clients.
+pub fn format_inventory(resources: &[ResourceRecord]) -> String {
+    if resources.is_empty() {
+        return "No Agent-owned worktrees.".into();
+    }
+    let mut ordered: Vec<_> = resources.iter().collect();
+    ordered.sort_by(|left, right| {
+        (&left.host_id, &left.repository, &left.branch, &left.id).cmp(&(
+            &right.host_id,
+            &right.repository,
+            &right.branch,
+            &right.id,
+        ))
+    });
+    let cell = |text: &str| text.replace('|', "\\|").replace(['\n', '\r'], " ");
+    let mut lines = vec![
+        "| Worktree | Branch | Host | State | Task |".into(),
+        "| --- | --- | --- | --- | --- |".into(),
+    ];
+    for resource in ordered {
+        let (state, reason) = match &resource.state {
+            ResourceState::Allocating => ("allocating", None),
+            ResourceState::Ready { .. } => ("ready", None),
+            ResourceState::Retiring { .. } => ("retiring", None),
+            ResourceState::Held { reason, .. } => ("held", Some(reason)),
+            ResourceState::Removed { .. } => ("removed", None),
+            ResourceState::Partial { reason, .. } => ("partial", Some(reason)),
+        };
+        let path = resource
+            .state
+            .identity()
+            .map_or(resource.repository.as_str(), |identity| {
+                identity.top.as_str()
+            });
+        let state = reason.map_or_else(|| state.to_owned(), |reason| format!("{state}: {reason}"));
+        lines.push(format!(
+            "| {} | {} | {} | {} | {} |",
+            cell(path),
+            cell(&resource.branch),
+            cell(&resource.host_id),
+            cell(&state),
+            resource.task_id,
+        ));
+    }
+    lines.join("\n")
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct CleanupPlan {
     #[ts(type = "string")]

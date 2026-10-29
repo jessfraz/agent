@@ -767,7 +767,7 @@ async fn main() -> Result<()> {
                     }
                     ChatCommand::Feedback { .. } => {}
                     command => {
-                        if !matches!(command, ChatCommand::Machines)
+                        if !matches!(command, ChatCommand::Machines | ChatCommand::Worktrees)
                             && let Some(model) = model
                         {
                             conversation_settings(
@@ -1967,7 +1967,7 @@ fn local_command_from_ui(
     while ui.controls.try_join_next().is_some() {}
     ui.controls.spawn(async move {
         let changed = async {
-            if let Some(request) = command.jobs() {
+            if let Some(request) = command.request() {
                 let events = exchange(
                     &config,
                     coordinator.as_deref(),
@@ -1977,7 +1977,13 @@ fn local_command_from_ui(
                 )
                 .await?;
                 for event in events {
-                    if let Some(text) = agent_cli::job_view::event(&event) {
+                    let text = match &event {
+                        RuntimeEventKind::Resources { resources } => {
+                            Some(agent_cli::resources::format_inventory(resources))
+                        }
+                        _ => agent_cli::job_view::event(&event),
+                    };
+                    if let Some(text) = text {
                         handle.notice(text)?;
                     }
                 }
@@ -2188,7 +2194,7 @@ async fn local_command_plain(
         }
         return Ok(());
     }
-    if let Some(request) = command.jobs() {
+    if let Some(request) = command.request() {
         for event in exchange(
             client.config,
             client.coordinator,
@@ -3624,47 +3630,7 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
             }
         }
         RuntimeEventKind::Resources { resources } => {
-            let mut previous_task = None;
-            let mut ordered: Vec<_> = resources.iter().collect();
-            ordered.sort_by_key(|resource| {
-                (
-                    resource.task_id.to_string(),
-                    resource.repository.clone(),
-                    resource.branch.clone(),
-                )
-            });
-            for resource in ordered {
-                if previous_task.as_ref() != Some(&resource.task_id) {
-                    println!("Task {}", resource.task_id);
-                    previous_task = Some(resource.task_id.clone());
-                }
-                let (status, reason) = match &resource.state {
-                    agent_cli::resources::ResourceState::Allocating => ("allocating", None),
-                    agent_cli::resources::ResourceState::Ready { .. } => ("ready", None),
-                    agent_cli::resources::ResourceState::Retiring { .. } => ("retiring", None),
-                    agent_cli::resources::ResourceState::Held { reason, .. } => {
-                        ("held", Some(reason))
-                    }
-                    agent_cli::resources::ResourceState::Removed { .. } => ("removed", None),
-                    agent_cli::resources::ResourceState::Partial { reason, .. } => {
-                        ("partial", Some(reason))
-                    }
-                };
-                let path = resource
-                    .state
-                    .identity()
-                    .map(|identity| identity.top.as_str())
-                    .unwrap_or(&resource.repository);
-                println!(
-                    "  {} ({})  {status}{}  @{}",
-                    path,
-                    resource.branch,
-                    reason
-                        .map(|reason| format!(": {reason}"))
-                        .unwrap_or_default(),
-                    resource.host_id,
-                );
-            }
+            println!("{}", agent_cli::resources::format_inventory(resources));
         }
         RuntimeEventKind::Sources { sources } => {
             for source in sources {

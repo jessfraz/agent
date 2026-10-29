@@ -168,7 +168,7 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                         args.request_with_id(format!("native-job:{input_id}")),
                     )));
                 }
-                if let Some(command) = control.jobs().or_else(|| control.settings(None)) {
+                if let Some(command) = control.request().or_else(|| control.settings(None)) {
                     return Ok(Operation::Runtime(Box::new(command)));
                 }
                 match control {
@@ -192,7 +192,7 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                     })),
                     ChatCommand::Status | ChatCommand::Model { .. } | ChatCommand::Fast { .. }
                     | ChatCommand::Reasoning { .. } | ChatCommand::Jobs { .. }
-                    | ChatCommand::RunJob(_) => anyhow::bail!("The shared control handler did not accept this request"),
+                    | ChatCommand::RunJob(_) | ChatCommand::Worktrees => anyhow::bail!("The shared control handler did not accept this request"),
                 }
             } else {
                 RuntimeCommand::MainInput {
@@ -307,6 +307,9 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
                 unavailable_host_ids: unavailable_host_ids.clone().unwrap_or_default(),
             }
             .format(std::time::SystemTime::now()),
+        },
+        RuntimeEventKind::Resources { resources } => NativeEvent::Notice {
+            text: crate::resources::format_inventory(resources),
         },
         RuntimeEventKind::FeedbackReady {
             receipt,
@@ -499,6 +502,71 @@ mod tests {
             })
             .unwrap(),
             Operation::Local(crate::native::NativeEvent::Rejected { .. })
+        ));
+    }
+
+    #[test]
+    fn worktree_control_uses_existing_inventory_without_model_input() {
+        for mode in [InputMode::Steer, InputMode::FollowUp] {
+            let operation = prepare(NativeRequest::Submit {
+                attachments: None,
+                input_id: uuid::Uuid::new_v4().to_string(),
+                text: "/worktrees".into(),
+                mode,
+            })
+            .unwrap();
+            assert!(matches!(
+                operation,
+                Operation::Runtime(command) if matches!(*command, RuntimeCommand::ListResources)
+            ));
+        }
+    }
+
+    #[test]
+    fn worktree_inventory_projects_to_existing_native_notice() {
+        let task_id = crate::protocol::TaskId::new();
+        let mut resource =
+            crate::resources::ResourceRecord::allocating(crate::resources::WorktreeAllocation {
+                host_id: "worker-a".into(),
+                task_id: task_id.clone(),
+                allocation_id: uuid::Uuid::new_v4(),
+                repository: "/workspace/project".into(),
+                branch: "task/review".into(),
+            });
+        resource.state = crate::resources::ResourceState::Held {
+            identity: Some(crate::resources::NativeWorktreeIdentity {
+                primary: "/workspace/project".into(),
+                top: "/workspace/project-review".into(),
+                common_dir: "/workspace/project/.git".into(),
+                git_dir: "/workspace/project/.git/worktrees/review".into(),
+                branch: "task/review".into(),
+                head: "fixture-head".into(),
+            }),
+            reason: "Task is still open".into(),
+        };
+        let Some(crate::native::NativeEvent::Notice { text }) =
+            crate::native::project(&crate::protocol::RuntimeEventKind::Resources {
+                resources: vec![resource],
+            })
+        else {
+            panic!("Native clients must receive the existing inventory");
+        };
+        let task_label = task_id.to_string();
+        for expected in [
+            "/workspace/project-review",
+            "task/review",
+            "worker-a",
+            "held",
+            "Task is still open",
+            task_label.as_str(),
+        ] {
+            assert!(text.contains(expected), "Missing {expected}: {text}");
+        }
+        assert!(matches!(
+            crate::native::project(&crate::protocol::RuntimeEventKind::Resources {
+                resources: vec![],
+            }),
+            Some(crate::native::NativeEvent::Notice { text }) if text == "No Agent-owned worktrees."
         ));
     }
 

@@ -9,8 +9,9 @@ recovery; [history](history.md) describes import and retrieval.
   verify real searches. Missing files stay explicit gaps.
 - [ ] Verify chat admission, steering, interruption, reopening and scrolling
   against a large live corpus while background work runs.
-- [ ] Pin and activate scheduled-chat reuse and recovery through Global Nix;
-  verify repeated runs reuse one chat and previously failed job lanes advance.
+- [ ] Pin and activate scheduled-chat reuse, recovery and shared worktree
+  controls through Global Nix; verify chat reuse, failed job lanes and native
+  inventory display live.
 - [x] Ship private lifecycle logs, `/machines`, local usage-reset times and
   countdowns, and the remaining viewport correction.
 
@@ -41,6 +42,8 @@ recovery; [history](history.md) describes import and retrieval.
   so restarts and retries cannot run a job twice.
 - [x] Reuse each scheduled job's Rex chat and Pi conversation across timer and
   manual runs, preserving each admitted run's prompt, model and identity.
+- [x] Shared worktree inventory through the CLI and `/worktrees`, including
+  native chat clients.
 
 ## Retrieval, learning and proof
 

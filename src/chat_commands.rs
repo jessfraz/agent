@@ -126,6 +126,8 @@ pub enum ChatCommand {
     Status,
     /// Show machines, capacity and observed load.
     Machines,
+    /// List Agent-owned worktrees across registered machines.
+    Worktrees,
     /// Show scheduled jobs, or inspect one job by its stable ID.
     Jobs {
         #[arg(value_name = "JOB_ID", value_parser = parse_job_id)]
@@ -231,8 +233,9 @@ impl ChatCommand {
         })
     }
 
-    pub fn jobs(&self) -> Option<RuntimeCommand> {
+    pub fn request(&self) -> Option<RuntimeCommand> {
         match self {
+            Self::Worktrees => Some(RuntimeCommand::ListResources),
             Self::RunJob(args) => Some(args.request()),
             Self::Jobs { id: None } => Some(RuntimeCommand::ListJobs),
             Self::Jobs { id: Some(job_id) } => Some(RuntimeCommand::ReadJob {
@@ -290,7 +293,7 @@ mod tests {
             job_id,
             schedule_id: Some(schedule_id),
             request_id,
-        }) = command.jobs()
+        }) = command.request()
         else {
             panic!("Manual job control must produce the shared admission request");
         };
@@ -302,14 +305,14 @@ mod tests {
             ChatCommand::parse("/run-job daily-review")
                 .unwrap()
                 .unwrap()
-                .jobs(),
+                .request(),
             Some(RuntimeCommand::RunJob {
                 schedule_id: None,
                 ..
             })
         ));
         assert!(
-            matches!(ChatCommand::parse("/jobs run").unwrap().unwrap().jobs(),
+            matches!(ChatCommand::parse("/jobs run").unwrap().unwrap().request(),
             Some(RuntimeCommand::ReadJob { job_id }) if job_id.as_str() == "run")
         );
         for invalid in [
@@ -326,7 +329,7 @@ mod tests {
     fn job_controls_produce_typed_requests_and_reject_invalid_ids() {
         let listing = ChatCommand::parse("/jobs").unwrap().unwrap();
         assert_eq!(listing, ChatCommand::Jobs { id: None });
-        assert!(matches!(listing.jobs(), Some(RuntimeCommand::ListJobs)));
+        assert!(matches!(listing.request(), Some(RuntimeCommand::ListJobs)));
         assert!(listing.settings(None).is_none());
 
         let job_id = JobId::try_from("daily-review".to_owned()).unwrap();
@@ -338,14 +341,14 @@ mod tests {
             }
         );
         assert!(matches!(
-            detail.jobs(),
+            detail.request(),
             Some(RuntimeCommand::ReadJob { job_id: actual }) if actual == job_id
         ));
         assert!(ChatCommand::parse("/jobs Daily_Review").unwrap().is_ok());
         for invalid in ["/jobs daily extra", "/jobs invalid\u{0007}"] {
             assert!(ChatCommand::parse(invalid).unwrap().is_err(), "{invalid}");
         }
-        assert!(ChatCommand::Machines.jobs().is_none());
+        assert!(ChatCommand::Machines.request().is_none());
         assert_eq!(
             crate::chat_commands::completions("/jo", 3)
                 .into_iter()
