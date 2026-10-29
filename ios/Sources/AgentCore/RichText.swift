@@ -1,4 +1,6 @@
+import Dispatch
 import Foundation
+import Synchronization
 
 public enum RichBlock: Sendable, Equatable {
   case prose(AttributedString)
@@ -10,8 +12,23 @@ public enum RichBlock: Sendable, Equatable {
   case table([[AttributedString]])
 }
 
-/// Foundation owns Markdown syntax. Preparation stays on the session actor.
+/// Foundation owns Markdown syntax; the session actor owns ordered snapshots.
 public enum RichText {
+  static func prepare(_ texts: [String]) -> [[RichBlock]] {
+    guard texts.count > 1 else { return texts.map(parse) }
+    let workers = min(4, ProcessInfo.processInfo.activeProcessorCount, texts.count)
+    let result = Mutex([[RichBlock]](repeating: [], count: texts.count))
+    // Complete row texts have independent Markdown scopes. Join all bounded
+    // workers before returning to the actor; no worker can mutate its state.
+    DispatchQueue.concurrentPerform(iterations: workers) { worker in
+      for index in stride(from: worker, to: texts.count, by: workers) {
+        let blocks = parse(texts[index])
+        result.withLock { $0[index] = blocks }
+      }
+    }
+    return result.withLock { $0 }
+  }
+
   public static func parse(_ text: String) -> [RichBlock] {
     guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
     guard let parsed = try? AttributedString(markdown: text) else {

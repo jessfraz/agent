@@ -72,7 +72,8 @@ import Testing
   #expect(group.summary.contains("1 running"))
 }
 
-@MainActor @Test func visibleToolLookupsAreSerialAndCancelledQueuedRowsNeverLoad() async throws {
+@MainActor @Test(.timeLimit(.minutes(1)))
+func visibleToolLookupsAreSerialAndCancelledQueuedRowsNeverLoad() async throws {
   var transcript = Transcript()
   transcript.activity(.toolStarted(.init(callId: "first", name: "exec")))
   transcript.activity(.toolStarted(.init(callId: "cancelled", name: "exec")))
@@ -81,21 +82,20 @@ import Testing
   let queue = ActivityDetailQueue()
   var calls: [String] = []
   var release: CheckedContinuation<Void, Never>?
+  let entered = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+  defer { entered.continuation.finish() }
   let loader: ToolDetailsLoader = { row in
     let id = row.tool?.callId ?? ""
     calls.append(id)
-    await withCheckedContinuation { release = $0 }
+    await withCheckedContinuation {
+      release = $0
+      entered.continuation.yield(())
+    }
     return .unavailable(.init(callId: id))
   }
   let first = Task { try await queue.load(firstRow, using: loader) }
-  let deadline = ContinuousClock.now + .seconds(1)
-  while release == nil {
-    guard ContinuousClock.now < deadline else {
-      first.cancel()
-      throw ConnectionError.timedOut
-    }
-    await Task.yield()
-  }
+  defer { first.cancel() }
+  for await _ in entered.stream { break }
   let second = Task { try await queue.load(secondRow, using: loader) }
   await Task.yield()
   second.cancel()

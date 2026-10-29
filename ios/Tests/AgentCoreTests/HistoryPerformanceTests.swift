@@ -44,12 +44,14 @@ private struct PreparationSample {
   let pageCount: Int
   let chunkCount: Int
   let streamBytes: Int
+  let snapshotCount: Int
 }
 
 private func exercisePreparation() -> PreparationSample {
   let clock = ContinuousClock()
   var transcript = Transcript()
   var pageTimes: [Duration] = []
+  var publishedHistory: [ChatRow] = []
   // Read the most recent page first, then advance older cursors one page at a time.
   for start in stride(from: 500, through: 0, by: -20) {
     let messages = measuredMessages(start..<(start + 20))
@@ -62,8 +64,9 @@ private func exercisePreparation() -> PreparationSample {
       .init(
         messages: Array(messages.suffix(10)), nextCursor: "before-\(start)", pageComplete: true),
       olderPage: start != 500, requestID: requestID)
+    publishedHistory = transcript.rows
     pageTimes.append(began.duration(to: clock.now))
-    #expect(transcript.rows.count <= Transcript.maximumRows)
+    #expect(publishedHistory.count <= Transcript.maximumRows)
   }
   #expect(transcript.rows.count == Transcript.maximumRows)
   #expect(transcript.rows.compactMap(\.entryID) == (0..<500).map { "measured-\($0)" })
@@ -78,8 +81,24 @@ private func exercisePreparation() -> PreparationSample {
     + (0..<100).map { "Detail \($0): **typed** content and `inline code`.\n\n" }
     + ["```swift\nlet count = 100\n```"]
   let streamBegan = clock.now
-  for chunk in chunks { transcript.response(chunk) }
+  var published: [ChatRow] = []
+  var observed: [ChatRow] = []
+  for (index, chunk) in chunks.enumerated() {
+    transcript.response(chunk)
+    // Observe frequent bursts, retaining the last snapshot as the UI does.
+    // The session already publishes at 50 ms, rather than after every delta.
+    if (index + 1).isMultiple(of: 4) {
+      published = transcript.rows
+      if let row = published.last { observed.append(row) }
+    }
+  }
+  published = transcript.rows
+  if let row = published.last { observed.append(row) }
   let streamTime = streamBegan.duration(to: clock.now)
+  for row in observed {
+    #expect(row.blocks == RichText.parse(row.text))
+    #expect(row.id == observed.first?.id)
+  }
   let answer = NativeEventAnswer(entryId: "measured-answer", text: chunks.joined())
   transcript.answer(answer)
   transcript.answer(answer)
@@ -93,7 +112,8 @@ private func exercisePreparation() -> PreparationSample {
 
   return PreparationSample(
     firstPage: pageTimes[0], history: pageTimes.reduce(Duration.zero, +), stream: streamTime,
-    pageCount: pageTimes.count, chunkCount: chunks.count, streamBytes: answer.text.utf8.count)
+    pageCount: pageTimes.count, chunkCount: chunks.count, streamBytes: answer.text.utf8.count,
+    snapshotCount: observed.count)
 }
 
 @Test func pagedHistoryAndStreamingPreparationRemainBoundedAndKeepCanonicalIdentity() {
@@ -119,7 +139,8 @@ private func exercisePreparation() -> PreparationSample {
       Release configuration. OS: \(ProcessInfo.processInfo.operatingSystemVersionString); CPUs: \(ProcessInfo.processInfo.processorCount).
       One warmup followed by \(samples.count) measured iterations; CI gates each sample median.
       Cursor-style history: \(workload.pageCount) pages of 20 messages, each split across two frames, retained window 500 rows.
-      Stream: \(workload.chunkCount) chunks, \(workload.streamBytes) UTF-8 bytes, one canonical answer.
+      Stream: \(workload.chunkCount) chunks, \(workload.streamBytes) UTF-8 bytes, \(workload.snapshotCount) observed snapshots, one canonical answer.
+      Observes every four deltas and the final prefix; every observed block matches fresh Foundation preparation.
       First-page samples (ms): \(samples.map { milliseconds($0.firstPage) }.joined(separator: ", ")).
       All-page samples (ms): \(samples.map { milliseconds($0.history) }.joined(separator: ", ")).
       Stream samples (ms): \(samples.map { milliseconds($0.stream) }.joined(separator: ", ")).
@@ -141,4 +162,73 @@ private func exercisePreparation() -> PreparationSample {
       streamMedian <= streamBudget,
       "Stream preparation exceeded its CI regression budget.")
   #endif
+}
+
+@Test func streamedSnapshotsKeepCurrentMarkdownAndEarlierSnapshotsImmutable() throws {
+  var transcript = Transcript()
+  let bursts = [
+    ["# 日本語\n\n", "First **bold", "** paragraph.\n\n"],
+    ["| A | B |\n", "| --- | --- |\n", "| 左\\|右 | β |\n\n"],
+    ["```swift\n", "let value = \"🦀\"\n", "```"],
+  ]
+  var text = ""
+  var snapshots: [ChatRow] = []
+  for burst in bursts {
+    for chunk in burst {
+      text += chunk
+      transcript.response(chunk)
+    }
+    let row = try #require(transcript.rows.last)
+    #expect(row.text == text)
+    #expect(row.blocks == RichText.parse(text))
+    snapshots.append(row)
+  }
+  #expect(snapshots.map(\.id).allSatisfy { $0 == snapshots.first?.id })
+  #expect(snapshots.first?.text == bursts[0].joined())
+  #expect(snapshots.first?.blocks == RichText.parse(bursts[0].joined()))
+  #expect(snapshots.last?.blocks.contains(.code("let value = \"🦀\"", language: "swift")) == true)
+}
+
+@Test func streamedThinkingPreparesAtSnapshotsAndReconnectDiscardsItsPendingPreparation() throws {
+  var transcript = Transcript()
+  transcript.activity(.thinking(.init(text: "First **")))
+  transcript.activity(.thinking(.init(text: "thought**\n\n- Check saved data")))
+  let first = try #require(transcript.rows.last)
+  #expect(first.blocks == RichText.parse(first.text))
+  transcript.activity(.thinking(.init(text: "\n- Check the live worker")))
+  transcript.reconnect()
+  #expect(transcript.rows.isEmpty)
+  transcript.response("```swift\n")
+  transcript.response("let count = 1")
+  transcript.answer(.init(entryId: "saved-answer", text: "Finished **answer**."))
+  let answer = try #require(transcript.rows.last)
+  #expect(answer.text == "Finished **answer**.")
+  #expect(answer.blocks == RichText.parse(answer.text))
+  #expect(transcript.rows.count == 1)
+}
+
+@Test func historySnapshotsKeepIndependentMarkdownScopesAndCanonicalOrder() {
+  let texts = (0..<40).map { index in
+    switch index % 5 {
+    case 0: "# 日本語 \(index)\n\nA **bold** line.\nAnother `line`."
+    case 1: "A [reference][target] remains unresolved in this message."
+    case 2: "[target]: https://example.invalid/\(index)"
+    case 3: "```swift\nlet value = \"🦀 \(index)\""
+    default: "| A | B |\n| --- | --- |\n| 左\\|右 | β \(index) |"
+    }
+  }
+  var transcript = Transcript()
+  transcript.history(
+    .init(
+      messages: texts.enumerated().map { index, text in
+        .init(
+          continuation: false, entryId: "scope-\(index)", finalChunk: true, role: .final,
+          text: text)
+      }, nextCursor: nil, pageComplete: true))
+  let snapshot = transcript.rows
+  #expect(snapshot.map(\.text) == texts)
+  #expect(snapshot.compactMap(\.entryID) == (0..<40).map { "scope-\($0)" })
+  #expect(snapshot.map(\.blocks) == texts.map(RichText.parse))
+  #expect(snapshot[2].blocks.isEmpty)
+  #expect(snapshot[3].blocks == [.code("let value = \"🦀 3\"", language: "swift")])
 }

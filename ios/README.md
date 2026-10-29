@@ -48,7 +48,9 @@ Mode if requested, then Run.
 - Saved history, streamed answer text, provider-exposed thinking, tool status,
   commentary, durable notices and compaction state use native views. Markdown
   uses Foundation's parser, with native headings, quotes, lists, code blocks and
-  tables. Parsing happens outside SwiftUI bodies. Rendering and incoming pages
+  tables. Changed rows are prepared once per published snapshot, outside SwiftUI
+  bodies. Complete messages use at most four parsing workers, joined before
+  publication. Rendering and incoming pages
   are bounded; display truncation does not alter coordinator history.
 - Startup reads a bounded recent page. Older history is cursor-paged through
   **Load earlier messages**; the phone never downloads the whole conversation

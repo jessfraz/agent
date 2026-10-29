@@ -26,20 +26,36 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
     self.entryID = entryID
     self.role = role
     self.text = text
-    blocks = RichText.parse(text)
+    blocks = []
     self.tool = tool
     self.delivery = delivery
     self.inputID = inputID
     self.attachments = attachments
   }
-  mutating func replace(_ text: String) {
-    self.text = text
-    blocks = RichText.parse(text)
-  }
 }
 
 struct Transcript: Sendable {
-  var rows: [ChatRow] = []
+  private var storage: [ChatRow] = []
+  private var dirtyRows: Set<String> = []
+
+  // The actor's existing publication cadence reads this snapshot. Prepare each
+  // changed row once, using its complete current text, before it becomes public.
+  var rows: [ChatRow] {
+    mutating get {
+      let indexes = dirtyRows.compactMap { id in storage.firstIndex { $0.id == id } }
+      let blocks = RichText.prepare(indexes.map { storage[$0].text })
+      for (index, value) in zip(indexes, blocks) {
+        storage[index].blocks = value
+      }
+      dirtyRows.removeAll(keepingCapacity: true)
+      return storage
+    }
+  }
+
+  private mutating func append(_ row: ChatRow) {
+    storage.append(row)
+    dirtyRows.insert(row.id)
+  }
   private struct Page: Sendable {
     var messages: [HistoryMessage] = []
     var bytes = 0
@@ -60,26 +76,27 @@ struct Transcript: Sendable {
     pages.removeValue(forKey: nil)
     finishResponse()
     thinkingID = nil
-    rows.removeAll { $0.id.hasPrefix("thinking:") }
+    storage.removeAll { $0.id.hasPrefix("thinking:") }
+    dirtyRows = dirtyRows.filter { !$0.hasPrefix("thinking:") }
   }
   mutating func pending(_ request: NativeRequestSubmit, delivery: Delivery) {
-    if let index = rows.firstIndex(where: { $0.inputID == request.inputId }) {
-      rows[index].delivery = delivery
+    if let index = storage.firstIndex(where: { $0.inputID == request.inputId }) {
+      storage[index].delivery = delivery
       return
     }
-    rows.append(
+    append(
       ChatRow(
         id: "input:\(request.inputId)", role: .user, text: request.text, delivery: delivery,
         inputID: request.inputId, attachments: request.attachments ?? []))
     bound()
   }
   mutating func delivery(_ id: String, _ state: Delivery, entryID: String? = nil) {
-    guard let index = rows.firstIndex(where: { $0.inputID == id }) else { return }
-    rows[index].delivery = state
+    guard let index = storage.firstIndex(where: { $0.inputID == id }) else { return }
+    storage[index].delivery = state
     if let entryID {
-      rows[index].entryID = entryID
-      rows[index].delivery = nil
-      rows.removeAll { $0.entryID == entryID && $0.inputID != id }
+      storage[index].entryID = entryID
+      storage[index].delivery = nil
+      storage.removeAll { $0.entryID == entryID && $0.inputID != id }
     }
   }
   mutating func abandonHistory(_ requestID: UUID) { pages.removeValue(forKey: requestID) }
@@ -101,32 +118,33 @@ struct Transcript: Sendable {
     }
     var loaded = Transcript()
     for message in page.messages { loaded.message(message, historical: true) }
-    let loadedIDs = Set(loaded.rows.compactMap(\.entryID))
+    let loadedIDs = Set(loaded.storage.compactMap(\.entryID))
     historicalEntries.formUnion(loadedIDs)
+    dirtyRows.formUnion(loaded.dirtyRows)
     // Reuse a correlated input's stable row identity at its canonical position.
     // Multiple user blocks can belong to one entry; only one inherits the input ID.
     var correlatedInputs: Set<String> = []
-    let incoming = loaded.rows.map { row in
+    let incoming = loaded.storage.map { row in
       if row.role == .user,
-        let input = rows.first(where: { $0.inputID != nil && $0.entryID == row.entryID }),
+        let input = storage.first(where: { $0.inputID != nil && $0.entryID == row.entryID }),
         correlatedInputs.insert(input.id).inserted
       {
         return input
       }
       // Calls and results have different entry IDs but share one tool row ID.
       // An older call must not replace its newer result or duplicate that row.
-      if olderPage, let current = rows.first(where: { $0.id == row.id }) { return current }
+      if olderPage, let current = storage.first(where: { $0.id == row.id }) { return current }
       return row
     }
     let incomingIDs = Set(incoming.map(\.id))
-    rows.removeAll { loadedIDs.contains($0.entryID ?? "") || incomingIDs.contains($0.id) }
+    storage.removeAll { loadedIDs.contains($0.entryID ?? "") || incomingIDs.contains($0.id) }
     if olderPage {
-      rows.insert(contentsOf: incoming, at: 0)
+      storage.insert(contentsOf: incoming, at: 0)
     } else {
-      let unsaved = rows.filter { $0.inputID != nil && $0.entryID == nil }
-      rows.removeAll { $0.inputID != nil && $0.entryID == nil }
-      rows.append(contentsOf: incoming)
-      rows.append(contentsOf: unsaved)
+      let unsaved = storage.filter { $0.inputID != nil && $0.entryID == nil }
+      storage.removeAll { $0.inputID != nil && $0.entryID == nil }
+      storage.append(contentsOf: incoming)
+      storage.append(contentsOf: unsaved)
     }
     for (id, count) in loaded.segmentCounts {
       segmentCounts[id] = max(segmentCounts[id] ?? 0, count)
@@ -139,49 +157,56 @@ struct Transcript: Sendable {
     }
   }
   mutating func response(_ text: String) {
-    if let id = responseID, let index = rows.firstIndex(where: { $0.id == id }) {
-      rows[index].replace(boundedText(rows[index].text + text))
+    if let id = responseID, let index = storage.firstIndex(where: { $0.id == id }) {
+      storage[index].text = boundedText(storage[index].text + text)
+      dirtyRows.insert(id)
     } else {
       let id = "response:\(UUID().uuidString)"
       responseID = id
-      rows.append(ChatRow(id: id, role: .partialAnswer, text: boundedText(text)))
+      append(ChatRow(id: id, role: .partialAnswer, text: boundedText(text)))
     }
     bound()
   }
   private mutating func finishResponse() {
-    if let id = responseID { rows.removeAll { $0.id == id } }
+    if let id = responseID {
+      storage.removeAll { $0.id == id }
+      dirtyRows.remove(id)
+    }
     responseID = nil
   }
   mutating func message(_ message: HistoryMessage, historical: Bool = false) {
     if !historical && message.role == .commentary { finishResponse() }
     if !historical && historicalEntries.contains(message.entryId) { return }
     if message.role == .user,
-      rows.contains(where: { $0.entryID == message.entryId && $0.inputID != nil })
+      storage.contains(where: { $0.entryID == message.entryId && $0.inputID != nil })
     {
       return
     }
     if let tool = message.tool {
       let id = "tool:\(tool.callId)"
-      if let index = rows.firstIndex(where: { $0.id == id }) {
-        rows[index].tool = tool
-        rows[index].entryID = message.entryId
+      if let index = storage.firstIndex(where: { $0.id == id }) {
+        storage[index].tool = tool
+        storage[index].entryID = message.entryId
         return
       }
-      rows.append(
+      append(
         ChatRow(id: id, entryID: message.entryId, role: .tool, text: tool.name, tool: tool))
     } else if message.continuation,
-      let index = rows.lastIndex(where: { $0.entryID == message.entryId && $0.role == message.role }
+      let index = storage.lastIndex(where: {
+        $0.entryID == message.entryId && $0.role == message.role
+      }
       )
     {
-      rows[index].replace(boundedText(rows[index].text + message.text))
+      storage[index].text = boundedText(storage[index].text + message.text)
+      dirtyRows.insert(storage[index].id)
       for attachment in message.attachments ?? []
-      where !rows[index].attachments.contains(where: { $0.id == attachment.id }) {
-        rows[index].attachments.append(attachment)
+      where !storage[index].attachments.contains(where: { $0.id == attachment.id }) {
+        storage[index].attachments.append(attachment)
       }
     } else {
       let segment = segmentCounts[message.entryId, default: 0]
       segmentCounts[message.entryId] = segment + 1
-      rows.append(
+      append(
         ChatRow(
           id: "entry:\(message.entryId):\(segment)", entryID: message.entryId, role: message.role,
           text: boundedText(message.text), attachments: message.attachments ?? []))
@@ -191,8 +216,8 @@ struct Transcript: Sendable {
   mutating func answer(_ answer: NativeEventAnswer) {
     finishResponse()
     guard !answer.text.isEmpty else { return }
-    if let id = answer.entryId, rows.contains(where: { $0.entryID == id }) { return }
-    rows.append(
+    if let id = answer.entryId, storage.contains(where: { $0.entryID == id }) { return }
+    append(
       ChatRow(
         id: "entry:\(answer.entryId ?? UUID().uuidString):0", entryID: answer.entryId, role: .final,
         text: boundedText(answer.text)))
@@ -202,41 +227,42 @@ struct Transcript: Sendable {
   mutating func activity(_ activity: ModelActivity) {
     switch activity {
     case .thinking(let value):
-      if let id = thinkingID, let index = rows.firstIndex(where: { $0.id == id }) {
-        rows[index].replace(boundedText(rows[index].text + value.text))
+      if let id = thinkingID, let index = storage.firstIndex(where: { $0.id == id }) {
+        storage[index].text = boundedText(storage[index].text + value.text)
+        dirtyRows.insert(id)
       } else {
         let id = "thinking:\(UUID().uuidString)"
         thinkingID = id
-        rows.append(ChatRow(id: id, role: .thinking, text: boundedText(value.text)))
+        append(ChatRow(id: id, role: .thinking, text: boundedText(value.text)))
       }
     case .toolStarted(let tool):
       thinkingID = nil
       let info = ToolHistory(callId: tool.callId, name: tool.name, status: .running)
-      if let index = rows.firstIndex(where: { $0.id == "tool:\(tool.callId)" }) {
-        rows[index].tool = info
+      if let index = storage.firstIndex(where: { $0.id == "tool:\(tool.callId)" }) {
+        storage[index].tool = info
       } else {
-        rows.append(ChatRow(id: "tool:\(tool.callId)", role: .tool, text: tool.name, tool: info))
+        append(ChatRow(id: "tool:\(tool.callId)", role: .tool, text: tool.name, tool: info))
       }
     case .toolFinished(let tool):
-      if let index = rows.firstIndex(where: { $0.id == "tool:\(tool.callId)" }),
-        rows[index].tool?.status == .running
+      if let index = storage.firstIndex(where: { $0.id == "tool:\(tool.callId)" }),
+        storage[index].tool?.status == .running
       {
-        rows[index].tool?.status = .finished
+        storage[index].tool?.status = .finished
       }
     case .compaction(let value):
       let text =
         value.failed
         ? "Context compaction failed. Saved history is retained."
         : "Compacting conversation context…"
-      rows.removeAll { $0.id == "compaction" }
+      storage.removeAll { $0.id == "compaction" }
       if value.active || value.failed {
-        rows.append(ChatRow(id: "compaction", role: .notice, text: text))
+        append(ChatRow(id: "compaction", role: .notice, text: text))
       }
     }
     bound()
   }
   mutating func notice(_ text: String, failure: Bool = false) {
-    rows.append(
+    append(
       ChatRow(
         id: "notice:\(UUID().uuidString)", role: .notice,
         text: (failure ? "Error: " : "") + boundedText(text)))
@@ -252,13 +278,15 @@ struct Transcript: Sendable {
       + "\n\n[Display limit reached. Full content remains on the coordinator.]"
   }
   private mutating func bound(olderPage: Bool = false) {
-    textBytes = rows.reduce(0) { $0 + $1.text.utf8.count }
-    while rows.count > Self.maximumRows || textBytes > Self.maximumTextBytes {
-      let candidates = rows.indices.filter { rows[$0].delivery == nil }
+    textBytes = storage.reduce(0) { $0 + $1.text.utf8.count }
+    while storage.count > Self.maximumRows || textBytes > Self.maximumTextBytes {
+      let candidates = storage.indices.filter { storage[$0].delivery == nil }
       guard let index = olderPage ? candidates.last : candidates.first else { break }
-      textBytes -= rows.remove(at: index).text.utf8.count
+      let removed = storage.remove(at: index)
+      textBytes -= removed.text.utf8.count
+      dirtyRows.remove(removed.id)
     }
-    let retained = Set(rows.compactMap(\.entryID))
+    let retained = Set(storage.compactMap(\.entryID))
     historicalEntries.formIntersection(retained)
     segmentCounts = segmentCounts.filter { retained.contains($0.key) }
   }
