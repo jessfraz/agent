@@ -234,7 +234,7 @@ test("real bridge preserves literal Unicode separators through LF-framed request
 });
 
 
-test("real bridge admits input before imported corpus catchup and interrupts a held semantic lookup", { timeout: 10_000 }, async () => {
+test("real bridge admits input before imported corpus catchup and interrupts a held semantic lookup", { timeout: 10_000 }, async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "agent-index-admission-")); await chmod(directory, 0o700);
   const harness = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models: builtinModels(), registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
@@ -271,12 +271,20 @@ test("real bridge admits input before imported corpus catchup and interrupts a h
   });
   const send = (id: number, command: RuntimeCommand) => child.stdin.write(JSON.stringify({ version: 1, id, command }) + "\n");
   const wait = (id: number, predicate: (event: RuntimeEventKind) => boolean): Promise<RuntimeEventKind> => new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { listeners.delete(check); reject(new Error("Bridge did not finish request " + id + ": " + JSON.stringify(frames.map((frame) => ({ id: frame.id, event: frame.event }))) + errors)); }, 3000);
-    const check = () => {
+    // The test's existing budget owns startup and cleanup. Admission is an
+    // ordering contract, not a second deadline racing the child module loader.
+    function cleanup(): void {
+      listeners.delete(check); t.signal.removeEventListener("abort", stopped); child.off("close", stopped);
+    }
+    function stopped(): void {
+      cleanup(); reject(new Error("Bridge did not finish request " + id + ": " + JSON.stringify(frames.map((frame) => ({ id: frame.id, event: frame.event }))) + errors));
+    }
+    function check(): void {
       const frame = frames.find((frame) => frame.id === id && predicate(frame.event));
-      if (frame === undefined) return; clearTimeout(timer); listeners.delete(check); resolve(frame.event);
-    };
-    listeners.add(check); check();
+      if (frame === undefined) return; cleanup(); resolve(frame.event);
+    }
+    listeners.add(check); t.signal.addEventListener("abort", stopped, { once: true }); child.once("close", stopped);
+    if (t.signal.aborted || child.exitCode !== null || child.signalCode !== null) stopped(); else check();
   });
   const chat = (input: string, input_id: string): RuntimeCommand => ({ type: "chat", input, input_id, model: DEFAULT_MODEL, instructions: "Brief answers.",
     cwd: "/example/project", origin_host_id: null, hosts: [] });
