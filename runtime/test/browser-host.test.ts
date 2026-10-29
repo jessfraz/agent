@@ -88,8 +88,8 @@ async function fixture(slowSubmit = false) {
       response.writeHead(401).end("<!doctype html><h1>Sign in required</h1>"); return;
     }
     if (request.url === "/form") response.end(`<!doctype html><title>Owned form</title><h1>Form ready</h1>
-      <form action="/submit" method="post"><label>Name <input name="name"></label>
-      <label>Choice <select name="choice"><option>First</option><option>Second</option></select></label>
+      <form action="/submit" method="post"><label>Name<input name="name"></label>
+      <label>Choice<select name="choice"><option>First</option><option>Second</option></select></label>
       <button type="button" onclick="window.open('/popup','_blank')">Open popup</button>
       <button type="button" onclick="alert('Fixture dialog')">Open dialog</button><button>Save</button></form>`);
     else if (request.url === "/done") response.end("<!doctype html><title>Saved form</title><h1>Saved</h1>");
@@ -146,16 +146,16 @@ function requests() {
   return (action: BrowserAction, operation_id = randomUUID()): BrowserRequest => ({ owner_id, session_id, operation_id, action });
 }
 
-function elementRef(output: string, name: string): string {
+function elementRef(output: string, role: string, name: string): string {
   const value: unknown = JSON.parse(output);
   assert.ok(object(value));
   function find(node: unknown): string | undefined {
     if (!object(node)) return undefined;
-    if (node.name === name && typeof node.id === "string") return node.id;
+    if (node.role === role && node.name === name && typeof node.id === "string") return node.id;
     if (Array.isArray(node.children)) for (const child of node.children) { const found = find(child); if (found !== undefined) return found; }
     return undefined;
   }
-  const result = find(value.snapshot); assert.ok(result, `Snapshot must contain ${name}`); return result;
+  const result = find(value.snapshot); assert.ok(result, `Snapshot must contain ${role} ${name}`); return result;
 }
 
 test("real Chrome adapter owns exact tabs and scoped popups, preserves unrelated pages and deduplicates mutations", { skip: skipChrome, timeout: 120_000 }, async () => {
@@ -172,26 +172,26 @@ test("real Chrome adapter owns exact tabs and scoped popups, preserves unrelated
     const unowned = (await host.execute(request({ type: "close_tab", tab_id: 0xffff_ffff }))).response;
     assert.equal(unowned.type, "failed");
 
-    const filled = (await host.execute(request({ type: "fill", tab_id: tab.id, element_ref: elementRef(opened.output, "Name"), value: "Synthetic user" }))).response;
-    assert.ok(filled.type === "ready"); assert.equal(filled.is_error, false);
-    const selected = (await host.execute(request({ type: "fill", tab_id: tab.id, element_ref: elementRef(filled.output, "Choice"), value: "Second" }))).response;
-    assert.ok(selected.type === "ready"); assert.equal(selected.is_error, false);
+    const filled = (await host.execute(request({ type: "fill", tab_id: tab.id, element_ref: elementRef(opened.output, "textbox", "Name"), value: "Synthetic user" }))).response;
+    assert.ok(filled.type === "ready", JSON.stringify(filled)); assert.equal(filled.is_error, false);
+    const selected = (await host.execute(request({ type: "fill", tab_id: tab.id, element_ref: elementRef(filled.output, "combobox", "Choice"), value: "Second" }))).response;
+    assert.ok(selected.type === "ready", JSON.stringify(selected)); assert.equal(selected.is_error, false);
     const waited = (await host.execute(request({ type: "wait_for", tab_id: tab.id, text: "Form ready" }))).response;
     assert.ok(waited.type === "ready"); assert.equal(waited.is_error, false);
 
-    const popupRequest = request({ type: "click", tab_id: tab.id, element_ref: elementRef(waited.output, "Open popup") });
+    const popupRequest = request({ type: "click", tab_id: tab.id, element_ref: elementRef(waited.output, "button", "Open popup") });
     const popupPending = host.execute(popupRequest);
     await f.client.call("Target.createTarget", { url: `${f.origin}/user-concurrent` });
     const popup = (await popupPending).response;
     assert.ok(popup.type === "ready", JSON.stringify(popup)); assert.equal(popup.is_error, false);
     assert.equal(popup.tabs.length, 2); assert.ok(popup.tabs.some(page => page.url === `${f.origin}/popup`));
     assert.equal(JSON.stringify(popup).includes("user-concurrent"), false);
-    const dialog = (await host.execute(request({ type: "click", tab_id: tab.id, element_ref: elementRef(popup.output, "Open dialog") }))).response;
+    const dialog = (await host.execute(request({ type: "click", tab_id: tab.id, element_ref: elementRef(popup.output, "button", "Open dialog") }))).response;
     assert.ok(dialog.type === "ready"); assert.ok(dialog.output.includes("Fixture dialog"));
     const accepted = (await host.execute(request({ type: "handle_dialog", tab_id: tab.id, accept: true, prompt_text: null }))).response;
     assert.ok(accepted.type === "ready"); assert.equal(accepted.is_error, false);
 
-    const submission = request({ type: "click", tab_id: tab.id, element_ref: elementRef(accepted.output, "Save") });
+    const submission = request({ type: "click", tab_id: tab.id, element_ref: elementRef(accepted.output, "button", "Save") });
     const saved = (await host.execute(submission)).response;
     assert.ok(saved.type === "ready", JSON.stringify(saved)); assert.equal(saved.is_error, false); assert.equal(f.count(), 1);
     const body = new URLSearchParams(f.submittedBodies()[0]);
@@ -226,7 +226,7 @@ test("lost browser transport leaves a submitted mutation uncertain without repla
   try {
     const opened = (await host.execute(request({ type: "open", url: `${f.origin}/form` }))).response;
     assert.ok(opened.type === "ready", JSON.stringify(opened)); const tab = opened.tabs[0]; assert.ok(tab);
-    const operation = request({ type: "click", tab_id: tab.id, element_ref: elementRef(opened.output, "Save") });
+    const operation = request({ type: "click", tab_id: tab.id, element_ref: elementRef(opened.output, "button", "Save") });
     const pending = host.execute(operation);
     await Promise.race([f.submitted, setTimeout(15_000, undefined, { ref: false }).then(() => { throw new Error("Fixture submission did not arrive"); })]);
     assert.equal(f.count(), 1); await host.close();
