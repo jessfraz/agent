@@ -12,7 +12,7 @@ there is no new HTTP endpoint, public listener or phone-side model credential.
    Existing coordinator setup is described in [setup](../docs/setup.md).
 2. Open `Agent.xcodeproj` in full Xcode with an iOS 18-or-newer SDK. The `Agent`
    scheme uses this directory's local Swift package without dependencies. For a
-   device build, choose a development team and replace the example bundle ID.
+   device build, choose a development team and use a bundle ID registered to it.
    Simulator builds do not require signing.
 3. Connect Tailscale on the device. The coordinator must authorize its peer
    through the existing same-user or explicitly pinned stable-peer policy.
