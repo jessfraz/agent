@@ -11,6 +11,7 @@ import { createRegistry, defineDoc, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { AgentNode } from "../src/generated/AgentNode.js";
 import type { HistoryItem } from "../src/generated/HistoryItem.js";
+import type { HistoryGap } from "../src/generated/HistoryGap.js";
 import type { HistoryRequest } from "../src/generated/HistoryRequest.js";
 import type { HistoryResponse } from "../src/generated/HistoryResponse.js";
 import type { HistoryThread } from "../src/generated/HistoryThread.js";
@@ -36,7 +37,8 @@ function item(id: string): HistoryItem {
     timestamp_ms: 1, data: { type: "userMessage", content: [{ type: "text", text: `Saved evidence ${id}` }] }, assets: [] };
 }
 function page(source: HistoryThread, items: HistoryItem[], next_cursor: string | null = null): HistoryResponse {
-  return { type: "read", thread_id: source.id, version: source.version, items, next_cursor, gaps: [], complete: next_cursor === null };
+  return { type: "read", thread_id: source.id, version: source.version, items, next_cursor, gaps: [], complete: next_cursor === null,
+    source_exhausted: next_cursor === null };
 }
 type Producer = (host: string, request: HistoryRequest) => HistoryResponse | Promise<HistoryResponse>;
 function native(producer: Producer): HostCall {
@@ -64,6 +66,125 @@ async function originals(app: Awaited<ReturnType<typeof open>>, id: string) {
   const entries = await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT);
   return { conversation, entries: entries.items.filter(ImportedItemEntry.is) };
 }
+
+test("unchanged partial imports retry only affected source pages across reopen and opaque page boundary changes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-import-page-retry-")); let app = await open(directory);
+  try {
+    const source = thread("paged-media"), first = item("first"), tail = item("tail"), one = item("media-one"), two = item("media-two");
+    const bytes = Buffer.from("synthetic media"), sha256 = createHash("sha256").update(bytes).digest("hex");
+    for (const entry of [one, two]) entry.assets = [{ path: "/source/" + entry.id, item_id: entry.id, version: entry.version,
+      kind: "local_media", media_type: "image/png", sha256, size: bytes.length }];
+    let available = false, readFailure = false; const reads: (string | null)[] = [];
+    const producer: Producer = (_host, request) => {
+      if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+      if (request.type === "asset") {
+        if (!available) throw new Error("Synthetic unavailable attachment");
+        return { type: "asset", path: request.path, offset: request.offset, data_base64: bytes.toString("base64"), next_offset: null, total_bytes: bytes.length, sha256 };
+      }
+      reads.push(request.cursor);
+      if (request.cursor === null) return page(source, [first], "opaque-media");
+      if (request.cursor === "opaque-media" && readFailure) return { ...page(source, []), complete: false, source_exhausted: false,
+        gaps: [{ code: "unavailable", item_id: null, message: "Synthetic retry page unavailable" }] };
+      if (request.cursor === "opaque-media") return page(source, available ? [one] : [one, two], available ? "opaque-media-split" : "opaque-tail");
+      if (request.cursor === "opaque-media-split") return page(source, [two], "opaque-tail");
+      assert.equal(request.cursor, "opaque-tail"); return page(source, [tail]);
+    };
+    const initial = await app.run(producer); assert.equal(initial.phase, "partial"); assert.equal(initial.items_added, 4);
+    assert.deepEqual(reads, [null, "opaque-media", "opaque-tail"]);
+    const before = await originals(app, source.id); assert.equal(before.entries.length, 4);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory); reads.length = 0;
+    readFailure = true;
+    const blocked = await app.run(producer); assert.equal(blocked.phase, "partial"); assert.equal(blocked.gap_count, 3);
+    assert.deepEqual(reads, ["opaque-media"]);
+    readFailure = false; reads.length = 0;
+    const repeated = await app.run(producer);
+    assert.deepEqual(reads, ["opaque-media"], "Unchanged text outside the failed asset page must not be read again");
+    assert.equal(repeated.phase, "partial"); assert.equal(repeated.items_added, 0); assert.equal(repeated.gap_count, 2);
+    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.source_exhausted, true);
+    available = true; reads.length = 0;
+    const recovered = await app.run(producer);
+    assert.deepEqual(reads, ["opaque-media", "opaque-media-split"], "Only enough native pages to find the affected item IDs may be retried");
+    assert.equal(recovered.phase, "complete"); assert.equal(recovered.items_added, 0); assert.equal(recovered.items_unchanged, 2);
+    assert.equal(recovered.gap_count, 0); assert.equal(recovered.assets_saved, 2);
+    assert.equal((await originals(app, source.id)).conversation.id, before.conversation.id);
+    assert.deepEqual((await originals(app, source.id)).entries, before.entries);
+    const saved = await app.histories.get(source.id); assert.equal(saved?.complete, true); assert.deepEqual(saved.gaps, []);
+    const checkpoint = await app.histories.checkpoint(source.id, coordinator.host_id);
+    assert.equal(checkpoint?.complete, true); assert.deepEqual(checkpoint.retry_pages, []);
+    reads.length = 0; assert.equal((await app.run(producer)).threads_unchanged, 1); assert.deepEqual(reads, []);
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a legacy partial checkpoint with media gaps receives one conservative scan before targeted retries", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-import-legacy-page-retry-")); const app = await open(directory);
+  try {
+    const source = thread("legacy-pages"), first = item("first"), media = item("media"), tail = item("tail");
+    const gaps = [{ code: "missing", item_id: media.id, message: "A referenced media asset is unavailable" } satisfies HistoryGap];
+    await app.histories.import({ host_id: coordinator.host_id, thread: source, items: [first, media], next_cursor: "legacy-tail", complete: false, gaps });
+    const reads: (string | null)[] = [];
+    const producer: Producer = (_host, request) => {
+      if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+      assert.equal(request.type, "read"); if (request.type !== "read") throw new Error("No transferable assets in this fixture");
+      reads.push(request.cursor);
+      if (request.cursor === null) return page(source, [first], "legacy-media");
+      if (request.cursor === "legacy-media") return { ...page(source, [media], "legacy-tail"), gaps };
+      assert.equal(request.cursor, "legacy-tail"); return page(source, [tail]);
+    };
+    assert.equal((await app.run(producer)).phase, "partial"); assert.deepEqual(reads, [null, "legacy-media", "legacy-tail"]);
+    reads.length = 0;
+    assert.equal((await app.run(producer)).phase, "partial"); assert.deepEqual(reads, ["legacy-media"]);
+    assert.equal((await originals(app, source.id)).entries.length, 3);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a failed native read keeps its unread cursor and clears that read gap after successful continuation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-import-read-gap-")); const app = await open(directory);
+  try {
+    const source = thread("source-read-failure"); let fail = true; const reads: (string | null)[] = [];
+    const producer: Producer = (_host, request) => {
+      if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+      assert.equal(request.type, "read"); if (request.type !== "read") throw new Error("No media in this fixture");
+      reads.push(request.cursor);
+      if (request.cursor === null) return page(source, [item("before-failure")], "unread-native-page");
+      assert.equal(request.cursor, "unread-native-page");
+      if (fail) return { ...page(source, []), complete: false, source_exhausted: false,
+        gaps: [{ code: "unavailable", item_id: null, message: "Synthetic source read failure" }] };
+      return page(source, [item("after-failure")]);
+    };
+    assert.equal((await app.run(producer)).phase, "partial");
+    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.next_cursor, "unread-native-page");
+    fail = false; reads.length = 0;
+    const recovered = await app.run(producer); assert.equal(recovered.phase, "complete"); assert.equal(recovered.items_added, 1);
+    assert.deepEqual(reads, ["unread-native-page"]); assert.equal(recovered.gap_count, 0);
+    assert.deepEqual((await app.histories.get(source.id))?.gaps, []); assert.equal((await originals(app, source.id)).entries.length, 2);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("changed and unreliable source versions scan safely instead of reusing a prior asset-only retry plan", async (t) => {
+  for (const changed of [true, false]) await t.test(changed ? "changed metadata and title" : "unreliable locator", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-import-retry-version-")); const app = await open(directory);
+    try {
+      let source = thread("versioned-media"), fail = true; const reads: (string | null)[] = [];
+      const producer: Producer = (_host, request) => {
+        if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+        assert.equal(request.type, "read"); if (request.type !== "read") throw new Error("No retained media in this fixture");
+        reads.push(request.cursor);
+        if (request.cursor === null) return page(source, [item("first")], "media-page");
+        assert.equal(request.cursor, "media-page");
+        return { ...page(source, [item("media")]), complete: !fail,
+          gaps: fail ? [{ code: "missing", item_id: "media", message: "A referenced media asset is unavailable" }] : [] };
+      };
+      assert.equal((await app.run(producer)).phase, "partial");
+      source = changed ? { ...source, title: "Renamed saved work", version: "native-v2", updated_at: 3 } : { ...source, version_reliable: false };
+      fail = false; reads.length = 0;
+      const recovered = await app.run(producer); assert.equal(recovered.phase, "complete"); assert.equal(recovered.items_added, 0);
+      assert.deepEqual(reads, [null, "media-page"]);
+      assert.equal((await app.histories.get(source.id))?.thread.title, source.title);
+      assert.equal((await originals(app, source.id)).entries.length, 2);
+    } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+});
 async function stoppedDuringIndexing(directory: string, producer: Producer) {
   const previous = await open(directory);
   let release = () => {}, entered = () => {}, indexes = 0;
@@ -546,7 +667,8 @@ test("operational asset transfer failures outrank missing media and recover with
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory); fail = false;
     const recovered = await app.run(producer);
     assert.equal(recovered.phase, "partial", "Native missing references remain coverage gaps");
-    assert.equal(recovered.gap_count, 58); assert.equal(recovered.items_added, 0); assert.equal(recovered.items_unchanged, 60);
+    assert.equal(recovered.gap_count, 58); assert.equal(recovered.items_added, 0); assert.equal(recovered.items_unchanged, 59,
+      "The intact sibling of the failed asset item does not need another read/import");
     assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.complete, true);
     assert.deepEqual((await app.histories.checkpoint(source.id, coordinator.host_id))?.gaps, []);
     const entries = (await originals(app, source.id)).entries;

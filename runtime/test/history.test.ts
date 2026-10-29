@@ -177,6 +177,72 @@ test("retained cold originals remain readable offline and full user text is avai
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("media-only evidence versions alias one immutable message and survive reopen without repeating text", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-history-evidence-alias-")); let app = await open(directory);
+  try {
+    const original = item("item1", "Keep this instruction while its image is unavailable.");
+    original.data = { type: "userMessage", content: [{ type: "text", text: original.text }, { type: "image", path: "/source/illustration.png" }] };
+    const initial = await app.imported.import(batch([original], { complete: false,
+      gaps: [{ code: "missing", item_id: original.id, message: "A referenced media asset is unavailable" }] }));
+    const conversation = await app.imported.conversation(initial.conversation.conversation_id); assert.ok(conversation);
+    const before = (await conversation.entries({ order: "ascending" }, 20, undefined, BACKGROUND_CONTEXT)).items.find(ImportedItemEntry.is); assert.ok(before);
+    const assets = join(directory, "assets"); await mkdir(assets);
+    const bytes = Buffer.from("synthetic media"), sha256 = createHash("sha256").update(bytes).digest("hex"), path = join(assets, sha256); await writeFile(path, bytes);
+    const available = { ...original, version: "v2", assets: [{ path, sha256, size: bytes.length, kind: "local_media", media_type: "image/png",
+      item_id: original.id, version: "v2" } satisfies HistoryAssetRef] };
+    const recovered = await app.imported.import(batch([available]));
+    assert.equal(recovered.added_items, 0, "A changed media evidence version must not append the same message again");
+    assert.equal(recovered.existing_items, 1); assert.notEqual(recovered.watermark, initial.watermark);
+    assert.deepEqual((await conversation.entries({ order: "ascending" }, 20, undefined, BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is), [before]);
+    const projected = await app.imported.entry(initial.conversation.conversation_id, before.id.toString()); assert.ok(ImportedItemEntry.is(projected));
+    assert.deepEqual(projected.data.item.assets, available.assets, "Retained refs must preserve the actual new evidence version");
+    const repeated = await app.imported.import(batch([available])); assert.deepEqual(repeated.entry_ids, []); assert.equal(repeated.watermark, recovered.watermark);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const reopened = await app.imported.import(batch([available])); assert.deepEqual(reopened.entry_ids, []); assert.equal(reopened.watermark, recovered.watermark);
+    const saved = await app.imported.conversation(initial.conversation.conversation_id); assert.ok(saved);
+    assert.deepEqual((await history(saved, null)).flatMap((frame) => frame.messages).filter((message) => message.role === "user").map((message) => message.text), [original.text]);
+    const records = []; for await (const record of app.tasks.records(saved.id.toString())) records.push(record);
+    assert.equal(records.filter((record) => record.text === original.text).length, 1); assert.equal(app.faux.state.callCount, 0);
+    const edited = { ...available, version: "v3", data: { type: "userMessage", text: original.text + " A distinct raw suffix." } };
+    assert.equal((await app.imported.import(batch([edited]))).added_items, 1, "Matching excerpts cannot hide a full-payload edit");
+    assert.equal((await app.imported.import(batch([{ ...available, version: "v4", timestamp_ms: 2 }]))).added_items, 1,
+      "Changed native context remains a distinct item version");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("duplicate source receipts within one batch still create exactly one canonical message", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-history-duplicate-receipt-")); const app = await open(directory);
+  try {
+    const original = item("item1", "Retain an overlapping native page once");
+    const saved = await app.imported.import(batch([original, original]));
+    assert.equal(saved.added_items, 1); assert.equal(saved.existing_items, 1);
+    const conversation = await app.imported.conversation(saved.conversation.conversation_id); assert.ok(conversation);
+    assert.equal((await conversation.entries({ order: "ascending" }, 20, undefined, BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is).length, 1);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("missing and ambiguous full originals remain distinct even when saved excerpts match", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-history-unknown-original-")); const app = await open(directory);
+  try {
+    const original = item("item1", "The same bounded excerpt"); const full = { type: "userMessage", text: original.text + " Original full suffix." };
+    original.data = null;
+    const first = await app.imported.import(batch([original], { complete: false }));
+    const known = { ...original, version: "v2", data: full };
+    assert.equal((await app.imported.import(batch([known]))).added_items, 1, "An unavailable full original cannot prove a media-only change");
+    assert.equal((await app.imported.import(batch([{ ...known, version: "v3" }]))).added_items, 1,
+      "An unreadable candidate still makes the otherwise matching identity ambiguous");
+    const assets = join(directory, "assets"); await mkdir(assets);
+    const bytes = Buffer.from(JSON.stringify(full)), sha256 = createHash("sha256").update(bytes).digest("hex"), path = join(assets, sha256); await writeFile(path, bytes);
+    await app.imported.import(batch([{ ...original, assets: [{ path, sha256, size: bytes.length, kind: "cold_evidence", media_type: "application/json",
+      item_id: original.id, version: original.version }] }]));
+    assert.equal((await app.imported.import(batch([{ ...known, version: "v4" }]))).added_items, 1,
+      "Multiple matching full originals cannot select an arbitrary canonical message");
+    const conversation = await app.imported.conversation(first.conversation.conversation_id); assert.ok(conversation);
+    assert.equal((await conversation.entries({ order: "ascending" }, 20, undefined, BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is).length, 4);
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("verified assets merge across same-version host retries while complete repeats preserve the search watermark", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-asset-recovery-")); let app = await open(directory);
   try {

@@ -937,6 +937,10 @@
                 "null"
               ]
             },
+            "source_exhausted": {
+              "type": "boolean",
+              "default": false
+            },
             "thread_id": {
               "type": "string"
             },

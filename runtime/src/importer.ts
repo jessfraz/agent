@@ -9,10 +9,11 @@ import type { HistoryGap } from "./generated/HistoryGap.js";
 import type { HistoryItem } from "./generated/HistoryItem.js";
 import type { HistoryRequest } from "./generated/HistoryRequest.js";
 import type { HistoryResponse } from "./generated/HistoryResponse.js";
+import type { HistoryRetryPage } from "./generated/HistoryRetryPage.js";
 import type { HistoryThread } from "./generated/HistoryThread.js";
 import type { ImportProgress } from "./generated/ImportProgress.js";
 import type { HostCall } from "./tasks.js";
-import type { HistoryStore } from "./history.js";
+import type { HistoryStore, ImportCheckpoint } from "./history.js";
 
 // Keep source progress separate from index errors so retries need no native walk.
 const Progress = defineDoc<{ progress: ImportProgress | null; indexing?: ImportProgress | null }>({ kind: "agent.import-progress", scope: "session", version: 1,
@@ -20,6 +21,13 @@ const Progress = defineDoc<{ progress: ImportProgress | null; indexing?: ImportP
 function initial(): ImportProgress { return { phase: "discovering", host_id: null, threads_seen: 0, threads_imported: 0,
   threads_unchanged: 0, items_added: 0, items_unchanged: 0, assets_saved: 0, gap_count: 0, gaps: [] }; }
 function unique(gaps: HistoryGap[]): HistoryGap[] { return [...new Map(gaps.map((gap) => [JSON.stringify(gap), gap])).values()]; }
+function assetGap(gap: HistoryGap): boolean {
+  return gap.item_id !== null && ["missing", "changed", "unavailable"].includes(gap.code);
+}
+function without(gaps: HistoryGap[], removed: HistoryGap[]): HistoryGap[] {
+  const keys = new Set(removed.map((gap) => JSON.stringify(gap)));
+  return gaps.filter((gap) => !keys.has(JSON.stringify(gap)));
+}
 function message(error: unknown): string { return error instanceof Error ? error.message : "History is unavailable"; }
 function addGap(progress: ImportProgress, gap: string, priority = true): void {
   progress.gap_count += 1;
@@ -123,38 +131,103 @@ export class CodexImporter {
   private async thread(host: string, thread: HistoryThread, progress: ImportProgress, call: HostCall): Promise<void> {
     const saved = await this.history.checkpoint(thread.id, host);
     if (thread.version_reliable && saved?.version === thread.version && saved.complete) { progress.threads_unchanged += 1; return; }
-    let cursor = saved?.version === thread.version ? saved.next_cursor : null;
+    let gaps: HistoryGap[] | undefined;
+    if (thread.version_reliable && saved?.version === thread.version && saved.source_exhausted && saved.retry_pages !== undefined) {
+      const planned = new Set(saved.retry_pages.flatMap((page) => page.gaps.map((gap) => JSON.stringify(gap))));
+      if (saved.gaps.every((gap) => planned.has(JSON.stringify(gap)))) gaps = await this.retry(host, thread, saved.retry_pages, progress, call);
+    }
+    gaps ??= await this.scan(host, thread, saved, progress, call);
+    progress.threads_imported += 1;
+    for (const gap of gaps) addGap(progress, `${thread.id}: ${gap.message}`, gap.code !== "missing" || gap.item_id === null);
+  }
+  private async retain(host: string, thread: HistoryThread, page: Extract<HistoryResponse, { type: "read" }>,
+    progress: ImportProgress, call: HostCall, targets?: ReadonlySet<string>): Promise<{ items: HistoryItem[]; gaps: HistoryGap[] }> {
+    const items: HistoryItem[] = [], gaps = page.gaps.filter((gap) => targets === undefined || gap.item_id === null || targets.has(gap.item_id));
+    for (const item of page.items) {
+      if (targets !== undefined && !targets.has(item.id)) continue;
+      const assets: HistoryAssetRef[] = [];
+      for (const source of item.assets) {
+        try { assets.push(await this.asset(host, thread.id, source, call)); progress.assets_saved += 1; }
+        catch (error) { gaps.push({ code: "unavailable", item_id: item.id, message: message(error) }); }
+      }
+      // Keep the original native payload even while its attachments recover.
+      items.push({ ...item, assets });
+    }
+    return { items, gaps: unique(gaps) };
+  }
+  private async scan(host: string, thread: HistoryThread, saved: ImportCheckpoint | undefined,
+    progress: ImportProgress, call: HostCall): Promise<HistoryGap[]> {
+    // Legacy partial checkpoints with gaps have no affected-page receipts.
+    // Read them conservatively once; an unreliable locator cannot skip a prefix.
+    const resume = thread.version_reliable && saved?.version === thread.version &&
+      (saved.retry_pages !== undefined || saved.gaps.length === 0);
+    let cursor = resume ? saved.next_cursor : null;
     let gaps: HistoryGap[] = cursor === null ? [] : saved?.gaps ?? [];
+    let retries: HistoryRetryPage[] = cursor === null ? [] : structuredClone(saved?.retry_pages ?? []);
+    const failed = retries.filter((page) => page.cursor === cursor && page.gaps.some((gap) => !assetGap(gap)));
+    gaps = without(gaps, failed.flatMap((page) => page.gaps)); retries = retries.filter((page) => !failed.includes(page));
     const cursors = new Set<string>(); let resets = 0;
     // Record the current observation before an RPC can fail, so a changed or
     // unreliable locator cannot keep advertising yesterday's complete coverage.
     await this.history.import({ host_id: host, thread, items: [], next_cursor: cursor,
-      gaps: [], complete: false });
+      gaps, complete: false, source_exhausted: false, retry_pages: retries });
     do {
       const page = await this.read(host, { type: "read", thread_id: thread.id, cursor }, call);
       if (page.type !== "read" || page.thread_id !== thread.id) throw new Error("History host returned another conversation");
-      if (page.gaps.some((gap) => gap.code === "changed") && resets++ === 0) { cursor = null; gaps = []; thread = { ...thread, version: page.version }; continue; }
-      if (page.version.length > 0) thread = { ...thread, version: page.version };
-      const items: HistoryItem[] = [];
-      for (const item of page.items) {
-        const assets: HistoryAssetRef[] = [];
-        for (const source of item.assets) {
-          try { assets.push(await this.asset(host, thread.id, source, call)); progress.assets_saved += 1; }
-          catch (error) { gaps.push({ code: "unavailable", item_id: item.id, message: message(error) }); }
-        }
-        // Native payloads already retain their original media locators. Keep
-        // their shape so full text and cold evidence remain readable.
-        items.push({ ...item, assets });
+      if (page.gaps.some((gap) => gap.code === "changed" && gap.item_id === null) && resets++ === 0) {
+        cursor = null; gaps = []; retries = []; thread = { ...thread, version: page.version || thread.version }; continue;
       }
-      gaps = unique([...gaps, ...page.gaps]);
-      const receipt = await this.history.import({ host_id: host, thread, items, next_cursor: page.next_cursor,
-        gaps, complete: page.complete && gaps.length === 0 });
+      if (page.version.length > 0) thread = { ...thread, version: page.version };
+      const retained = await this.retain(host, thread, page, progress, call);
+      gaps = unique([...gaps, ...retained.gaps]);
+      const exhausted = page.source_exhausted === true || page.complete;
+      const readFailed = page.next_cursor === null && !exhausted && page.gaps.some((gap) => gap.item_id === null);
+      const retryGaps = readFailed ? retained.gaps : retained.gaps.filter(assetGap);
+      if (retryGaps.length > 0) retries.push({ cursor, gaps: retryGaps });
+      const receipt = await this.history.import({ host_id: host, thread, items: retained.items, next_cursor: readFailed ? cursor : page.next_cursor,
+        gaps, complete: exhausted && gaps.length === 0, source_exhausted: exhausted, retry_pages: retries });
       progress.items_added += receipt.added_items; progress.items_unchanged += receipt.existing_items;
+      if (readFailed) break;
       cursor = page.next_cursor;
       if (cursor !== null) { if (cursors.has(cursor)) throw new Error("History reader repeated a cursor"); cursors.add(cursor); }
     } while (cursor !== null);
-    progress.threads_imported += 1;
-    for (const gap of gaps) addGap(progress, `${thread.id}: ${gap.message}`, gap.code !== "missing" || gap.item_id === null);
+    return gaps;
+  }
+  private async retry(host: string, thread: HistoryThread, saved: HistoryRetryPage[],
+    progress: ImportProgress, call: HostCall): Promise<HistoryGap[] | undefined> {
+    const retries = structuredClone(saved), cursors = new Set<string>();
+    for (let index = 0; index < retries.length;) {
+      const pending = retries[index]; if (pending === undefined) break;
+      const targets = new Set(pending.gaps.filter(assetGap).flatMap((gap) => gap.item_id === null ? [] : [gap.item_id]));
+      if (targets.size === 0) return undefined;
+      const locator = JSON.stringify([pending.cursor, [...targets].sort()]);
+      if (cursors.has(locator)) throw new Error("History reader repeated a retry cursor");
+      cursors.add(locator);
+      const page = await this.read(host, { type: "read", thread_id: thread.id, cursor: pending.cursor }, call);
+      if (page.type !== "read" || page.thread_id !== thread.id) throw new Error("History host returned another conversation");
+      if ((page.version.length > 0 && page.version !== thread.version) || page.gaps.some((gap) => gap.code === "changed" && gap.item_id === null)) return undefined;
+      const retained = await this.retain(host, thread, page, progress, call, targets);
+      const seen = new Set(retained.items.map((item) => item.id)), remaining = pending.gaps.filter((gap) => assetGap(gap) && gap.item_id !== null && !seen.has(gap.item_id));
+      const replacements: HistoryRetryPage[] = [];
+      if (remaining.length > 0 && page.next_cursor === null) {
+        replacements.push({ cursor: pending.cursor, gaps: unique([...remaining, ...retained.gaps,
+          ...(retained.gaps.length === 0 ? [{ code: "unavailable", item_id: null, message: "Affected history items were not returned; retained evidence is unchanged." } satisfies HistoryGap] : [])]) });
+      } else {
+        if (retained.gaps.length > 0) replacements.push({ cursor: pending.cursor, gaps: retained.gaps });
+        if (remaining.length > 0) replacements.push({ cursor: page.next_cursor, gaps: remaining });
+      }
+      retries.splice(index, 1, ...replacements);
+      const gaps = unique(retries.flatMap((page) => page.gaps));
+      const receipt = await this.history.import({ host_id: host, thread, items: retained.items, next_cursor: null,
+        gaps, complete: retries.length === 0, source_exhausted: true, retry_pages: retries });
+      progress.items_added += receipt.added_items; progress.items_unchanged += receipt.existing_items;
+      // Failed items wait for a later import. Follow only a new continuation
+      // needed to locate this page's other affected IDs.
+      if (remaining.length > 0 && page.next_cursor !== null) {
+        index += retained.gaps.length > 0 ? 1 : 0;
+      } else index += replacements.length;
+    }
+    return unique(retries.flatMap((page) => page.gaps));
   }
   private async asset(host: string, thread: string, source: HistoryAssetRef, call: HostCall): Promise<HistoryAssetRef> {
     await mkdir(this.assetRoot, { recursive: true, mode: 0o700 });

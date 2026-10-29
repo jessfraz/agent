@@ -272,6 +272,7 @@ impl CodexHistory {
             // reconciliation without discarding progress through this scan.
             version: position.version,
             items,
+            source_exhausted: next_cursor.is_none(),
             next_cursor,
             gaps,
             complete,
@@ -964,6 +965,7 @@ fn gap_response(
         version,
         items: vec![],
         next_cursor: None,
+        source_exhausted: false,
         gaps: vec![gap(code, None, message)],
         complete: false,
     }
@@ -1474,6 +1476,244 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             }],
         })
         .unwrap()
+    }
+
+    fn mixed_media_item(path: &Path) -> Value {
+        #[derive(serde::Serialize)]
+        #[serde(tag = "type", rename_all = "camelCase")]
+        enum Content {
+            Text { text: &'static str },
+            LocalImage { path: String },
+        }
+        #[derive(serde::Serialize)]
+        struct Message {
+            id: &'static str,
+            #[serde(rename = "type")]
+            kind: &'static str,
+            content: Vec<Content>,
+        }
+        serde_json::to_value(Message {
+            id: "media-a",
+            kind: "userMessage",
+            content: vec![
+                Content::Text {
+                    text: "Inspect this image without losing its accompanying text.",
+                },
+                Content::LocalImage {
+                    path: path.to_string_lossy().into_owned(),
+                },
+            ],
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_missing_media_recovery_keeps_one_imported_message_in_actual_sqlite() {
+        #[derive(serde::Serialize)]
+        struct Evidence<'a> {
+            missing: &'a crate::history::HistoryItem,
+            available: &'a crate::history::HistoryItem,
+            gaps: &'a [crate::history::HistoryGap],
+            asset_root: PathBuf,
+            database: PathBuf,
+        }
+        #[derive(Deserialize)]
+        struct Receipt {
+            message_entries: usize,
+            model_calls: usize,
+            executions: usize,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let asset_root = directory.path().join("assets");
+        std::fs::create_dir(&asset_root).unwrap();
+        let image = asset_root.join("image.png");
+        let source = history(directory.path(), "unused-native-reader".into());
+        let native = NativeEntry {
+            turn_id: "turn-a".into(),
+            item: mixed_media_item(&image),
+            started_at_ms: Some(1000),
+            completed_at_ms: Some(2000),
+        };
+        let (missing, gaps) = source.normalize("thread-a", &native, 0).await.unwrap();
+        let missing = missing.unwrap();
+        assert!(missing.assets.is_empty());
+        assert!(
+            gaps.iter()
+                .any(|gap| matches!(gap.code, HistoryGapCode::Missing))
+        );
+        std::fs::write(&image, b"synthetic local image bytes").unwrap();
+        let (available, recovered_gaps) = source.normalize("thread-a", &native, 0).await.unwrap();
+        let available = available.unwrap();
+        assert!(recovered_gaps.is_empty());
+        assert_eq!(missing.data, available.data);
+        assert_ne!(
+            missing.version, available.version,
+            "Real evidence versions retain available asset hashes"
+        );
+        assert_eq!(available.assets.len(), 1);
+        assert_eq!(available.assets[0].version, available.version);
+        let runtime = std::env::var_os("AGENT_RUNTIME_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/dist/src/bridge.js")
+            });
+        let runtime_root = runtime
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let mut child = tokio::process::Command::new("node")
+            .args(["--no-warnings", "--input-type=module", "--eval", r#"
+import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
+import {readFile} from 'node:fs/promises';
+import {pathToFileURL} from 'node:url';
+import {BACKGROUND_CONTEXT} from '@earendil-works/chord/context';
+import {openNodeSqliteDatabase} from '@earendil-works/chord/sqlite/node';
+import {createModels,fauxProvider} from '@earendil-works/pi-ai';
+import {createRegistry,Harness} from '@earendil-works/pi-durable';
+import {SqliteStorage} from '@earendil-works/pi-durable/storage/sqlite';
+const runtime=pathToFileURL(process.argv[1]);
+const {HistoryStore,ImportedItemEntry}=await import(new URL('./history.js',runtime));
+const {transcript}=await import(new URL('./transcript.js',runtime));
+let serialized='';for await(const chunk of process.stdin)serialized+=chunk;
+const input=JSON.parse(serialized), {missing,available}=input;
+const thread={id:'thread-a',title:'Inspect synthetic media',cwd:'/example/project',created_at:1,updated_at:2,
+  forked_from_id:null,parent_thread_id:null,version:'native-thread-v1',version_reliable:true,archived:true};
+const batch=(item)=>({host_id:'source-host',thread,items:[item],next_cursor:null,
+  complete:item.version===available.version,gaps:item.version===available.version?[]:input.gaps});
+async function open(){
+  const models=createModels(), faux=fauxProvider({provider:'openai',models:[{id:'unused'}]});models.setProvider(faux.provider);
+  const session=await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(input.database)),
+    {models,registry:createRegistry(),identity:{attribution:null}},BACKGROUND_CONTEXT);
+  return {session,faux,store:new HistoryStore(session,input.asset_root)};
+}
+let app=await open();
+try{
+  const first=await app.store.import(batch(missing));assert.equal(first.added_items,1);
+  const conversation=await app.store.conversation(first.conversation.conversation_id);assert.ok(conversation);
+  const before=(await conversation.entries({order:'ascending'},100,undefined,BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is);
+  assert.equal(before.length,1);const original=before[0];
+  const recovered=await app.store.import(batch(available));
+  assert.equal(recovered.added_items,0,'Restoring native media must not append the same message');
+  assert.equal(recovered.existing_items,1);
+  const entries=(await conversation.entries({order:'ascending'},100,undefined,BACKGROUND_CONTEXT)).items;
+  assert.deepEqual(entries.filter(ImportedItemEntry.is),before,'Canonical imported messages stay immutable');
+  assert.equal(entries.flatMap(transcript).filter(message=>message.text===missing.text).length,1);
+  const overlaid=await app.store.entry(conversation.id.toString(),original.id.toString());
+  assert.equal(overlaid.data.item.version,missing.version);
+  assert.deepEqual(overlaid.data.item.assets,available.assets,'Recovered refs retain their actual incoming evidence version');
+  assert.equal(createHash('sha256').update(await readFile(available.assets[0].path)).digest('hex'),available.assets[0].sha256);
+  assert.deepEqual(await app.store.original(overlaid),missing.data);
+  assert.equal(app.faux.state.callCount,0);
+  assert.equal((await app.session.commit(tx=>tx.scanTasks({},100),BACKGROUND_CONTEXT)).items.length,0);
+  await app.session.close(BACKGROUND_CONTEXT);app=await open();
+  for(const item of [missing,available]){
+    const repeated=await app.store.import(batch(item));assert.equal(repeated.added_items,0);
+    assert.deepEqual(repeated.entry_ids,[]);assert.equal(repeated.watermark,recovered.watermark);
+  }
+  const reopened=await app.store.conversation(first.conversation.conversation_id);assert.ok(reopened);
+  const saved=(await reopened.entries({order:'ascending'},100,undefined,BACKGROUND_CONTEXT)).items;
+  assert.deepEqual(saved.filter(ImportedItemEntry.is),before);
+  assert.equal(saved.flatMap(transcript).filter(message=>message.text===missing.text).length,1);
+  assert.deepEqual((await app.store.entry(reopened.id.toString(),original.id.toString())).data.item.assets,available.assets);
+  const executions=(await app.session.commit(tx=>tx.scanTasks({},100),BACKGROUND_CONTEXT)).items.length;
+  assert.equal(executions,0);assert.equal(app.faux.state.callCount,0);
+  process.stdout.write(JSON.stringify({message_entries:1,model_calls:app.faux.state.callCount,executions})+'\n');
+}finally{await app.session.close(BACKGROUND_CONTEXT);}
+"#])
+            .arg(&runtime).current_dir(runtime_root).stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        use tokio::io::AsyncWriteExt;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                &serde_json::to_vec(&Evidence {
+                    missing: &missing,
+                    available: &available,
+                    gaps: &gaps,
+                    asset_root,
+                    database: directory.path().join("history.sqlite"),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "Actual native import consumer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: Receipt = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(receipt.message_entries, 1);
+        assert_eq!(receipt.model_calls, 0);
+        assert_eq!(receipt.executions, 0);
+    }
+
+    #[tokio::test]
+    async fn native_eof_is_distinct_from_complete_media_and_failed_reads_remain_unknown() {
+        #[derive(Deserialize)]
+        struct ReadState {
+            #[serde(default)]
+            source_exhausted: bool,
+            complete: bool,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source = fixture(
+            directory.path(),
+            &provider_fixture(vec![mixed_media_item(
+                &directory.path().join("missing.png"),
+            )]),
+        );
+        let response = source
+            .request(HistoryRequest::Read {
+                thread_id: "thread-a".into(),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let HistoryResponse::Read {
+            items,
+            gaps,
+            complete,
+            ..
+        } = &response
+        else {
+            panic!("Expected native read");
+        };
+        assert_eq!(items.len(), 1);
+        assert!(!complete);
+        assert!(
+            gaps.iter()
+                .any(|gap| matches!(gap.code, HistoryGapCode::Missing))
+        );
+        let state: ReadState =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert!(state.source_exhausted);
+        assert!(!state.complete);
+        let unavailable = crate::history::codex::gap_response(
+            "thread-a".into(),
+            "v1".into(),
+            HistoryGapCode::Unavailable,
+            "Synthetic failed page",
+        );
+        let failed: ReadState =
+            serde_json::from_slice(&serde_json::to_vec(&unavailable).unwrap()).unwrap();
+        assert!(!failed.source_exhausted);
+        assert!(!failed.complete);
+        let legacy: HistoryResponse = serde_json::from_str(r#"{"type":"read","thread_id":"legacy","version":"v1","items":[],"next_cursor":null,"gaps":[],"complete":false}"#).unwrap();
+        let legacy: ReadState =
+            serde_json::from_slice(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(!legacy.source_exhausted);
+        assert!(!legacy.complete);
     }
 
     #[tokio::test]

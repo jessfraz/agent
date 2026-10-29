@@ -14,7 +14,10 @@ agent history open CONVERSATION_ID
 ```
 
 Run import again to catch up. Completed reliable source versions are skipped;
-partial reads resume their committed cursor. Retained text is indexed before
+partial reads resume their committed cursor. Once a transcript scan reaches its
+end, missing attachments retry only their affected source pages. Changed or
+unreliable sources are scanned again; older partial checkpoints reconcile once
+before using targeted retries. Retained text is indexed before
 source scanning and again afterward, so attachment retries do not hold existing
 conversations out of search. Interrupted or failed final indexing resumes from
 the retained corpus before the next fresh import. Explicit
@@ -72,6 +75,9 @@ resume from committed checkpoints without duplicating entries.
 
 Missing or deleted attachments leave explicit gaps while available message text
 still imports. Later runs can recover files without repeating the message.
+Recovery matches the full original item and its native context, preserving the
+existing message while retaining each asset's evidence version. Excerpts never
+establish that two items are the same; genuine content edits remain distinct.
 An unavailable full payload remains incomplete; its excerpt is not a substitute
 for the original.
 

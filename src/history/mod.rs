@@ -116,6 +116,10 @@ pub enum HistoryResponse {
         next_cursor: Option<String>,
         gaps: Vec<HistoryGap>,
         complete: bool,
+        // The native transcript reached EOF, independent of missing media.
+        #[serde(default)]
+        #[ts(optional = nullable)]
+        source_exhausted: bool,
     },
     Asset {
         path: String,

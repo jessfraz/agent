@@ -1107,6 +1107,19 @@ pub struct HistoryImportBatch {
     pub next_cursor: Option<String>,
     pub gaps: Vec<HistoryGap>,
     pub complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub source_exhausted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub retry_pages: Option<Vec<HistoryRetryPage>>,
+}
+
+/// An opaque native page locator and the unresolved asset items on that page.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct HistoryRetryPage {
+    pub cursor: Option<String>,
+    pub gaps: Vec<HistoryGap>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
