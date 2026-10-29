@@ -245,6 +245,22 @@ fn validate(config: &mut ClientConfig) -> Result<()> {
             "Chrome profile must be a directory name such as Default or Profile 1"
         );
     }
+    if let Some(port) = config
+        .browser
+        .as_ref()
+        .and_then(|browser| browser.debugging_port)
+    {
+        ensure!(
+            port != 0,
+            "Chrome debugging port must be between 1 and 65535"
+        );
+        ensure!(
+            config.browser.as_ref().is_some_and(|browser| {
+                browser.user_data_dir.is_none() && browser.profile_dir_name.is_none()
+            }),
+            "Chrome native debugging selects the connected browser's current profile; omit user_data_dir and profile_dir_name"
+        );
+    }
     if let Some(command) = config
         .browser
         .as_ref()
@@ -254,6 +270,20 @@ fn validate(config: &mut ClientConfig) -> Result<()> {
             command.first().is_some_and(|program| !program.is_empty())
                 && command.iter().all(|argument| !argument.contains('\0')),
             "Browser credential command requires an executable and valid arguments"
+        );
+    }
+    if let Some(browser) = &config.browser {
+        ensure!(
+            browser.secret_environment.iter().all(|name| {
+                !name.is_empty()
+                    && name != "OP_SERVICE_ACCOUNT_TOKEN"
+                    && name.bytes().enumerate().all(|(index, byte)| {
+                        byte == b'_'
+                            || byte.is_ascii_alphabetic()
+                            || (index > 0 && byte.is_ascii_digit())
+                    })
+            }),
+            "Browser secret_environment requires credential field names, excluding provider bootstrap tokens"
         );
     }
     for repository in &mut config.context_repositories {

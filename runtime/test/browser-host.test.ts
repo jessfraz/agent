@@ -12,12 +12,13 @@ import { setImmediate, setTimeout } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
 import { inspect, promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import type { Browser } from "playwright-core";
+import type { Browser, Page } from "playwright-core";
 import { BrowserHost } from "../src/browser-host.js";
 import type { BrowserAction } from "../src/generated/BrowserAction.js";
 import type { BrowserRequest } from "../src/generated/BrowserRequest.js";
 import type { BrowserReply } from "../src/generated/BrowserReply.js";
 import type { BrowserResponse } from "../src/generated/BrowserResponse.js";
+declare const document: { title: string };
 
 function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -242,7 +243,9 @@ async function fixture(t: TestContext, options: { slowSubmit?: boolean; foreignF
     if (url.pathname === "/form" && !request.headers.cookie?.includes("fixture_login=signed-in")) {
       response.writeHead(401).end("<!doctype html><h1>Sign in required</h1>"); return;
     }
-    if (url.pathname === "/form") response.end(`<!doctype html><title>Owned form</title><h1>Form ready</h1>
+    if (url.pathname === "/inline-password") response.end(`<!doctype html><label>Password<input type="password"></label><output></output>
+      <script>const field=document.querySelector('input');field.value='SYNTHETIC_INLINE_PASSWORD_42';document.querySelector('output').textContent=field.value;field.value='';</script>`);
+    else if (url.pathname === "/form") response.end(`<!doctype html><title>Owned form</title><h1>Form ready</h1>
       <form action="/submit${url.search}" method="post"><label>Name<input name="name"></label>
       <label>Choice<select name="choice" onchange="const button=this.form.querySelector('button[type=submit]'); button.disabled=true; fetch('/validate${url.search}').then(response => { if(response.ok) button.disabled=false; });"><option>First</option><option>Second</option></select></label>
       <button type="button" onclick="window.open('/popup','_blank')">Open popup</button>
@@ -251,6 +254,11 @@ async function fixture(t: TestContext, options: { slowSubmit?: boolean; foreignF
     else if (url.pathname === "/done") response.end("<!doctype html><title>Saved form</title><h1>Saved</h1>");
     else if (request.url === "/popup") response.end("<!doctype html><title>Owned popup</title><h1>Popup ready</h1>");
     else if (url.pathname === "/embedded") response.end("<!doctype html><label>Frame note<input name=note></label>");
+    else if (url.pathname === "/password") response.end("<!doctype html><title>Owned password form</title><form>"
+      + '<label>Normal field<input name=normal value="Visible normal field"></label><label>Password<input name=password type=password></label>'
+      + '<button type=button onclick="const field=this.form.elements.password; const value=field.value; field.value=\'\'; prompt(value,value)">Clear password into dialog</button>'
+      + '<iframe title="Password frame" src="/password-frame"></iframe></form>');
+    else if (url.pathname === "/password-frame") response.end("<!doctype html><label>Frame password<input name=frame-password type=password></label>");
     else if (request.url === "/retained") response.end("<!doctype html><title>Retained result</title><h1>Draft ready for review</h1>");
     else if (url.pathname === "/beforeunload") response.end(`<!doctype html><title>Owned draft</title><button onclick="this.textContent='Draft edited'">Edit draft</button>
       <script>addEventListener('beforeunload', event => { event.preventDefault(); event.returnValue=''; });</script>`);
@@ -991,4 +999,114 @@ test("release reports final-page closure from native readback, including any ret
   if (remaining.length > 0) assert.equal(released.tabs[0]?.id, tab.id);
   await host.close();
   assert.equal(f.browser.exitCode, null);
+});
+
+test("password capture redacts real snapshots, scripts, logs, errors and URLs before escaping and truncation",
+  { skip: skipChrome, timeout: 90_000 }, async t => {
+  const f = await fixture(t), host = f.host, request = requests("1");
+  const opened = (await host.execute(request({ type: "open", url: f.origin + "/password" }))).response;
+  assert.ok(opened.type === "ready", JSON.stringify(opened)); const tab = opened.tabs[0]; assert.ok(tab);
+  const values = { password: "SYNTHETIC_PASSWORD_MAIN-\"'\\<&?=+%☃", framed: "[redacted]SYNTHETIC_PASSWORD_FRAME-\"'\\<&?=+%☃",
+    later: "SYNTHETIC_PASSWORD_LATER-\"'\\<&?=+%☃" };
+  const privateOutput = (value: unknown) => assert.equal(JSON.stringify(value).includes("SYNTHETIC_PASSWORD_"), false,
+    "No raw, escaped, URL-encoded or truncated password prefix may enter a browser reply");
+  const run = async (fn: (page: Page, args: typeof values) => Promise<unknown>) =>
+    (await host.execute(request({ type: "run_code", tab_id: tab.id,
+      code: "async page => (" + fn.toString() + ")(page," + JSON.stringify(values) + ")" }))).response;
+  const filled = await run(async (page, values) => {
+    await page.getByLabel("Password", { exact: true }).fill(values.password);
+    await page.frameLocator('iframe[title="Password frame"]').getByLabel("Frame password").fill(values.framed);
+    console.log(values.password, { password: values.password }, JSON.stringify(values.password), encodeURIComponent(values.password));
+    return { password: values.password, framed: values.framed, normal: await page.getByLabel("Normal field").inputValue() };
+  });
+  assert.ok(filled.type === "ready", JSON.stringify(filled)); privateOutput(filled);
+  assert.ok(filled.output.includes("Visible normal field")); assert.ok(filled.output.includes("[redacted]"));
+  const snapshot = (await host.execute(request({ type: "snapshot", tab_id: tab.id }))).response;
+  assert.ok(snapshot.type === "ready"); privateOutput(snapshot); assert.ok(snapshot.output.includes("Visible normal field"));
+  const modal = (await host.execute(request({ type: "click", tab_id: tab.id,
+    element_ref: elementRef(snapshot.output, "button", "Clear password into dialog") }))).response;
+  assert.ok(modal.type === "ready", JSON.stringify(modal)); privateOutput(modal);
+  const modalOutput: unknown = JSON.parse(modal.output);
+  assert.ok(object(modalOutput) && object(modalOutput.dialog));
+  assert.equal(modalOutput.dialog.message, "[redacted]"); assert.equal(modalOutput.dialog.defaultValue, "[redacted]");
+  const dismissed = (await host.execute(request({ type: "handle_dialog", tab_id: tab.id, accept: false, prompt_text: null }))).response;
+  assert.ok(dismissed.type === "ready"); privateOutput(dismissed);
+  const navigated = await run(async (page, values) => {
+    await page.getByLabel("Password", { exact: true }).fill(values.later);
+    const captured = await page.getByLabel("Password", { exact: true }).inputValue();
+    await page.getByLabel("Password", { exact: true }).fill("");
+    console.log({ captured });
+    const target = new URL("/redaction", page.url()); target.searchParams.set("value", captured);
+    await page.goto(target.href); await page.evaluate(value => { document.title = value; }, captured);
+    return { captured, escaped: JSON.stringify(captured), encoded: encodeURIComponent(captured) };
+  });
+  assert.ok(navigated.type === "ready", JSON.stringify(navigated)); privateOutput(navigated);
+  assert.ok(navigated.tabs[0]?.url.includes("[redacted]")); assert.equal(navigated.tabs[0]?.title, "[redacted]");
+  const large = await run(async (_page, values) => { console.log("x".repeat(65520) + values.later); return values.later; });
+  assert.ok(large.type === "ready"); privateOutput(large); assert.ok(large.output.length <= 65536);
+  const failed = await run(async (page, values) => {
+    await page.goto(new URL("/password", page.url()).href);
+    const secret = "SYNTHETIC_PASSWORD_ERROR-" + values.password;
+    await page.getByLabel("Password", { exact: true }).fill(secret);
+    await page.getByLabel("Password", { exact: true }).fill("");
+    await page.goto(new URL("/retained", page.url()).href);
+    throw new Error("x".repeat(8160) + JSON.stringify(secret));
+  });
+  assert.ok(failed.type === "uncertain", JSON.stringify(failed)); privateOutput(failed); assert.ok(failed.message.includes("[redacted]"));
+  const released = (await host.execute(request({ type: "release" }))).response;
+  assert.ok(released.type === "closed", JSON.stringify(released)); privateOutput(released);
+});
+
+test("unverifiable bounded password capture withholds script output and still permits exact owned cleanup",
+  { skip: skipChrome, timeout: 60_000 }, async t => {
+  const f = await fixture(t), request = requests("1");
+  const opened = (await f.host.execute(request({ type: "open", url: f.origin + "/password" }))).response;
+  assert.ok(opened.type === "ready", JSON.stringify(opened)); const tab = opened.tabs[0]; assert.ok(tab);
+  const failed = (await f.host.execute(request({ type: "run_code", tab_id: tab.id,
+    code: 'async page => { const value="SYNTHETIC_PASSWORD_OVERSIZED_"+"q".repeat(9000); await page.getByLabel("Password",{exact:true}).fill(value); console.log(value); return value; }' }))).response;
+  assert.ok(failed.type === "uncertain", JSON.stringify(failed)); assert.match(failed.message, /output was withheld.*password capture/);
+  assert.equal(JSON.stringify(failed).includes("SYNTHETIC_PASSWORD_"), false);
+  const released = (await f.host.execute(request({ type: "release" }))).response;
+  assert.ok(released.type === "closed", JSON.stringify(released));
+  assert.equal((await f.client.pages()).some(page => page.url === tab.url), false); assert.equal(f.browser.exitCode, null);
+});
+
+test("document-start clears and ordinary blank or srcdoc frames never expose filled passwords",
+  { skip: skipChrome, timeout: 90_000 }, async t => {
+  const f = await fixture(t), request = requests();
+  const opened = (await f.host.execute(request({ type: "open", url: f.origin + "/inline-password" }))).response;
+  assert.ok(opened.type === "ready", JSON.stringify(opened));
+  assert.equal(JSON.stringify(opened).includes("SYNTHETIC_INLINE_PASSWORD_42"), false);
+  assert.ok(opened.output.includes("[redacted]"));
+  const tab = opened.tabs[0]; assert.ok(tab);
+  const filled = (await f.host.execute(request({ type: "run_code", tab_id: tab.id, code: `async page => {
+    const child = await page.context().newPage();
+    await child.setContent('<label>Blank password<input type="password"></label>');
+    await child.getByLabel('Blank password').fill('SYNTHETIC_BLANK_PASSWORD_42');
+    const blank = await child.getByLabel('Blank password').inputValue();
+    await child.getByLabel('Blank password').fill('');
+    await page.evaluate(() => {
+      const frame = document.createElement('iframe'); frame.title = 'Inline frame';
+      frame.srcdoc = '<label>Frame password<input type="password"></label>'; document.body.append(frame);
+    });
+    const field = page.frameLocator('iframe[title="Inline frame"]').getByLabel('Frame password');
+    await field.fill('SYNTHETIC_SRCDOC_PASSWORD_42');
+    return { blank, srcdoc: await field.inputValue() };
+  }` }))).response;
+  assert.ok(filled.type === "ready", JSON.stringify(filled));
+  assert.equal(JSON.stringify(filled).includes("SYNTHETIC_"), false);
+  const result: unknown = JSON.parse(filled.output);
+  assert.ok(object(result) && object(result.result));
+  assert.deepEqual(result.result, { blank: "[redacted]", srcdoc: "[redacted]" });
+  const failed = (await f.host.execute(request({ type: "run_code", tab_id: tab.id, code: `async page => {
+    await page.evaluate(() => {
+      const input = document.querySelector('input'); if (!input) throw new Error('Missing password');
+      input.value = 'SYNTHETIC_IMMEDIATE_ERROR_42'; const value = input.value; input.value = ''; throw new Error(value);
+    });
+  }` }))).response;
+  assert.ok(failed.type === "uncertain", JSON.stringify(failed));
+  assert.equal(failed.message.includes("SYNTHETIC_"), false);
+  const released = (await f.host.execute(request({ type: "release" }))).response;
+  assert.equal(released.type, "closed", JSON.stringify(released));
+  assert.ok((await f.client.pages()).some(page => page.url === f.origin + "/unrelated"));
 });

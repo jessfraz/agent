@@ -154,10 +154,34 @@ browser restarts reuse the token without another connection approval click.
 Upstream opens a temporary Chrome connector URL containing the token. Agent
 discards its output and closes that connector after pairing.
 
-Agent connects to installed Chrome and the selected existing profile. Chrome
-for Testing is a disposable test fixture, never a production fallback. Native
-remote debugging and an exposed debugging port are unnecessary. The connector
-can start installed Chrome with that same profile when it is closed.
+An existing Chrome with native debugging enabled can instead use a loopback
+CDP connection:
+
+```toml
+[browser]
+debugging_port = 9222
+```
+
+This selects the connected browser's current profile. Omit `user_data_dir` and
+`profile_dir_name` in this mode; they cannot pin a profile through CDP. Native
+connections disconnect without quitting Chrome and require no Playwright
+extension token. Agent does not launch Chrome or create a replacement profile
+when this endpoint is unavailable.
+
+Chrome's `chrome://inspect` connection mode requires approval for each new
+connection. Unattended native CDP requires Chrome's command-line debugging
+port with a nondefault user-data root. Moving an existing profile needs a
+separate migration and launch setup; pointing at an empty directory loses its
+signed-in context. Chrome's upcoming macOS encryption changes also make
+default-root cookies incompatible with custom roots. See Chrome's
+[debugging requirements](https://developer.chrome.com/blog/remote-debugging-port)
+and the [cookie-key change](https://github.com/chromium/chromium/commit/c7ee20cc2303adf430ec7c1996afa8d20f2f8641).
+Migrating a disposable profile is not proof of personal account continuity.
+
+The extension connects to installed Chrome and the selected existing profile.
+Chrome for Testing is a disposable test fixture, never a production fallback.
+Extension mode needs no native debugging port. Its connector can start
+installed Chrome with that same profile when it is closed.
 
 `profile_dir_name` selects the final directory component shown by Chrome's
 profile path, such as `Default` or `Profile 1`. `user_data_dir` selects the
@@ -165,6 +189,37 @@ existing browser's data root, not the profile directory inside it. The token
 must belong to that exact profile. Confirm the website's account before an
 account-specific action. Browser state remains local. Script scope is not a
 process security sandbox; the existing task authorization applies to code.
+
+Scheduled sign-ins can use the existing machine credential launcher, even
+while the password-manager UI is locked. Configure a profile that resolves the
+selected login fields into the browser helper's child environment, then name
+only those fields in `secret_environment`:
+
+```toml
+[browser]
+debugging_port = 9222
+credential_command = ["with-credentials", "browser-login", "--"]
+secret_environment = ["BROWSER_LOGIN_USERNAME", "BROWSER_LOGIN_PASSWORD"]
+```
+
+`browser_status` lists the configured names. Browser scripts can use them
+without embedding values in their source:
+
+```js
+async (page, secret) => {
+  await page.getByLabel("Email").fill(secret("BROWSER_LOGIN_USERNAME"));
+  await page.getByLabel("Password").fill(secret("BROWSER_LOGIN_PASSWORD"));
+  await page.getByRole("button", { name: "Sign in" }).click();
+}
+```
+
+The credential profile stays fixed for the connection. Resolved values are
+registered for output redaction before browser input. Lookup failure stops
+the credential-bearing helper; it never opens a desktop approval prompt or
+falls back to a broader account. Provider bootstrap tokens stay in the
+credential provider. For extension mode, its pairing launcher can wrap the
+login launcher in `credential_command`. Existing one-argument scripts still
+work with the full Playwright Page API.
 
 Ask Agent to use Chrome on a named machine when necessary. `browser_open`
 creates an owned tab. `browser_status` inspects the live connection;
@@ -205,7 +260,9 @@ operation and unverified cleanup rather than treating the tab as closed or
 replaying its actions. This upstream compatibility issue remains unresolved.
 1Password autofill has not passed acceptance. The successful live form checks
 used scripted DOM input without focusing fields; they did not exercise autofill
-or filling a login secret from 1Password.
+or filling a login secret from 1Password. Native CDP avoids that extension
+debugger restriction, but actual 1Password autofill and secret handling still
+require acceptance on the intended host before deployment is considered done.
 
 See the upstream [extension setup](https://github.com/microsoft/playwright/blob/main/packages/extension/README.md)
 for installation, profile selection and token pairing.

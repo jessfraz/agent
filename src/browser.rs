@@ -22,17 +22,23 @@ use uuid::Uuid;
 
 use crate::runtime::FrameReader;
 
-/// Selects an existing Chrome profile. Pairing credentials arrive through the
+/// Selects an existing Chrome connection. Pairing credentials arrive through the
 /// helper environment and never enter these serialized helper arguments.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserConfig {
     pub user_data_dir: Option<PathBuf>,
     pub profile_dir_name: Option<String>,
+    // Native CDP connects to an existing browser on an explicitly configured
+    // loopback port; it never creates a browser profile.
+    pub debugging_port: Option<u16>,
     // Optional credential launcher prefix, e.g. ["with-credentials", "browser", "--"].
     // It wraps only the browser helper, so unavailable browser credentials do
     // not prevent the rest of Agent from starting.
     pub credential_command: Option<Vec<String>>,
+    // Only these child-environment fields are available to browser scripts.
+    #[serde(default)]
+    pub secret_environment: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -196,6 +202,11 @@ impl Process {
         } else {
             Command::new("node")
         };
+        if config.credential_command.is_some() {
+            for name in &config.secret_environment {
+                command.env_remove(name);
+            }
+        }
         let mut child = command
             .arg(helper)
             .arg(serde_json::to_string(config)?)
@@ -327,7 +338,7 @@ impl BrowserHost {
             }
             let Some(config) = &self.config else {
                 return Ok(BrowserResponse::Failed { session_id: request.session_id,
-                    message: "Chrome is not configured on this host. Add a [browser] section to its private Agent configuration and pair the Playwright extension in its existing Chrome profile.".into() });
+                    message: "Chrome is not configured on this host. Add a [browser] section to its private Agent configuration and configure extension pairing or a native debugging port for its existing Chrome.".into() });
             };
             let runtime = self
                 .runtime
@@ -476,7 +487,9 @@ input.on('close', () => { writeFileSync(join(directory, 'closed'), 'closed'); })
             Some(BrowserConfig {
                 user_data_dir: Some(directory.to_owned()),
                 profile_dir_name: None,
+                debugging_port: None,
                 credential_command: None,
+                secret_environment: Vec::new(),
             }),
         )
     }

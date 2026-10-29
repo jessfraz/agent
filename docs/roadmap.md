@@ -29,8 +29,9 @@ recovery; [history](history.md) describes import and retrieval.
   CLIs, using the selected host's existing signed-in profile, owned tabs and
   interruption receipts. Pairing survives new tasks and service or browser
   restarts without recurring approval clicks. 1Password inline menus can still
-  interrupt control; autofill and safe secret filling remain open. Browser
-  screenshot attachments remain unsupported.
+  interrupt extension control. Native CDP offers a separate transport; existing
+  profile migration, live autofill and safe secret filling remain open.
+  Browser screenshot attachments remain unsupported.
 - [x] A phone client for the main conversation, using the same submission,
   steering and queueing path as the CLI. The native iPhone app fulfills the
   planned WhatsApp/iMessage client use case.
