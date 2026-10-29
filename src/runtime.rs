@@ -789,14 +789,21 @@ process.stdin.on('data',chunk=>{
         let state = tempfile::tempdir().unwrap();
         let script = state.path().join("cancel.mjs");
         std::fs::write(&script, r#"
-import {watch} from 'node:fs';
+import {existsSync} from 'node:fs';
+import {join} from 'node:path';
 let input='',first,paused=false;
 const emit=(id,event)=>process.stdout.write(JSON.stringify({version:1,id,event})+'\n');
 process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
  input+=chunk;
  if(first!==undefined&&!paused&&!input.includes('\n')){
   paused=true;process.stdin.pause();
-  const waiting=watch(process.argv[2],(_,name)=>{if(name==='release'){waiting.close();process.stdin.resume();}});
+  // The marker is durable; filesystem notifications can be lost or coalesced.
+  const waiting=setInterval(()=>{
+   if(!existsSync(join(process.argv[2],'release')))return;
+   clearInterval(waiting);
+   emit(first,{type:'notice',task_id:null,text:'release marker consumed'});
+   process.stdin.resume();
+  },5);
   emit(first,{type:'notice',task_id:null,text:'partial command is waiting'});
  }
  while(input.includes('\n')){
@@ -861,9 +868,18 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
         submission.abort();
         assert!(matches!(submission.await, Err(error) if error.is_cancelled()));
         std::fs::write(state.path().join("release"), "Complete the same frame").unwrap();
+        let mut release_observed = false;
+        let completed = timeout(Duration::from_secs(2), async {
+            assert!(matches!(first.events.recv().await,
+                Some(RuntimeEventKind::Notice { text, .. }) if text == "release marker consumed"));
+            release_observed = true;
+            assert!(matches!(first.events.recv().await,
+                Some(RuntimeEventKind::Notice { text, .. }) if text == "unowned host effect rejected"));
+        })
+        .await;
         assert!(
-            matches!(timeout(Duration::from_secs(2), first.events.recv()).await.unwrap(),
-            Some(RuntimeEventKind::Notice { text, .. }) if text == "unowned host effect rejected")
+            completed.is_ok(),
+            "Canceled admission did not reject its host effect; release marker consumed: {release_observed}"
         );
         let runtime = match Arc::try_unwrap(runtime) {
             Ok(runtime) => runtime,
