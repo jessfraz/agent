@@ -113,32 +113,33 @@ async function closeChrome(browser: ChildProcess, exited: Promise<void>, client:
 async function fixture(t: TestContext, slowSubmit = false) {
   assert.ok(chrome);
   let submissions = 0;
-  const submittedBodies: string[] = [];
+  const submittedForms: { path: string; body: string }[] = [];
   let delayed: ServerResponse | undefined;
   let submittedResolve = () => {};
   const submitted = new Promise<void>(resolve => { submittedResolve = resolve; });
   const server = createServer((request, response) => {
-    if (request.url === "/submit") {
+    const url = new URL(request.url ?? "/", "http://fixture.invalid");
+    if (url.pathname === "/submit") {
       request.setEncoding("utf8");
       let body = "";
       request.on("data", (chunk: string) => { body += chunk; });
       request.on("end", () => {
-        submittedBodies.push(body); submissions++; submittedResolve();
+        submittedForms.push({ path: url.pathname + url.search, body }); submissions++; submittedResolve();
         if (slowSubmit) { delayed = response; return; }
-        response.writeHead(303, { Location: "/done" }).end();
+        response.writeHead(303, { Location: "/done" + url.search }).end();
       });
       return;
     }
     response.setHeader("Content-Type", "text/html; charset=utf-8");
-    if (request.url === "/form" && !request.headers.cookie?.includes("fixture_login=signed-in")) {
+    if (url.pathname === "/form" && !request.headers.cookie?.includes("fixture_login=signed-in")) {
       response.writeHead(401).end("<!doctype html><h1>Sign in required</h1>"); return;
     }
-    if (request.url === "/form") response.end(`<!doctype html><title>Owned form</title><h1>Form ready</h1>
-      <form action="/submit" method="post"><label>Name<input name="name"></label>
+    if (url.pathname === "/form") response.end(`<!doctype html><title>Owned form</title><h1>Form ready</h1>
+      <form action="/submit${url.search}" method="post"><label>Name<input name="name"></label>
       <label>Choice<select name="choice"><option>First</option><option>Second</option></select></label>
       <button type="button" onclick="window.open('/popup','_blank')">Open popup</button>
       <button type="button" onclick="alert('Fixture dialog')">Open dialog</button><button>Save</button></form>`);
-    else if (request.url === "/done") response.end("<!doctype html><title>Saved form</title><h1>Saved</h1>");
+    else if (url.pathname === "/done") response.end("<!doctype html><title>Saved form</title><h1>Saved</h1>");
     else if (request.url === "/popup") response.end("<!doctype html><title>Owned popup</title><h1>Popup ready</h1>");
     else if (request.url === "/retained") response.end("<!doctype html><title>Retained result</title><h1>Draft ready for review</h1>");
     else response.end("<!doctype html><title>User tab sentinel</title><h1>Unrelated user content sentinel</h1>");
@@ -147,7 +148,7 @@ async function fixture(t: TestContext, slowSubmit = false) {
   const address = server.address(); assert.ok(address !== null && typeof address !== "string");
   const origin = `http://127.0.0.1:${address.port}`;
   const directory = await mkdtemp(join(tmpdir(), "agent-browser-test-"));
-  const driverLog = join(directory, "chrome-driver.log");
+  const driverLogs: string[] = [];
   const args = ["--headless=new", "--remote-debugging-port=0", `--user-data-dir=${directory}`, "--no-first-run", "--no-default-browser-check", "about:blank"];
   if (process.getuid?.() === 0) args.unshift("--no-sandbox");
   const browser: ChildProcess = spawn(chrome, args, { stdio: "ignore" });
@@ -155,12 +156,12 @@ async function fixture(t: TestContext, slowSubmit = false) {
   let startupError: Error | undefined;
   browser.once("error", error => { startupError = error; });
   let client: ChromeFixtureClient | undefined;
-  let host: BrowserHost | undefined;
+  const hosts: BrowserHost[] = [];
   t.after(async () => {
     const failures: unknown[] = [];
     let stopped = false;
-    try { await host?.close(); } catch (error) { failures.push(error); }
-    if (!t.passed && existsSync(driverLog)) {
+    for (const host of hosts) try { await host.close(); } catch (error) { failures.push(error); }
+    if (!t.passed) for (const driverLog of driverLogs) if (existsSync(driverLog)) {
       try { t.diagnostic("Disposable Chrome driver:\n" + (await readFile(driverLog, "utf8")).slice(-16_384)); }
       catch (error) { failures.push(error); }
     }
@@ -194,11 +195,16 @@ async function fixture(t: TestContext, slowSubmit = false) {
   await client.call("Storage.setCookies", { cookies: [{ name: "fixture_login", value: "signed-in", url: origin, httpOnly: true, sameSite: "Lax" }] });
   await client.call("Target.createTarget", { url: `${origin}/unrelated` });
   const fixtureClient = client;
-  host = new BrowserHost({ user_data_dir: null }, { serverArguments: [`--browser-url=http://127.0.0.1:${port}`, "--logFile", driverLog] });
+  const newHost = () => {
+    const driverLog = join(directory, `chrome-driver-${hosts.length + 1}.log`);
+    const host = new BrowserHost({ user_data_dir: null }, { serverArguments: [`--browser-url=http://127.0.0.1:${port}`, "--logFile", driverLog] });
+    hosts.push(host); driverLogs.push(driverLog); return host;
+  };
   return {
-    origin, browser, client: fixtureClient, submitted, host,
+    origin, browser, client: fixtureClient, submitted, host: newHost(), newHost,
     count: () => submissions,
-    submittedBodies: () => [...submittedBodies],
+    submittedBodies: () => submittedForms.map(form => form.body),
+    submittedForms: () => submittedForms.map(form => ({ ...form })),
     finishSubmission() { delayed?.writeHead(303, { Location: "/done" }).end(); delayed = undefined; },
   };
 }
@@ -280,6 +286,67 @@ test("real Chrome adapter owns exact tabs and scoped popups, preserves unrelated
   assert.equal(pages.some(page => page.url === `${f.origin}/done` || page.url === `${f.origin}/popup`), false);
   await host.close();
   assert.equal(f.browser.exitCode, null, "Disconnect must leave attached Chrome running");
+});
+
+test("concurrent browser connections keep form input, tab ownership and cleanup separate", { skip: skipChrome, timeout: 120_000 }, async t => {
+  const f = await fixture(t);
+  const owners = [
+    { host: f.host, request: requests(), name: "Alpha owner", choice: "First", key: "alpha" },
+    { host: f.newHost(), request: requests(), name: "Beta owner", choice: "Second", key: "beta" },
+  ];
+  const opened = await Promise.all(owners.map(async owner => {
+    const url = `${f.origin}/form?owner=${owner.key}`;
+    const response = (await owner.host.execute(owner.request({ type: "open", url }))).response;
+    assert.ok(response.type === "ready", JSON.stringify(response)); assert.equal(response.is_error, false);
+    assert.equal(response.tabs.length, 1); const tab = response.tabs[0]; assert.ok(tab);
+    assert.equal(tab.url, url);
+    return { ...owner, tab, output: response.output };
+  }));
+  const filled = await Promise.all(opened.map(async owner => {
+    const response = (await owner.host.execute(owner.request({ type: "fill", tab_id: owner.tab.id,
+      element_ref: elementRef(owner.output, "textbox", "Name"), value: owner.name }))).response;
+    assert.ok(response.type === "ready", JSON.stringify(response)); assert.equal(response.is_error, false);
+    return { ...owner, output: response.output };
+  }));
+  const selected = await Promise.all(filled.map(async owner => {
+    const response = (await owner.host.execute(owner.request({ type: "fill", tab_id: owner.tab.id,
+      element_ref: elementRef(owner.output, "combobox", "Choice"), value: owner.choice }))).response;
+    assert.ok(response.type === "ready", JSON.stringify(response)); assert.equal(response.is_error, false);
+    return { ...owner, output: response.output };
+  }));
+  const saved = await Promise.all(selected.map(async owner => {
+    const response = (await owner.host.execute(owner.request({ type: "click", tab_id: owner.tab.id,
+      element_ref: elementRef(owner.output, "button", "Save") }))).response;
+    assert.ok(response.type === "ready", JSON.stringify(response)); assert.equal(response.is_error, false);
+    assert.deepEqual(response.tabs, [{ ...owner.tab, url: `${f.origin}/done?owner=${owner.key}`, title: "Saved form" }]);
+    return owner;
+  }));
+  assert.equal(f.count(), 2);
+  const submitted = new Map(f.submittedForms().map(form => [form.path, new URLSearchParams(form.body)]));
+  assert.equal(submitted.size, 2);
+  for (const owner of owners) {
+    const form = submitted.get(`/submit?owner=${owner.key}`); assert.ok(form);
+    assert.equal(form.get("name"), owner.name, "Each native form must submit its own owner's input");
+    assert.equal(form.get("choice"), owner.choice);
+  }
+
+  const first = saved[0], second = saved[1]; assert.ok(first && second);
+  const released = (await first.host.execute(first.request({ type: "release" }))).response;
+  assert.ok(released.type === "closed", JSON.stringify(released)); assert.equal(released.tabs.length, 0);
+  const status = (await second.host.execute(second.request({ type: "status" }))).response;
+  assert.ok(status.type === "ready", JSON.stringify(status)); assert.equal(status.is_error, false);
+  assert.deepEqual(status.tabs, [{ ...second.tab, url: `${f.origin}/done?owner=${second.key}`, title: "Saved form" }]);
+  const snapshot = (await second.host.execute(second.request({ type: "snapshot", tab_id: second.tab.id }))).response;
+  assert.ok(snapshot.type === "ready", JSON.stringify(snapshot)); assert.equal(snapshot.is_error, false);
+  assert.ok(snapshot.output.includes("Saved"));
+  const pages = await f.client.pages();
+  assert.equal(pages.some(page => page.url === `${f.origin}/done?owner=${first.key}`), false);
+  assert.ok(pages.some(page => page.url === `${f.origin}/done?owner=${second.key}`));
+  assert.ok(pages.some(page => page.url === `${f.origin}/unrelated`));
+  const secondRelease = (await second.host.execute(second.request({ type: "release" }))).response;
+  assert.ok(secondRelease.type === "closed", JSON.stringify(secondRelease)); assert.equal(secondRelease.tabs.length, 0);
+  assert.ok((await f.client.pages()).some(page => page.url === `${f.origin}/unrelated`));
+  assert.equal(f.browser.exitCode, null, "Releasing either connection must preserve the shared Chrome instance");
 });
 
 test("direct input activates only its owned native page while snapshots stay in the background", { skip: skipChrome, timeout: 120_000 }, async t => {
