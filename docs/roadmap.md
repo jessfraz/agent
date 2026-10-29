@@ -51,6 +51,8 @@ recovery; [history](history.md) describes import and retrieval.
 - [ ] Performance benchmarks for startup, input admission, first visible
   activity, steering/stop, long-history scrolling, search and import contention.
   Separate application delay from model latency; track CPU, RAM and token use.
+- [x] Nightly operational log review through scheduled jobs, with coordinator
+  collection, retained summaries and explicit coverage gaps.
 - [ ] Dreams and Dreams evals: inspect private logs nightly and propose useful
   improvements as reviewable diffs with before/after evidence. Learned changes
   take effect only after approval of that diff.

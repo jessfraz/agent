@@ -52,6 +52,14 @@
         nativeBuildInputs = [pkgs.makeWrapper];
         nativeCheckInputs = [pkgs.nodejs_26 pkgs.git pkgs.lsof];
         AGENT_RUNTIME_PATH = "${runtime}/lib/agent-runtime/dist/src/bridge.js";
+        preCheck = ''
+          fixtureProfileFlags=()
+          if [ "$cargoCheckType" != debug ]; then
+            fixtureProfileFlags=(--profile "$cargoCheckType")
+          fi
+          cargo build --offline --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} \
+            "''${fixtureProfileFlags[@]}" --example terminal-fixture
+        '';
         postInstall = ''
           wrapProgram "$out/bin/agent" \
             --set AGENT_RUNTIME_PATH "${runtime}/lib/agent-runtime/dist/src/bridge.js" \
