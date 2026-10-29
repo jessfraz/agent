@@ -165,6 +165,160 @@
         "sources"
       ]
     },
+    "BrowserResponse": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "is_error": {
+              "type": "boolean"
+            },
+            "output": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "tabs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/BrowserTab"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "ready"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "session_id",
+            "tabs",
+            "output",
+            "is_error"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "output": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "tabs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/BrowserTab"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "closed"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "session_id",
+            "tabs",
+            "output"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string",
+              "const": "disconnected"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "session_id",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string",
+              "const": "failed"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "session_id",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string",
+              "const": "uncertain"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "session_id",
+            "message"
+          ]
+        }
+      ]
+    },
+    "BrowserTab": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "title": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "url",
+        "title"
+      ]
+    },
     "CleanupPlan": {
       "type": "object",
       "properties": {
@@ -925,6 +1079,22 @@
     },
     "HostResult": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "response": {
+              "$ref": "#/$defs/BrowserResponse"
+            },
+            "type": {
+              "type": "string",
+              "const": "browser"
+            }
+          },
+          "required": [
+            "type",
+            "response"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -3491,6 +3661,10 @@
     "WorkerCapabilities": {
       "type": "object",
       "properties": {
+        "browser": {
+          "type": "boolean",
+          "default": false
+        },
         "resume_agent": {
           "type": "boolean",
           "default": false

@@ -27,6 +27,9 @@ fast = false
 provider = "github"
 enabled = true
 namespaces = ["github.example"]
+
+[browser]
+user_data_dir = "/example/chrome-data"
 "#;
 
 fn apply(path: &Path, settings: &Path) -> Output {
@@ -67,6 +70,10 @@ fn real_cli_applies_selected_preferences_preserves_private_fields_and_leaves_rep
     assert_eq!(current.tailscale_socket, before.tailscale_socket);
     assert_eq!(current.trusted_nodes, before.trusted_nodes);
     assert_eq!(current.node_name, before.node_name);
+    assert_eq!(
+        current.browser.as_ref().unwrap().user_data_dir,
+        before.browser.as_ref().unwrap().user_data_dir
+    );
     assert_eq!(current.model, before.model);
     assert_eq!(
         serde_json::to_string(&current.sources).unwrap(),

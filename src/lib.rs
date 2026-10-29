@@ -15,6 +15,7 @@ pub mod service;
 
 pub mod background;
 pub mod broker;
+pub mod browser;
 pub mod callback;
 pub mod instructions;
 pub mod intake;

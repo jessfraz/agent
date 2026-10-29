@@ -29,6 +29,8 @@ pub struct ClientConfig {
     #[serde(default)]
     pub trusted_nodes: Vec<String>,
     pub node_name: Option<String>,
+    /// Local Chrome connection settings never travel to another host.
+    pub browser: Option<crate::browser::BrowserConfig>,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
     #[serde(default = "default_poll_interval")]
@@ -48,6 +50,7 @@ impl Default for ClientConfig {
             tailscale_socket: None,
             trusted_nodes: Vec::new(),
             node_name: None,
+            browser: None,
             sources: Vec::new(),
             poll_interval_seconds: default_poll_interval(),
         }
@@ -219,6 +222,11 @@ pub fn load(explicit: Option<&Path>) -> Result<ClientConfig> {
 fn validate(config: &mut ClientConfig) -> Result<()> {
     config.model.validate()?;
     let home = dirs::home_dir();
+    if let Some(browser) = &mut config.browser
+        && let Some(path) = &mut browser.user_data_dir
+    {
+        *path = context_repository_path(path, home.as_deref())?;
+    }
     for repository in &mut config.context_repositories {
         *repository = context_repository_path(repository, home.as_deref())?;
     }

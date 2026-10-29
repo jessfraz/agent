@@ -19,8 +19,10 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Ship hosted web search and page retrieval with source links for supported
   OpenAI models. The existing ChatGPT login has passed an isolated search,
   open-page and find-in-page check. Other providers need their own integration.
-- [ ] Chrome browser tool as the last fallback after APIs and CLIs; reuse the
-  selected machine's browser session.
+- [x] Chrome browser tools as the last fallback after APIs and CLIs, using the
+  selected host's signed-in default profile, with owned tabs and interruption
+  receipts. Arbitrary secondary profiles and browser screenshot attachments
+  remain unsupported.
 - [ ] WhatsApp or iMessage input for the main conversation, using the same
   submission, steering and queueing path as the CLI.
 - [ ] Direct coordination between task sessions: durable messages with delivery

@@ -2298,7 +2298,10 @@ async fn worker_service(
         "A worker needs a selected coordinator"
     );
     let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
-    let executor = Arc::new(host::Executor::with_tailscale(directory, daemon.clone()));
+    let executor = Arc::new(
+        host::Executor::with_tailscale(directory, daemon.clone())
+            .with_browser(script, config.browser.clone()),
+    );
     let mut delay = 1;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -2739,10 +2742,13 @@ async fn request_presented(
     let mut operations = tokio::task::JoinSet::new();
     let mut feedback = tokio::task::JoinSet::new();
     let mut cancellations: HashMap<String, tokio::sync::watch::Sender<bool>> = HashMap::new();
-    let executor = Arc::new(host::Executor::with_tailscale(
-        directory,
-        agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?,
-    ));
+    let executor = Arc::new(
+        host::Executor::with_tailscale(
+            directory,
+            agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?,
+        )
+        .with_browser(script, config.browser.clone()),
+    );
     let mut thinking = false;
     let mut wire = connection(config, coordinator, script, directory, login).await?;
     let relay_needed = match (

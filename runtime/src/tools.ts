@@ -94,6 +94,7 @@ export class HostRequests {
       let operation = command;
       while (operation.type === "on_node") operation = operation.command;
       const timeout = operation.type === "exec" ? operation.timeout_seconds * 1000 + 10_000
+        : operation.type === "browser" ? 170_000
         : operation.type === "background" && operation.request.type === "poll_sources" ? 930_000
         : operation.type === "history" ? 930_000 : operation.type === "embed" ? 330_000
         : operation.type.startsWith("resource_") ? 310_000 : 30_000;

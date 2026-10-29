@@ -106,6 +106,62 @@ Availability depends on the model and account; an unsupported tool is reported
 as a capability failure. Other providers keep their native tool configuration.
 This does not give the agent access to a signed-in Chrome session.
 
+### Chrome
+
+Chrome tools are an optional fallback when an API or CLI cannot complete the
+task. They use the selected host's running Chrome, on macOS or Linux. Browser
+effects stay on that host even when the coordinator runs elsewhere.
+
+On each host that should provide Chrome, add this section to its private Agent
+configuration:
+
+```toml
+[browser]
+# Optional: an existing Chrome instance's user-data root, not a copied profile.
+# user_data_dir = "/example/chrome-data"
+```
+
+Restart that host's Agent service after changing its configuration. In Chrome
+144 or newer, open `chrome://inspect/#remote-debugging` and enable remote
+debugging for that browser instance. Chrome asks for connection consent when
+Agent first uses it. The packaged server runs locally; no debugging port needs
+to be exposed to other machines. Agent does not launch or replace personal
+Chrome, install extensions, or export its cookies.
+
+Automatic connection uses **Chrome's default profile**, as determined by
+Chrome, for the selected instance. It cannot choose a secondary named profile
+or infer an account from the active window. `user_data_dir` selects an existing
+browser instance's data root, not `Profile 1` inside it. Confirm the website's
+account before taking an account-specific action. Chrome's native connection
+consent exposes that profile's browser state to the local server; the adapter's
+tool allowlist is not a process sandbox.
+
+Ask Agent to use Chrome on a named machine when necessary. `browser_open`
+creates an owned background tab. `browser_status` inspects the live connection;
+`browser_action` navigates, reads accessibility snapshots, fills forms, selects
+options by displayed text, clicks, presses keys and handles dialogs. Native
+page IDs prevent user tab reordering from retargeting an action. Only owned
+tabs and popups attributed to their actions reach the model. Delayed popups
+outside that action's observation window remain unowned.
+
+Disposable tabs close when the turn finishes. `retain_tab` preserves a needed
+draft or result for the user; `browser_release` closes remaining owned tabs and
+disconnects while Chrome keeps running. The upstream server can retain its
+final open page; a retained tab is reported as incomplete cleanup.
+
+After interruption or connection loss, Agent retains uncertain operations and
+inspects their outcome before repeating them. A browser or host restart
+invalidates old tab handles; it does not prove a submission failed. Reconnect
+to continue, preserving tabs whose ownership cannot be verified.
+
+The first version uses accessibility snapshots. Canvas-only interfaces,
+screenshots sent to the model, uploads and downloads need additional support.
+Chrome settings, desktop applications and general desktop control are outside
+these tools. Usage statistics and URL-based performance lookups are disabled.
+
+See the upstream [Chrome connection documentation](https://developer.chrome.com/docs/devtools/agents/get-started/configuration#connect-to-an-existing-browser-session)
+for Chrome's own prerequisites and consent flow.
+
 `/feedback <description>` saves private diagnostics and starts a background
 repair worker on the originating machine. A repair started inside Rex uses a
 named terminal in that folder; later reports reuse the repair task. From a raw

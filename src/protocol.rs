@@ -32,6 +32,8 @@ pub struct CoordinatorSettings {
 pub struct WorkerCapabilities {
     #[serde(default)]
     pub resume_agent: bool,
+    #[serde(default)]
+    pub browser: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -677,6 +679,10 @@ pub struct SourceState {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostCommand {
+    Browser {
+        host_id: String,
+        request: crate::browser::BrowserRequest,
+    },
     Background {
         request: crate::background::BackgroundRequest,
     },
@@ -782,6 +788,9 @@ pub enum HostCommand {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostResult {
+    Browser {
+        response: crate::browser::BrowserResponse,
+    },
     Background {
         response: crate::background::BackgroundResponse,
     },

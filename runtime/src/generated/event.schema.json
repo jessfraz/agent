@@ -523,6 +523,301 @@
         }
       ]
     },
+    "BrowserAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "status"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "open"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "new_tab"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "tab_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "snapshot"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "tab_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "tab_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "navigate"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "tab_id",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "element_ref": {
+              "type": "string"
+            },
+            "tab_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "click"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "tab_id",
+            "element_ref"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "element_ref": {
+              "type": "string"
+            },
+            "tab_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "fill"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "tab_id",
+            "element_ref",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "tab_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "press_key"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "tab_id",
+            "key"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "tab_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "wait_for"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "tab_id",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "accept": {
+              "type": "boolean"
+            },
+            "prompt_text": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tab_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "handle_dialog"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "tab_id",
+            "accept"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "tab_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "close_tab"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "tab_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "tab_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "retain_tab"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "tab_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "release"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
+    "BrowserRequest": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/BrowserAction"
+        },
+        "operation_id": {
+          "type": "string"
+        },
+        "owner_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "owner_id",
+        "session_id",
+        "operation_id",
+        "action"
+      ]
+    },
     "BuiltinTrigger": {
       "type": "string",
       "enum": [
@@ -1344,6 +1639,26 @@
     },
     "HostCommand": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "host_id": {
+              "type": "string"
+            },
+            "request": {
+              "$ref": "#/$defs/BrowserRequest"
+            },
+            "type": {
+              "type": "string",
+              "const": "browser"
+            }
+          },
+          "required": [
+            "type",
+            "host_id",
+            "request"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -4328,6 +4643,10 @@
     "WorkerCapabilities": {
       "type": "object",
       "properties": {
+        "browser": {
+          "type": "boolean",
+          "default": false
+        },
         "resume_agent": {
           "type": "boolean",
           "default": false

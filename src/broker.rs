@@ -25,6 +25,7 @@ struct Peer {
     calls: mpsc::Sender<Effect>,
     stop: watch::Sender<bool>,
     resume_agent: bool,
+    browser: bool,
 }
 struct Effect {
     command: HostCommand,
@@ -65,10 +66,20 @@ impl Broker {
             )?,
             None => ContextStore::default(),
         };
+        let mut executor = host::Executor::with_tailscale(state, daemon);
+        if let Some(launch) = local.as_ref().map(|node| &node.launch)
+            && let Some(runtime) = &launch.runtime
+        {
+            let browser = match &launch.config {
+                Some(path) => crate::config::load(Some(Path::new(path)))?.browser,
+                None => None,
+            };
+            executor = executor.with_browser(Path::new(runtime), browser);
+        }
         Ok(Self {
             local,
             contexts,
-            executor: host::Executor::with_tailscale(state, daemon),
+            executor,
             instructions: bootstrap
                 .and_then(|value| value.node.as_ref())
                 .and_then(|node| node.launch.instructions.as_ref())
@@ -118,6 +129,10 @@ impl Broker {
                     .capabilities
                     .as_ref()
                     .is_some_and(|capabilities| capabilities.resume_agent),
+                browser: node
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.browser),
             },
         );
         if let Err(error) = control(
@@ -172,10 +187,21 @@ impl Broker {
             .lock()
             .await
             .get(id)
-            .map(|peer| (peer.calls.clone(), peer.resume_agent));
-        let Some((sender, resume_agent)) = sender else {
+            .map(|peer| (peer.calls.clone(), peer.resume_agent, peer.browser));
+        let Some((sender, resume_agent, browser)) = sender else {
             return unavailable();
         };
+        if let HostCommand::Browser { request, .. } = &command
+            && !browser
+        {
+            return HostResult::Browser {
+                response: crate::browser::BrowserResponse::Failed {
+                    session_id: request.session_id,
+                    message: "Update Agent on this host before using its Chrome browser tools."
+                        .into(),
+                },
+            };
+        }
         if matches!(command, HostCommand::ResumeAgentWorker { .. }) && !resume_agent {
             return HostResult::Failed {
                 message: "Update agent on this host before resuming a saved child agent".into(),
@@ -361,6 +387,7 @@ impl Broker {
 
 fn target(command: &HostCommand) -> Option<&str> {
     match command {
+        HostCommand::Browser { host_id, .. } => Some(host_id),
         HostCommand::ResourceAllocate { request } => Some(&request.host_id),
         HostCommand::ResourceInspect { record }
         | HostCommand::ResourcePlanCleanup { record }
@@ -557,6 +584,23 @@ mod tests {
         let broker = Arc::new(Broker::new(None, std::path::Path::new("/tmp")).unwrap());
         let id = "11111111-1111-4111-8111-111111111111";
         let mut worker = Worker::connect(broker.clone(), runtime.clone(), id).await;
+        let session_id = uuid::Uuid::new_v4();
+        let browser = broker
+            .execute(HostCommand::Browser {
+                host_id: id.into(),
+                request: crate::browser::BrowserRequest {
+                    owner_id: uuid::Uuid::new_v4(),
+                    session_id,
+                    operation_id: "browser-open".into(),
+                    action: crate::browser::BrowserAction::Open {
+                        url: "https://example.com/".into(),
+                    },
+                },
+            })
+            .await;
+        assert!(
+            matches!(browser, HostResult::Browser { response: crate::browser::BrowserResponse::Failed { session_id: actual, .. } } if actual == session_id)
+        );
         let host = crate::protocol::WorkerHost {
             host_id: Some(id.into()),
             name: "legacy".into(),

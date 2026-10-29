@@ -31,6 +31,7 @@ pub struct Executor {
     embeddings: tokio::sync::Mutex<Option<Arc<LlamaProvider>>>,
     state: PathBuf,
     daemon: crate::tailnet::Daemon,
+    browser: crate::browser::BrowserHost,
 }
 
 impl Executor {
@@ -44,11 +45,31 @@ impl Executor {
             embeddings: tokio::sync::Mutex::new(None),
             state: state.to_owned(),
             daemon,
+            browser: crate::browser::BrowserHost::default(),
         }
+    }
+
+    pub fn with_browser(
+        mut self,
+        runtime: &Path,
+        config: Option<crate::browser::BrowserConfig>,
+    ) -> Self {
+        self.browser = crate::browser::BrowserHost::new(runtime, config);
+        self
     }
 
     pub async fn execute(&self, command: HostCommand) -> HostResult {
         let result = match command {
+            HostCommand::Browser { host_id, request } => {
+                async {
+                    require_local_host(&host_id).await?;
+                    let (_owner, cancelled) = tokio::sync::watch::channel(false);
+                    Ok(HostResult::Browser {
+                        response: self.browser.execute(request, cancelled).await,
+                    })
+                }
+                .await
+            }
             HostCommand::MachineSnapshot => crate::machines::observe(&self.daemon)
                 .await
                 .map(|snapshot| HostResult::MachineSnapshot { snapshot }),
@@ -87,6 +108,16 @@ impl Executor {
         command: HostCommand,
         mut cancelled: tokio::sync::watch::Receiver<bool>,
     ) -> HostResult {
+        if let HostCommand::Browser { host_id, request } = &command {
+            return match require_local_host(host_id).await {
+                Ok(()) => HostResult::Browser {
+                    response: self.browser.execute(request.clone(), cancelled).await,
+                },
+                Err(error) => HostResult::Failed {
+                    message: error.to_string(),
+                },
+            };
+        }
         if matches!(&command, HostCommand::Embed { .. }) {
             // Embeddings have no external write to reconcile. Dropping this
             // future releases its place behind background corpus work.
@@ -166,6 +197,7 @@ pub async fn execute(command: HostCommand) -> HostResult {
 async fn execute_inner(command: HostCommand) -> Result<HostResult> {
     match command {
         HostCommand::History { .. }
+        | HostCommand::Browser { .. }
         | HostCommand::Embed { .. }
         | HostCommand::ReadUsage { .. }
         | HostCommand::MachineSnapshot => {

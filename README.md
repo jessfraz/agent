@@ -117,7 +117,10 @@ Codex account's quota and cannot report a separate allowance for this app.
 
 Supported OpenAI Responses models get hosted web search, page opening and
 find-in-page tools. Source links stay in saved replies. Other providers need
-their own search integration; Chrome control is planned separately.
+their own search integration. Chrome control is an optional last fallback
+after APIs and CLIs, using the chosen host's signed-in browser. The
+[Chrome setup](docs/setup.md#chrome) describes connection consent and profile
+limits.
 
 Sources use existing authenticated CLIs: Google mail and calendars through
 Switchboard and `gws`, GitHub through Switchboard and `gh`, a configured Slack
