@@ -12,8 +12,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
-use crate::protocol::{ErrorCode, InputMode, ModelActivity, RuntimeCommand, RuntimeEventKind};
+use crate::{
+    browser::BrowserResponse,
+    protocol::{ErrorCode, HostResult, InputMode, ModelActivity, RuntimeCommand, RuntimeEventKind},
+};
 
 const MAX_BYTES: u64 = 1024 * 1024;
 const CAPACITY: usize = 256;
@@ -46,7 +50,7 @@ fn token(value: &str) -> Option<String> {
         && value.len() <= 128
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:".contains(&byte)))
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:|".contains(&byte)))
     .then(|| value.to_owned())
 }
 
@@ -98,15 +102,21 @@ pub(crate) enum Event {
     HostCall {
         call_id: Option<String>,
         command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        browser: Option<BrowserCall>,
     },
     HostReply {
         call_id: Option<String>,
         command: Option<String>,
         duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        browser: Option<BrowserReceipt>,
     },
     HostCancelRequested {
         call_id: Option<String>,
         duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        browser: Option<BrowserCall>,
     },
     InterruptReceived,
     ControlIgnored,
@@ -120,6 +130,184 @@ pub(crate) enum Event {
     RuntimeStopped {
         code: ErrorCode,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct BrowserCall {
+    pub(crate) owner_id: Option<String>,
+    pub(crate) session_id: Uuid,
+    pub(crate) operation_id: Option<String>,
+    pub(crate) action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tab_id: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct BrowserReceipt {
+    #[serde(flatten)]
+    pub(crate) call: BrowserCall,
+    pub(crate) outcome: BrowserOutcome,
+    pub(crate) is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) owned_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cause: Option<BrowserCause>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BrowserOutcome {
+    Ready,
+    Closed,
+    Disconnected,
+    Failed,
+    Uncertain,
+    HostFailed,
+    UnexpectedReply,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BrowserCause {
+    Pairing,
+    McpTransport,
+    ExtensionAttach,
+    EndpointDiscovery,
+    BrowserAttach,
+    ProfileContext,
+    ConnectorIdentity,
+    PageCreation,
+    ConnectorCleanup,
+    McpClosed,
+    BrowserDisconnected,
+    OwnedPageClosed,
+    BrowserOperation,
+}
+impl BrowserCause {
+    fn from_message(message: &str) -> Option<Self> {
+        [
+            ("Connection stage: pairing.", Self::Pairing),
+            ("Connection stage: mcp_transport.", Self::McpTransport),
+            ("Connection stage: extension_attach.", Self::ExtensionAttach),
+            (
+                "Connection stage: endpoint_discovery.",
+                Self::EndpointDiscovery,
+            ),
+            ("Connection stage: browser_attach.", Self::BrowserAttach),
+            ("Connection stage: profile_context.", Self::ProfileContext),
+            (
+                "Connection stage: connector_identity.",
+                Self::ConnectorIdentity,
+            ),
+            ("Connection stage: page_creation.", Self::PageCreation),
+            (
+                "Connection stage: connector_cleanup.",
+                Self::ConnectorCleanup,
+            ),
+            ("Control lost: mcp_closed.", Self::McpClosed),
+            (
+                "Control lost: browser_disconnected.",
+                Self::BrowserDisconnected,
+            ),
+            ("Control lost: owned_page_closed.", Self::OwnedPageClosed),
+            ("Failure stage: browser_operation.", Self::BrowserOperation),
+        ]
+        .into_iter()
+        .find_map(|(marker, cause)| message.starts_with(marker).then_some(cause))
+    }
+}
+
+// Decode only identity and action metadata. Serde skips script bodies, URLs,
+// form values and every other payload field before a log record is created.
+#[derive(Deserialize)]
+struct BrowserFrame {
+    event: BrowserEvent,
+}
+#[derive(Deserialize)]
+struct BrowserEvent {
+    command: BrowserCommand,
+}
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum BrowserCommand {
+    Browser {
+        request: BrowserRequest,
+    },
+    OnNode {
+        command: Box<BrowserCommand>,
+    },
+    #[serde(other)]
+    Other,
+}
+#[derive(Deserialize)]
+struct BrowserRequest {
+    owner_id: String,
+    session_id: Uuid,
+    operation_id: String,
+    action: BrowserAction,
+}
+#[derive(Deserialize)]
+struct BrowserAction {
+    #[serde(rename = "type")]
+    kind: String,
+    tab_id: Option<u32>,
+}
+impl BrowserCall {
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut command = serde_json::from_slice::<BrowserFrame>(bytes)
+            .ok()?
+            .event
+            .command;
+        loop {
+            match command {
+                BrowserCommand::Browser { request } => {
+                    return Some(Self {
+                        owner_id: token(&request.owner_id),
+                        session_id: request.session_id,
+                        operation_id: token(&request.operation_id),
+                        action: token(&request.action.kind)?,
+                        tab_id: request.action.tab_id,
+                    });
+                }
+                BrowserCommand::OnNode { command: inner } => command = *inner,
+                BrowserCommand::Other => return None,
+            }
+        }
+    }
+
+    fn reply(&self, result: &HostResult) -> BrowserReceipt {
+        let cause = match result {
+            HostResult::Browser {
+                response:
+                    BrowserResponse::Disconnected { message, .. }
+                    | BrowserResponse::Failed { message, .. }
+                    | BrowserResponse::Uncertain { message, .. },
+            } => BrowserCause::from_message(message),
+            _ => None,
+        };
+        let (outcome, is_error, owned_count) = match result {
+            HostResult::Browser { response } => match response {
+                BrowserResponse::Ready { is_error, tabs, .. } => {
+                    (BrowserOutcome::Ready, *is_error, Some(tabs.len()))
+                }
+                BrowserResponse::Closed { tabs, .. } => {
+                    (BrowserOutcome::Closed, !tabs.is_empty(), Some(tabs.len()))
+                }
+                BrowserResponse::Disconnected { .. } => (BrowserOutcome::Disconnected, true, None),
+                BrowserResponse::Failed { .. } => (BrowserOutcome::Failed, true, None),
+                BrowserResponse::Uncertain { .. } => (BrowserOutcome::Uncertain, true, None),
+            },
+            HostResult::Failed { .. } => (BrowserOutcome::HostFailed, true, None),
+            _ => (BrowserOutcome::UnexpectedReply, true, None),
+        };
+        BrowserReceipt {
+            call: self.clone(),
+            outcome,
+            is_error,
+            owned_count,
+            cause,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -294,31 +482,36 @@ impl Trace {
 pub(crate) struct HostTiming {
     pub started: Instant,
     pub command: Option<String>,
+    browser: Option<BrowserCall>,
 }
 impl HostTiming {
     pub fn new(bytes: &[u8]) -> Self {
         Self {
             started: Instant::now(),
             command: host_kind(bytes),
+            browser: BrowserCall::decode(bytes),
         }
     }
     pub fn received(&self, call_id: &str) -> Event {
         Event::HostCall {
             call_id: token(call_id),
             command: self.command.clone(),
+            browser: self.browser.clone(),
         }
     }
-    pub fn reply(&self, call_id: &str) -> Event {
+    pub fn reply(&self, call_id: &str, result: &HostResult) -> Event {
         Event::HostReply {
             call_id: token(call_id),
             command: self.command.clone(),
             duration_ms: millis(self.started.elapsed()),
+            browser: self.browser.as_ref().map(|browser| browser.reply(result)),
         }
     }
     pub fn cancel(call_id: &str, timing: Option<&Self>) -> Event {
         Event::HostCancelRequested {
             call_id: token(call_id),
             duration_ms: timing.map(|timing| millis(timing.started.elapsed())),
+            browser: timing.and_then(|timing| timing.browser.clone()),
         }
     }
 }

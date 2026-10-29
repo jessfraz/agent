@@ -381,17 +381,14 @@ fn disconnected_write(
         } else if let Some(view) = call.view.take() {
             view.command()
         } else if let Some(call_id) = call.host_calls.keys().next().cloned() {
+            let result = HostResult::Failed {
+                message: "The execution client disconnected; no command ran on a fallback host."
+                    .into(),
+            };
             if let Some(timing) = call.host_calls.remove(&call_id) {
-                diagnostics.record(*id, &call.trace, timing.reply(&call_id));
+                diagnostics.record(*id, &call.trace, timing.reply(&call_id, &result));
             }
-            RuntimeCommand::HostReply {
-                call_id,
-                result: HostResult::Failed {
-                    message:
-                        "The execution client disconnected; no command ran on a fallback host."
-                            .into(),
-                },
-            }
+            RuntimeCommand::HostReply { call_id, result }
         } else {
             continue;
         };
@@ -495,7 +492,7 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                     Some(CommandMessage::Reply { request_id, call_id, result }) => {
                         if let Some(call) = pending.get_mut(&request_id)
                             && let Some(timing) = call.host_calls.remove(&call_id) {
-                            diagnostics.record(request_id, &call.trace, timing.reply(&call_id));
+                            diagnostics.record(request_id, &call.trace, timing.reply(&call_id, &result));
                             outgoing = Some(PendingWrite::new(RuntimeRequest { version: PROTOCOL_VERSION, id: request_id,
                                 command: RuntimeCommand::HostReply { call_id, result } }, call.trace.clone(), WriteCompletion::Effect)?);
                         }
@@ -1037,7 +1034,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
         use crate::protocol::{InputMode, RuntimeCommand, RuntimeEventKind};
         use crate::runtime::{
             Runtime,
-            diagnostics::{Event, Record},
+            diagnostics::{BrowserCause, BrowserOutcome, Event, Record},
         };
         let state = tempfile::tempdir().unwrap();
         let script = state.path().join("fixture.mjs");
@@ -1055,11 +1052,13 @@ createInterface({input:process.stdin}).on('line',line=>{
   emit({type:'activity',activity:{type:'tool_started',call_id:'tool-one',name:'PRIVATE_TOOL_NAME_SENTINEL'}});
   emit({type:'host_call',call_id:'host-one',command:{type:'on_node',host_id:'PRIVATE_IDENTITY_SENTINEL',command:{type:'exec',program:'PRIVATE_PROGRAM_SENTINEL',args:['PRIVATE_ARGUMENT_SENTINEL'],cwd:'/PRIVATE_PATH_SENTINEL',timeout_seconds:10}}});
  } else if(command.type==='host_reply') {
-  emit({type:'activity',activity:{type:'tool_finished',call_id:'tool-one',name:'PRIVATE_TOOL_NAME_SENTINEL'}});
+  if(command.call_id==='host-one') emit({type:'host_call',call_id:'browser-ready',command:{type:'browser',host_id:'PRIVATE_BROWSER_HOST_SENTINEL',request:{owner_id:'1',session_id:'11111111-1111-4111-8111-111111111111',operation_id:'browser-ready|tool-one',action:{type:'run_code',tab_id:7,code:"async page => page.goto('https://PRIVATE_BROWSER_URL_SENTINEL/?token=PRIVATE_CREDENTIAL_SENTINEL')"}}}});
+  else if(command.call_id==='browser-ready') emit({type:'host_call',call_id:'browser-timeout',command:{type:'browser',host_id:'PRIVATE_BROWSER_HOST_SENTINEL',request:{owner_id:'1',session_id:'11111111-1111-4111-8111-111111111111',operation_id:'browser-timeout|tool-one',action:{type:'navigate',tab_id:7,url:'https://PRIVATE_BROWSER_URL_SENTINEL'}}}});
+  else emit({type:'activity',activity:{type:'tool_finished',call_id:'tool-one',name:'PRIVATE_TOOL_NAME_SENTINEL'}});
  } else if(command.type==='submit_input') {
   emit({type:'input_accepted',input_id:command.input_id});
   emit({type:'input_placed',input_id:command.input_id,entry_id:'entry-two'});
-  emit({type:'host_call',call_id:'host-two',command:{type:'embed',texts:['PRIVATE_EMBEDDING_SENTINEL'],purpose:'query'}});
+  emit({type:'host_call',call_id:'host-two',command:{type:'browser',host_id:'PRIVATE_BROWSER_HOST_SENTINEL',request:{owner_id:'1',session_id:'11111111-1111-4111-8111-111111111111',operation_id:'browser-cancel|tool-two',action:{type:'fill',tab_id:7,element_ref:'PRIVATE_SELECTOR_SENTINEL',value:'PRIVATE_FORM_VALUE_SENTINEL'}}}});
  } else if(command.type==='read_history') {
   emit({type:'history',conversation_id:'child-conversation',messages:[],next_cursor:null}); emit({type:'done'});
  } else if(command.type==='interrupt') {
@@ -1089,19 +1088,28 @@ createInterface({input:process.stdin}).on('line',line=>{
         timeout(Duration::from_secs(3), async {
             loop {
                 match call.events.recv().await.unwrap() {
-                    RuntimeEventKind::HostCall { call_id, .. } => runtime
-                        .reply(
-                            request_id,
-                            call_id,
-                            crate::protocol::HostResult::Process {
+                    RuntimeEventKind::HostCall { call_id, command } => {
+                        let result = if let crate::protocol::HostCommand::Browser { request, .. } = *command {
+                            crate::protocol::HostResult::Browser { response: if call_id == "browser-ready" {
+                                crate::browser::BrowserResponse::Ready {
+                                    session_id: request.session_id,
+                                    tabs: vec![crate::browser::BrowserTab { id: 7,
+                                        title: "PRIVATE_BROWSER_TITLE_SENTINEL".into(),
+                                        url: "https://PRIVATE_BROWSER_URL_SENTINEL".into() }],
+                                    output: "PRIVATE_BROWSER_OUTPUT_SENTINEL".into(), is_error: false,
+                                }
+                            } else { crate::browser::BrowserResponse::Uncertain {
+                                session_id: request.session_id,
+                                message: "Failure stage: browser_operation. PRIVATE_BROWSER_ERROR_SENTINEL Connection stage: pairing.".into(),
+                            } } }
+                        } else { crate::protocol::HostResult::Process {
                                 exit_code: 0,
                                 stdout: "PRIVATE_STDOUT_SENTINEL".into(),
                                 stderr: "PRIVATE_STDERR_SENTINEL".into(),
                                 truncated: false,
-                            },
-                        )
-                        .await
-                        .unwrap(),
+                            } };
+                        runtime.reply(request_id, call_id, result).await.unwrap();
+                    }
                     RuntimeEventKind::Activity {
                         activity: crate::protocol::ModelActivity::ToolFinished { .. },
                     } => break,
@@ -1234,8 +1242,46 @@ createInterface({input:process.stdin}).on('line',line=>{
         assert!(events.iter().any(
             |event| matches!(event, Event::HostReply { command: Some(kind), .. } if kind == "exec")
         ));
+        let browser_calls = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::HostCall {
+                    browser: Some(browser),
+                    ..
+                } => Some(browser),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(browser_calls.len(), 3);
+        assert!(
+            browser_calls
+                .iter()
+                .all(|browser| browser.owner_id.as_deref() == Some("1")
+                    && browser.session_id.to_string() == "11111111-1111-4111-8111-111111111111"
+                    && browser.tab_id == Some(7))
+        );
+        assert_eq!(browser_calls[0].action, "run_code");
+        assert_eq!(
+            browser_calls[0].operation_id.as_deref(),
+            Some("browser-ready|tool-one")
+        );
+        assert!(events.iter().any(|event| matches!(event,
+            Event::HostReply { call_id: Some(id), browser: Some(browser), .. }
+            if id == "browser-ready" && matches!(browser.outcome, BrowserOutcome::Ready)
+                && !browser.is_error && browser.owned_count == Some(1)
+                && browser.call.operation_id.as_deref() == Some("browser-ready|tool-one"))));
+        assert!(events.iter().any(|event| matches!(event,
+            Event::HostReply { call_id: Some(id), browser: Some(browser), .. }
+            if id == "browser-timeout" && matches!(browser.outcome, BrowserOutcome::Uncertain)
+                && browser.is_error && browser.owned_count.is_none()
+                && matches!(browser.cause, Some(BrowserCause::BrowserOperation))
+                && browser.call.operation_id.as_deref() == Some("browser-timeout|tool-one"))));
+        assert!(events.iter().any(|event| matches!(event,
+            Event::HostCancelRequested { call_id: Some(id), browser: Some(browser), .. }
+            if id == "host-two" && browser.action == "fill"
+                && browser.operation_id.as_deref() == Some("browser-cancel|tool-two"))));
         assert!(events.iter().any(|event| matches!(event, Event::InputReceived { input_id: Some(id), mode: Some(InputMode::FollowUp) } if id == "queued-input")));
-        assert!(events.iter().any(|event| matches!(event, Event::HostCancelRequested { call_id: Some(id), duration_ms: Some(_) } if id == "host-two")));
+        assert!(events.iter().any(|event| matches!(event, Event::HostCancelRequested { call_id: Some(id), duration_ms: Some(_), .. } if id == "host-two")));
         assert!(events.iter().any(|event| matches!(
             event,
             Event::Failure {
