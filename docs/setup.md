@@ -234,12 +234,11 @@ Chrome may detach an extension debugger when another extension inserts a
 protected frame, including some password-manager menus. That loses the live
 Page handle even if the native tab stays open. Agent reports the interrupted
 operation and unverified cleanup rather than treating the tab as closed or
-replaying its actions. This upstream compatibility issue remains unresolved.
-1Password autofill has not passed acceptance. The successful live form checks
-used scripted DOM input without focusing fields; they did not exercise autofill
-or filling a login secret from 1Password. Native CDP avoids that extension
-debugger restriction, but actual 1Password autofill and secret handling still
-require acceptance on the intended host before deployment is considered done.
+replaying its actions. Native CDP avoids this extension debugger restriction.
+Verify completed sign-in and the intended task on each host with 1Password
+enabled before considering deployment complete. A filled field does not prove
+the website accepted input or authenticated the account. MFA, rejected requests
+and uncertain submissions remain unfinished work until resolved.
 
 See the upstream [extension setup](https://github.com/microsoft/playwright/blob/main/packages/extension/README.md)
 for installation, profile selection and token pairing.
