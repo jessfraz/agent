@@ -203,6 +203,9 @@ protected frame, including some password-manager menus. That loses the live
 Page handle even if the native tab stays open. Agent reports the interrupted
 operation and unverified cleanup rather than treating the tab as closed or
 replaying its actions. This upstream compatibility issue remains unresolved.
+1Password autofill has not passed acceptance. The successful live form checks
+used scripted DOM input without focusing fields; they did not exercise autofill
+or filling a login secret from 1Password.
 
 See the upstream [extension setup](https://github.com/microsoft/playwright/blob/main/packages/extension/README.md)
 for installation, profile selection and token pairing.

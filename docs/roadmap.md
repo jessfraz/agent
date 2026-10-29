@@ -22,11 +22,12 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Ship hosted web search and page retrieval with source links for supported
   OpenAI models. The existing ChatGPT login has passed an isolated search,
   open-page and find-in-page check. Other providers need their own integration.
-- [x] Unattended Chrome tools with general Playwright scripting after APIs and
+- [ ] Unattended Chrome tools with general Playwright scripting after APIs and
   CLIs, using the selected host's existing signed-in profile, owned tabs and
   interruption receipts. Pairing survives new tasks and service or browser
-  restarts without recurring approval clicks. Browser screenshot attachments
-  remain unsupported.
+  restarts without recurring approval clicks. 1Password inline menus can still
+  interrupt control; autofill and safe secret filling remain open. Browser
+  screenshot attachments remain unsupported.
 - [x] A phone client for the main conversation, using the same submission,
   steering and queueing path as the CLI. The native iPhone app fulfills the
   planned WhatsApp/iMessage client use case.
