@@ -224,7 +224,7 @@ async fn serve_with_transport(
                     let daemon = daemon.clone();
                     let broker = broker.clone();
                     clients.spawn(async move {
-                        authenticated(stream, runtime, broker, crate::tailnet::validate_connection(local, peer, &policy, &daemon)).await
+                        authenticated(stream, runtime, broker, peer, crate::tailnet::validate_connection(local, peer, &policy, &daemon)).await
                     });
                 }
                 Err(error) => break Err(error.into()),
@@ -286,9 +286,13 @@ async fn authenticated<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     runtime: Arc<Runtime>,
     broker: Arc<Broker>,
+    peer: std::net::SocketAddr,
     authorization: impl Future<Output = Result<()>>,
 ) -> Result<()> {
-    authorization.await?;
+    if let Err(error) = authorization.await {
+        runtime.record_peer_rejected(peer, &error.to_string());
+        return Err(error);
+    }
     handle(stream, runtime, broker).await
 }
 
@@ -303,8 +307,57 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         .next_frame()
         .await?
         .context("Client sent no command")?;
-    let command: RuntimeCommand =
+    let mut command: RuntimeCommand =
         serde_json::from_slice(&initial).context("Client sent an invalid command")?;
+    let attachment = match &command {
+        RuntimeCommand::Attachment { request } => Some((request.clone(), false)),
+        RuntimeCommand::Native {
+            request: crate::native::NativeRequest::Attachment { request },
+        } => Some((request.clone(), true)),
+        _ => None,
+    };
+    if let Some((mut request, native)) = attachment {
+        // One authenticated owner transfers a file sequentially, without a
+        // new socket or a live main-conversation observer for every chunk.
+        loop {
+            let mut call = runtime
+                .request(RuntimeCommand::Attachment { request })
+                .await?;
+            let mut completed = false;
+            while let Some(event) = call.events.recv().await {
+                let done = matches!(event, RuntimeEventKind::Done);
+                if native {
+                    if let Some(event) = crate::native::project(&event) {
+                        write_frame(&mut writer, &event).await?;
+                    }
+                } else {
+                    write_frame(&mut writer, &event).await?;
+                }
+                if done {
+                    completed = true;
+                    break;
+                }
+            }
+            anyhow::ensure!(completed, "Attachment transfer ended without completion");
+            let Some(frame) =
+                tokio::time::timeout(std::time::Duration::from_secs(60), reader.next_frame())
+                    .await??
+            else {
+                return Ok(());
+            };
+            request = match serde_json::from_slice::<RuntimeCommand>(&frame)? {
+                RuntimeCommand::Attachment { request } if !native => request,
+                RuntimeCommand::Native {
+                    request: crate::native::NativeRequest::Attachment { request },
+                } if native => request,
+                next if matches!(&next, RuntimeCommand::Native { .. }) == native => {
+                    command = next;
+                    break;
+                }
+                _ => anyhow::bail!("An attachment connection must preserve its protocol envelope"),
+            };
+        }
+    }
     let native = matches!(command, RuntimeCommand::Native { .. });
     let command = match command {
         RuntimeCommand::Native { request } => {
@@ -644,6 +697,7 @@ mod tests {
         write_frame(
             &mut unscoped,
             &RuntimeCommand::SubmitInput {
+                attachments: None,
                 input_id: "unscoped".into(),
                 input: "Rejected".into(),
                 mode: InputMode::Steer,
@@ -666,6 +720,7 @@ mod tests {
         write_frame(
             &mut chat,
             &RuntimeCommand::Chat {
+                attachments: None,
                 input: "Start chat".into(),
                 input_id: None,
                 instructions: String::new(),
@@ -684,6 +739,7 @@ mod tests {
             write_frame(
                 &mut write,
                 &RuntimeCommand::SubmitInput {
+                    attachments: None,
                     input_id: input_id.into(),
                     input: input_id.into(),
                     mode,
@@ -739,6 +795,14 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let script = directory.path().join("fixture.mjs");
             fs::write(&script, FIXTURE).unwrap();
+            Self::start_script(directory, script, reason).await
+        }
+
+        async fn start_script(
+            directory: tempfile::TempDir,
+            script: PathBuf,
+            reason: ShutdownReason,
+        ) -> Self {
             let state = directory.path().to_path_buf();
             let (stop, stopped) = oneshot::channel();
             let task = tokio::spawn(async move {
@@ -795,6 +859,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_attachment_store_transfers_multiple_chunks_on_one_socket_and_reads_through_native_envelope()
+     {
+        use crate::attachments::{
+            ATTACHMENT_CHUNK_BYTES, AttachmentRequest, AttachmentResponse, upload_file,
+        };
+        use crate::native::{NativeEvent, NativeRequest};
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let directory = tempfile::tempdir().unwrap();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/dist/src/bridge.js");
+        let service = Running::start_script(directory, script, ShutdownReason::Requested).await;
+        let bytes = vec![b'a'; ATTACHMENT_CHUNK_BYTES as usize + 11];
+        let source = service.directory.path().join("upload.txt");
+        fs::write(&source, &bytes).unwrap();
+        let stream = service.client().await;
+        let (reader, writer) = stream.into_split();
+        let connection = Arc::new(tokio::sync::Mutex::new((
+            FrameReader::new(BufReader::new(reader)),
+            writer,
+        )));
+        let attachment = upload_file(&source, |request| {
+            let connection = connection.clone();
+            async move {
+                let mut connection = connection.lock().await;
+                let (reader, writer) = &mut *connection;
+                write_frame(writer, &RuntimeCommand::Attachment { request }).await?;
+                let mut response = None;
+                loop {
+                    let frame = reader.next_frame().await?.unwrap();
+                    match serde_json::from_slice::<RuntimeEventKind>(&frame)? {
+                        RuntimeEventKind::Attachment { response: received } => {
+                            response = Some(received)
+                        }
+                        RuntimeEventKind::Done => {
+                            return response
+                                .ok_or_else(|| anyhow::anyhow!("Missing attachment response"));
+                        }
+                        RuntimeEventKind::Failure { message, .. } => anyhow::bail!(message),
+                        _ => anyhow::bail!("Unexpected transfer event"),
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(attachment.size_bytes as usize, bytes.len());
+        drop(connection);
+        let mut native = service.client().await;
+        write_frame(
+            &mut native,
+            &RuntimeCommand::Native {
+                request: NativeRequest::Attachment {
+                    request: AttachmentRequest::Download {
+                        id: attachment.id,
+                        offset: ATTACHMENT_CHUNK_BYTES,
+                        limit: 32,
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let (native_read, mut native_write) = native.into_split();
+        let mut reader = FrameReader::new(BufReader::new(native_read));
+        let event: NativeEvent =
+            serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
+        assert!(
+            matches!(event, NativeEvent::Attachment { response: AttachmentResponse::Download { data_base64, next_offset: None } } if STANDARD.decode(&data_base64).unwrap() == bytes[ATTACHMENT_CHUNK_BYTES as usize..])
+        );
+        assert!(matches!(
+            serde_json::from_slice::<NativeEvent>(&reader.next_frame().await.unwrap().unwrap())
+                .unwrap(),
+            NativeEvent::Done
+        ));
+        write_frame(
+            &mut native_write,
+            &RuntimeCommand::Native {
+                request: NativeRequest::Submit {
+                    input_id: uuid::Uuid::new_v4().to_string(),
+                    text: "/help".into(),
+                    mode: InputMode::Steer,
+                    attachments: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<NativeEvent>(&reader.next_frame().await.unwrap().unwrap())
+                .unwrap(),
+            NativeEvent::Notice { .. }
+        ));
+        assert!(matches!(
+            serde_json::from_slice::<NativeEvent>(&reader.next_frame().await.unwrap().unwrap())
+                .unwrap(),
+            NativeEvent::Done
+        ));
+        drop(reader);
+        drop(native_write);
+        service.stop().await;
+    }
+
+    #[tokio::test]
     async fn signal_shutdown_records_exact_intent_before_stopping_active_requests() {
         #[derive(serde::Deserialize)]
         #[serde(tag = "event", rename_all = "snake_case")]
@@ -834,6 +1000,7 @@ mod tests {
             write_frame(
                 &mut client,
                 &RuntimeCommand::Chat {
+                    attachments: None,
                     input: "Keep this synthetic request active".into(),
                     input_id: None,
                     instructions: String::new(),
@@ -1007,6 +1174,7 @@ mod tests {
         write_frame(
             &mut writer,
             &RuntimeCommand::WorkerInput {
+                attachments: None,
                 input_id: "input-one".into(),
                 input: "A reply in the existing tab".into(),
             },
@@ -1198,13 +1366,15 @@ mod tests {
         let mut denied_client = TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();
-        let (server, _) = listener.accept().await.unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let denied_peer = peer;
         let rejected_runtime = runtime.clone();
         let rejected = tokio::spawn(async move {
             authenticated(
                 server,
                 rejected_runtime,
                 Arc::new(crate::broker::Broker::new(None, std::path::Path::new("/tmp")).unwrap()),
+                peer,
                 async {
                     anyhow::bail!("Rejected synthetic peer");
                 },
@@ -1221,13 +1391,14 @@ mod tests {
         let allowed_client = TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();
-        let (server, _) = listener.accept().await.unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
         let allowed_runtime = runtime.clone();
         let allowed = tokio::spawn(async move {
             authenticated(
                 server,
                 allowed_runtime,
                 Arc::new(crate::broker::Broker::new(None, std::path::Path::new("/tmp")).unwrap()),
+                peer,
                 async { Ok(()) },
             )
             .await
@@ -1241,6 +1412,23 @@ mod tests {
             .close()
             .await
             .unwrap();
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "event", rename_all = "snake_case")]
+        enum Receipt {
+            PeerRejected {
+                peer: std::net::SocketAddr,
+                reason: String,
+            },
+            #[serde(other)]
+            Other,
+        }
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let saved = fs::read_to_string(directory.path().join("diagnostics/runtime.jsonl")).unwrap_or_default();
+                if saved.lines().any(|line| matches!(serde_json::from_str::<Receipt>(line).unwrap(), Receipt::PeerRejected { peer, reason } if peer == denied_peer && reason == "Rejected synthetic peer")) { break; }
+                sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
     }
 
     #[tokio::test]

@@ -111,9 +111,25 @@ function diagnostic(entry: EntryRecord, capture: Capture): FeedbackEntry {
 /** Private snapshots reuse native Pi evidence. Capturing never runs a model or a host command. */
 export class FeedbackStore {
   private readonly directory: string;
+  private readonly capturing = new Map<string, Promise<FeedbackBundle>>();
   constructor(state: string, private readonly tasks: TaskStore) { this.directory = join(state, "feedback"); }
 
-  async capture(description: string, input: FeedbackContext): Promise<FeedbackBundle> {
+  async capture(description: string, input: FeedbackContext, inputId?: string): Promise<FeedbackBundle> {
+    if (inputId === undefined) return this.captureNew(description, input);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(inputId) || inputId === "00000000-0000-0000-0000-000000000000") throw new Error("Feedback needs a nonnil UUID request ID");
+    const operation = this.capturing.get(inputId) ?? this.captureNew(description, input, inputId);
+    this.capturing.set(inputId, operation);
+    try {
+      const saved = await operation;
+      if (saved.description !== new Capture().text(description, 4096) ||
+        JSON.stringify(saved.context.attachments ?? []) !== JSON.stringify(input.attachments ?? [])) throw new Error("A feedback request ID cannot be reused with different content");
+      return saved;
+    } finally { if (this.capturing.get(inputId) === operation) this.capturing.delete(inputId); }
+  }
+  private async captureNew(description: string, input: FeedbackContext, inputId?: string): Promise<FeedbackBundle> {
+    if (inputId !== undefined) {
+      try { return await this.read(inputId); } catch (error) { if (!object(error) || error.code !== "ENOENT") throw error; }
+    }
     if (description.trim().length === 0) throw new Error("Describe the issue after /feedback.");
     if (input.origin_host_id.length === 0) throw new Error("Feedback needs the originating execution machine.");
     const capture = new Capture(); capture.truncated = input.truncated === true;
@@ -136,7 +152,7 @@ export class FeedbackStore {
       client_errors: input.client_errors.slice(-8).map((value) => capture.text(value, 2048)) };
     if (input.queued_inputs.length > 16 || input.client_errors.length > 8) capture.truncated = true;
     const entries = page.items.map((entry) => diagnostic(entry, capture)).reverse().filter((entry) => entry.evidence.length > 0);
-    const bundle: FeedbackBundle = { id: randomUUID(), created_at: Date.now(), description: boundedDescription, context,
+    const bundle: FeedbackBundle = { id: inputId ?? randomUUID(), created_at: Date.now(), description: boundedDescription, context,
       entries, older_entries: page.next !== undefined, truncated: capture.truncated,
       omissions: ["System instructions, auth/config/environment stores, hidden thinking and media bytes are excluded.",
         "Execution/file/unknown tool payloads are omitted; canonical entry and call IDs remain available.",

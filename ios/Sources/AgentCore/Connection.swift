@@ -6,31 +6,84 @@ public struct CoordinatorAddress: Sendable, Equatable {
   public let host: String
   public let port: UInt16
 
-  // Numeric tailnet addresses only. No DNS rebinding or unencrypted LAN fallback.
+  // Full MagicDNS names are resolved and pinned to a validated tailnet address per connection.
   public init(host: String, port: UInt16 = 43187) throws {
-    let parts = host.split(separator: ".", omittingEmptySubsequences: false)
-    let octets = parts.compactMap { UInt8($0) }
-    guard octets.count == 4, parts.map(String.init) == octets.map(String.init),
-      octets[0] == 100, (64...127).contains(octets[1]), port > 0
-    else { throw ConnectionError.invalidAddress }
+    let host =
+      host.lowercased().hasSuffix(".") ? String(host.dropLast()).lowercased() : host.lowercased()
+    let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+    let magicDNS =
+      host.hasSuffix(".ts.net") && labels.count >= 4 && host.utf8.count <= 253
+      && labels.allSatisfy { label in
+        !label.isEmpty && label.utf8.count <= 63 && label.first != "-" && label.last != "-"
+          && label.utf8.allSatisfy { (97...122).contains($0) || (48...57).contains($0) || $0 == 45 }
+      }
+    guard port > 0, Self.isTailnetIP(host) || magicDNS else { throw ConnectionError.invalidAddress }
     self.host = host
     self.port = port
+  }
+  static func isTailnetIP(_ host: String) -> Bool {
+    let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+    let octets = parts.compactMap { UInt8($0) }
+    return octets.count == 4 && parts.map(String.init) == octets.map(String.init)
+      && octets[0] == 100 && (64...127).contains(octets[1])
+  }
+
+  func resolvedHost(using resolve: (String) throws -> [String] = Self.resolve) throws -> String {
+    if Self.isTailnetIP(host) { return host }
+    let addresses = try resolve(host)
+    guard let first = addresses.first, addresses.allSatisfy(Self.isTailnetIP) else {
+      throw ConnectionError.invalidAddress
+    }
+    return first
+  }
+  private static func resolve(_ host: String) throws -> [String] {
+    var hints = addrinfo()
+    hints.ai_family = AF_INET
+    hints.ai_socktype = SOCK_STREAM
+    hints.ai_protocol = IPPROTO_TCP
+    var first: UnsafeMutablePointer<addrinfo>?
+    guard getaddrinfo(host, nil, &hints, &first) == 0 else { throw ConnectionError.dnsUnavailable }
+    defer { freeaddrinfo(first) }
+    var addresses: [String] = []
+    var cursor = first
+    while let item = cursor {
+      defer { cursor = item.pointee.ai_next }
+      var name = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+      guard
+        getnameinfo(
+          item.pointee.ai_addr, item.pointee.ai_addrlen, &name, socklen_t(name.count), nil, 0,
+          NI_NUMERICHOST) == 0
+      else { throw ConnectionError.dnsUnavailable }
+      addresses.append(
+        String(
+          decoding: name.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self))
+    }
+    return addresses
   }
 }
 
 public enum ConnectionError: Error, LocalizedError, Sendable {
-  case invalidAddress, vpnUnavailable, frameTooLarge, incompleteFrame, closed, timedOut
+  case invalidAddress, dnsUnavailable, vpnUnavailable, frameTooLarge, incompleteFrame, closed,
+    timedOut
   public var errorDescription: String? {
     switch self {
     case .vpnUnavailable:
       "Connect Tailscale first. No active point-to-point interface has a Tailscale IPv4 address."
-    case .invalidAddress: "Enter the coordinator’s numeric Tailscale IPv4 address and port."
+    case .invalidAddress: "Enter a Tailscale IPv4 address or full MagicDNS name and port."
+    case .dnsUnavailable:
+      "The coordinator name could not be resolved. Check Tailscale’s DNS settings."
     case .frameTooLarge: "The coordinator sent a frame larger than 4 MiB."
     case .incompleteFrame:
       "The connection ended during a message. Reconnect to recover saved history."
     case .closed: "The coordinator disconnected. Saved work remains on the coordinator."
     case .timedOut: "The coordinator did not respond. Check Tailscale and the coordinator service."
     }
+  }
+  static func describe(_ error: any Error) -> String {
+    if let network = error as? NWError, case .posix(.ECONNRESET) = network {
+      return "The coordinator closed the connection. This device may need access."
+    }
+    return error.localizedDescription
   }
 }
 
@@ -41,7 +94,7 @@ actor LineConnection {
   private var ended = false
   static let maximumFrameBytes = 4 * 1024 * 1024
 
-  init(address: CoordinatorAddress) throws {
+  init(address: CoordinatorAddress) async throws {
     guard let port = NWEndpoint.Port(rawValue: address.port) else {
       throw ConnectionError.invalidAddress
     }
@@ -55,7 +108,10 @@ actor LineConnection {
     // Binding the tunnel's own address fails closed when the VPN disappears.
     // Merely recognizing 100.64/10 is not enough on a carrier-grade NAT LAN.
     parameters.requiredLocalEndpoint = .hostPort(host: .init(try Self.tunnelAddress()), port: .any)
-    connection = NWConnection(host: .init(address.host), port: port, using: parameters)
+    let host = try await Task.detached(priority: .userInitiated) { try address.resolvedHost() }
+      .value
+    try Task.checkCancellation()
+    connection = NWConnection(host: .init(host), port: port, using: parameters)
     connection.start(queue: .global(qos: .userInitiated))
   }
 
@@ -84,7 +140,7 @@ actor LineConnection {
       else { continue }
       let bytes = host.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }
       let value = String(decoding: bytes, as: UTF8.self)
-      if (try? CoordinatorAddress(host: value)) != nil { return value }
+      if CoordinatorAddress.isTailnetIP(value) { return value }
     }
     throw ConnectionError.vpnUnavailable
   }

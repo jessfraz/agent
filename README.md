@@ -62,8 +62,14 @@ Reset times use the client's local timezone and include a countdown.
 `/machines` shows connected hosts, hardware capacity and recent load samples.
 Use `--no-tui` for plain output.
 
+The [iPhone app](ios/README.md) opens the same main conversation. Private
+TestFlight updates are built from `main` after required native checks.
+Attach files or photos on iOS, or drag file paths into the terminal composer.
+
 `/feedback <description>` starts a background repair on the same machine with
-private diagnostic context. Its result returns to the main chat.
+private diagnostics and any attached files. It includes the current app view
+on iOS or the originating terminal's HTML capture in Rex. Its result returns
+to the main chat.
 
 For example, JLCPCB emails about a missing fabrication file. The agent finds
 the existing hardware task, attaches the email and continues its Rex session.

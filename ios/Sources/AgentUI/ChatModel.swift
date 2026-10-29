@@ -3,6 +3,11 @@ import CryptoKit
 import Foundation
 import Observation
 
+#if os(iOS)
+  import PhotosUI
+  import SwiftUI
+#endif
+
 @MainActor @Observable
 final class RowModel: Identifiable {
   let id: String
@@ -25,12 +30,24 @@ final class ChatModel {
   var error: String?
   var revision = 0
   var draft = ""
+  var attachments: [LocalAttachment] = []
+  var previewURL: URL?
+  private(set) var preparingAttachments = false
   var mode: InputMode = .steer
   private(set) var admitting = false
   @ObservationIgnored private var generation = UUID()
-  @ObservationIgnored private var admit: @Sendable (String, InputMode) async -> Bool
+  @ObservationIgnored private var admit:
+    @Sendable (String, InputMode, [LocalAttachment]) async -> Bool
+  @ObservationIgnored private var draftStore: AttachmentStore?
+  @ObservationIgnored private var feedbackScreenshotID: String?
 
-  init(admit: @escaping @Sendable (String, InputMode) async -> Bool = { _, _ in false }) {
+  init(
+    draftStore: AttachmentStore? = nil,
+    admit: @escaping @Sendable (String, InputMode, [LocalAttachment]) async -> Bool = { _, _, _ in
+      false
+    }
+  ) {
+    self.draftStore = draftStore
     self.admit = admit
   }
   deinit {
@@ -66,7 +83,7 @@ final class ChatModel {
   func connect(session: CoordinatorSession, address: CoordinatorAddress) async {
     self.address = address
     self.session = session
-    admit = { text, mode in await session.submit(text, mode: mode) }
+    admit = { text, mode, files in await session.submit(text, mode: mode, files: files) }
     rows = []
     error = nil
     observation = Task { [weak self] in
@@ -90,7 +107,7 @@ final class ChatModel {
     let ownedSession = session
     session = nil
     connection = .disconnected
-    admit = { _, _ in false }
+    admit = { _, _, _ in false }
     await ownedSession?.disconnect()
   }
   func setActive(_ active: Bool) async {
@@ -98,20 +115,129 @@ final class ChatModel {
     guard let session, let address else { return }
     if active { await session.connect(address) } else { await session.disconnect() }
   }
-  func send() async {
-    guard !admitting, connection == .connected,
-      !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  var canSend: Bool {
+    !admitting && !preparingAttachments && connection == .connected
+      && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
+  }
+  func send(screenshot: (@MainActor () throws -> Data)? = nil) async {
+    guard canSend
     else { return }
     admitting = true
     defer { admitting = false }
     let text = draft
+    let mode = mode
+    let generation = generation
+    let admit = admit
+    var files = attachments
+    do {
+      if text.split(whereSeparator: \.isWhitespace).first == "/feedback",
+        feedbackScreenshotID == nil, let screenshot
+      {
+        guard files.count < AttachmentLimits.maximumCount else { throw AttachmentError.tooMany }
+        // Capture before the composer changes. A failed admission retains this exact image.
+        let data = try screenshot()
+        let file = try await attachmentStore().stage(
+          data: data, name: "Feedback.png", mediaType: "image/png")
+        guard self.generation == generation else {
+          try? await draftStore?.remove(file)
+          return
+        }
+        attachments.append(file)
+        files.append(file)
+        feedbackScreenshotID = file.id
+      }
+    } catch {
+      self.error = error.localizedDescription
+      return
+    }
+    guard self.generation == generation else { return }
     // Keep the draft until the owned actor has validated and saved the input.
     // Failures also remain available in the input row for copy/retry.
-    if await admit(text, mode), draft == text { draft = "" }
+    if await admit(text, mode, files), self.generation == generation {
+      if draft == text { draft = "" }
+      let sentIDs = Set(files.map(\.id))
+      attachments.removeAll { sentIDs.contains($0.id) }
+      if let id = feedbackScreenshotID, sentIDs.contains(id) { feedbackScreenshotID = nil }
+      if let store = draftStore {
+        for file in files { try? await store.remove(file) }
+      }
+    }
   }
   func restore(_ id: String) async {
-    guard let text = await session?.restore(id) else { return }
-    draft = text
+    guard !admitting, draft.isEmpty, attachments.isEmpty else {
+      error = "Send or clear the current draft before restoring another message."
+      return
+    }
+    do {
+      let store = try attachmentStore()
+      guard let restored = await session?.restore(id, to: store) else { return }
+      draft = restored.text + (draft.isEmpty ? "" : "\n\n" + draft)
+      attachments.insert(contentsOf: restored.attachments, at: 0)
+      mode = restored.mode
+      if restored.text.split(whereSeparator: \.isWhitespace).first == "/feedback" {
+        feedbackScreenshotID =
+          restored.attachments.last(where: { $0.reference.name == "Feedback.png" })?.id
+      }
+    } catch { self.error = error.localizedDescription }
+  }
+  private func attachmentStore() throws -> AttachmentStore {
+    if let draftStore { return draftStore }
+    let directory = try FileManager.default.url(
+      for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+    let store = AttachmentStore(directory: directory.appending(path: "Agent/Drafts"))
+    draftStore = store
+    return store
+  }
+  func attach(urls: [URL]) async {
+    guard !preparingAttachments else { return }
+    preparingAttachments = true
+    defer { preparingAttachments = false }
+    do {
+      let store = try attachmentStore()
+      for url in urls {
+        guard attachments.count < AttachmentLimits.maximumCount else {
+          throw AttachmentError.tooMany
+        }
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        attachments.append(try await store.stage(url: url))
+      }
+    } catch { self.error = error.localizedDescription }
+  }
+  func attach(data: Data, name: String, mediaType: String) async {
+    do {
+      guard attachments.count < AttachmentLimits.maximumCount else { throw AttachmentError.tooMany }
+      let file = try await attachmentStore().stage(data: data, name: name, mediaType: mediaType)
+      guard attachments.count < AttachmentLimits.maximumCount else {
+        try? await draftStore?.remove(file)
+        throw AttachmentError.tooMany
+      }
+      attachments.append(file)
+    } catch { self.error = error.localizedDescription }
+  }
+  #if os(iOS)
+    func attach(photo: PhotosPickerItem) async {
+      guard !preparingAttachments else { return }
+      preparingAttachments = true
+      defer { preparingAttachments = false }
+      do {
+        guard let image = try await photo.loadTransferable(type: ImportedPhoto.self) else {
+          throw AttachmentError.invalidFile
+        }
+        await attach(data: image.data, name: "Photo.jpg", mediaType: "image/jpeg")
+      } catch { self.error = error.localizedDescription }
+    }
+  #endif
+  func removeAttachment(_ file: LocalAttachment) async {
+    guard !admitting else { return }
+    attachments.removeAll { $0.id == file.id }
+    if feedbackScreenshotID == file.id { feedbackScreenshotID = nil }
+    try? await draftStore?.remove(file)
+  }
+  func preview(_ reference: AttachmentRef) async {
+    do { previewURL = try await session?.preview(reference) } catch {
+      self.error = error.localizedDescription
+    }
   }
   func retry(_ id: String) async { await session?.retry(id) }
   func history() async { await session?.loadEarlier() }

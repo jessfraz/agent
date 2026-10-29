@@ -90,6 +90,130 @@
         "other"
       ]
     },
+    "AttachmentRef": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "media_type",
+        "size_bytes",
+        "sha256"
+      ]
+    },
+    "AttachmentRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "complete": {
+              "type": "boolean"
+            },
+            "data_base64": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "media_type": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "offset": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "size_bytes": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "upload"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "id",
+            "name",
+            "media_type",
+            "size_bytes",
+            "offset",
+            "data_base64",
+            "complete"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "limit": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "offset": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "download"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "id",
+            "offset",
+            "limit"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "discard"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "id"
+          ]
+        }
+      ]
+    },
     "BackgroundResponse": {
       "oneOf": [
         {
@@ -647,6 +771,15 @@
             "null"
           ]
         },
+        "attachments": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/AttachmentRef"
+          }
+        },
         "binding": {
           "anyOf": [
             {
@@ -1083,6 +1216,30 @@
     },
     "HostResult": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "next_offset": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "attachment_written"
+            }
+          },
+          "required": [
+            "type",
+            "next_offset"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -1612,6 +1769,23 @@
         {
           "type": "object",
           "properties": {
+            "request": {
+              "$ref": "#/$defs/AttachmentRequest"
+            },
+            "type": {
+              "type": "string",
+              "const": "attachment"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "request"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "input_ids": {
               "type": "array",
               "items": {
@@ -1632,6 +1806,15 @@
         {
           "type": "object",
           "properties": {
+            "attachments": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/$defs/AttachmentRef"
+              }
+            },
             "input_id": {
               "type": "string"
             },
@@ -2076,6 +2259,22 @@
         {
           "type": "object",
           "properties": {
+            "request": {
+              "$ref": "#/$defs/AttachmentRequest"
+            },
+            "type": {
+              "type": "string",
+              "const": "attachment"
+            }
+          },
+          "required": [
+            "type",
+            "request"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "settings": {
               "$ref": "#/$defs/BackgroundSettings"
             },
@@ -2433,6 +2632,15 @@
           "description": "Owner-independent admission using Pi's durable request identity.",
           "type": "object",
           "properties": {
+            "attachments": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/$defs/AttachmentRef"
+              }
+            },
             "context": {
               "anyOf": [
                 {
@@ -2479,8 +2687,23 @@
         {
           "type": "object",
           "properties": {
+            "attachments": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/$defs/AttachmentRef"
+              }
+            },
             "description": {
               "type": "string"
+            },
+            "input_id": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "type": "string",
@@ -2584,6 +2807,15 @@
         {
           "type": "object",
           "properties": {
+            "attachments": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/$defs/AttachmentRef"
+              }
+            },
             "cwd": {
               "type": "string"
             },
@@ -2730,6 +2962,15 @@
           "description": "Admit input independently of any observing terminal's lifetime.",
           "type": "object",
           "properties": {
+            "attachments": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/$defs/AttachmentRef"
+              }
+            },
             "context": {
               "anyOf": [
                 {
@@ -2867,6 +3108,12 @@
             },
             "description": {
               "type": "string"
+            },
+            "input_id": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "type": "string",
@@ -3075,6 +3322,15 @@
         {
           "type": "object",
           "properties": {
+            "attachments": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/$defs/AttachmentRef"
+              }
+            },
             "input": {
               "type": "string"
             },
@@ -3095,6 +3351,15 @@
         {
           "type": "object",
           "properties": {
+            "attachments": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/$defs/AttachmentRef"
+              }
+            },
             "input": {
               "type": "string"
             },

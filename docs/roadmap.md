@@ -24,15 +24,16 @@ recovery; [history](history.md) describes import and retrieval.
   interruption receipts. Authorization must survive new tasks and service or
   browser restarts without recurring consent clicks. Browser screenshot
   attachments remain unsupported.
-- [ ] WhatsApp or iMessage input for the main conversation, using the same
-  submission, steering and queueing path as the CLI.
+- [x] A phone client for the main conversation, using the same submission,
+  steering and queueing path as the CLI. The native iPhone app fulfills the
+  planned WhatsApp/iMessage client use case.
 - [ ] Direct coordination between task sessions: durable messages with delivery
   receipts, steering or queueing, and references to shared work. Reuse existing
   task inboxes and workers.
 - [ ] Voice input through a transcription provider interface.
-- [ ] Drag/paste attachments into chat, transfer them from the originating
-  machine, retain them with the conversation, and deliver supported content to
-  the selected model.
+- [x] File/photo attachments on iOS and dragged files in the terminal, retained
+  with the conversation and delivered to Pi on the selected execution host.
+- [ ] Paste image attachments from the clipboard.
 - [x] Scheduled jobs through the existing coordinator background process and
   task follow-through path. Reuse durable timers; persist occurrence identities
   so restarts and retries cannot run a job twice.

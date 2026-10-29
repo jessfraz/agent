@@ -104,12 +104,24 @@ change the chat's project directory. Node registration refreshes executable
 and configuration paths when a task resumes, while preserving that task's
 model selection and working directory.
 Local clients use a private Unix socket. Remote clients use Tailscale with live
-peer identity checks, or an existing SSH connection. Empty `trusted_nodes`
-allows only authorized, untagged peers of the same user. An explicit list pins
-exact stable node IDs instead, including tagged servers whose owner is the
-shared tagged-device identity. Check the connected /32 against native WhoIs
-metadata in both cases; names, tags and user-supplied claims do not grant
-access.
+peer identity checks, or an existing SSH connection. With no trust pins,
+authorized untagged peers of the same user are accepted. `trusted_nodes` pins
+stable node IDs, including tagged servers; `trusted_user_ids` pins human
+accounts for their authorized, untagged devices. Either list disables the
+default same-user rule. The connected /32 and node owner must match native
+WhoIs metadata. See [trust configuration](setup.md#trust).
+
+The SwiftUI iPhone client uses this same coordinator and main conversation.
+It loads recent history first and fetches older pages on demand, retaining at
+most 500 display rows and 4 MiB of text. A full MagicDNS name is resolved and
+validated on each connection. Pending input and immutable attachment copies
+stay in a protected, endpoint-specific outbox until admission is acknowledged.
+
+Rust owns the shared attachment types and transfer limits. Files travel in
+bounded chunks over the existing authenticated connection, are verified by
+SHA-256, and are materialized on the selected execution host. Pi receives its
+native image content or a tool-readable file reference. History contains file
+metadata; the phone fetches preview bytes only when requested.
 
 The MVP does not replicate the store or recover onto another host. If the
 coordinator is down, the client reports that it is unavailable. Copying a live

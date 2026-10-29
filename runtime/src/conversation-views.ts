@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { validateInput } from "./attachments.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AgentDoc, ROOT_CONVERSATION_ID, type Conversation, type Harness } from "@earendil-works/pi-durable";
 import type { ConversationCatalog } from "./catalog.js";
@@ -90,7 +91,7 @@ export class ConversationViews {
   }
   /** No generation occurs here; ordinary task dispatch owns execution and effects. */
   async input(command: Extract<RuntimeCommand, { type: "conversation_input" }>, call: HostCall, emit: Emit): Promise<void> {
-    if (command.input.trim().length === 0 || Buffer.byteLength(command.input, "utf8") > 65_536) throw new TaskError("Input must contain 1 to 65536 UTF-8 bytes");
+    validateInput(command.input, command.attachments);
     const app = await this.services(), summary = await this.summary(app, command.conversation_id);
     if (summary.conversation_id === ROOT_CONVERSATION_ID.toString()) throw new TaskError("The main conversation uses its existing main input path");
     const conversation = await app.tasks.conversation(summary.conversation_id);
@@ -107,13 +108,13 @@ export class ConversationViews {
     }
     if (task === undefined) throw new TaskError("This saved conversation has no task");
     if (summary.agent_id === null) {
-      await app.tasks.enqueue(task.id, command.input, command.input_id, undefined, command.mode);
+      await app.tasks.enqueue(task.id, command.input, command.input_id, undefined, command.mode, command.attachments);
       emit({ type: "input_accepted", input_id: command.input_id });
       const dispatched = await app.tasks.dispatch(task.id, await this.host(app, task, imported?.thread.id, imported?.thread.cwd), call);
       if (dispatched.worker.state !== "bound") throw new TaskError("Session allocation is unconfirmed; its saved input is retained.");
     } else {
       const dispatched = await app.tasks.continueAgent(task.id, summary.agent_id, command.input, command.input_id, call, command.mode,
-        () => emit({ type: "input_accepted", input_id: command.input_id }));
+        () => emit({ type: "input_accepted", input_id: command.input_id }), command.attachments);
       if (dispatched.agents.find((agent) => agent.id === summary.agent_id)?.worker.state !== "bound") {
         throw new TaskError("Agent allocation is unconfirmed; its saved input is retained.");
       }

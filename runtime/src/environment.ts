@@ -132,7 +132,7 @@ export class CoordinatorEnvironment {
     return this.host(node, host.cwd, model);
   }
   route(command: HostCommand, node: WorkerHost | null): HostCommand {
-    if (!["exec", "read_file", "write_file", "edit_file"].includes(command.type)) return command;
+    if (!["exec", "read_file", "write_file", "edit_file", "attachment_write"].includes(command.type)) return command;
     if (node === null) throw new EnvironmentError("The coordinator execution host is offline; choose a connected host explicitly.");
     return node.host_id === null || node.host_id === undefined ? command : { type: "on_node", host_id: node.host_id, command };
   }

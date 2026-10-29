@@ -17,6 +17,9 @@ pub enum NativeCommand {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NativeRequest {
+    Attachment {
+        request: crate::attachments::AttachmentRequest,
+    },
     Observe {
         input_ids: Vec<String>,
     },
@@ -24,6 +27,9 @@ pub enum NativeRequest {
         input_id: String,
         text: String,
         mode: InputMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        attachments: Option<Vec<crate::attachments::AttachmentRef>>,
     },
     History {
         cursor: Option<String>,
@@ -40,6 +46,13 @@ pub struct SlashCommand {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NativeEvent {
+    FeedbackReady {
+        input_id: String,
+        receipt: crate::feedback::FeedbackReceipt,
+    },
+    Attachment {
+        response: crate::attachments::AttachmentResponse,
+    },
     Commands {
         commands: Vec<SlashCommand>,
     },
@@ -102,6 +115,7 @@ pub fn commands() -> Vec<SlashCommand> {
 
 pub fn prepare(request: NativeRequest) -> Result<Operation> {
     let command = match request {
+        NativeRequest::Attachment { request } => RuntimeCommand::Attachment { request },
         NativeRequest::Observe { input_ids } => {
             ensure!(input_ids.len() <= 32, "Too many pending inputs");
             for id in &input_ids {
@@ -119,10 +133,13 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
             input_id,
             text,
             mode,
+            attachments,
         } => {
             validate_id(&input_id)?;
             ensure!(
-                !text.trim().is_empty() && text.len() <= 65_536,
+                (!text.trim().is_empty()
+                    || attachments.as_ref().is_some_and(|items| !items.is_empty()))
+                    && text.len() <= 65_536,
                 "Input must contain 1 to 65536 UTF-8 bytes"
             );
             if let Some(control) = ChatCommand::parse(&text) {
@@ -135,6 +152,17 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                         }));
                     }
                 };
+                ensure!(
+                    attachments
+                        .as_ref()
+                        .is_none_or(|items| items.len() <= crate::attachments::MAX_ATTACHMENTS),
+                    "Choose at most eight attachments"
+                );
+                if !matches!(&control, ChatCommand::Feedback { .. })
+                    && attachments.as_ref().is_some_and(|items| !items.is_empty())
+                {
+                    return Ok(Operation::Local(NativeEvent::Rejected { input_id, message: "This command does not accept attachments; use /feedback or send a message.".into() }));
+                }
                 if let ChatCommand::RunJob(args) = &control {
                     return Ok(Operation::Runtime(Box::new(
                         args.request_with_id(format!("native-job:{input_id}")),
@@ -157,7 +185,7 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                     },
                     ChatCommand::Machines => RuntimeCommand::Environment { telemetry: true },
                     ChatCommand::Feedback { description } => RuntimeCommand::MainFeedback {
-                        description: description.join(" "),
+                        description: description.join(" "), input_id: attachments.as_ref().map(|_| input_id), attachments,
                     },
                     ChatCommand::Resume { .. } => return Ok(Operation::Local(NativeEvent::Rejected {
                         input_id, message: "This phone client stays on the main conversation. Saved conversation viewing with /resume is available in the TUI.".into(),
@@ -172,6 +200,7 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                     input: text,
                     mode,
                     context: None,
+                    attachments,
                 }
             }
         }
@@ -204,6 +233,9 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
         return Some(NativeEvent::Notice { text });
     }
     Some(match event {
+        RuntimeEventKind::Attachment { response } => NativeEvent::Attachment {
+            response: response.clone(),
+        },
         RuntimeEventKind::MainReady {
             conversation_id,
             model,
@@ -276,7 +308,17 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             }
             .format(std::time::SystemTime::now()),
         },
-        RuntimeEventKind::FeedbackReady { receipt } => NativeEvent::Notice {
+        RuntimeEventKind::FeedbackReady {
+            receipt,
+            input_id: Some(input_id),
+        } => NativeEvent::FeedbackReady {
+            input_id: input_id.clone(),
+            receipt: receipt.clone(),
+        },
+        RuntimeEventKind::FeedbackReady {
+            receipt,
+            input_id: None,
+        } => NativeEvent::Notice {
             text: format!("Feedback saved. Repair task: {}", receipt.task_id),
         },
         _ => return None,
@@ -289,10 +331,85 @@ mod tests {
         native::{NativeRequest, Operation, prepare},
         protocol::{InputMode, RuntimeCommand},
     };
+
+    #[test]
+    fn omitted_attachment_fields_preserve_old_wire_and_new_feedback_has_a_correlated_receipt() {
+        let input_id = uuid::Uuid::new_v4().to_string();
+        let legacy: NativeRequest = serde_json::from_str(&format!(r#"{{"type":"submit","input_id":"{input_id}","text":"/feedback report","mode":"steer"}}"#)).unwrap();
+        assert!(
+            !String::from_utf8(serde_json::to_vec(&legacy).unwrap())
+                .unwrap()
+                .contains("attachments")
+        );
+        let Operation::Runtime(command) = prepare(legacy).unwrap() else {
+            panic!("Expected shared feedback")
+        };
+        assert!(matches!(
+            *command,
+            RuntimeCommand::MainFeedback {
+                input_id: None,
+                attachments: None,
+                ..
+            }
+        ));
+        let Operation::Runtime(command) = prepare(NativeRequest::Submit {
+            input_id: input_id.clone(),
+            text: "/feedback report".into(),
+            mode: InputMode::Steer,
+            attachments: Some(vec![]),
+        })
+        .unwrap() else {
+            panic!("Expected shared feedback")
+        };
+        assert!(
+            matches!(*command, RuntimeCommand::MainFeedback { input_id: Some(ref id), .. } if id == &input_id)
+        );
+        let receipt = crate::feedback::FeedbackReceipt {
+            id: input_id.clone(),
+            path: "/invented/private/feedback.json".into(),
+            task_id: crate::protocol::TaskId::new(),
+            agent_id: None,
+        };
+        assert!(matches!(
+            crate::native::project(&crate::protocol::RuntimeEventKind::FeedbackReady {
+                receipt: receipt.clone(),
+                input_id: None
+            }),
+            Some(crate::native::NativeEvent::Notice { .. })
+        ));
+        assert!(
+            matches!(crate::native::project(&crate::protocol::RuntimeEventKind::FeedbackReady { receipt, input_id: Some(input_id.clone()) }), Some(crate::native::NativeEvent::FeedbackReady { input_id: id, .. }) if id == input_id)
+        );
+    }
+
+    #[test]
+    fn file_only_input_reaches_main_but_control_commands_preserve_the_attachment_draft() {
+        let attachment = crate::attachments::AttachmentRef {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "screenshot.png".into(),
+            media_type: "image/png".into(),
+            size_bytes: 0,
+            sha256: "0".repeat(64),
+        };
+        let request = |text: &str| NativeRequest::Submit {
+            input_id: uuid::Uuid::new_v4().to_string(),
+            text: text.into(),
+            mode: InputMode::Steer,
+            attachments: Some(vec![attachment.clone()]),
+        };
+        assert!(
+            matches!(prepare(request("")).unwrap(), Operation::Runtime(command) if matches!(*command, RuntimeCommand::MainInput { ref attachments, .. } if attachments.as_ref().unwrap() == std::slice::from_ref(&attachment)))
+        );
+        assert!(matches!(
+            prepare(request("/help")).unwrap(),
+            Operation::Local(crate::native::NativeEvent::Rejected { .. })
+        ));
+    }
     #[test]
     fn manual_job_controls_reuse_native_input_identity_across_retries() {
         let input_id = uuid::Uuid::new_v4().to_string();
         let request = || NativeRequest::Submit {
+            attachments: None,
             input_id: input_id.clone(),
             text: "/run-job Daily_Review.v2 --schedule Morning.v1".into(),
             mode: InputMode::Steer,
@@ -339,6 +456,7 @@ mod tests {
         for input_id in [String::new(), uuid::Uuid::nil().to_string()] {
             assert!(
                 prepare(NativeRequest::Submit {
+                    attachments: None,
                     input_id,
                     text: "Hello".into(),
                     mode: InputMode::Steer
@@ -355,6 +473,7 @@ mod tests {
         for text in [" ".to_owned(), "🦀".repeat(16385)] {
             assert!(
                 prepare(NativeRequest::Submit {
+                    attachments: None,
                     input_id: uuid::Uuid::new_v4().to_string(),
                     text,
                     mode: InputMode::Steer
@@ -373,6 +492,7 @@ mod tests {
         );
         assert!(matches!(
             prepare(NativeRequest::Submit {
+                attachments: None,
                 input_id: uuid::Uuid::new_v4().to_string(),
                 text: "/resume saved-chat".into(),
                 mode: InputMode::Steer
@@ -397,6 +517,7 @@ mod tests {
             "/quit",
         ] {
             let operation = prepare(NativeRequest::Submit {
+                attachments: None,
                 input_id: uuid::Uuid::new_v4().to_string(),
                 text: text.into(),
                 mode: InputMode::Steer,
@@ -412,6 +533,7 @@ mod tests {
         }
         assert!(
             prepare(NativeRequest::Submit {
+                attachments: None,
                 input_id: "invalid".into(),
                 text: "Hi".into(),
                 mode: InputMode::Steer

@@ -282,6 +282,23 @@ impl Runtime {
         }
     }
 
+    pub(crate) fn record_peer_rejected(&self, peer: std::net::SocketAddr, reason: &str) {
+        if let Ok(mut diagnostics) = self.service_diagnostics.lock() {
+            diagnostics.record(
+                0,
+                &Trace::unowned(),
+                DiagnosticEvent::PeerRejected {
+                    peer,
+                    reason: reason
+                        .chars()
+                        .filter(|character| !character.is_control())
+                        .take(256)
+                        .collect(),
+                },
+            );
+        }
+    }
+
     pub async fn close(mut self) -> Result<()> {
         let _ = self.shutdown.send(true);
         match self.actor.take() {
@@ -695,6 +712,7 @@ process.stdin.on('data',chunk=>{
         let submission = tokio::spawn(async move {
             owner
                 .request(RuntimeCommand::Chat {
+                    attachments: None,
                     input: "x".repeat(2 * 1024 * 1024),
                     input_id: Some("large-input".into()),
                     instructions: String::new(),
@@ -804,6 +822,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
         let submission = tokio::spawn(async move {
             owner
                 .request(RuntimeCommand::Chat {
+                    attachments: None,
                     input: "x".repeat(2 * 1024 * 1024),
                     input_id: Some("canceled-input".into()),
                     instructions: String::new(),
@@ -886,6 +905,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
             .commands
             .send(CommandMessage::Request {
                 command: Box::new(RuntimeCommand::Chat {
+                    attachments: None,
                     input: "x".repeat(2 * 1024 * 1024),
                     input_id: Some("blocked-input".into()),
                     instructions: String::new(),
@@ -1038,6 +1058,7 @@ createInterface({input:process.stdin}).on('line',line=>{
         let runtime = Runtime::start(&script, state.path()).unwrap();
         let mut call = runtime
             .request(RuntimeCommand::Chat {
+                attachments: None,
                 input: "PRIVATE_PROMPT_SENTINEL".into(),
                 input_id: Some("initial-input".into()),
                 instructions: "PRIVATE_INSTRUCTIONS_SENTINEL".into(),
@@ -1075,6 +1096,7 @@ createInterface({input:process.stdin}).on('line',line=>{
                 .worker_control(
                     request_id,
                     RuntimeCommand::SubmitInput {
+                        attachments: None,
                         input_id: "queued-input".into(),
                         input: "PRIVATE_STEERING_SENTINEL".into(),
                         mode: InputMode::FollowUp,
@@ -1098,6 +1120,7 @@ createInterface({input:process.stdin}).on('line',line=>{
             .worker_control(
                 request_id,
                 RuntimeCommand::SubmitInput {
+                    attachments: None,
                     input_id: "late-input".into(),
                     input: "PRIVATE_LATE_INPUT_SENTINEL".into(),
                     mode: InputMode::Steer,

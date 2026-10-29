@@ -1,6 +1,11 @@
+{"type":"native","request":{"type":"attachment","request":{"type":"upload","id":"example","name":"example","media_type":"example","size_bytes":1,"offset":1,"data_base64":"example","complete":false}}}
+{"type":"native","request":{"type":"attachment","request":{"type":"upload","id":"example","name":"example","media_type":"example","size_bytes":1,"offset":1,"data_base64":"example","complete":true}}}
+{"type":"native","request":{"type":"attachment","request":{"type":"download","id":"example","offset":1,"limit":1}}}
+{"type":"native","request":{"type":"attachment","request":{"type":"discard","id":"example"}}}
 {"type":"native","request":{"type":"observe","input_ids":["example"]}}
+{"type":"native","request":{"type":"submit","input_id":"example","text":"example","mode":"steer","attachments":[{"id":"example","name":"example","media_type":"example","size_bytes":1,"sha256":"example"}]}}
 {"type":"native","request":{"type":"submit","input_id":"example","text":"example","mode":"steer"}}
-{"type":"native","request":{"type":"submit","input_id":"example","text":"example","mode":"follow_up"}}
+{"type":"native","request":{"type":"submit","input_id":"example","text":"example","mode":"follow_up","attachments":[{"id":"example","name":"example","media_type":"example","size_bytes":1,"sha256":"example"}]}}
 {"type":"native","request":{"type":"history","cursor":"example"}}
 {"type":"native","request":{"type":"history","cursor":null}}
 {"type":"native","request":{"type":"interrupt"}}

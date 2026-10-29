@@ -56,6 +56,10 @@ pub(crate) enum Event {
     ServiceShutdown {
         signal: crate::runtime::ShutdownSignal,
     },
+    PeerRejected {
+        peer: std::net::SocketAddr,
+        reason: String,
+    },
     RequestReceived,
     CommandSent {
         command: String,
@@ -1254,6 +1258,7 @@ mod tests {
         let mut diagnostics = Diagnostics { sender, dropped: 0 };
         let commands = [
             RuntimeCommand::MainInput {
+                attachments: None,
                 input_id: "main-input".into(),
                 input: "A private input body".into(),
                 mode: InputMode::Steer,
@@ -1265,6 +1270,7 @@ mod tests {
                 }),
             },
             RuntimeCommand::ConversationInput {
+                attachments: None,
                 conversation_id: "saved-conversation".into(),
                 input_id: "saved-input".into(),
                 input: "Another private input body".into(),

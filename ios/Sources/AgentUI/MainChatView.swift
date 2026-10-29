@@ -1,11 +1,22 @@
 import AgentCore
 import SwiftUI
+import UniformTypeIdentifiers
+
+#if os(iOS)
+  import PhotosUI
+  import QuickLook
+#endif
 
 public struct MainChatView: View {
   @State private var model = ChatModel()
   @State private var settings = false
   @State private var followsLatest = true
   @State private var userScrolling = false
+  @State private var importingFiles = false
+  #if os(iOS)
+    @State private var selectedPhoto: PhotosPickerItem?
+    @State private var capture = AppScreenshot()
+  #endif
   @AppStorage("coordinatorAddress") private var host = ""
   @AppStorage("coordinatorPort") private var port = "43187"
   @Environment(\.scenePhase) private var scenePhase
@@ -37,6 +48,30 @@ public struct MainChatView: View {
         }
       }
       .sheet(isPresented: $settings) { connectionSettings }
+      .fileImporter(
+        isPresented: $importingFiles, allowedContentTypes: [.item], allowsMultipleSelection: true
+      ) { result in
+        switch result {
+        case .success(let urls): Task { await model.attach(urls: urls) }
+        case .failure(let error): model.error = error.localizedDescription
+        }
+      }
+      .dropDestination(for: URL.self) { urls, _ in
+        guard !urls.isEmpty else { return false }
+        Task { await model.attach(urls: urls) }
+        return true
+      }
+      #if os(iOS)
+        .background(ScreenshotAnchor(capture: capture).frame(width: 0, height: 0))
+        .quickLookPreview($model.previewURL)
+        .onChange(of: selectedPhoto) { _, photo in
+          guard let photo else { return }
+          Task {
+            defer { selectedPhoto = nil }
+            await model.attach(photo: photo)
+          }
+        }
+      #endif
       .task {
         // Keep the SwiftUI-owned task alive. Cancellation on removal
         // tears down both the UI subscription and its network owner.
@@ -51,8 +86,8 @@ public struct MainChatView: View {
       Circle().fill(model.connection == .connected ? .green : .secondary).frame(width: 7, height: 7)
         .accessibilityHidden(true)
       VStack(alignment: .leading, spacing: 2) {
-        Text(model.connection.label).font(.caption).foregroundStyle(.secondary)
-        Text(model.model).font(.caption).lineLimit(2)
+        Text(model.connection.label).font(.caption).foregroundStyle(.primary)
+        Text(model.model).font(.caption).fixedSize(horizontal: false, vertical: true)
       }
       Spacer()
       if model.busy { ProgressView().controlSize(.small).accessibilityLabel("Agent is working") }
@@ -76,16 +111,14 @@ public struct MainChatView: View {
             .disabled(model.loadingHistory).frame(maxWidth: .infinity).padding(.vertical)
           }
           if model.rows.isEmpty {
-            ContentUnavailableView(
-              "Main conversation", systemImage: "bubble.left.and.bubble.right",
-              description: Text(
-                "Connect to the existing coordinator. Conversations and work stay on the coordinator."
-              ))
+            Text("No messages yet").font(.callout).foregroundStyle(.primary)
+              .frame(maxWidth: .infinity).padding(.vertical, 32)
           }
           ForEach(model.rows) { row in
             MessageRow(
               model: row, retry: { id in Task { await model.retry(id) } },
-              restore: { id in Task { await model.restore(id) } })
+              restore: { id in Task { await model.restore(id) } },
+              preview: { file in Task { await model.preview(file) } })
           }
           Color.clear.frame(height: 1).id("latest")
         }
@@ -122,21 +155,60 @@ public struct MainChatView: View {
   }
   private var composer: some View {
     VStack(spacing: 8) {
+      if !model.attachments.isEmpty {
+        ScrollView(.horizontal) {
+          HStack(spacing: 8) {
+            ForEach(model.attachments) { file in
+              HStack(spacing: 0) {
+                AttachmentLabel(reference: file.reference)
+                Button("Remove \(file.reference.name)", systemImage: "xmark.circle.fill") {
+                  Task { await model.removeAttachment(file) }
+                }
+                .labelStyle(.iconOnly).frame(minWidth: 44, minHeight: 44)
+                .disabled(model.admitting)
+              }
+            }
+          }
+        }
+      }
       HStack(alignment: .bottom, spacing: 12) {
+        Menu {
+          Button("Choose files", systemImage: "folder") { importingFiles = true }
+          #if os(iOS)
+            PhotosPicker(selection: $selectedPhoto, matching: .images) {
+              Label("Choose photo", systemImage: "photo")
+            }
+          #endif
+        } label: {
+          Image(systemName: "paperclip").frame(width: 44, height: 44)
+        }
+        .disabled(
+          model.preparingAttachments || model.attachments.count >= AttachmentLimits.maximumCount
+        )
+        .accessibilityLabel("Attach files or photos")
         TextField("Message the coordinator", text: $model.draft, axis: .vertical)
           .lineLimit(1...8).textFieldStyle(.plain).padding(12)
           .background(.quaternary, in: RoundedRectangle(cornerRadius: 16))
           .accessibilityLabel("Message the coordinator")
         Button {
-          Task { await model.send() }
+          Task {
+            #if os(iOS)
+              await model.send(screenshot: capture.png)
+            #else
+              await model.send()
+            #endif
+          }
         } label: {
-          Image(systemName: "arrow.up").font(.headline).frame(width: 44, height: 44)
+          Group {
+            if model.admitting || model.preparingAttachments {
+              ProgressView()
+            } else {
+              Image(systemName: "arrow.up").font(.headline)
+            }
+          }.frame(width: 44, height: 44)
         }
         .buttonStyle(.borderedProminent).clipShape(Circle())
-        .disabled(
-          model.admitting || model.connection != .connected
-            || model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        )
+        .disabled(!model.canSend)
         .accessibilityLabel(model.mode == .steer ? "Send message" : "Queue follow-up")
       }
       HStack {
@@ -150,18 +222,19 @@ public struct MainChatView: View {
             }
           }
         } label: {
-          Label("Commands", systemImage: "command")
+          Label("Commands", systemImage: "command").frame(minHeight: 44)
         }
+        .tint(.primary)
         Spacer()
         Picker("Delivery", selection: $model.mode) {
           Text("Steer").tag(InputMode.steer)
           Text("Follow-up").tag(InputMode.followUp)
         }
-        .pickerStyle(.menu).fixedSize()
+        .pickerStyle(.menu).fixedSize().frame(minHeight: 44).contentShape(Rectangle())
         if model.busy {
           Button("Stop", systemImage: "stop.fill", role: .destructive) {
             Task { await model.interrupt() }
-          }
+          }.frame(minHeight: 44).contentShape(Rectangle())
         }
       }
       .font(.caption).controlSize(.small)
@@ -171,22 +244,24 @@ public struct MainChatView: View {
   private var connectionSettings: some View {
     NavigationStack {
       Form {
-        Section("Coordinator") {
-          TextField("Tailscale IPv4 address", text: $host)
-            #if os(iOS)
-              .keyboardType(.decimalPad).textInputAutocapitalization(.never)
-            #endif
-            .autocorrectionDisabled()
-          TextField("Port", text: $port)
-            #if os(iOS)
-              .keyboardType(.numberPad)
-            #endif
-        }
         Section {
-          Text(
-            "Tailscale must be connected on this device. The coordinator verifies the peer using its existing trust policy. No agent or model credentials belong on this phone."
-          )
-          Text("Attachments, notifications, and voice input are not part of this version.")
+          VStack(alignment: .leading, spacing: 8) {
+            Text("Tailscale address").font(.subheadline)
+            TextField("", text: $host, prompt: Text("machine.example.ts.net"), axis: .vertical)
+              #if os(iOS)
+                .keyboardType(.URL).textInputAutocapitalization(.never)
+              #endif
+              .lineLimit(1...3).fixedSize(horizontal: false, vertical: true)
+              .autocorrectionDisabled().accessibilityIdentifier("coordinatorAddress")
+              .accessibilityLabel("Tailscale address")
+          }
+          LabeledContent("Port") {
+            TextField("", text: $port, prompt: Text("43187"))
+              #if os(iOS)
+                .keyboardType(.numberPad)
+              #endif
+              .accessibilityIdentifier("coordinatorPort")
+          }
         }
         if let error = model.error { Text(error).foregroundStyle(.red) }
         Button("Connect") {
@@ -194,17 +269,25 @@ public struct MainChatView: View {
             await model.connect(host: host, port: port)
             if model.error == nil { settings = false }
           }
-        }
+        }.disabled(!validAddress)
         Button("Disconnect", role: .destructive) {
           Task { await model.stop() }
           settings = false
-        }
+        }.disabled(model.connection == .disconnected)
       }
       .navigationTitle("Connection")
       .toolbar {
-        ToolbarItem(placement: .cancellationAction) { Button("Done") { settings = false } }
+        ToolbarItem(placement: .confirmationAction) {
+          Button("Done") { settings = false }.accessibilityIdentifier("dismissConnection")
+        }
       }
     }
+  }
+  private var validAddress: Bool {
+    guard let port = UInt16(port) else { return false }
+    return
+      (try? CoordinatorAddress(
+        host: host.trimmingCharacters(in: .whitespacesAndNewlines), port: port)) != nil
   }
 }
 
@@ -212,14 +295,19 @@ struct MessageRow: View {
   let model: RowModel
   let retry: (String) -> Void
   let restore: (String) -> Void
+  let preview: (AttachmentRef) -> Void
   @State private var expanded = false
   @Environment(\.dynamicTypeSize) private var typeSize
   @ScaledMetric(relativeTo: .callout) private var toolIconSize = 20
 
-  init(model: RowModel, retry: @escaping (String) -> Void, restore: @escaping (String) -> Void) {
+  init(
+    model: RowModel, retry: @escaping (String) -> Void, restore: @escaping (String) -> Void,
+    preview: @escaping (AttachmentRef) -> Void = { _ in }
+  ) {
     self.model = model
     self.retry = retry
     self.restore = restore
+    self.preview = preview
   }
 
   var body: some View {
@@ -245,7 +333,7 @@ struct MessageRow: View {
           Label("Check / retry", systemImage: "arrow.clockwise")
             .lineLimit(nil).fixedSize(horizontal: false, vertical: true).frame(minHeight: 44)
         }
-        .font(.callout).buttonStyle(.bordered)
+        .font(.callout).buttonStyle(.plain)
         .accessibilityHint(
           "Checks the original message ID and retries without creating another message.")
       }
@@ -255,7 +343,7 @@ struct MessageRow: View {
         } label: {
           Label("Restore to composer", systemImage: "arrow.uturn.backward")
             .lineLimit(nil).fixedSize(horizontal: false, vertical: true).frame(minHeight: 44)
-        }.font(.callout).buttonStyle(.bordered)
+        }.font(.callout).buttonStyle(.plain)
       }
     }
     .padding(.leading, isUser && !typeSize.isAccessibilitySize ? 32 : 0)
@@ -304,6 +392,14 @@ struct MessageRow: View {
         RichMessage(
           blocks: model.row.blocks, textStyle: model.row.role == .commentary ? .callout : .body)
       }
+      ForEach(model.row.attachments, id: \.id) { reference in
+        Button {
+          preview(reference)
+        } label: {
+          AttachmentLabel(reference: reference)
+        }
+        .buttonStyle(.plain).accessibilityHint("Download and preview attachment")
+      }
     }
   }
   private var title: String {
@@ -343,6 +439,7 @@ private struct RichMessage: View {
   let blocks: [RichBlock]
   var textStyle: Font = .body
   @ScaledMetric(relativeTo: .body) private var leading = 3
+  @ScaledMetric(relativeTo: .body) private var columnSpacing = 16
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
       ForEach(blocks.indices, id: \.self) { index in
@@ -370,15 +467,19 @@ private struct RichMessage: View {
           }.padding(12).background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
         case .table(let rows):
           ScrollView(.horizontal) {
-            Grid(alignment: .topLeading, horizontalSpacing: 16, verticalSpacing: 10) {
+            Grid(alignment: .topLeading, horizontalSpacing: columnSpacing, verticalSpacing: 10) {
               ForEach(rows.indices, id: \.self) { row in
                 GridRow {
                   ForEach(rows[row].indices, id: \.self) { column in
                     Text(rows[row][column]).fontWeight(row == 0 ? .semibold : .regular)
-                      .textSelection(.enabled)
+                      .fixedSize(horizontal: true, vertical: false).textSelection(.enabled)
                   }
                 }
-                if row == 0 { Divider().gridCellUnsizedAxes(.horizontal) }
+                if row == 0 {
+                  GridRow {
+                    Divider().gridCellColumns(rows[row].count).gridCellUnsizedAxes(.horizontal)
+                  }
+                }
               }
             }.padding(12)
           }.background(.quaternary, in: RoundedRectangle(cornerRadius: 12))

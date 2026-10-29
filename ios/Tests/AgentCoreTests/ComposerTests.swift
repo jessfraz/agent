@@ -31,7 +31,7 @@ private actor AdmissionGate {
 @MainActor @Test(.timeLimit(.minutes(1)))
 func sendPreservesNewTypingAndCannotAdmitTheSameDraftTwice() async {
   let gate = AdmissionGate()
-  let model = ChatModel(admit: { text, _ in await gate.admit(text) })
+  let model = ChatModel(admit: { text, _, _ in await gate.admit(text) })
   model.connection = .connected
   model.draft = "Original draft"
   let sending = Task { await model.send() }
@@ -47,16 +47,63 @@ func sendPreservesNewTypingAndCannotAdmitTheSameDraftTwice() async {
 
 @MainActor @Test(.timeLimit(.minutes(1)))
 func sendKeepsAnUnadmittedDraftAndClearsOnlyItsAdmittedOriginal() async {
-  let model = ChatModel(admit: { _, _ in false })
+  let model = ChatModel(admit: { _, _, _ in false })
   model.connection = .connected
   model.draft = "Not saved"
   await model.send()
   #expect(model.draft == "Not saved")
-  let admitted = ChatModel(admit: { _, _ in true })
+  let admitted = ChatModel(admit: { _, _, _ in true })
   admitted.connection = .connected
   admitted.draft = "Saved original"
   await admitted.send()
   #expect(admitted.draft.isEmpty)
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func feedbackCapturesOnceAndFailedAdmissionKeepsTheExactScreenshot() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let model = ChatModel(
+    draftStore: AttachmentStore(directory: root), admit: { _, _, _ in false })
+  model.connection = .connected
+  model.draft = "/feedback The text is clipped"
+  var captures = 0
+  await model.send(screenshot: {
+    captures += 1
+    return Data([1, 2, 3])
+  })
+  let original = try #require(model.attachments.first)
+  await model.send(screenshot: {
+    captures += 1
+    return Data([4, 5, 6])
+  })
+  #expect(captures == 1)
+  #expect(model.attachments == [original])
+  #expect(try Data(contentsOf: original.url) == Data([1, 2, 3]))
+  #expect(model.draft == "/feedback The text is clipped")
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func attachmentOnlyAdmissionPreservesFilesAddedWhileTheOriginalIsSaving() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let gate = AdmissionGate()
+  let model = ChatModel(
+    draftStore: AttachmentStore(directory: root),
+    admit: { text, _, files in
+      #expect(text.isEmpty)
+      #expect(files.count == 1)
+      return await gate.admit(text)
+    })
+  model.connection = .connected
+  await model.attach(data: Data([1]), name: "First.txt", mediaType: "text/plain")
+  let sending = Task { await model.send() }
+  for await _ in gate.entered { break }
+  await model.attach(data: Data([2]), name: "Second.txt", mediaType: "text/plain")
+  await gate.finish(true)
+  await sending.value
+  #expect(model.attachments.map(\.reference.name) == ["Second.txt"])
+  #expect(try Data(contentsOf: #require(model.attachments.first).url) == Data([2]))
 }
 
 @MainActor private func connectModelThenRelease(_ session: CoordinatorSession) async throws {

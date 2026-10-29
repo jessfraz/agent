@@ -60,6 +60,21 @@ impl Executor {
 
     pub async fn execute(&self, command: HostCommand) -> HostResult {
         let result = match command {
+            HostCommand::AttachmentWrite {
+                attachment,
+                offset,
+                data_base64,
+                complete,
+            } => {
+                crate::attachments::write_on_host(
+                    &self.state,
+                    attachment,
+                    offset,
+                    data_base64,
+                    complete,
+                )
+                .await
+            }
             HostCommand::Browser { host_id, request } => {
                 async {
                     require_local_host(&host_id).await?;
@@ -196,6 +211,9 @@ pub async fn execute(command: HostCommand) -> HostResult {
 
 async fn execute_inner(command: HostCommand) -> Result<HostResult> {
     match command {
+        HostCommand::AttachmentWrite { .. } => {
+            anyhow::bail!("Attachment transfer needs its owning host executor")
+        }
         HostCommand::History { .. }
         | HostCommand::Browser { .. }
         | HostCommand::Embed { .. }

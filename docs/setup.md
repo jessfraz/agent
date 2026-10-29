@@ -90,6 +90,12 @@ for plain output or `agent --json chat` for protocol events.
 Reopen the CLI after updating it to load presentation changes. Detaching an
 older client preserves server-owned work and saved history.
 
+Drag files into the terminal composer to attach them. Complete shell-escaped
+file paths become attachment chips; ordinary text stays in the prompt. Up to
+eight files of 16 MiB each are copied before transfer. Backspace in an empty
+editor removes the last attachment. Images use Pi's model image input; other
+files are available to agent tools on the execution host.
+
 `/resume` opens a saved-chat picker in this terminal. Filter by title or ID,
 press Enter to choose, or Esc to keep the current chat and draft. Browsing
 history does not start work. A new message reuses the selected conversation's
@@ -197,7 +203,10 @@ repair worker on the originating machine. A repair started inside Rex uses a
 named terminal in that folder; later reports reuse the repair task. From a raw
 CLI, the first report creates its repair session. Results appear in the saved
 main chat. `agent feedback latest` and `agent feedback show <id>` read captures;
-they are never uploaded automatically.
+`agent feedback retry <id>` retries a saved report with its original identity.
+Inside Rex, feedback includes an HTML capture of the originating terminal.
+On iOS, it includes a screenshot of the current app window. Added files follow
+the report to the repair worker. Captures stay in private coordinator storage.
 
 Import existing local Codex conversations after both services are connected:
 
@@ -215,8 +224,10 @@ registered host. An unavailable source is reported as partial coverage, not
 silently skipped. [History](history.md) describes storage and retrieval.
 
 A CLI-only client uses the same `agent init --coordinator ...` command and
-skips the service. Phone access is the Rex phone CLI connected to one of these
-machines, running the same `agent chat` command.
+skips the service. The [native iPhone client](../ios/README.md) connects to the
+same main conversation over Tailscale. Use the coordinator's full MagicDNS
+name and port `43187`; numeric tailnet IPv4 addresses also work. Rex's phone
+CLI remains available for terminal access.
 
 If the coordinator is unavailable, chat reports the failure. If a worker goes
 offline, its tasks remain assigned to it. The MVP does not transfer live work

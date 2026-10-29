@@ -235,6 +235,27 @@ impl RexClient {
         decode(&output)
     }
 
+    /// Capture only the explicitly owned terminal, never the client's focused pane.
+    pub async fn capture_terminal(
+        &self,
+        session: &SessionId,
+        block: &BlockId,
+    ) -> Result<String, RexError> {
+        let output = self
+            .run(vec![
+                "capture".to_owned(),
+                "--session".to_owned(),
+                session.to_string(),
+                "--block".to_owned(),
+                block.to_string(),
+                "--format".to_owned(),
+                "html".to_owned(),
+            ])
+            .await
+            .map_err(read_failure)?;
+        String::from_utf8(output).map_err(|_| RexError::InvalidResponse)
+    }
+
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, RexError> {
         let output = self
             .api("session.list", &Empty {})
@@ -787,6 +808,73 @@ mod tests {
     const WINDOW: &str = "window:22222222-2222-4222-8222-222222222222";
     const BLOCK: &str = "block:33333333-3333-4333-8333-333333333333";
     const HOST: &str = "44444444-4444-4444-8444-444444444444";
+
+    #[tokio::test]
+    async fn terminal_capture_targets_only_the_explicit_pane_and_keeps_rendered_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "AGENT_TEST_REX_CAPTURE_CHILD";
+        const TEST: &str = "rex::tests::terminal_capture_targets_only_the_explicit_pane_and_keeps_rendered_evidence";
+        if std::env::var_os(CHILD).is_some() {
+            let output = RexClient::new(None)
+                .capture_terminal(
+                    &SessionId::parse(SESSION).unwrap(),
+                    &BlockId::parse(BLOCK).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(output, "<pre>Current task view 🦀</pre>\n");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("rex");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+set -eu
+[ -z "${REX_SESSION-}" ] && [ -z "${REX_BLOCK-}" ] && [ -z "${REX_CLIENT-}" ]
+printf '%s\n' "$@" > "$AGENT_TEST_REX_CAPTURE_ARGS"
+printf '<pre>Current task view 🦀</pre>\n'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let arguments = directory.path().join("arguments");
+        let path = std::env::join_paths(std::iter::once(directory.path().to_owned()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env("AGENT_TEST_REX_CAPTURE_ARGS", &arguments)
+            .env("PATH", path)
+            .env("REX_SESSION", "unrelated-session")
+            .env("REX_BLOCK", "unrelated-pane")
+            .env("REX_CLIENT", "unrelated-client")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let actual = std::fs::read_to_string(arguments).unwrap();
+        assert_eq!(
+            actual.lines().collect::<Vec<_>>(),
+            [
+                "--autostart=false",
+                "--timeout",
+                "8s",
+                "capture",
+                "--session",
+                SESSION,
+                "--block",
+                BLOCK,
+                "--format",
+                "html"
+            ]
+        );
+    }
 
     #[test]
     fn validates_native_id_kinds_and_rejects_nil_or_malformed_ids() {

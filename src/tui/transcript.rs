@@ -35,6 +35,7 @@ impl MarkdownBody {
 pub(super) struct CachedText {
     markdown: Option<MarkdownBody>,
     paragraphs: Vec<Paragraph<'static>>,
+    trailing: Vec<Paragraph<'static>>,
     row_ends: Vec<usize>,
     width: Option<u16>,
 }
@@ -47,6 +48,7 @@ impl CachedText {
                 .into_iter()
                 .map(|line| Paragraph::new(line).wrap(Wrap { trim: false }))
                 .collect(),
+            trailing: Vec::new(),
             row_ends: Vec::new(),
             width: None,
         }
@@ -68,9 +70,20 @@ impl CachedText {
         Self {
             markdown,
             paragraphs,
+            trailing: Vec::new(),
             row_ends: Vec::new(),
             width: None,
         }
+    }
+
+    pub(super) fn append_line(&mut self, line: Line<'static>) {
+        let paragraph = Paragraph::new(line).wrap(Wrap { trim: false });
+        if self.markdown.is_some() {
+            self.trailing.push(paragraph);
+        } else {
+            self.paragraphs.push(paragraph);
+        }
+        self.width = None;
     }
 
     #[cfg(test)]
@@ -82,6 +95,7 @@ impl CachedText {
         if self.width != Some(width) {
             if let Some(body) = &self.markdown {
                 self.paragraphs = body.paragraphs(width);
+                self.paragraphs.extend(self.trailing.iter().cloned());
             }
             self.row_ends.clear();
             let mut total = 0;

@@ -33,6 +33,7 @@ use agent_cli::{
     rex::{BlockId, RexClient, SessionId},
     runtime::{FrameReader, decode_coordinator_event},
     service,
+    tui::attachments::ComposerInput,
     tui::{Tui, TuiHandle, TuiInfo, TuiInput},
     usage,
 };
@@ -266,7 +267,13 @@ enum HistoryAction {
 #[derive(Subcommand)]
 enum FeedbackAction {
     Latest,
-    Show { id: String },
+    Show {
+        id: String,
+    },
+    /// Retry the exact locally retained report after an unconfirmed delivery.
+    Retry {
+        id: uuid::Uuid,
+    },
 }
 
 #[derive(Subcommand)]
@@ -640,11 +647,10 @@ async fn main() -> Result<()> {
             JobsAction::Check { .. } => bail!("Job checks must run locally"),
         },
         Action::Nodes => RuntimeCommand::Environment { telemetry: false },
-        Action::Feedback { command } => RuntimeCommand::ReadFeedback {
-            id: match command {
-                FeedbackAction::Latest => None,
-                FeedbackAction::Show { id } => Some(id),
-            },
+        Action::Feedback { command } => match command {
+            FeedbackAction::Latest => RuntimeCommand::ReadFeedback { id: None },
+            FeedbackAction::Show { id } => RuntimeCommand::ReadFeedback { id: Some(id) },
+            FeedbackAction::Retry { id } => read_feedback_submission(&directory, id)?,
         },
         Action::Resources { command } => match command {
             ResourcesAction::List => RuntimeCommand::ListResources,
@@ -1113,8 +1119,8 @@ enum UiRecoveryOwner {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct UiRecovery {
     owner: UiRecoveryOwner,
-    draft: String,
-    queued_inputs: Vec<String>,
+    draft: ComposerInput,
+    queued_inputs: Vec<QueuedInput>,
 }
 
 async fn preserve_ui_recovery(
@@ -1122,7 +1128,7 @@ async fn preserve_ui_recovery(
     owner: UiRecoveryOwner,
     ui: &UiSession,
 ) -> Result<Option<PathBuf>> {
-    let draft = ui.handle.draft().await?;
+    let draft = ui.handle.composer_draft().await?;
     if draft.is_empty() && ui.queued.is_empty() && ui.submitted.is_empty() {
         return Ok(None);
     }
@@ -1134,8 +1140,7 @@ async fn preserve_ui_recovery(
             queued_inputs: ui
                 .queued
                 .iter()
-                .map(|input| &input.text)
-                .chain(ui.submitted.iter().map(|(_, text, _)| text))
+                .chain(ui.submitted.iter())
                 .cloned()
                 .collect(),
         },
@@ -1168,10 +1173,10 @@ fn write_ui_recovery(directory: &Path, recovery: &UiRecovery) -> Result<PathBuf>
     saved?;
     Ok(path)
 }
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct QueuedInput {
     id: String,
-    text: String,
+    input: ComposerInput,
     mode: InputMode,
 }
 
@@ -1183,14 +1188,14 @@ struct UiSession {
     exiting: bool,
     failure_shown: bool,
     conversation_id: Option<String>,
-    submitted: VecDeque<(String, String, InputMode)>,
+    submitted: VecDeque<QueuedInput>,
     errors: VecDeque<String>,
     controls: tokio::task::JoinSet<()>,
     selected: Option<SavedConversation>,
     admissions: tokio::task::JoinSet<()>,
     pending_admissions: Vec<Arc<chat_admission::Admission>>,
     interrupts: HashMap<String, tokio::sync::watch::Receiver<bool>>,
-    drafts: HashMap<String, String>,
+    drafts: HashMap<String, ComposerInput>,
     view: Option<chat_view::View>,
     history: Option<chat_history::Job>,
     initial_replay: Option<agent_cli::tui::HistoryReplay>,
@@ -1260,24 +1265,24 @@ impl UiSession {
                     )
                 ) {
                     if current {
-                        self.handle.restore_input(input.text.clone())?;
+                        self.handle.restore_composer(input.input()?)?;
                     } else {
                         let draft = self
                             .drafts
                             .entry(input.conversation_id.clone())
                             .or_default();
-                        if !draft.is_empty() {
-                            draft.push('\n');
-                        }
-                        draft.push_str(&input.text);
+                        draft.append(input.input()?);
                     }
                 }
             } else if current
                 && let RuntimeEventKind::InputRejected { input_id, .. } = &event
-                && let Some(index) = self.submitted.iter().position(|(id, _, _)| id == input_id)
-                && let Some((_, text, _)) = self.submitted.remove(index)
+                && let Some(index) = self
+                    .submitted
+                    .iter()
+                    .position(|input| &input.id == input_id)
+                && let Some(input) = self.submitted.remove(index)
             {
-                self.handle.restore_input(text)?;
+                self.handle.restore_composer(input.input)?;
             }
         }
         if !current {
@@ -1339,10 +1344,7 @@ impl UiSession {
         for input in &self.pending_admissions {
             if input.conversation_id == conversation_id && input.cancel_waiting()? {
                 let draft = self.drafts.entry(conversation_id.to_owned()).or_default();
-                if !draft.is_empty() {
-                    draft.push('\n');
-                }
-                draft.push_str(&input.text);
+                draft.append(input.input()?);
                 canceled.push(input.id.clone());
             }
         }
@@ -1361,18 +1363,14 @@ impl UiSession {
         self.controls.abort_all();
         while self.controls.join_next().await.is_some() {}
     }
-    fn enqueue(&mut self, input: String, mode: InputMode) -> Result<()> {
+    fn enqueue(&mut self, input: ComposerInput, mode: InputMode) -> Result<()> {
         let id = uuid::Uuid::new_v4().to_string();
-        self.handle.pending_input(id.clone(), input.clone(), mode)?;
-        self.queued.push_back(QueuedInput {
-            id,
-            text: input,
-            mode,
-        });
+        self.handle.pending_composer(id.clone(), &input, mode)?;
+        self.queued.push_back(QueuedInput { id, input, mode });
         Ok(())
     }
     fn placed_input(&mut self, input_id: &str) {
-        if let Some(index) = self.submitted.iter().position(|(id, _, _)| id == input_id) {
+        if let Some(index) = self.submitted.iter().position(|input| input.id == input_id) {
             self.submitted.remove(index);
         }
     }
@@ -1381,7 +1379,7 @@ impl UiSession {
 fn selected_input(
     client: ClientContext<'_>,
     ui: &mut UiSession,
-    text: String,
+    input: ComposerInput,
     mode: InputMode,
     cwd: PathBuf,
 ) -> Result<()> {
@@ -1396,7 +1394,7 @@ fn selected_input(
         .as_ref()
         .context("Conversation view is unavailable")?;
     if view.state() == agent_cli::tui::ObservationState::Disconnected {
-        ui.handle.restore_input(text)?;
+        ui.handle.restore_composer(input)?;
         ui.handle.notice(format!(
             "Reconnect with `/resume {conversation_id}` before sending. Saved work may still be running."
         ))?;
@@ -1405,11 +1403,11 @@ fn selected_input(
     let token = view.token;
     let mut ready = view.ready.clone();
     let interrupt = ui.interrupts.get(&conversation_id).cloned();
-    let admission = Arc::new(chat_admission::Admission::new(conversation_id, text, mode));
+    let admission = Arc::new(chat_admission::Admission::new(conversation_id, input, mode));
     ui.pending_admissions
         .retain(|input| !matches!(input.retained(), Ok(false)));
     ui.handle
-        .pending_input(admission.id.clone(), admission.text.clone(), admission.mode)?;
+        .pending_composer(admission.id.clone(), &admission.input()?, admission.mode)?;
     ui.pending_admissions.push(admission.clone());
     let sender = ui.view_sender.clone();
     let config = client.config.clone();
@@ -1427,6 +1425,15 @@ fn selected_input(
                 }
                 return Err(chat_view::ViewError::Coordinator(anyhow::anyhow!("The conversation view did not attach; this input remains unsent.")));
             }
+            if admission.stage()? == chat_admission::Stage::Canceled {
+                return Ok(());
+            }
+            let mut input = admission.input()?;
+            let prepared = prepare_attachments(ClientContext {
+                config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory,
+            }, &mut input).await;
+            admission.prepared(input.clone())?;
+            prepared?;
             if admission.stage()? == chat_admission::Stage::Canceled {
                 return Ok(());
             }
@@ -1468,6 +1475,7 @@ fn selected_input(
                     conversation_id: admission.conversation_id.clone(),
                     input_id: admission.id.clone(),
                     input: admission.text.clone(),
+                    attachments: (!input.attachments.is_empty()).then_some(input.attachments),
                     mode: admission.mode,
                     context: Some(context),
                 },
@@ -1501,7 +1509,7 @@ async fn selected_interrupt(client: ClientContext<'_>, ui: &mut UiSession) -> Re
     };
     let conversation_id = selected.conversation_id.clone();
     ui.drafts
-        .insert(conversation_id.clone(), ui.handle.draft().await?);
+        .insert(conversation_id.clone(), ui.handle.composer_draft().await?);
     let canceled = ui.cancel_waiting(&conversation_id)?;
     for input_id in &canceled {
         ui.handle.event(RuntimeEventKind::InputRejected {
@@ -1511,7 +1519,7 @@ async fn selected_interrupt(client: ClientContext<'_>, ui: &mut UiSession) -> Re
     }
     if !canceled.is_empty() {
         ui.handle
-            .set_draft(ui.drafts.get(&conversation_id).cloned().unwrap_or_default())?;
+            .set_composer(ui.drafts.get(&conversation_id).cloned().unwrap_or_default())?;
     }
     // The stop and later input use independent connections. Retain their
     // conversation order so a delayed stop cannot abort the next request.
@@ -1586,6 +1594,7 @@ async fn feedback_context(
         queued_inputs: Vec::new(),
         client_errors: Vec::new(),
         truncated: None,
+        attachments: None,
     })
 }
 
@@ -1596,7 +1605,7 @@ fn feedback_from_ui(
     directory: &Path,
     ui: &mut UiSession,
     target: Option<(TaskId, Option<String>)>,
-    description: String,
+    input: ComposerInput,
 ) {
     let config = config.clone();
     let coordinator = coordinator.map(str::to_owned);
@@ -1607,13 +1616,16 @@ fn feedback_from_ui(
     let queued_inputs = ui
         .queued
         .iter()
-        .map(|input| &input.text)
-        .chain(ui.submitted.iter().map(|(_, text, _)| text))
+        .map(|input| &input.input.text)
+        .chain(ui.submitted.iter().map(|input| &input.input.text))
         .cloned()
         .collect();
     let client_errors = ui.errors.iter().cloned().collect();
     while ui.controls.try_join_next().is_some() {}
     ui.controls.spawn(async move {
+        let input_id = uuid::Uuid::new_v4();
+        let mut input = input;
+        let mut submitted = false;
         let result = async {
             let info = handle.info().await?;
             let draft = handle.draft().await?;
@@ -1622,20 +1634,58 @@ fn feedback_from_ui(
             context.draft = draft;
             context.queued_inputs = queued_inputs;
             context.client_errors = client_errors;
-            exchange(
+            // Capture the origin pane before feedback can create a repair worker.
+            // Rex's supported visual format is HTML, not a whole-desktop image.
+            let capture = if input.attachment_count() < agent_cli::attachments::MAX_ATTACHMENTS {
+                match context.binding.as_ref() {
+                    Some(binding) => match capture_feedback_view(&directory, binding).await {
+                        Ok(capture) => Some(capture),
+                        Err(error) => {
+                            context.client_errors.push(format!("Terminal view capture unavailable: {error}"));
+                            None
+                        }
+                    },
+                    None => {
+                        context.client_errors.push("No exact Rex pane was available for a terminal view capture.".into());
+                        None
+                    }
+                }
+            } else {
+                context.client_errors.push("Terminal view capture omitted because all attachment slots are occupied.".into());
+                None
+            };
+            if let Some(capture) = &capture {
+                input.files.push(agent_cli::tui::attachments::ComposerFile::read_metadata(capture.path.clone())?);
+            }
+            let prepared = prepare_attachments(ClientContext {config:&config,coordinator:coordinator.as_deref(),script:&script,directory:&directory}, &mut input).await;
+            if prepared.is_err() && let Some(capture)=&capture {
+                input.files.retain(|file| file.path != capture.path);
+            }
+            prepared?;
+            context.attachments = (!input.attachments.is_empty()).then(||input.attachments.clone());
+            let mut command = context.command(input.text.clone());
+            if let RuntimeCommand::Feedback { input_id: id, .. } = &mut command {
+                *id = Some(input_id.to_string());
+            }
+            write_feedback_submission(&directory,input_id,&command)?;
+            submitted = true;
+            let events = exchange(
                 &config,
                 coordinator.as_deref(),
                 &script,
                 &directory,
-                context.command(description),
+                command,
             )
-            .await
+            .await?;
+            ensure!(events.iter().any(|event|matches!(event,RuntimeEventKind::FeedbackReady{input_id:Some(id),..} if id==&input_id.to_string())),"Feedback admission was not confirmed");
+            acknowledge_feedback_submission(&directory,&input_id.to_string());
+            Ok::<_,anyhow::Error>(events)
         }
         .await;
         match result {
             Ok(events) => {
                 for event in events {
-                    if let RuntimeEventKind::FeedbackReady { receipt } = event {
+                    if let RuntimeEventKind::FeedbackReady { receipt, .. } = event {
                         let _ = handle.notice(format!(
                             "Feedback {}: debugging in the background; results will return here.",
                             receipt.id
@@ -1644,10 +1694,116 @@ fn feedback_from_ui(
                 }
             }
             Err(error) => {
-                let _ = handle.notice(format!("Feedback could not start: {error}"));
+                if submitted {
+                    let _=handle.notice(format!("Feedback delivery is unconfirmed: {error}. The original report was retained; check `agent feedback latest` before retrying with `agent feedback retry {input_id}`."));
+                } else {
+                    input.text = if input.text.is_empty() {"/feedback".into()} else {format!("/feedback {}",input.text)};
+                    let _=handle.restore_composer(input);
+                    let _ = handle.notice(format!("Feedback was not sent: {error}"));
+                }
             }
         }
     });
+}
+
+struct FeedbackViewCapture {
+    path: PathBuf,
+}
+impl Drop for FeedbackViewCapture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(directory) = self.path.parent() {
+            let _ = std::fs::remove_dir(directory);
+        }
+    }
+}
+async fn capture_feedback_view(
+    directory: &Path,
+    binding: &WorkerRef,
+) -> Result<FeedbackViewCapture> {
+    use std::io::Write;
+    use std::os::unix::fs::DirBuilderExt;
+    let html = RexClient::new(None)
+        .capture_terminal(
+            &SessionId::parse(&binding.session_id)?,
+            &BlockId::parse(&binding.block_id)?,
+        )
+        .await?;
+    let folder = directory
+        .join("feedback-views")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&folder)?;
+    let capture = FeedbackViewCapture {
+        path: folder.join("terminal-view.html"),
+    };
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&capture.path)?;
+    file.write_all(html.as_bytes())?;
+    file.sync_all()?;
+    Ok(capture)
+}
+fn write_feedback_submission(
+    directory: &Path,
+    id: uuid::Uuid,
+    command: &RuntimeCommand,
+) -> Result<()> {
+    use std::{io::Write, os::unix::fs::DirBuilderExt};
+    let folder = directory.join("feedback-outbox");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&folder)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(folder.join(format!("{id}.json")))?;
+    file.write_all(&serde_json::to_vec(command)?)?;
+    file.sync_all()?;
+    Ok(())
+}
+fn read_feedback_submission(directory: &Path, id: uuid::Uuid) -> Result<RuntimeCommand> {
+    ensure!(!id.is_nil(), "Invalid feedback input ID");
+    let command: RuntimeCommand = serde_json::from_slice(&std::fs::read(
+        directory.join("feedback-outbox").join(format!("{id}.json")),
+    )?)?;
+    ensure!(
+        matches!(&command,RuntimeCommand::Feedback {input_id:Some(saved),..} if saved==&id.to_string()),
+        "The retained report does not match this feedback input ID"
+    );
+    Ok(command)
+}
+fn acknowledge_feedback_submission(directory: &Path, id: &str) {
+    if let Ok(id) = uuid::Uuid::parse_str(id) {
+        let _ = std::fs::remove_file(directory.join("feedback-outbox").join(format!("{id}.json")));
+    }
+}
+fn acknowledge_feedback_event(
+    directory: &Path,
+    command: &RuntimeCommand,
+    event: &RuntimeEventKind,
+) -> Result<()> {
+    if let (
+        RuntimeCommand::Feedback {
+            input_id: Some(expected),
+            ..
+        },
+        RuntimeEventKind::FeedbackReady { input_id, .. },
+    ) = (command, event)
+    {
+        ensure!(
+            input_id.as_ref() == Some(expected),
+            "Feedback receipt does not match the submitted report"
+        );
+        acknowledge_feedback_submission(directory, expected);
+    }
+    Ok(())
 }
 
 async fn finish_controls(admissions: &mut tokio::task::JoinSet<()>) {
@@ -1908,6 +2064,77 @@ struct ClientContext<'a> {
     directory: &'a Path,
 }
 
+async fn prepare_attachments(client: ClientContext<'_>, input: &mut ComposerInput) -> Result<()> {
+    use agent_cli::attachments::{MAX_ATTACHMENTS, upload_file};
+    ensure!(
+        input.attachment_count() <= MAX_ATTACHMENTS,
+        "Attach at most 8 files"
+    );
+    if input.files.is_empty() {
+        return Ok(());
+    }
+    let Wire {
+        reader,
+        writer,
+        child,
+    } = connection(
+        client.config,
+        client.coordinator,
+        client.script,
+        client.directory,
+        false,
+    )
+    .await?;
+    // The upload callback owns this one connection across chunks, including
+    // its buffered reader and any local relay child.
+    let transfer = Arc::new(tokio::sync::Mutex::new((
+        FrameReader::new(BufReader::new(reader)),
+        writer,
+        child,
+    )));
+    while let Some(file) = input.files.first().cloned() {
+        let attachment = upload_file(&file.path, |request| {
+            let transfer = transfer.clone();
+            async move {
+                let mut owned = transfer.lock().await;
+                let (reader, writer, _child) = &mut *owned;
+                write_command(&mut **writer, &RuntimeCommand::Attachment { request }).await?;
+                timeout(Duration::from_secs(30), async {
+                    let mut response = None;
+                    loop {
+                        let frame = reader
+                            .next_frame()
+                            .await?
+                            .context("Coordinator disconnected during attachment upload")?;
+                        match decode_coordinator_event(&frame)? {
+                            RuntimeEventKind::Attachment { response: value }
+                                if response.is_none() =>
+                            {
+                                response = Some(value)
+                            }
+                            RuntimeEventKind::Done => {
+                                return response.context("Attachment upload returned no receipt");
+                            }
+                            RuntimeEventKind::Failure { message, .. } => {
+                                bail!("Attachment could not be uploaded: {message}")
+                            }
+                            _ => {
+                                bail!("The coordinator returned an unexpected attachment response")
+                            }
+                        }
+                    }
+                })
+                .await
+                .context("Attachment upload timed out")?
+            }
+        })
+        .await?;
+        input.attachments.push(attachment);
+        input.files.remove(0);
+    }
+    Ok(())
+}
+
 async fn machine_inventory(
     client: ClientContext<'_>,
 ) -> Result<agent_cli::machines::MachineInventory> {
@@ -2135,7 +2362,7 @@ async fn chat_tui(
                     }
                 }
             } else {
-                selected_input(client, &mut ui, prompt, InputMode::Steer, cwd.to_owned())?;
+                selected_input(client, &mut ui, prompt.into(), InputMode::Steer, cwd.to_owned())?;
             }
             initial_prompt = None;
         }
@@ -2204,15 +2431,29 @@ async fn chat_tui(
     }
     let queued_inputs = initial_prompt
         .into_iter()
+        .map(|text| QueuedInput {
+            id: uuid::Uuid::new_v4().to_string(),
+            input: text.into(),
+            mode: InputMode::Steer,
+        })
         .chain(startup_inputs.iter().filter_map(|input| match input {
-            TuiInput::Submit(text) | TuiInput::Queue(text) => Some(text.clone()),
+            TuiInput::Submit(input) => Some(QueuedInput {
+                id: uuid::Uuid::new_v4().to_string(),
+                input: input.clone(),
+                mode: InputMode::Steer,
+            }),
+            TuiInput::Queue(input) => Some(QueuedInput {
+                id: uuid::Uuid::new_v4().to_string(),
+                input: input.clone(),
+                mode: InputMode::FollowUp,
+            }),
             _ => None,
         }))
         .collect::<Vec<_>>();
     let recovery = if ui.selected.is_none() || !queued_inputs.is_empty() {
         Some(
             async {
-                let draft = ui.handle.draft().await?;
+                let draft = ui.handle.composer_draft().await?;
                 if draft.is_empty() && queued_inputs.is_empty() {
                     return Ok(None);
                 }
@@ -2255,6 +2496,7 @@ async fn exchange(
     directory: &Path,
     command: RuntimeCommand,
 ) -> Result<Vec<RuntimeEventKind>> {
+    let feedback = matches!(&command, RuntimeCommand::Feedback { .. });
     let mut wire = connection(config, coordinator, script, directory, false).await?;
     write_command(&mut *wire.writer, &command).await?;
     let mut reader = FrameReader::new(BufReader::new(wire.reader));
@@ -2265,7 +2507,12 @@ async fn exchange(
             .await?
             .context("Coordinator disconnected")?;
         let event = decode_coordinator_event(&frame)?;
+        acknowledge_feedback_event(directory, &command, &event)?;
         match event {
+            event @ RuntimeEventKind::FeedbackReady { .. } if feedback => {
+                events.push(event);
+                return Ok(events);
+            }
             RuntimeEventKind::Done => return Ok(events),
             RuntimeEventKind::Failure { message, .. } => bail!(message),
             RuntimeEventKind::HostCall { .. } => {
@@ -2472,6 +2719,7 @@ async fn chat_command(
     }
     Ok(RuntimeCommand::Chat {
         input,
+        attachments: None,
         input_id: None,
         instructions: instructions::project(cwd)?,
         model,
@@ -2843,18 +3091,25 @@ async fn request_presented(
                 let action = action.unwrap_or(TuiInput::Exit);
                 let mode = if matches!(action, TuiInput::Queue(_)) { InputMode::FollowUp } else { InputMode::Steer };
                 match action {
-                    TuiInput::Submit(text) | TuiInput::Queue(text) => {
+                    TuiInput::Submit(mut input) | TuiInput::Queue(mut input) => {
                         let ui = presentation.as_mut().and_then(|view| view.session.as_deref_mut()).context("Missing terminal input owner")?;
                         if ui.selected.is_some() {
                             let cwd=feedback_settings.as_ref().map(|(_,cwd)|PathBuf::from(cwd)).unwrap_or(env::current_dir()?);
-                            selected_input(ClientContext{config,coordinator,script,directory},ui,text,mode,cwd)?;
-                        } else if (chat && (!main_view || ready)) || (attached && ready) {
-                            active_turn = true;
-                            let input_id = uuid::Uuid::new_v4().to_string();
-                            ui.handle.pending_input(input_id.clone(), text.clone(), mode)?;
-                            ui.submitted.push_back((input_id.clone(), text.clone(), mode));
-                            write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: text, mode }).await?;
-                        } else { ui.enqueue(text, mode)?; }
+                            selected_input(ClientContext{config,coordinator,script,directory},ui,input,mode,cwd)?;
+                        } else {
+                            if let Err(error) = prepare_attachments(ClientContext{config,coordinator,script,directory}, &mut input).await {
+                                ui.handle.restore_composer(input)?;
+                                ui.handle.notice(format!("Nothing was sent: {error}"))?;
+                                continue;
+                            }
+                            if (chat && (!main_view || ready)) || (attached && ready) {
+                                active_turn = true;
+                                let input_id = uuid::Uuid::new_v4().to_string();
+                                ui.handle.pending_composer(input_id.clone(), &input, mode)?;
+                                ui.submitted.push_back(QueuedInput {id:input_id.clone(), input:input.clone(), mode});
+                                write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: input.text, attachments: (!input.attachments.is_empty()).then_some(input.attachments), mode }).await?;
+                            } else { ui.enqueue(input, mode)?; }
+                        }
                     }
                     TuiInput::Feedback(description) => {
                         if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
@@ -2955,7 +3210,7 @@ async fn request_presented(
                         }
                     } else if !line.trim().is_empty() {
                         write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput {
-                            input_id: uuid::Uuid::new_v4().to_string(), input: line, mode: InputMode::Steer,
+                            input_id: uuid::Uuid::new_v4().to_string(), input: line, attachments:None, mode: InputMode::Steer,
                         }).await?;
                     }
                 }
@@ -2977,16 +3232,17 @@ async fn request_presented(
             }
         };
         let event = decode_coordinator_event(&frame)?;
+        acknowledge_feedback_event(directory, &command, &event)?;
         if let Some(ui) = presentation
             .as_mut()
             .and_then(|view| view.session.as_deref_mut()).filter(|ui|ui.selected.is_none())
         {
             match &event {
                 RuntimeEventKind::InputRejected { input_id, .. } => {
-                    if let Some(index) = ui.submitted.iter().position(|(id, _, _)| id == input_id)
-                        && let Some((_, text, _)) = ui.submitted.remove(index)
+                    if let Some(index) = ui.submitted.iter().position(|input| &input.id == input_id)
+                        && let Some(input) = ui.submitted.remove(index)
                     {
-                        ui.handle.restore_input(text)?;
+                        ui.handle.restore_composer(input.input)?;
                     }
                 }
                 RuntimeEventKind::InputPlaced { input_id, .. } => {
@@ -3105,9 +3361,9 @@ async fn request_presented(
                 ready = true;
                 if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
                     while let Some(input) = ui.queued.pop_front() {
-                        let input_id = input.id;
-                        ui.submitted.push_back((input_id.clone(), input.text.clone(), input.mode));
-                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: input.text, mode: input.mode }).await?;
+                        let input_id = input.id.clone();
+                        ui.submitted.push_back(input.clone());
+                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: input.input.text, attachments: (!input.input.attachments.is_empty()).then_some(input.input.attachments), mode: input.mode }).await?;
                     }
                 }
                 if arguments.json { display(&event, true)?; }
@@ -3120,9 +3376,9 @@ async fn request_presented(
                     .and_then(|view| view.session.as_deref_mut())
                 {
                     while let Some(input) = ui.queued.pop_front() {
-                        let input_id = input.id;
-                        ui.submitted.push_back((input_id.clone(), input.text.clone(), input.mode));
-                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: input.text, mode: input.mode }).await?;
+                        let input_id = input.id.clone();
+                        ui.submitted.push_back(input.clone());
+                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: input.input.text, attachments: (!input.input.attachments.is_empty()).then_some(input.input.attachments), mode: input.mode }).await?;
                     }
                 } else if arguments.json {
                     display(&event, true)?;
@@ -3261,7 +3517,7 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
         return Ok(());
     }
     match event {
-        RuntimeEventKind::FeedbackReady { receipt } => println!(
+        RuntimeEventKind::FeedbackReady { receipt, .. } => println!(
             "Feedback {}: debugging in the background; results will return to the main chat.",
             receipt.id
         ),
@@ -3503,6 +3759,274 @@ mod tests {
         assert!(Arguments::try_parse_from(["agent", "feedback", "upload"]).is_err());
     }
 
+    fn attachment_feedback_command(id: uuid::Uuid) -> agent_cli::protocol::RuntimeCommand {
+        let context = agent_cli::feedback::FeedbackContext {
+            origin_host_id: "11111111-1111-4111-8111-111111111111".into(),
+            cwd: "/example/project".into(),
+            conversation_id: Some("fixture".into()),
+            task_id: None,
+            agent_id: None,
+            model: None,
+            binding: None,
+            draft: "Keep this draft".into(),
+            queued_inputs: Vec::new(),
+            client_errors: Vec::new(),
+            truncated: None,
+            attachments: Some(vec![agent_cli::attachments::AttachmentRef {
+                id: "22222222-2222-4222-8222-222222222222".into(),
+                name: "terminal-view.html".into(),
+                media_type: "text/html".into(),
+                size_bytes: 13,
+                sha256: "a".repeat(64),
+            }]),
+        };
+        let mut command = context.command("The composer is clipped".into());
+        let agent_cli::protocol::RuntimeCommand::Feedback { input_id, .. } = &mut command else {
+            panic!("Expected feedback")
+        };
+        *input_id = Some(id.to_string());
+        command
+    }
+
+    #[test]
+    fn feedback_retry_retains_exact_attachment_receipts_and_report_identity_privately() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let command = attachment_feedback_command(id);
+        crate::write_feedback_submission(directory.path(), id, &command).unwrap();
+        let restored = crate::read_feedback_submission(directory.path(), id).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&restored).unwrap(),
+            serde_json::to_vec(&command).unwrap()
+        );
+        let parsed =
+            Arguments::try_parse_from(["agent", "feedback", "retry", &id.to_string()]).unwrap();
+        assert!(
+            matches!(parsed.command,Some(Action::Feedback {command:crate::FeedbackAction::Retry {id:saved}}) if saved==id)
+        );
+        assert!(Arguments::try_parse_from(["agent", "feedback", "retry", "../other"]).is_err());
+        let path = directory
+            .path()
+            .join("feedback-outbox")
+            .join(format!("{id}.json"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        crate::acknowledge_feedback_submission(directory.path(), "not-an-id");
+        assert!(path.exists());
+        let mut receipt = agent_cli::protocol::RuntimeEventKind::FeedbackReady {
+            input_id: None,
+            receipt: agent_cli::feedback::FeedbackReceipt {
+                id: "fixture-report".into(),
+                path: "/example/private/feedback.json".into(),
+                task_id: "33333333-3333-4333-8333-333333333333".parse().unwrap(),
+                agent_id: None,
+            },
+        };
+        assert!(crate::acknowledge_feedback_event(directory.path(), &command, &receipt).is_err());
+        assert!(
+            path.exists(),
+            "A missing input identity must not acknowledge this report"
+        );
+        let agent_cli::protocol::RuntimeEventKind::FeedbackReady { input_id, .. } = &mut receipt
+        else {
+            panic!("Expected receipt")
+        };
+        *input_id = Some(id.to_string());
+        crate::acknowledge_feedback_event(directory.path(), &command, &receipt).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_feedback_ready_receipt_confirms_admission_even_without_a_done_frame() {
+        use agent_cli::{
+            protocol::{RuntimeCommand, RuntimeEventKind},
+            runtime::FrameReader,
+        };
+        use tokio::{io::AsyncWriteExt, net::UnixListener};
+        let directory = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let command = attachment_feedback_command(id);
+        crate::write_feedback_submission(directory.path(), id, &command).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = FrameReader::new(tokio::io::BufReader::new(reader));
+            let command: RuntimeCommand =
+                serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
+            assert!(
+                matches!(command,RuntimeCommand::Feedback {input_id:Some(saved),context,..} if saved==id.to_string() && context.attachments.as_ref().is_some_and(|attachments|attachments.len()==1))
+            );
+            let event = RuntimeEventKind::FeedbackReady {
+                input_id: Some(id.to_string()),
+                receipt: agent_cli::feedback::FeedbackReceipt {
+                    id: "fixture-report".into(),
+                    path: "/example/private/feedback.json".into(),
+                    task_id: "33333333-3333-4333-8333-333333333333".parse().unwrap(),
+                    agent_id: None,
+                },
+            };
+            writer
+                .write_all(&serde_json::to_vec(&event).unwrap())
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        });
+        let events = crate::exchange(
+            &agent_cli::config::ClientConfig::default(),
+            None,
+            Path::new("/example/unused-runtime"),
+            directory.path(),
+            command,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(RuntimeEventKind::FeedbackReady { .. })
+        ));
+        assert!(crate::read_feedback_submission(directory.path(), id).is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attachment_upload_keeps_one_chunk_connection_and_preserves_partial_preparation() {
+        use agent_cli::{
+            attachments::{
+                ATTACHMENT_CHUNK_BYTES, AttachmentRef, AttachmentRequest, AttachmentResponse,
+            },
+            protocol::{RuntimeCommand, RuntimeEventKind},
+            runtime::FrameReader,
+            tui::attachments::{ComposerFile, ComposerInput},
+        };
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use sha2::{Digest, Sha256};
+        use tokio::{io::AsyncWriteExt, net::UnixListener};
+        let directory = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();
+        let first = directory.path().join("report.txt");
+        let missing = directory.path().join("missing.txt");
+        let bytes = vec![b'a'; ATTACHMENT_CHUNK_BYTES as usize + 17];
+        std::fs::write(&first, &bytes).unwrap();
+        std::fs::write(&missing, b"remove before preparation").unwrap();
+        let mut input = ComposerInput {
+            text: "Review these files".into(),
+            files: vec![
+                ComposerFile::read_metadata(first.clone()).unwrap(),
+                ComposerFile::read_metadata(missing.clone()).unwrap(),
+            ],
+            attachments: Vec::new(),
+        };
+        std::fs::remove_file(&missing).unwrap();
+        let expected = bytes.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = FrameReader::new(tokio::io::BufReader::new(reader));
+            let mut uploaded = Vec::new();
+            let mut identity = None;
+            let mut chunks = 0;
+            loop {
+                let command: RuntimeCommand =
+                    serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
+                let RuntimeCommand::Attachment {
+                    request:
+                        AttachmentRequest::Upload {
+                            id,
+                            name,
+                            media_type,
+                            size_bytes,
+                            offset,
+                            data_base64,
+                            complete,
+                        },
+                } = command
+                else {
+                    panic!("Expected only attachment transfer")
+                };
+                assert_eq!(offset as usize, uploaded.len());
+                assert_eq!(size_bytes as usize, expected.len());
+                if let Some(previous) = &identity {
+                    assert_eq!(previous, &id);
+                } else {
+                    identity = Some(id.clone());
+                }
+                let data = STANDARD.decode(data_base64).unwrap();
+                assert!(data.len() <= ATTACHMENT_CHUNK_BYTES as usize);
+                uploaded.extend(data);
+                chunks += 1;
+                let receipt = complete.then(|| AttachmentRef {
+                    id,
+                    name,
+                    media_type,
+                    size_bytes,
+                    sha256: format!("{:x}", Sha256::digest(&uploaded)),
+                });
+                let event = RuntimeEventKind::Attachment {
+                    response: AttachmentResponse::Uploaded {
+                        next_offset: uploaded.len() as u32,
+                        attachment: receipt.clone(),
+                    },
+                };
+                for event in [event, RuntimeEventKind::Done] {
+                    writer
+                        .write_all(&serde_json::to_vec(&event).unwrap())
+                        .await
+                        .unwrap();
+                    writer.write_all(b"\n").await.unwrap();
+                }
+                if let Some(receipt) = receipt {
+                    assert_eq!(uploaded, expected);
+                    assert_eq!(chunks, 2);
+                    return receipt;
+                }
+            }
+        });
+        let config = agent_cli::config::ClientConfig::default();
+        let client = crate::ClientContext {
+            config: &config,
+            coordinator: None,
+            script: Path::new("/example/unused-runtime"),
+            directory: directory.path(),
+        };
+        assert!(
+            crate::prepare_attachments(client, &mut input)
+                .await
+                .is_err()
+        );
+        let receipt = server.await.unwrap();
+        assert_eq!(input.attachments, vec![receipt.clone()]);
+        assert_eq!(input.files.len(), 1);
+        assert_eq!(input.files[0].path, missing);
+        assert_eq!(input.text, "Review these files");
+        std::fs::write(first, b"changed after immutable upload").unwrap();
+        input.files.clear();
+        crate::prepare_attachments(client, &mut input)
+            .await
+            .unwrap();
+        assert_eq!(input.attachments, vec![receipt]);
+        let admission = crate::chat_admission::Admission::new(
+            "fixture".into(),
+            input.clone(),
+            agent_cli::protocol::InputMode::Steer,
+        );
+        let id = admission.id.clone();
+        assert!(admission.sending().unwrap());
+        assert_eq!(admission.input().unwrap(), input);
+        assert_eq!(admission.id, id);
+    }
+
     #[test]
     fn history_import_and_terminal_flags_parse_into_typed_commands() {
         let parsed = Arguments::try_parse_from([
@@ -3592,7 +4116,11 @@ mod tests {
                 allocation_id: "22222222-2222-4222-8222-222222222222".into(),
             },
             draft: "Unsubmitted correction\nwith Unicode 🦀".into(),
-            queued_inputs: vec!["Queued but not submitted".into()],
+            queued_inputs: vec![crate::QueuedInput {
+                id: "33333333-3333-4333-8333-333333333333".into(),
+                input: "Queued but not submitted".into(),
+                mode: agent_cli::protocol::InputMode::Steer,
+            }],
         };
         let path = crate::write_ui_recovery(directory.path(), &recovery).unwrap();
         let saved: crate::UiRecovery =

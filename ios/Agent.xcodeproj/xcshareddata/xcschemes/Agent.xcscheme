@@ -8,12 +8,18 @@
       <BuildActionEntry buildForTesting="YES" buildForRunning="NO" buildForProfiling="NO" buildForArchiving="NO" buildForAnalyzing="YES">
         <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="A00000000000000000000025" BuildableName="AgentRenderingTests.xctest" BlueprintName="AgentRenderingTests" ReferencedContainer="container:Agent.xcodeproj"/>
       </BuildActionEntry>
+      <BuildActionEntry buildForTesting="YES" buildForRunning="NO" buildForProfiling="NO" buildForArchiving="NO" buildForAnalyzing="YES">
+        <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="A00000000000000000000030" BuildableName="AgentUITests.xctest" BlueprintName="AgentUITests" ReferencedContainer="container:Agent.xcodeproj"/>
+      </BuildActionEntry>
     </BuildActionEntries>
   </BuildAction>
   <TestAction buildConfiguration="Debug" shouldUseLaunchSchemeArgsEnv="YES">
     <Testables>
       <TestableReference skipped="NO" parallelizable="NO">
         <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="A00000000000000000000025" BuildableName="AgentRenderingTests.xctest" BlueprintName="AgentRenderingTests" ReferencedContainer="container:Agent.xcodeproj"/>
+      </TestableReference>
+      <TestableReference skipped="NO" parallelizable="NO">
+        <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="A00000000000000000000030" BuildableName="AgentUITests.xctest" BlueprintName="AgentUITests" ReferencedContainer="container:Agent.xcodeproj"/>
       </TestableReference>
     </Testables>
   </TestAction>

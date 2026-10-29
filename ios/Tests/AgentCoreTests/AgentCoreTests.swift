@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Network
 import Testing
@@ -38,11 +39,12 @@ import Testing
 @Test func reconnectHistoryAndPlacementDoNotDuplicateAnInput() {
   var transcript = Transcript()
   let request = NativeRequestSubmit(
-    inputId: "11111111-1111-4111-8111-111111111111", mode: .steer, text: "Hello")
+    attachments: nil, inputId: "11111111-1111-4111-8111-111111111111", mode: .steer, text: "Hello")
   transcript.pending(request, delivery: .uncertain)
   let stableID = transcript.rows.first?.id
   let user = HistoryMessage(
-    continuation: false, entryId: "saved-user", finalChunk: true, role: .user, text: "Hello",
+    attachments: nil, continuation: false, entryId: "saved-user", finalChunk: true, role: .user,
+    text: "Hello",
     tool: nil)
   transcript.history(.init(messages: [user], nextCursor: nil, pageComplete: true))
   transcript.delivery(request.inputId, .saved, entryID: "saved-user")
@@ -55,13 +57,16 @@ import Testing
 @Test func historyReconstructsMultipleBlocksChunksAndToolFailure() {
   var transcript = Transcript()
   let first = HistoryMessage(
-    continuation: false, entryId: "entry", finalChunk: false, role: .commentary, text: "First ",
+    attachments: nil, continuation: false, entryId: "entry", finalChunk: false, role: .commentary,
+    text: "First ",
     tool: nil)
   let continuation = HistoryMessage(
-    continuation: true, entryId: "entry", finalChunk: true, role: .commentary, text: "block",
+    attachments: nil, continuation: true, entryId: "entry", finalChunk: true, role: .commentary,
+    text: "block",
     tool: nil)
   let second = HistoryMessage(
-    continuation: false, entryId: "entry", finalChunk: true, role: .thinking, text: "Another block",
+    attachments: nil, continuation: false, entryId: "entry", finalChunk: true, role: .thinking,
+    text: "Another block",
     tool: nil)
   transcript.history(.init(messages: [first], nextCursor: nil, pageComplete: false))
   #expect(transcript.rows.isEmpty)
@@ -75,7 +80,8 @@ import Testing
   transcript.activity(.toolStarted(.init(callId: "tool", name: "check")))
   transcript.message(
     .init(
-      continuation: false, entryId: "result", finalChunk: true, role: .tool, text: "check failed",
+      attachments: nil, continuation: false, entryId: "result", finalChunk: true, role: .tool,
+      text: "check failed",
       tool: .init(callId: "tool", name: "check", status: .failed)))
   #expect(transcript.rows.filter { $0.tool?.callId == "tool" }.count == 1)
   #expect(transcript.rows.last?.tool?.status == .failed)
@@ -218,6 +224,12 @@ actor FixtureCoordinator {
   }
   private var sockets: [NWConnection] = []
   private var submissions: [NativeRequestSubmit] = []
+  private var files: [String: Data] = [:]
+  private var uploads = 0
+  private var rejectUploads = false
+  func refuseUploads() { rejectUploads = true }
+  func uploadCount() -> Int { uploads }
+  func uploaded(_ id: String) -> Data? { files[id] }
   func count() -> Int { submissions.count }
   func stop() {
     for socket in sockets { socket.cancel() }
@@ -227,59 +239,201 @@ actor FixtureCoordinator {
     sockets.append(socket)
     socket.start(queue: .global())
     var bytes = Data()
-    while !bytes.contains(10) {
-      let data = try await withCheckedThrowingContinuation {
-        (continuation: CheckedContinuation<Data, any Error>) in
-        socket.receive(minimumIncompleteLength: 1, maximumLength: 65536) {
-          data, _, complete, error in
-          if let error {
-            continuation.resume(throwing: error)
-          } else if complete && data == nil {
-            continuation.resume(throwing: ConnectionError.closed)
-          } else {
-            continuation.resume(returning: data ?? Data())
+    while true {
+      while !bytes.contains(10) {
+        let data = try await withCheckedThrowingContinuation {
+          (continuation: CheckedContinuation<Data, any Error>) in
+          socket.receive(minimumIncompleteLength: 1, maximumLength: 65536) {
+            data, _, complete, error in
+            if let error {
+              continuation.resume(throwing: error)
+            } else if complete && data == nil {
+              continuation.resume(throwing: ConnectionError.closed)
+            } else {
+              continuation.resume(returning: data ?? Data())
+            }
           }
         }
+        bytes.append(data)
       }
-      bytes.append(data)
-    }
-    let command = try JSONDecoder().decode(NativeCommand.self, from: bytes)
-    guard case .native(let value) = command else { return }
-    switch value.request {
-    case .observe(let request):
-      try await emit(
-        .ready(.init(conversationId: "fixture-root", model: "fixture/model")), on: socket)
-      if delaySnapshot { await withCheckedContinuation { release = $0 } }
-      let messages = submissions.filter { request.inputIds.contains($0.inputId) }.map { input in
-        HistoryMessage(
-          continuation: false, entryId: "placed-\(input.inputId)", finalChunk: true, role: .user,
-          text: input.text, tool: nil)
-      }
-      try await emit(
-        .history(.init(messages: messages, nextCursor: nil, pageComplete: true)), on: socket)
-      for input in submissions where request.inputIds.contains(input.inputId) {
+      let end = try #require(bytes.firstIndex(of: 10))
+      let command = try JSONDecoder().decode(NativeCommand.self, from: bytes.prefix(upTo: end))
+      bytes.removeSubrange(...end)
+      guard case .native(let value) = command else { return }
+      switch value.request {
+      case .observe(let request):
         try await emit(
-          .placed(.init(entryId: "placed-\(input.inputId)", inputId: input.inputId)), on: socket)
-      }
-      try await emit(.idle, on: socket)
-      await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-        socket.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, _, _ in
-          continuation.resume()
+          .ready(.init(conversationId: "fixture-root", model: "fixture/model")), on: socket)
+        if delaySnapshot { await withCheckedContinuation { release = $0 } }
+        let messages = submissions.filter { request.inputIds.contains($0.inputId) }.map { input in
+          HistoryMessage(
+            attachments: input.attachments, continuation: false, entryId: "placed-\(input.inputId)",
+            finalChunk: true, role: .user,
+            text: input.text, tool: nil)
         }
+        try await emit(
+          .history(.init(messages: messages, nextCursor: nil, pageComplete: true)), on: socket)
+        for input in submissions where request.inputIds.contains(input.inputId) {
+          try await emit(
+            .placed(.init(entryId: "placed-\(input.inputId)", inputId: input.inputId)), on: socket)
+        }
+        try await emit(.idle, on: socket)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+          socket.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, _, _ in
+            continuation.resume()
+          }
+        }
+        closedContinuation.yield(())
+        return
+      case .submit(let request):
+        submissions.append(request)
+        if request.text.hasPrefix("/feedback ") {
+          try await emit(
+            .feedbackReady(
+              .init(
+                inputId: request.inputId,
+                receipt: .init(
+                  id: "feedback-fixture", path: "private/feedback", taskId: "repair-fixture"))),
+            on: socket)
+          // The client may close as soon as the durable receipt arrives.
+          try? await emit(.done, on: socket)
+          return
+        }
+        try await emit(.accepted(.init(inputId: request.inputId)), on: socket)
+        socket.send(
+          content: nil, contentContext: .finalMessage, isComplete: true, completion: .idempotent)
+        return
+      case .attachment(let value):
+        let response: AttachmentResponse
+        switch value.request {
+        case .upload(let chunk):
+          if rejectUploads {
+            try await emit(.failure(.init(message: "Attachment storage is full")), on: socket)
+            return
+          }
+          uploads += 1
+          let data = try #require(Data(base64Encoded: chunk.dataBase64))
+          var file = files[chunk.id] ?? Data()
+          #expect(chunk.offset <= file.count)
+          let end = chunk.offset + data.count
+          if end > file.count { file.append(data.suffix(end - file.count)) }
+          files[chunk.id] = file
+          let reference =
+            chunk.complete
+            ? AttachmentRef(
+              id: chunk.id, mediaType: chunk.mediaType, name: chunk.name,
+              sha256: SHA256.hash(data: file).map { String(format: "%02x", $0) }.joined(),
+              sizeBytes: file.count) : nil
+          response = .uploaded(.init(attachment: reference, nextOffset: end))
+        case .download(let chunk):
+          let file = try #require(files[chunk.id])
+          let end = min(chunk.offset + chunk.limit, file.count)
+          response = .download(
+            .init(
+              dataBase64: file.subdata(in: chunk.offset..<end).base64EncodedString(),
+              nextOffset: end < file.count ? end : nil))
+        case .discard: response = .discarded
+        }
+        try await emit(.attachment(.init(response: response)), on: socket)
+        try await emit(.done, on: socket)
+      default:
+        try await emit(.done, on: socket)
+        return
       }
-      closedContinuation.yield(())
-    case .submit(let request):
-      submissions.append(request)
-      try await emit(.accepted(.init(inputId: request.inputId)), on: socket)
-      socket.send(
-        content: nil, contentContext: .finalMessage, isComplete: true, completion: .idempotent)
-    default: try await emit(.done, on: socket)
     }
   }
   private func emit(_ event: NativeEvent, on socket: NWConnection) async throws {
     var data = try JSONEncoder().encode(event)
     data.append(10)
     try await send(data, on: socket)
+  }
+}
+
+@Test(.timeLimit(.minutes(1))) func attachmentsSurviveUncertainDeliveryAndDownloadOnlyOnDemand()
+  async throws
+{
+  try await withCoordinator { session, fixture, outbox in
+    let store = AttachmentStore(
+      directory: outbox.deletingLastPathComponent().appending(path: "Drafts"))
+    let bytes = Data(repeating: 42, count: AttachmentLimits.chunkBytes + 17)
+    let file = try await store.stage(data: bytes, name: "Notes.txt", mediaType: "text/plain")
+    let address = try CoordinatorAddress(host: "100.64.1.2")
+    await session.connect(address)
+    _ = try await until(session) { $0.connection == .connected }
+    #expect(await session.submit("", files: [file]))
+    let uncertain = try await until(session) { $0.rows.contains { $0.delivery == .uncertain } }
+    #expect(uncertain.rows.last?.attachments == [file.reference])
+    #expect(await fixture.uploadCount() == 2)
+    #expect(await fixture.uploaded(file.id) == bytes)
+    let saved = try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    #expect(saved.first?.attachments == [file.reference])
+    // The pending copy has its own lifetime, independent of the picker/draft copy.
+    try await store.remove(file)
+    let pendingFile = outbox.deletingLastPathComponent().appending(
+      path: "Attachments/\(file.id)/Notes.txt")
+    #expect(try Data(contentsOf: pendingFile) == bytes)
+    let preview = try await session.preview(file.reference)
+    #expect(try Data(contentsOf: preview) == bytes)
+    #expect(try await session.preview(file.reference) == preview)
+    #expect(await session.submit("/help", files: [file]) == false)
+    #expect(await fixture.count() == 1, "A rejected control must not admit or clear its files")
+    await session.disconnect()
+    await session.connect(address)
+    _ = try await until(session) { $0.connection == .connected && $0.rows.last?.delivery == nil }
+    #expect(await fixture.count() == 1)
+    #expect(
+      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+  }
+}
+
+@Test(.timeLimit(.minutes(1))) func feedbackReceiptAcknowledgesTheOriginalDurableInput()
+  async throws
+{
+  try await withCoordinator { session, _, outbox in
+    let store = AttachmentStore(
+      directory: outbox.deletingLastPathComponent().appending(path: "Drafts"))
+    let file = try await store.stage(
+      data: Data([1, 2, 3]), name: "Feedback.png", mediaType: "image/png")
+    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    _ = try await until(session) { $0.connection == .connected }
+    #expect(await session.submit("/feedback Fix this", files: [file]))
+    let result = try await until(session) {
+      $0.rows.contains { $0.text.contains("Repair task: repair-fixture") }
+    }
+    #expect(result.rows.first(where: { $0.role == .user })?.delivery == .saved)
+    #expect(
+      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+  }
+}
+
+@Test(.timeLimit(.minutes(1))) func rejectedUploadRestoresFilesUnderTheDraftOwnersLifetime()
+  async throws
+{
+  try await withCoordinator { session, fixture, outbox in
+    let store = AttachmentStore(
+      directory: outbox.deletingLastPathComponent().appending(path: "Drafts"))
+    let bytes = Data("Keep this file".utf8)
+    let file = try await store.stage(data: bytes, name: "Notes.txt", mediaType: "text/plain")
+    await fixture.refuseUploads()
+    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    _ = try await until(session) { $0.connection == .connected }
+    #expect(await session.submit("Fix this", files: [file]))
+    let rejected = try await until(session) { $0.rows.last?.delivery == .rejected }
+    let id = try #require(rejected.rows.last?.inputID)
+    #expect(await fixture.count() == 0, "Upload refusal must happen before input admission")
+    try await store.remove(file)
+    let restored = try #require(await session.restore(id, to: store))
+    #expect(restored.text == "Fix this")
+    let restoredFile = try #require(restored.attachments.first)
+    #expect(restoredFile.id != file.id)
+    #expect(
+      restoredFile.url.deletingLastPathComponent().deletingLastPathComponent()
+        == file.url.deletingLastPathComponent().deletingLastPathComponent())
+    #expect(try Data(contentsOf: restoredFile.url) == bytes)
+    try await store.remove(restoredFile)
+    #expect(!FileManager.default.fileExists(atPath: restoredFile.url.path))
+    #expect(
+      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
   }
 }
 
@@ -303,7 +457,11 @@ func withCoordinator(
     if case .failed(let error) = state { ready.continuation.finish(throwing: error) }
   }
   listener.newConnectionHandler = { socket in
-    Task { do { try await fixture.accept(socket) } catch { Issue.record(error) } }
+    Task {
+      do { try await fixture.accept(socket) } catch ConnectionError.closed {
+        // A completed transfer releases its owned socket.
+      } catch { Issue.record(error) }
+    }
   }
   listener.start(queue: .global())
   defer { listener.cancel() }
@@ -357,16 +515,20 @@ func withCoordinator(
   var transcript = Transcript()
   let action = UUID()
   let observerFirst = HistoryMessage(
-    continuation: false, entryId: "current", finalChunk: false, role: .final, text: "Current ",
+    attachments: nil, continuation: false, entryId: "current", finalChunk: false, role: .final,
+    text: "Current ",
     tool: nil)
   let observerLast = HistoryMessage(
-    continuation: true, entryId: "current", finalChunk: true, role: .final, text: "answer",
+    attachments: nil, continuation: true, entryId: "current", finalChunk: true, role: .final,
+    text: "answer",
     tool: nil)
   let actionFirst = HistoryMessage(
-    continuation: false, entryId: "older", finalChunk: false, role: .user, text: "Older ", tool: nil
+    attachments: nil, continuation: false, entryId: "older", finalChunk: false, role: .user,
+    text: "Older ", tool: nil
   )
   let actionLast = HistoryMessage(
-    continuation: true, entryId: "older", finalChunk: true, role: .user, text: "question", tool: nil
+    attachments: nil, continuation: true, entryId: "older", finalChunk: true, role: .user,
+    text: "question", tool: nil
   )
   transcript.history(.init(messages: [observerFirst], nextCursor: nil, pageComplete: false))
   transcript.history(
@@ -387,7 +549,8 @@ func withCoordinator(
 @Test func durableLiveNoticeDeduplicatesAgainstReconnectHistory() {
   var transcript = Transcript()
   let notice = HistoryMessage(
-    continuation: false, entryId: "durable-notice", finalChunk: true, role: .notice,
+    attachments: nil, continuation: false, entryId: "durable-notice", finalChunk: true,
+    role: .notice,
     text: "A useful update", tool: nil)
   transcript.message(notice)
   let stableID = transcript.rows.first?.id

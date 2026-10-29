@@ -503,6 +503,7 @@ fn native_job_input_replay_reaches_one_durable_admission_after_restart() {
     let input_id = uuid::Uuid::new_v4().to_string();
     let produce = |text: &str| {
         let Operation::Runtime(command) = native::prepare(NativeRequest::Submit {
+            attachments: None,
             input_id: input_id.clone(),
             text: text.to_owned(),
             mode: InputMode::Steer,

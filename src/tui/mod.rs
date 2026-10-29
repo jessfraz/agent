@@ -1,10 +1,12 @@
 //! Terminal presentation only. Request ownership, model calls and durable input stay outside this module.
+pub mod attachments;
 mod conversations;
 mod inline;
 mod markdown;
 mod transcript;
 
 use crate::tui::{
+    attachments::{ComposerFile, ComposerInput, dropped_files},
     conversations::ConversationPicker,
     inline::{CellOutput, Output, Screen, View},
     transcript::CachedText,
@@ -40,9 +42,9 @@ pub struct TuiInfo {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum TuiInput {
-    Submit(String),
-    Queue(String),
-    Feedback(String),
+    Submit(ComposerInput),
+    Queue(ComposerInput),
+    Feedback(ComposerInput),
     Command(ChatCommand),
     History,
     Interrupt,
@@ -67,14 +69,15 @@ enum Update {
     Status(TuiInfo),
     Working(bool),
     Observation(ObservationState),
-    Draft(tokio::sync::oneshot::Sender<String>),
+    Draft(tokio::sync::oneshot::Sender<ComposerInput>),
     Info(tokio::sync::oneshot::Sender<TuiInfo>),
     Notice(String),
-    RestoreInput(String),
-    SetDraft(String),
+    RestoreInput(ComposerInput),
+    SetDraft(ComposerInput),
     PendingInput {
         input_id: String,
         text: String,
+        attachments: Vec<AttachmentLabel>,
         mode: InputMode,
     },
     HistoryReplay(HistoryUpdate),
@@ -184,6 +187,9 @@ impl TuiHandle {
         self.send(Update::Observation(state))
     }
     pub async fn draft(&self) -> Result<String> {
+        Ok(self.composer_draft().await?.text)
+    }
+    pub async fn composer_draft(&self) -> Result<ComposerInput> {
         let (sender, draft) = tokio::sync::oneshot::channel();
         self.send(Update::Draft(sender))?;
         draft.await.context("The terminal draft could not be read")
@@ -196,16 +202,31 @@ impl TuiHandle {
     pub fn notice(&self, text: String) -> Result<()> {
         self.send(Update::Notice(text))
     }
-    pub fn restore_input(&self, text: String) -> Result<()> {
-        self.send(Update::RestoreInput(text))
+    pub fn restore_composer(&self, input: ComposerInput) -> Result<()> {
+        self.send(Update::RestoreInput(input))
     }
-    pub fn set_draft(&self, text: String) -> Result<()> {
-        self.send(Update::SetDraft(text))
+    pub fn set_composer(&self, input: ComposerInput) -> Result<()> {
+        self.send(Update::SetDraft(input))
     }
-    pub fn pending_input(&self, input_id: String, text: String, mode: InputMode) -> Result<()> {
+    pub fn pending_composer(
+        &self,
+        input_id: String,
+        input: &ComposerInput,
+        mode: InputMode,
+    ) -> Result<()> {
         self.send(Update::PendingInput {
             input_id,
-            text,
+            text: input.text.clone(),
+            attachments: input
+                .attachments
+                .iter()
+                .map(AttachmentLabel::uploaded)
+                .chain(input.files.iter().map(|file| AttachmentLabel {
+                    id: None,
+                    name: file.name.clone(),
+                    size_bytes: file.size_bytes,
+                }))
+                .collect(),
             mode,
         })
     }
@@ -349,6 +370,23 @@ struct Message {
     rendered: Option<CachedText>,
     kind: MessageKind,
     output: CellOutput,
+    attachments: Vec<AttachmentLabel>,
+}
+
+#[derive(Clone)]
+struct AttachmentLabel {
+    id: Option<String>,
+    name: String,
+    size_bytes: u32,
+}
+impl AttachmentLabel {
+    fn uploaded(file: &crate::attachments::AttachmentRef) -> Self {
+        Self {
+            id: Some(file.id.clone()),
+            name: file.name.clone(),
+            size_bytes: file.size_bytes,
+        }
+    }
 }
 
 enum InputDelivery {
@@ -503,6 +541,7 @@ impl Message {
             rendered: None,
             kind: MessageKind::Text,
             output: CellOutput::Ready,
+            attachments: Vec::new(),
         }
     }
     fn with_output(mut self, output: CellOutput) -> Self {
@@ -549,7 +588,18 @@ impl Message {
             } else {
                 Style::default()
             };
-            CachedText::markdown(header, &self.text, style)
+            let mut rendered = CachedText::markdown(header, &self.text, style);
+            for file in &self.attachments {
+                rendered.append_line(Line::styled(
+                    format!(
+                        "Attachment: {} · {} bytes",
+                        markdown::plain(&file.name),
+                        file.size_bytes
+                    ),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            rendered
         })
     }
     fn append(&mut self, text: &str) {
@@ -575,6 +625,8 @@ struct State {
     #[cfg(test)]
     layout_work: LayoutWork,
     editor: TextArea<'static>,
+    files: Vec<ComposerFile>,
+    attachments: Vec<crate::attachments::AttachmentRef>,
     input_history: InputHistory,
     completion: Option<CompletionMenu>,
     dismissed_completion: Option<String>,
@@ -614,6 +666,8 @@ impl State {
             #[cfg(test)]
             layout_work: LayoutWork::default(),
             editor: editor(),
+            files: Vec::new(),
+            attachments: Vec::new(),
             input_history: InputHistory::default(),
             completion: None,
             dismissed_completion: None,
@@ -690,7 +744,9 @@ impl State {
         }
         self.changed = true;
     }
-    fn committed(&mut self, message: HistoryMessage, historical: bool) {
+    fn committed(&mut self, mut message: HistoryMessage, historical: bool) {
+        let entry_id = message.entry_id.clone();
+        let attachments = message.attachments.take().unwrap_or_default();
         let output = if historical {
             if self.loading_history.is_some() {
                 CellOutput::Retained
@@ -817,6 +873,27 @@ impl State {
             self.invalidate(self.messages.len());
             self.messages
                 .push(Message::new(Some(message.entry_id), role, message.text).with_output(output));
+        }
+        if !attachments.is_empty()
+            && let Some(index) = self
+                .messages
+                .iter()
+                .rposition(|saved| saved.id.as_ref() == Some(&entry_id) && saved.role == role)
+        {
+            let saved = &mut self.messages[index];
+            for attachment in &attachments {
+                if !saved
+                    .attachments
+                    .iter()
+                    .any(|label| label.id.as_ref() == Some(&attachment.id))
+                {
+                    saved
+                        .attachments
+                        .push(AttachmentLabel::uploaded(attachment));
+                }
+            }
+            saved.rendered = None;
+            self.invalidate(index);
         }
         self.changed = true;
     }
@@ -1246,6 +1323,34 @@ impl State {
         self.editor.insert_str(markdown::plain(&text));
         self.changed = true;
     }
+    fn composer_draft(&self) -> ComposerInput {
+        ComposerInput {
+            text: self.editor.lines().join("\n"),
+            files: self.files.clone(),
+            attachments: self.attachments.clone(),
+        }
+    }
+    fn take_composer(&mut self, text: String) -> ComposerInput {
+        ComposerInput {
+            text,
+            files: std::mem::take(&mut self.files),
+            attachments: std::mem::take(&mut self.attachments),
+        }
+    }
+    fn restore_composer(&mut self, input: ComposerInput) {
+        if !input.text.is_empty() {
+            if self.editor.lines().iter().any(|line| !line.is_empty()) {
+                self.editor.insert_newline();
+            }
+            self.editor.insert_str(markdown::plain(&input.text));
+        }
+        self.files.extend(input.files);
+        self.attachments.extend(input.attachments);
+        self.changed = true;
+    }
+    fn attachment_count(&self) -> usize {
+        self.files.len() + self.attachments.len()
+    }
     fn load_history(&mut self, mode: HistoryLoad) -> Option<TuiInput> {
         self.output.view = View::History;
         self.changed = true;
@@ -1376,6 +1481,14 @@ impl State {
                     }
                 }
                 match key.code {
+                    KeyCode::Backspace
+                        if self.editor.lines().iter().all(String::is_empty)
+                            && self.attachment_count() > 0 =>
+                    {
+                        if self.files.pop().is_none() {
+                            self.attachments.pop();
+                        }
+                    }
                     KeyCode::Char('?') if self.editor.lines().iter().all(String::is_empty) => {
                         self.help_open = !self.help_open;
                         self.help_scroll = 0;
@@ -1487,7 +1600,9 @@ impl State {
                                             self.help_scroll = 0;
                                         }
                                         ChatCommand::Feedback { description } => {
-                                            return Some(TuiInput::Feedback(description.join(" ")));
+                                            return Some(TuiInput::Feedback(
+                                                self.take_composer(description.join(" ")),
+                                            ));
                                         }
                                         ChatCommand::History => {
                                             return self.load_history(HistoryLoad::Older);
@@ -1502,17 +1617,18 @@ impl State {
                             }
                             return None;
                         }
-                        if !value.trim().is_empty() {
+                        if !value.trim().is_empty() || self.attachment_count() > 0 {
                             self.input_history.remember(value.clone());
                             self.editor = editor();
                             self.help_open = false;
                             self.scroll = 0;
                             self.output.view = View::Live;
+                            let input = self.take_composer(value);
                             if key.code == KeyCode::Tab {
-                                return Some(TuiInput::Queue(value));
+                                return Some(TuiInput::Queue(input));
                             }
                             self.working = true;
-                            return Some(TuiInput::Submit(value));
+                            return Some(TuiInput::Submit(input));
                         }
                     }
                     _ if !self.exiting => {
@@ -1522,7 +1638,31 @@ impl State {
                 }
             }
             Event::Paste(text) if !self.exiting => {
-                self.editor.insert_str(markdown::plain(&text));
+                let dropped = std::env::current_dir()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|directory| dropped_files(&text, &directory));
+                match dropped {
+                    Ok(Some(files))
+                        if self.attachment_count() + files.len()
+                            <= crate::attachments::MAX_ATTACHMENTS =>
+                    {
+                        self.files.extend(files);
+                    }
+                    Ok(Some(_)) => {
+                        self.editor.insert_str(markdown::plain(&text));
+                        self.push(
+                            Role::Failure,
+                            "Attach at most 8 files. The pasted paths remain in the draft.".into(),
+                        );
+                    }
+                    Err(error) => {
+                        self.editor.insert_str(markdown::plain(&text));
+                        self.push(Role::Failure, error.to_string());
+                    }
+                    Ok(None) => {
+                        self.editor.insert_str(markdown::plain(&text));
+                    }
+                }
             }
             _ => {}
         }
@@ -1592,12 +1732,18 @@ impl State {
             return;
         }
         self.prepare_editor();
+        let attachment_height = u16::try_from(self.attachment_count()).unwrap_or(u16::MAX);
         let height = self.editor_height(
             frame.area().width,
-            frame.area().height.saturating_sub(5).clamp(1, 6),
+            frame
+                .area()
+                .height
+                .saturating_sub(5u16.saturating_add(attachment_height))
+                .clamp(1, 6),
         );
         let areas = Layout::vertical([
             Constraint::Min(1),
+            Constraint::Length(attachment_height),
             Constraint::Length(height),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -1660,7 +1806,28 @@ impl State {
             let top = maximum.saturating_sub(self.scroll);
             self.draw_transcript(frame, areas[0], top + base);
         }
-        frame.render_widget(&self.editor, areas[1]);
+        let files = self
+            .attachments
+            .iter()
+            .map(|file| (&file.name, file.size_bytes))
+            .chain(self.files.iter().map(|file| (&file.name, file.size_bytes)))
+            .enumerate()
+            .map(|(index, (name, size))| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("[{}] ", index + 1),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::raw(markdown::plain(name)),
+                    Span::styled(
+                        format!(" · {} bytes", size),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(files), areas[1]);
+        frame.render_widget(&self.editor, areas[2]);
         if let Some(menu) = &self.completion {
             let height = usize::from(areas[0].height).min(6).min(menu.items.len());
             let start = menu.selected.saturating_sub(height.saturating_sub(1));
@@ -1743,33 +1910,41 @@ impl State {
                 ),
             ),
         ]);
-        frame.render_widget(Paragraph::new(Line::from(status)), areas[2]);
+        frame.render_widget(Paragraph::new(Line::from(status)), areas[3]);
         frame.render_widget(
             Paragraph::new(Line::from(
-                [Shortcut::Steer, Shortcut::Queue, Shortcut::Help]
-                    .into_iter()
-                    .enumerate()
-                    .flat_map(|(index, shortcut)| {
-                        let (key, hint, _) = shortcut.definition();
-                        let hint = if self.completion.is_some() {
-                            match shortcut {
-                                Shortcut::Steer => "run",
-                                Shortcut::Queue => "complete",
-                                _ => hint,
-                            }
-                        } else {
-                            hint
-                        };
-                        [
-                            Span::raw(if index == 0 { "" } else { " · " }),
-                            Span::styled(key, Style::default().fg(Color::Yellow)),
-                            Span::raw(format!(" {hint}")),
-                        ]
-                    })
-                    .collect::<Vec<_>>(),
+                [
+                    Shortcut::Steer,
+                    Shortcut::Queue,
+                    Shortcut::Help,
+                    Shortcut::RemoveFile,
+                ]
+                .into_iter()
+                .filter(|shortcut| {
+                    !matches!(shortcut, Shortcut::RemoveFile) || self.attachment_count() > 0
+                })
+                .enumerate()
+                .flat_map(|(index, shortcut)| {
+                    let (key, hint, _) = shortcut.definition();
+                    let hint = if self.completion.is_some() {
+                        match shortcut {
+                            Shortcut::Steer => "run",
+                            Shortcut::Queue => "complete",
+                            _ => hint,
+                        }
+                    } else {
+                        hint
+                    };
+                    [
+                        Span::raw(if index == 0 { "" } else { " · " }),
+                        Span::styled(key, Style::default().fg(Color::Yellow)),
+                        Span::raw(format!(" {hint}")),
+                    ]
+                })
+                .collect::<Vec<_>>(),
             ))
             .style(Style::default().fg(Color::DarkGray)),
-            areas[3],
+            areas[4],
         );
         self.changed = false;
     }
@@ -1834,6 +2009,7 @@ enum Shortcut {
     Scroll,
     History,
     Recall,
+    RemoveFile,
     Help,
 }
 impl Shortcut {
@@ -1862,6 +2038,11 @@ impl Shortcut {
                 "Up/Down",
                 "recall",
                 "Recall previous prompts; select visible completions",
+            ),
+            Self::RemoveFile => (
+                "Backspace",
+                "remove file",
+                "Remove the last staged file when the message is empty",
             ),
             Self::Help => (
                 "?",
@@ -1924,25 +2105,34 @@ fn run(
                     state.changed = true;
                 }
                 Ok(Update::Draft(sender)) => {
-                    let _ = sender.send(state.editor.lines().join("\n"));
+                    let _ = sender.send(state.composer_draft());
                 }
                 Ok(Update::Info(sender)) => {
                     let _ = sender.send(state.info.clone());
                 }
                 Ok(Update::Notice(text)) => state.push(Role::Notice, text),
-                Ok(Update::RestoreInput(text)) => {
-                    if state.editor.lines().iter().any(|line| !line.is_empty()) {
-                        state.editor.insert_newline();
-                    }
-                    state.editor.insert_str(text);
+                Ok(Update::RestoreInput(input)) => {
+                    state.restore_composer(input);
                     state.push(Role::Notice, "Unsent input returned to the draft.".into());
                 }
-                Ok(Update::SetDraft(text)) => state.set_draft(text),
+                Ok(Update::SetDraft(input)) => {
+                    state.set_draft(input.text);
+                    state.files = input.files;
+                    state.attachments = input.attachments;
+                }
                 Ok(Update::PendingInput {
                     input_id,
                     text,
+                    attachments,
                     mode,
-                }) => state.pending_input(input_id, text, mode),
+                }) => {
+                    state.pending_input(input_id.clone(), text, mode);
+                    if let Some(index)=state.messages.iter().position(|message|matches!(&message.kind, MessageKind::Input {input_id:id,..} if id==&input_id)) {
+                        state.messages[index].attachments = attachments;
+                        state.messages[index].rendered = None;
+                        state.invalidate(index);
+                    }
+                }
                 Ok(Update::HistoryReplay(update)) => state.history_update(update),
                 Ok(Update::ChooseConversation {
                     choices,
@@ -2130,6 +2320,7 @@ mod tests {
                 text: "Saved reply loaded before attachment".into(),
                 continuation: false,
                 final_chunk: true,
+                attachments: None,
                 tool: None,
             }],
             next_cursor: None,
@@ -2222,6 +2413,7 @@ mod tests {
                 text: text.into(),
                 continuation: false,
                 final_chunk: true,
+                attachments: None,
                 tool: None,
             }],
             next_cursor: None,
@@ -2291,6 +2483,7 @@ mod tests {
                 text: text.into(),
                 continuation,
                 final_chunk: true,
+                attachments: None,
                 tool: None,
             }],
             next_cursor: None,
@@ -2321,6 +2514,7 @@ mod tests {
                 text: "Live ".into(),
                 continuation: false,
                 final_chunk: true,
+                attachments: None,
                 tool: None,
             },
         });
@@ -2332,6 +2526,7 @@ mod tests {
                 text: "continuation".into(),
                 continuation: true,
                 final_chunk: true,
+                attachments: None,
                 tool: None,
             },
         });
@@ -2969,6 +3164,7 @@ mod tests {
                     text: text.into(),
                     continuation: false,
                     final_chunk: true,
+                    attachments: None,
                     tool: None,
                 }],
                 next_cursor: None,
@@ -3073,6 +3269,7 @@ mod tests {
             text: text.into(),
             continuation,
             final_chunk: true,
+            attachments: None,
             tool: None,
         };
         view.event(history(vec![
@@ -3126,6 +3323,7 @@ mod tests {
                 text: text.into(),
                 continuation: false,
                 final_chunk: true,
+                attachments: None,
                 tool: None,
             })
             .collect(),
@@ -3166,6 +3364,7 @@ mod tests {
                 text: text.into(),
                 continuation: false,
                 final_chunk: true,
+                attachments: None,
                 tool: None,
             }],
             next_cursor: Some("older".into()),
@@ -3281,6 +3480,7 @@ mod tests {
                 text: (0..40).map(|i| format!("Line {i}\n\n")).collect(),
                 continuation: false,
                 final_chunk: true,
+                attachments: None,
                 tool: None,
             }],
             next_cursor: Some("older".into()),
@@ -3310,6 +3510,7 @@ mod tests {
                 text: "Older saved answer\n".repeat(30),
                 continuation: false,
                 final_chunk: true,
+                attachments: None,
                 tool: None,
             }],
             next_cursor: None,
@@ -3361,6 +3562,7 @@ mod tests {
                 text: "Same correction".into(),
                 continuation: false,
                 final_chunk: true,
+                attachments: None,
                 tool: None,
             },
         });
@@ -3415,6 +3617,7 @@ mod tests {
                     text,
                     continuation,
                     final_chunk: true,
+                    attachments: None,
                     tool: None,
                 },
             });
@@ -3486,6 +3689,7 @@ mod tests {
                     text: "read_source".into(),
                     continuation: false,
                     final_chunk: true,
+                    attachments: None,
                     tool: Some(ToolHistory {
                         call_id: "native-call".into(),
                         name: "read_source".into(),
@@ -3498,6 +3702,7 @@ mod tests {
                     text: "NEW_REQUEST".into(),
                     continuation: false,
                     final_chunk: true,
+                    attachments: None,
                     tool: None,
                 },
             ],
@@ -3512,6 +3717,7 @@ mod tests {
                 text: "read_source finished".into(),
                 continuation: false,
                 final_chunk: true,
+                attachments: None,
                 tool: Some(ToolHistory {
                     call_id: "native-call".into(),
                     name: "read_source".into(),
@@ -3566,6 +3772,7 @@ mod tests {
                 text: "Original question".into(),
                 continuation: false,
                 final_chunk: true,
+                attachments: None,
                 tool: None,
             },
             HistoryMessage {
@@ -3574,6 +3781,7 @@ mod tests {
                 text: "First thinking block".into(),
                 continuation: false,
                 final_chunk: true,
+                attachments: None,
                 tool: None,
             },
             HistoryMessage {
@@ -3582,6 +3790,7 @@ mod tests {
                 text: "Second thinking block".into(),
                 continuation: false,
                 final_chunk: true,
+                attachments: None,
                 tool: None,
             },
             HistoryMessage {
@@ -3590,6 +3799,7 @@ mod tests {
                 text: "Original answer".into(),
                 continuation: false,
                 final_chunk: true,
+                attachments: None,
                 tool: None,
             },
         ];
@@ -3607,6 +3817,7 @@ mod tests {
             text: "Finished while attaching".into(),
             continuation: false,
             final_chunk: true,
+            attachments: None,
             tool: None,
         });
         for message in refreshed {
@@ -3697,6 +3908,7 @@ mod tests {
                 text: "Review".into(),
                 continuation: false,
                 final_chunk: true,
+                attachments: None,
                 tool: None,
             },
         });
@@ -3732,6 +3944,7 @@ mod tests {
                     text: text.into(),
                     continuation,
                     final_chunk: true,
+                    attachments: None,
                     tool: None,
                 },
             });
@@ -3739,5 +3952,129 @@ mod tests {
         assert_eq!(chunked.messages.len(), 1);
         assert_eq!(chunked.messages[0].id.as_deref(), Some("local"));
         assert_eq!(chunked.messages[0].text, "Complete local input");
+    }
+
+    #[test]
+    fn dropped_files_are_previewed_before_send_and_restoration_preserves_new_typing() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("plot image.png");
+        std::fs::write(&file, b"image bytes").unwrap();
+        let mut view = state();
+        view.input(Event::Paste("Explain this plot".into()));
+        assert!(
+            view.input(Event::Paste(format!("'{}'", file.display())))
+                .is_none()
+        );
+        assert_eq!(view.editor.lines().join("\n"), "Explain this plot");
+        let preview = rendered(&mut view, 100, 20);
+        assert!(preview.contains("plot image.png"));
+        assert!(preview.contains("11 bytes"));
+        let Some(TuiInput::Submit(input)) = view.input(key(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Expected explicit attachment send")
+        };
+        assert_eq!(input.text, "Explain this plot");
+        assert_eq!(input.files[0].path, file);
+        assert!(view.composer_draft().is_empty());
+        view.input(Event::Paste("New typing".into()));
+        view.restore_composer(input);
+        assert_eq!(
+            view.editor.lines().join("\n"),
+            "New typing\nExplain this plot"
+        );
+        assert_eq!(view.files[0].path, file);
+    }
+
+    #[test]
+    fn file_only_input_can_be_removed_queued_or_added_to_feedback_without_losing_chips() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("report.txt");
+        std::fs::write(&file, b"report").unwrap();
+        let drop = format!("'{}'", file.display());
+        let mut view = state();
+        view.input(Event::Paste(drop.clone()));
+        view.input(key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(view.files.is_empty());
+        view.input(Event::Paste(drop.clone()));
+        let Some(TuiInput::Queue(input)) = view.input(key(KeyCode::Tab, KeyModifiers::NONE)) else {
+            panic!("Expected file-only follow-up")
+        };
+        assert!(input.text.is_empty());
+        assert_eq!(input.files[0].path, file);
+        view.input(Event::Paste(drop));
+        view.input(Event::Paste("/status".into()));
+        assert!(matches!(
+            view.input(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(TuiInput::Command(_))
+        ));
+        assert_eq!(
+            view.files.len(),
+            1,
+            "Read-only controls must not discard staged files"
+        );
+        view.input(Event::Paste("/feedback the view is clipped".into()));
+        let Some(TuiInput::Feedback(input)) = view.input(key(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Expected feedback with staged file")
+        };
+        assert_eq!(input.text, "the view is clipped");
+        assert_eq!(input.files[0].path, file);
+        assert!(view.files.is_empty());
+    }
+
+    #[test]
+    fn attachment_history_keeps_first_chunk_metadata_separate_from_continuations() {
+        let attachment = crate::attachments::AttachmentRef {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "plot image.png".into(),
+            media_type: "image/png".into(),
+            size_bytes: 11,
+            sha256: "a".repeat(64),
+        };
+        let mut view = state();
+        for (text, continuation, final_chunk, attachments) in [
+            ("Review ", false, false, Some(vec![attachment.clone()])),
+            ("this image", true, true, None),
+        ] {
+            view.event(RuntimeEventKind::Message {
+                message: HistoryMessage {
+                    entry_id: "saved-file-input".into(),
+                    role: HistoryRole::User,
+                    text: text.into(),
+                    continuation,
+                    final_chunk,
+                    tool: None,
+                    attachments,
+                },
+            });
+        }
+        assert_eq!(view.messages.len(), 1);
+        assert_eq!(view.messages[0].text, "Review this image");
+        assert_eq!(view.messages[0].attachments.len(), 1);
+        let visible = rendered(&mut view, 100, 20);
+        assert!(visible.contains("Review this image"));
+        assert_eq!(visible.matches("plot image.png").count(), 1);
+        view.event(RuntimeEventKind::History {
+            conversation_id: "fixture".into(),
+            messages: vec![HistoryMessage {
+                entry_id: "saved-file-input".into(),
+                role: HistoryRole::User,
+                text: "Review this image".into(),
+                continuation: false,
+                final_chunk: true,
+                tool: None,
+                attachments: Some(vec![attachment]),
+            }],
+            next_cursor: None,
+            page_complete: true,
+        });
+        assert_eq!(view.messages.len(), 1);
+        assert_eq!(view.messages[0].attachments.len(), 1);
+        assert_eq!(
+            rendered(&mut view, 100, 20)
+                .matches("plot image.png")
+                .count(),
+            1
+        );
     }
 }

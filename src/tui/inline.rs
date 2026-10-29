@@ -237,7 +237,10 @@ impl State {
         let body = rows
             .pending
             .max(if self.completion.is_some() { 6 } else { 1 });
-        let chrome = self.editor_height(size.width, 6) + 2;
+        let chrome = self
+            .editor_height(size.width, 6)
+            .saturating_add(2)
+            .saturating_add(u16::try_from(self.attachment_count()).unwrap_or(u16::MAX));
         let minimum = u16::try_from(body)
             .unwrap_or(u16::MAX)
             .saturating_add(chrome)
@@ -673,6 +676,7 @@ mod tests {
             text: text.into(),
             continuation,
             final_chunk,
+            attachments: None,
             tool: None,
         }
     }

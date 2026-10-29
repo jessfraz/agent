@@ -1,6 +1,9 @@
 //! Admission belongs to its conversation, independently of the selected view.
 
-use agent_cli::protocol::{InputMode, RuntimeEventKind};
+use agent_cli::{
+    protocol::{InputMode, RuntimeEventKind},
+    tui::attachments::ComposerInput,
+};
 use anyhow::Result;
 use std::sync::Mutex;
 
@@ -18,17 +21,33 @@ pub(crate) struct Admission {
     pub(crate) conversation_id: String,
     pub(crate) text: String,
     pub(crate) mode: InputMode,
+    input: Mutex<ComposerInput>,
     stage: Mutex<Stage>,
 }
 impl Admission {
-    pub(crate) fn new(conversation_id: String, text: String, mode: InputMode) -> Self {
+    pub(crate) fn new(conversation_id: String, input: ComposerInput, mode: InputMode) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             conversation_id,
-            text,
+            text: input.text.clone(),
             mode,
+            input: Mutex::new(input),
             stage: Mutex::new(Stage::Waiting),
         }
+    }
+    pub(crate) fn input(&self) -> Result<ComposerInput> {
+        Ok(self
+            .input
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Input attachment state is unavailable"))?
+            .clone())
+    }
+    pub(crate) fn prepared(&self, input: ComposerInput) -> Result<()> {
+        *self
+            .input
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Input attachment state is unavailable"))? = input;
+        Ok(())
     }
     pub(crate) fn stage(&self) -> Result<Stage> {
         Ok(*self

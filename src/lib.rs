@@ -1,3 +1,4 @@
+pub mod attachments;
 pub mod chat_commands;
 pub mod config;
 pub mod context;

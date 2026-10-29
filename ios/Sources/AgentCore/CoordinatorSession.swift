@@ -25,6 +25,12 @@ public struct ChatSnapshot: Sendable {
   public var error: String?
 }
 
+public struct RestoredDraft: Sendable {
+  public let text: String
+  public let mode: InputMode
+  public let attachments: [LocalAttachment]
+}
+
 /// Owns all network work, decoding, rendering preparation and the on-device outbox.
 /// Reconnect observes and reconciles. It never automatically replays an uncertain write.
 public actor CoordinatorSession {
@@ -37,20 +43,34 @@ public actor CoordinatorSession {
   private var connection: LineConnection?
   private var actions: [UUID: Task<Void, Never>] = [:]
   private var actionConnections: [UUID: LineConnection] = [:]
+  private var previewRequests: Set<UUID> = []
   private var pending: [NativeRequestSubmit] = []
+  private var attemptedInputs: Set<String> = []
   private var generation = UUID()
   private var flush: Task<Void, Never>?
   private let outboxURL: URL
-  private let connectTransport: @Sendable (CoordinatorAddress) throws -> LineConnection
+  private let attachments: AttachmentStore
+  private let previews: AttachmentStore
+  private let connectTransport: @Sendable (CoordinatorAddress) async throws -> LineConnection
 
   public init(outboxURL: URL) {
-    self.init(outboxURL: outboxURL, connectTransport: { try LineConnection(address: $0) })
+    self.init(
+      outboxURL: outboxURL,
+      previewDirectory: URL.cachesDirectory.appending(
+        path: "Agent/Previews/\(outboxURL.deletingLastPathComponent().lastPathComponent)"),
+      connectTransport: { try await LineConnection(address: $0) })
   }
   init(
     outboxURL: URL,
-    connectTransport: @escaping @Sendable (CoordinatorAddress) throws -> LineConnection
+    previewDirectory: URL? = nil,
+    connectTransport: @escaping @Sendable (CoordinatorAddress) async throws -> LineConnection
   ) {
     self.outboxURL = outboxURL
+    attachments = AttachmentStore(
+      directory: outboxURL.deletingLastPathComponent().appending(path: "Attachments"))
+    previews = AttachmentStore(
+      directory: previewDirectory
+        ?? outboxURL.deletingLastPathComponent().appending(path: "Previews"))
     self.connectTransport = connectTransport
     let pair = AsyncStream<ChatSnapshot>.makeStream(bufferingPolicy: .bufferingNewest(1))
     updates = pair.stream
@@ -73,6 +93,7 @@ public actor CoordinatorSession {
     }
     // A different coordinator must never inherit another coordinator's outbox.
     // The UI supplies a per-endpoint outbox directory, not a shared queue.
+    attemptedInputs.formUnion(pending.map(\.inputId))
     for request in pending { transcript.pending(request, delivery: .uncertain) }
     observation = Task { [weak self] in await self?.observe(address, generation: generation) }
   }
@@ -96,20 +117,50 @@ public actor CoordinatorSession {
     for connection in ownedConnections { await connection.close() }
   }
 
-  @discardableResult public func submit(_ text: String, mode: InputMode = .steer) -> Bool {
+  @discardableResult public func submit(
+    _ text: String, mode: InputMode = .steer, files: [LocalAttachment] = []
+  ) async -> Bool {
     guard actions.count < 32, snapshot.connection == .connected,
-      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !files.isEmpty
     else { return false }
     guard text.utf8.count <= 65536 else {
       snapshot.error = "Messages must be at most 64 KiB."
       publish()
       return false
     }
-    let request = NativeRequestSubmit(inputId: UUID().uuidString, mode: mode, text: text)
+    guard files.count <= AttachmentLimits.maximumCount,
+      Set(files.map(\.id)).count == files.count
+    else {
+      snapshot.error = AttachmentError.tooMany.localizedDescription
+      publish()
+      return false
+    }
+    let feedback = text.split(whereSeparator: \.isWhitespace).first == "/feedback"
     let control =
       text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/")
       || text.trimmingCharacters(in: .whitespacesAndNewlines) == "?"
-    if !control {
+    guard files.isEmpty || !control || feedback else {
+      snapshot.error = "Files can be sent with messages or /feedback."
+      publish()
+      return false
+    }
+    let generation = generation
+    do {
+      for file in files { _ = try await attachments.adopt(file) }
+    } catch {
+      snapshot.error = error.localizedDescription
+      publish()
+      return false
+    }
+    guard self.generation == generation, snapshot.connection == .connected, actions.count < 32
+    else {
+      return false
+    }
+    let request = NativeRequestSubmit(
+      attachments: files.isEmpty && !feedback ? nil : files.map(\.reference),
+      inputId: UUID().uuidString, mode: mode, text: text)
+    let durable = !control || feedback
+    if durable {
       guard pending.count < 32 else {
         snapshot.error = "Resolve pending messages before sending more."
         publish()
@@ -125,7 +176,7 @@ public actor CoordinatorSession {
       transcript.pending(request, delivery: .sending)
     }
     snapshot.error = nil
-    perform(.submit(request), inputID: control ? nil : request.inputId)
+    perform(.submit(request), inputID: durable ? request.inputId : nil)
     publish()
     return true
   }
@@ -138,13 +189,29 @@ public actor CoordinatorSession {
     perform(.submit(request), inputID: inputID)
     publish()
   }
-  public func restore(_ inputID: String) -> String? {
+  public func restore(_ inputID: String, to draftStore: AttachmentStore) async -> RestoredDraft? {
     guard let request = pending.first(where: { $0.inputId == inputID }) else { return nil }
-    pending.removeAll { $0.inputId == inputID }
-    persistOutboxOrReport()
+    var files: [LocalAttachment] = []
+    do {
+      for reference in request.attachments ?? [] {
+        let original = try await attachments.local(reference)
+        // Restoring creates a new draft. Original acknowledgement cleanup
+        // must never share a file identity with a later submission.
+        files.append(try await draftStore.duplicate(original))
+      }
+    } catch {
+      snapshot.error = error.localizedDescription
+      publish()
+      return nil
+    }
+    guard pending.contains(request) else { return nil }
+    guard acknowledge(inputID) else {
+      publish()
+      return nil
+    }
     transcript.delivery(inputID, .rejected)
     publish()
-    return request.text
+    return RestoredDraft(text: request.text, mode: request.mode, attachments: files)
   }
   public func loadEarlier() {
     guard actions.count < 32, let cursor = snapshot.olderCursor, !snapshot.loadingHistory,
@@ -166,7 +233,11 @@ public actor CoordinatorSession {
         transcript.reconnect()
         snapshot.connection = .connecting
         publish()
-        let opened = try connectTransport(address)
+        let opened = try await connectTransport(address)
+        guard self.generation == generation, !Task.isCancelled else {
+          await opened.close()
+          return
+        }
         stream = opened
         connection = opened
         let stream = opened
@@ -191,7 +262,7 @@ public actor CoordinatorSession {
         guard !Task.isCancelled, self.generation == generation else { return }
         connection = nil
         for request in pending { transcript.delivery(request.inputId, .uncertain) }
-        snapshot.connection = .retrying(error.localizedDescription)
+        snapshot.connection = .retrying(ConnectionError.describe(error))
         snapshot.busy = false
         publish()
         attempt = min(attempt + 1, 5)
@@ -217,8 +288,22 @@ public actor CoordinatorSession {
       transcript.abandonHistory(id)
     }
     do {
-      let stream = try connectTransport(address)
+      let stream = try await connectTransport(address)
+      guard self.generation == generation, !Task.isCancelled else {
+        await stream.close()
+        return
+      }
       actionConnections[id] = stream
+      if case .submit(let input) = request {
+        for reference in input.attachments ?? [] {
+          try Task.checkCancellation()
+          let file = try await attachments.local(reference)
+          try await upload(file, on: stream)
+        }
+      }
+      try Task.checkCancellation()
+      guard self.generation == generation else { throw CancellationError() }
+      if let inputID { attemptedInputs.insert(inputID) }
       try await timedSend(stream, request)
       while !Task.isCancelled {
         let event = try await timedNext(stream)
@@ -237,17 +322,120 @@ public actor CoordinatorSession {
         schedulePublish()
         if case .placed(let placed) = event, placed.inputId == inputID { break }
         if case .rejected(let rejected) = event, rejected.inputId == inputID { break }
+        if case .feedbackReady(let ready) = event, ready.inputId == inputID { break }
       }
     } catch {
       if self.generation == generation && !Task.isCancelled {
-        if let inputID { transcript.delivery(inputID, .uncertain) }
-        snapshot.error = error.localizedDescription
+        if let inputID, pending.contains(where: { $0.inputId == inputID }) {
+          transcript.delivery(inputID, attemptedInputs.contains(inputID) ? .uncertain : .rejected)
+        }
+        snapshot.error = ConnectionError.describe(error)
       }
     }
     await actionConnections.removeValue(forKey: id)?.close()
     if self.generation == generation {
       snapshot.loadingHistory = false
       publish()
+    }
+  }
+  private func transfer(_ request: AttachmentRequest, on stream: LineConnection) async throws
+    -> AttachmentResponse
+  {
+    try await timedSend(stream, .attachment(.init(request: request)))
+    var response: AttachmentResponse?
+    while true {
+      let event = try await timedNext(stream)
+      switch event {
+      case .attachment(let value):
+        guard response == nil else { throw AttachmentError.invalidResponse }
+        response = value.response
+      case .done:
+        guard let response else { throw AttachmentError.invalidResponse }
+        return response
+      case .failure(let value): throw AttachmentError.unavailable(value.message)
+      default: throw AttachmentError.invalidResponse
+      }
+    }
+  }
+  private func upload(_ file: LocalAttachment, on stream: LineConnection) async throws {
+    let input = try FileHandle(forReadingFrom: file.url)
+    defer { try? input.close() }
+    let reference = file.reference
+    var offset = 0
+    repeat {
+      let bytes = try input.read(upToCount: AttachmentLimits.chunkBytes) ?? Data()
+      let end = offset + bytes.count
+      guard end <= reference.sizeBytes, !bytes.isEmpty || end == reference.sizeBytes else {
+        throw AttachmentError.changed
+      }
+      let complete = end == reference.sizeBytes
+      let response = try await transfer(
+        .upload(
+          .init(
+            complete: complete, dataBase64: bytes.base64EncodedString(), id: reference.id,
+            mediaType: reference.mediaType, name: reference.name, offset: offset,
+            sizeBytes: reference.sizeBytes)), on: stream)
+      guard case .uploaded(let uploaded) = response, uploaded.nextOffset == end,
+        complete ? uploaded.attachment == reference : uploaded.attachment == nil
+      else { throw AttachmentError.changed }
+      offset = end
+      if complete {
+        guard (try input.read(upToCount: 1) ?? Data()).isEmpty else {
+          throw AttachmentError.changed
+        }
+        return
+      }
+    } while true
+  }
+
+  /// Fetch only on an explicit preview request; history carries metadata, never image bytes.
+  public func preview(_ reference: AttachmentRef) async throws -> URL {
+    guard actions.count + previewRequests.count < 32 else {
+      throw AttachmentError.unavailable("Wait for the current files to finish opening.")
+    }
+    let id = UUID()
+    previewRequests.insert(id)
+    defer { previewRequests.remove(id) }
+    if let cached = try await previews.existing(reference) { return cached.url }
+    guard let address, snapshot.connection == .connected
+    else { throw ConnectionError.closed }
+    let generation = generation
+    let stream = try await connectTransport(address)
+    guard self.generation == generation, !Task.isCancelled else {
+      await stream.close()
+      throw CancellationError()
+    }
+    actionConnections[id] = stream
+    do {
+      var data = Data()
+      var offset = 0
+      repeat {
+        let response = try await transfer(
+          .download(.init(id: reference.id, limit: AttachmentLimits.chunkBytes, offset: offset)),
+          on: stream)
+        guard self.generation == generation else { throw CancellationError() }
+        guard case .download(let chunk) = response,
+          let bytes = Data(base64Encoded: chunk.dataBase64),
+          bytes.count <= AttachmentLimits.chunkBytes,
+          data.count + bytes.count <= min(reference.sizeBytes, AttachmentLimits.maximumBytes)
+        else { throw AttachmentError.invalidResponse }
+        data.append(bytes)
+        let end = offset + bytes.count
+        if let next = chunk.nextOffset {
+          guard next == end, next > offset, next < reference.sizeBytes else {
+            throw AttachmentError.invalidResponse
+          }
+          offset = next
+        } else {
+          break
+        }
+      } while true
+      let staged = try await previews.receive(data, reference: reference)
+      await actionConnections.removeValue(forKey: id)?.close()
+      return staged.url
+    } catch {
+      await actionConnections.removeValue(forKey: id)?.close()
+      throw error
     }
   }
   private func timedNext(_ connection: LineConnection) async throws -> NativeEvent {
@@ -298,8 +486,11 @@ public actor CoordinatorSession {
     case .accepted(let value): transcript.delivery(value.inputId, .saved)
     case .placed(let value):
       transcript.delivery(value.inputId, .saved, entryID: value.entryId)
-      pending.removeAll { $0.inputId == value.inputId }
-      persistOutboxOrReport()
+      acknowledge(value.inputId)
+    case .feedbackReady(let value):
+      transcript.delivery(value.inputId, .saved)
+      transcript.notice("Feedback saved. Repair task: \(value.receipt.taskId)")
+      acknowledge(value.inputId)
     case .rejected(let value):
       transcript.delivery(value.inputId, .rejected)
       // Keep the original on disk until the user explicitly restores it.
@@ -312,7 +503,7 @@ public actor CoordinatorSession {
     case .idle:
       snapshot.busy = false
       transcript.idle()
-    case .disconnect, .done: break
+    case .attachment, .disconnect, .done: break
     }
   }
   private func schedulePublish() {
@@ -330,11 +521,24 @@ public actor CoordinatorSession {
     snapshot.rows = transcript.rows
     continuation.yield(snapshot)
   }
-  private func persistOutboxOrReport() {
+  @discardableResult private func acknowledge(_ inputID: String) -> Bool {
+    let previous = pending
+    let completed = pending.filter { $0.inputId == inputID }.flatMap { $0.attachments ?? [] }
+    pending.removeAll { $0.inputId == inputID }
     do { try saveOutbox() } catch {
-      snapshot.error =
-        "The outbox could not be updated. Reconnect reconciles saved message IDs before retry."
+      pending = previous
+      snapshot.error = "The saved outbox could not be updated. Original files were preserved."
+      return false
     }
+    attemptedInputs.remove(inputID)
+    let retained = Set(pending.flatMap { $0.attachments ?? [] }.map(\.id))
+    let store = attachments
+    Task {
+      for reference in completed where !retained.contains(reference.id) {
+        if let file = try? await store.local(reference) { try? await store.remove(file) }
+      }
+    }
+    return true
   }
   private func saveOutbox() throws {
     try FileManager.default.createDirectory(

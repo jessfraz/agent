@@ -264,6 +264,103 @@
         "other"
       ]
     },
+    "AttachmentRef": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "media_type",
+        "size_bytes",
+        "sha256"
+      ]
+    },
+    "AttachmentResponse": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "attachment": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AttachmentRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "next_offset": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "uploaded"
+            }
+          },
+          "required": [
+            "type",
+            "next_offset"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "data_base64": {
+              "type": "string"
+            },
+            "next_offset": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "download"
+            }
+          },
+          "required": [
+            "type",
+            "data_base64"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "discarded"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
     "AuthStatus": {
       "oneOf": [
         {
@@ -1194,6 +1291,15 @@
             "null"
           ]
         },
+        "attachments": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/AttachmentRef"
+          }
+        },
         "binding": {
           "anyOf": [
             {
@@ -1472,6 +1578,15 @@
     "HistoryMessage": {
       "type": "object",
       "properties": {
+        "attachments": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/AttachmentRef"
+          }
+        },
         "continuation": {
           "type": "boolean"
         },
@@ -1662,6 +1777,36 @@
     },
     "HostCommand": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "attachment": {
+              "$ref": "#/$defs/AttachmentRef"
+            },
+            "complete": {
+              "type": "boolean"
+            },
+            "data_base64": {
+              "type": "string"
+            },
+            "offset": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "attachment_write"
+            }
+          },
+          "required": [
+            "type",
+            "attachment",
+            "offset",
+            "data_base64",
+            "complete"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -3006,6 +3151,22 @@
         {
           "type": "object",
           "properties": {
+            "response": {
+              "$ref": "#/$defs/AttachmentResponse"
+            },
+            "type": {
+              "type": "string",
+              "const": "attachment"
+            }
+          },
+          "required": [
+            "type",
+            "response"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "run": {
               "$ref": "#/$defs/JobRunReceipt"
             },
@@ -3105,6 +3266,12 @@
         {
           "type": "object",
           "properties": {
+            "input_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "receipt": {
               "$ref": "#/$defs/FeedbackReceipt"
             },
@@ -4376,6 +4543,15 @@
     "TaskInput": {
       "type": "object",
       "properties": {
+        "attachments": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/AttachmentRef"
+          }
+        },
         "content": {
           "type": "string"
         },

@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { AttachmentStore, AttachmentError, validateInput } from "./attachments.js";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
@@ -84,7 +85,7 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
 }
 
 type Application = TriageApplication & { stopPlacements(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore;
-  histories: HistoryStore; catalog: ConversationCatalog; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler };
+  histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler };
 async function openApplication(): Promise<Application> {
   const database = await openNodeSqliteDatabase(join(state, "session.sqlite"));
   await database.exec("PRAGMA synchronous = FULL");
@@ -93,6 +94,7 @@ async function openApplication(): Promise<Application> {
   const harness = await Harness.open(storage, { models, registry, identity: { attribution: null },
     settings: { steeringMode: "all", followUpMode: "one-at-a-time" } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(harness, inference);
+  const attachments = new AttachmentStore(state); tasks.useAttachments(attachments);
   const environment = new CoordinatorEnvironment(harness); environment.useLiveGuidance(); tasks.useEnvironment(environment);
   const assets = join(state, "history", "assets");
   const histories = new HistoryStore(harness, assets); tasks.useHistory(histories);
@@ -126,7 +128,7 @@ async function openApplication(): Promise<Application> {
       if (conversation.id.toString() === conversationId && !ending.has(id)) emit(id, { type: "input_placed", input_id, entry_id });
     }
   });
-  const core = { stopPlacements, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, feedback, repairs };
+  const core = { stopPlacements, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, attachments, feedback, repairs };
   const background = new BackgroundScheduler(harness, registry, tasks, {
     async plan(cadence, after, now) {
       const result = await backgroundCall({ type: "background", request: { type: "plan", cadence, after, now } });
@@ -228,19 +230,26 @@ function submitInput(id: number, command: Extract<RuntimeCommand, { type: "submi
   if (main !== undefined) main.admissions += 1;
   const operations = inputControls.get(id) ?? new Set<Promise<void>>(); inputControls.set(id, operations);
   const operation = (async () => {
-    if (command.input.trim().length === 0 || Buffer.byteLength(command.input, "utf8") > 65_536) throw new TaskError("Input must contain 1 to 65536 UTF-8 bytes");
+    validateInput(command.input, command.attachments);
     if (main !== undefined && !await main.ready) throw new TaskError("The turn could not start; this input was not accepted");
     const stopping = interrupts.get(id); await stopping;
     if (worker !== undefined) {
       if (worker.controller.signal.aborted) throw new TaskError("This worker is detaching");
-      await (await app()).tasks.input(worker.command, command.input, command.input_id, command.mode);
+      await (await app()).tasks.input(worker.command, command.input, command.input_id, command.mode, command.attachments);
     } else {
       if (main === undefined || !main.accepting || main.conversation === undefined) throw new TaskError("The turn has finished; this input was not accepted");
       if (interrupts.get(id) === stopping) {
         interrupts.delete(id); interrupted.delete(id); hostRequests.resumeRequest(id);
       }
-      const submission = await main.conversation.submit({ type: "input", content: command.input, requestId: command.input_id,
-        whenBusy: command.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
+      const application = await app();
+      const prepared = await application.attachments.input(command.input, command.attachments, application.executions.get(main.conversation.id.toString()).call);
+      const conversation = main.conversation;
+      const submission = await application.attachments.admit(command.attachments, () => {
+        if (!main.accepting || interrupted.has(id) || interrupts.get(id) !== undefined) return undefined;
+        return conversation.submit({ type: "input", ...prepared, requestId: command.input_id,
+          whenBusy: command.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
+      });
+      if (submission === undefined) throw new TaskError("The turn stopped while attachments were being prepared; this input was not accepted");
       if (!main.accepting) {
         await main.conversation.abort(BACKGROUND_CONTEXT);
         throw new TaskError("The turn ended while this input was being saved; its original is retained");
@@ -271,16 +280,17 @@ async function handle(request: RuntimeRequest): Promise<void> {
   try {
     if (effective.type === "conversation_input" && effective.conversation_id === ROOT_CONVERSATION_ID.toString()) {
       effective = { type: "main_input", input_id: effective.input_id, input: effective.input, mode: effective.mode,
-        ...(effective.context === undefined ? {} : { context: effective.context }) };
+        ...(effective.context === undefined ? {} : { context: effective.context }), ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) };
     }
     if (effective.type === "main_input") {
+      validateInput(effective.input, effective.attachments);
       const application = await app();
       const root = await application.harness.root(BACKGROUND_CONTEXT);
       const reconciled = await reconcileMainInput(root, effective.input_id);
       if (reconciled !== undefined) { for (const event of reconciled) emit(id, event); return; }
       const owner = [...mainTurns].find(([owner, turn]) => turn.accepting && !ending.has(owner))?.[0];
       if (owner !== undefined) {
-        await submitInput(owner, { type: "submit_input", input_id: effective.input_id, input: effective.input, mode: effective.mode }, id);
+        await submitInput(owner, { type: "submit_input", input_id: effective.input_id, input: effective.input, mode: effective.mode, ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) }, id);
         return;
       }
       const context = effective.context;
@@ -289,15 +299,16 @@ async function handle(request: RuntimeRequest): Promise<void> {
       if (host === null) throw new TaskError("The coordinator execution host is offline");
       const admittedOwner = [...mainTurns].find(([owner, turn]) => turn.accepting && !ending.has(owner))?.[0];
       if (admittedOwner !== undefined) {
-        await submitInput(admittedOwner, { type: "submit_input", input_id: effective.input_id, input: effective.input, mode: effective.mode }, id);
+        await submitInput(admittedOwner, { type: "submit_input", input_id: effective.input_id, input: effective.input, mode: effective.mode, ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) }, id);
         return;
       }
       effective = { type: "chat", input: effective.input, input_id: effective.input_id, instructions: context?.instructions ?? "", model: null,
-        origin_host_id: context?.origin_host_id ?? host.host_id ?? null, cwd: context?.cwd ?? host.cwd, hosts };
+        origin_host_id: context?.origin_host_id ?? host.host_id ?? null, cwd: context?.cwd ?? host.cwd, hosts, ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) };
       activeCommands.add(id); mainTurns.set(id, mainTurn());
     }
     const command = effective;
     switch (command.type) {
+      case "attachment": emit(id, { type: "attachment", response: await (await app()).attachments.request(command.request) }); break;
       case "run_background": {
         if (backgroundOwner !== undefined) throw new TaskError("The coordinator already owns background execution");
         backgroundOwner = id;
@@ -371,9 +382,12 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const root = await application.harness.root(BACKGROUND_CONTEXT);
         const context = { ...command.context, model: command.context.model ?? application.executions.model(root.id.toString()) ??
           await application.environment.model(null) };
-        const bundle = await application.feedback.capture(command.description, context);
+        const refs = await application.attachments.resolve(command.context.attachments);
+        const bundle = await application.feedback.capture(command.description, { ...context, attachments: refs }, command.input_id);
+        await application.attachments.retain(bundle.context.attachments);
+        if (command.input_id !== undefined) emit(id, { type: "input_accepted", input_id: command.input_id });
         const receipt = await application.repairs.dispatch(bundle, (operation) => hostRequests.call(id, operation));
-        emit(id, { type: "feedback_ready", receipt }); break;
+        emit(id, { type: "feedback_ready", receipt, ...(command.input_id === undefined ? {} : { input_id: command.input_id }) }); break;
       }
       case "read_feedback": emit(id, { type: "feedback", bundle: await (await app()).feedback.read(command.id) }); break;
       case "import_codex": {
@@ -515,12 +529,15 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const root = await application.harness.root(BACKGROUND_CONTEXT);
         const host = await application.environment.defaultHost(await application.environment.hosts("/", null, []));
         if (host?.host_id === undefined || host.host_id === null) throw new TaskError("The coordinator execution host is offline");
-        const bundle = await application.feedback.capture(command.description, { origin_host_id: host.host_id,
+        const refs = await application.attachments.resolve(command.attachments);
+        const bundle = await application.feedback.capture(command.description, { attachments: refs, origin_host_id: host.host_id,
           cwd: host.cwd, conversation_id: root.id.toString(), task_id: null, agent_id: null,
           model: application.executions.model(root.id.toString()) ?? await application.environment.model(null),
-          binding: null, draft: "", queued_inputs: [], client_errors: [] });
+          binding: null, draft: "", queued_inputs: [], client_errors: [] }, command.input_id);
+        await application.attachments.retain(bundle.context.attachments);
+        if (command.input_id !== undefined) emit(id, { type: "input_accepted", input_id: command.input_id });
         const receipt = await application.repairs.dispatch(bundle, (operation) => hostRequests.call(id, operation));
-        emit(id, { type: "feedback_ready", receipt }); break;
+        emit(id, { type: "feedback_ready", receipt, ...(command.input_id === undefined ? {} : { input_id: command.input_id }) }); break;
       }
       case "observe_main": {
         const application = await app();
@@ -607,9 +624,14 @@ async function handle(request: RuntimeRequest): Promise<void> {
               instructions: (await environment.instructions(command.instructions)) + relatedContext + hostsContext, cwd: command.cwd, extensions: toolsets.main });
             executions.setModel(root.id.toString(), selected);
             if (interrupted.has(id)) { await interrupts.get(id); return; }
-            submissionAttempted = true;
-            const submission = await root.submit({ type: "input", content: command.input,
-              ...(command.input_id === undefined ? {} : { requestId: command.input_id }) }, BACKGROUND_CONTEXT);
+            const prepared = await application.attachments.input(command.input, command.attachments, executions.get(root.id.toString()).call);
+            const submission = await application.attachments.admit(command.attachments, () => {
+              if (interrupted.has(id)) return undefined;
+              submissionAttempted = true;
+              return root.submit({ type: "input", ...prepared,
+                ...(command.input_id === undefined ? {} : { requestId: command.input_id }) }, BACKGROUND_CONTEXT);
+            });
+            if (submission === undefined) { await interrupts.get(id); return; }
             if (command.input_id !== undefined) emit(id, { type: "input_accepted", input_id: command.input_id });
             if (turn === undefined) throw new TaskError("The main execution owner is unavailable");
             turn.conversation = root; turn.info = { type: "main_ready", conversation_id: root.id.toString(), model: selected, cwd: command.cwd };
@@ -670,7 +692,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
       if (stopping === undefined) emit(id, { type: "interrupted" });
       else await stopping.catch(() => failure(id, "internal", "Interruption could not be confirmed; inspect current work"));
     }
-    else if (error instanceof TaskError || error instanceof ModelError || error instanceof EnvironmentError) failure(id, "invalid_request", error.message);
+    else if (error instanceof TaskError || error instanceof ModelError || error instanceof EnvironmentError || error instanceof AttachmentError) failure(id, "invalid_request", error.message);
     else emit(id, errorEvent(error));
   } finally {
     ending.add(id);
@@ -735,7 +757,7 @@ try {
         const { input, input_id } = request.command;
         try {
           if (worker.controller.signal.aborted) throw new TaskError("This worker is detaching");
-          await (await app()).tasks.input(worker.command, input, input_id);
+          await (await app()).tasks.input(worker.command, input, input_id, undefined, request.command.attachments);
         } catch (error) {
           emit(request.id, { type: "input_rejected", input_id,
             message: error instanceof TaskError ? error.message : "Input could not be saved; its previous history is retained" });

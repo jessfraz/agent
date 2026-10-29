@@ -420,6 +420,7 @@ async fn chief_startup(mode: ChiefStartup) {
                         vec![RuntimeEventKind::History {
                             conversation_id,
                             messages: vec![HistoryMessage {
+                                attachments: None,
                                 entry_id: "saved-answer".into(),
                                 role: HistoryRole::Final,
                                 text: "The known chief history is visible.".into(),
@@ -608,10 +609,16 @@ async fn chief_startup(mode: ChiefStartup) {
             Main,
         }
         #[derive(serde::Deserialize)]
+        struct RecoveryInput {
+            id: String,
+            input: agent_cli::tui::attachments::ComposerInput,
+            mode: agent_cli::protocol::InputMode,
+        }
+        #[derive(serde::Deserialize)]
         struct Recovery {
             owner: Owner,
-            draft: String,
-            queued_inputs: Vec<String>,
+            draft: agent_cli::tui::attachments::ComposerInput,
+            queued_inputs: Vec<RecoveryInput>,
         }
         let saved = fs::read_dir(directory.path().join("recovery"))
             .unwrap()
@@ -620,16 +627,44 @@ async fn chief_startup(mode: ChiefStartup) {
         assert_eq!(saved.len(), 1);
         let recovery: Recovery = serde_json::from_slice(&fs::read(&saved[0]).unwrap()).unwrap();
         assert!(matches!(recovery.owner, Owner::Main));
-        assert_eq!(recovery.draft, "A partial draft");
+        assert_eq!(recovery.draft, "A partial draft".into());
         let initial = if matches!(mode, ChiefStartup::Exit) {
             "Do the initial CLI request"
         } else {
             "/resume retained-target"
         };
         assert_eq!(
-            recovery.queued_inputs,
+            recovery
+                .queued_inputs
+                .iter()
+                .map(|queued| queued.input.text.as_str())
+                .collect::<Vec<_>>(),
             [initial, "An early request", "A later request"]
         );
+        assert_eq!(
+            recovery
+                .queued_inputs
+                .iter()
+                .map(|queued| queued.mode)
+                .collect::<Vec<_>>(),
+            [
+                agent_cli::protocol::InputMode::Steer,
+                agent_cli::protocol::InputMode::Steer,
+                agent_cli::protocol::InputMode::FollowUp
+            ]
+        );
+        let ids = recovery
+            .queued_inputs
+            .iter()
+            .map(|queued| {
+                let id = uuid::Uuid::parse_str(&queued.id).unwrap();
+                assert!(!id.is_nil());
+                assert!(queued.input.files.is_empty());
+                assert!(queued.input.attachments.is_empty());
+                id
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids.len(), recovery.queued_inputs.len());
         assert_eq!(
             fs::metadata(&saved[0]).unwrap().permissions().mode() & 0o777,
             0o600
@@ -868,6 +903,7 @@ async fn exact_resume_renders_history_without_fetching_fuzzy_catalog_pages() {
                         vec![RuntimeEventKind::History {
                             conversation_id,
                             messages: vec![HistoryMessage {
+                                attachments: None,
                                 entry_id: "saved-answer".into(),
                                 role: HistoryRole::Final,
                                 text: "The exact saved chat is visible.".into(),
@@ -1020,6 +1056,7 @@ async fn main_history(older: bool) {
                             conversation_id: "persisted-main".into(),
                             messages: vec![
                                 HistoryMessage {
+                                    attachments: None,
                                     entry_id: if older { "1" } else { "2" }.into(),
                                     role: HistoryRole::User,
                                     text: if older {
@@ -1033,6 +1070,7 @@ async fn main_history(older: bool) {
                                     tool: None,
                                 },
                                 HistoryMessage {
+                                    attachments: None,
                                     entry_id: if older { "3" } else { "4" }.into(),
                                     role: HistoryRole::Assistant,
                                     text: if older {

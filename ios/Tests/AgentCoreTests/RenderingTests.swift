@@ -79,23 +79,31 @@
     let roles: [HistoryRole] = [
       .user, .assistant, .commentary, .partialAnswer, .final, .notice, .thinking,
     ]
+    let file = AttachmentRef(
+      id: "11111111-1111-4111-8111-111111111111", mediaType: "application/pdf",
+      name: "Design notes.pdf",
+      sha256: String(repeating: "a", count: 64), sizeBytes: 24576)
     for role in roles {
       transcript.message(
         .init(
-          continuation: false, entryId: role.rawValue, finalChunk: true, role: role,
+          attachments: role == .user ? [file] : nil, continuation: false, entryId: role.rawValue,
+          finalChunk: true,
+          role: role,
           text: "A **useful** message with `inline code` and a [link](https://example.invalid).",
           tool: nil))
     }
     for status in [ToolStatus.running, .finished, .failed] {
       transcript.message(
         .init(
-          continuation: false, entryId: "tool-\(status.rawValue)", finalChunk: true, role: .tool,
+          attachments: nil, continuation: false, entryId: "tool-\(status.rawValue)",
+          finalChunk: true, role: .tool,
           text: "Build the native client",
           tool: .init(callId: status.rawValue, name: "build", status: status)))
     }
     transcript.message(
       .init(
-        continuation: false, entryId: "rich-answer", finalChunk: true, role: .final,
+        attachments: nil, continuation: false, entryId: "rich-answer", finalChunk: true,
+        role: .final,
         text: """
           # Native rendering
 
@@ -111,7 +119,9 @@
           """, tool: nil))
     for delivery in [Delivery.uncertain, .rejected] {
       transcript.pending(
-        .init(inputId: UUID().uuidString, mode: .steer, text: "Keep this original message"),
+        .init(
+          attachments: nil, inputId: UUID().uuidString, mode: .steer,
+          text: "Keep this original message"),
         delivery: delivery)
     }
     for scheme in [ColorScheme.light, .dark] {
@@ -130,7 +140,8 @@
       var transcript = Transcript()
       transcript.message(
         .init(
-          continuation: false, entryId: "long-answer", finalChunk: true, role: .final,
+          attachments: nil, continuation: false, entryId: "long-answer", finalChunk: true,
+          role: .final,
           text: """
             This answer should wrap at the phone's available width. Increasing the preferred text size
             must increase the row's height so that the full message remains readable.

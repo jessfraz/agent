@@ -18,12 +18,13 @@ test("native main observation survives idle, correlates notices, streams text an
     "publish-native": [{ tool: "notify", args: { keys: [], text: "A useful durable notice." } }, { text: "Published the update." }],
     "stop-native": [{ tool: "exec", args: { program: "held", args: [] } }],
     "never-run-native": [{ text: "Must never run" }],
+    "attachment-native": [{ text: "The image is available." }],
   }));
   const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("./fixtures/coordinator-runtime.js", import.meta.url)), directory],
     { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, OPENAI_API_KEY: "sk-synthetic-fixture", AGENT_TEST_MODEL_QUEUE: queue } });
   const closed = new Promise<number | null>((resolve) => child.once("close", resolve));
   const frames: RuntimeEvent[] = [], changes = new Set<() => void>();
-  let errors = "", held: { request: number; call: string } | undefined;
+  let errors = "", held: { request: number; call: string } | undefined, feedbackSpawns = 0;
   child.stderr.setEncoding("utf8").on("data", (text: string) => { errors += text; });
   const send = (id: number, command: RuntimeCommand) => child.stdin.write(JSON.stringify({ version: 1, id, command }) + "\n");
   const wait = (id: number, predicate: (event: RuntimeEventKind) => boolean): Promise<RuntimeEventKind> => new Promise((resolve) => {
@@ -42,7 +43,13 @@ test("native main observation survives idle, correlates notices, streams text an
       if (frame.event.type !== "host_call") continue;
       let command = frame.event.command; while (command.type === "on_node") command = command.command;
       if (command.type === "exec") { held = { request: frame.id, call: frame.event.call_id }; continue; }
-      const result: HostResult = command.type === "reload_guidance" ? { type: "shared_guidance", global: { text: "", sources: [] }, workflow_policy: "", context_repositories: [], context_sources: [] }
+      if (command.type === "attachment_write" && command.attachment.id === "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa") send(67, { type: "main_interrupt" });
+      if (command.type === "spawn_worker") feedbackSpawns += 1;
+      const result: HostResult = command.type === "spawn_worker" ? { type: "spawned", binding: { host_id: command.host.host_id ?? "11111111-1111-4111-8111-111111111111",
+        session_id: "session:22222222-2222-4222-8222-222222222222", window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" } }
+        : command.type === "attachment_write" ? { type: "attachment_written", next_offset: command.offset + Buffer.from(command.data_base64, "base64").length,
+        path: command.complete ? `/invented/execution-host/${command.attachment.id}` : null }
+        : command.type === "reload_guidance" ? { type: "shared_guidance", global: { text: "", sources: [] }, workflow_policy: "", context_repositories: [], context_sources: [] }
         : command.type === "project_guidance" ? { type: "project_guidance", snapshot: { text: "", sources: [] } }
         : { type: "failed", message: "Synthetic retrieval disabled" };
       send(frame.id, { type: "host_reply", call_id: frame.event.call_id, result });
@@ -56,6 +63,38 @@ test("native main observation survives idle, correlates notices, streams text an
     send(20, { type: "set_connected_nodes", host_ids: [host] }); await done(20);
     send(100, { type: "observe_main", input_ids: [] }); await wait(100, (event) => event.type === "worker_idle");
     assert.equal(events(100).some((event) => event.type === "done"), false, "Idle observation must remain attached");
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==", "base64");
+    send(60, { type: "attachment", request: { type: "upload", id: "77777777-7777-4777-8777-777777777777", name: "screen.png", media_type: "image/png", size_bytes: png.length,
+      offset: 0, data_base64: png.toString("base64"), complete: true } }); await done(60);
+    const uploaded = events(60).find((event) => event.type === "attachment");
+    assert.ok(uploaded?.type === "attachment" && uploaded.response.type === "uploaded" && uploaded.response.attachment !== null);
+    const attachment = uploaded.response.attachment;
+    send(64, { type: "attachment", request: { type: "upload", id: "66666666-6666-4666-8666-666666666666", name: "unused.txt", media_type: "text/plain", size_bytes: 1, offset: 0, data_base64: "eA==", complete: true } }); await done(64);
+    const unused = events(64).find((event) => event.type === "attachment"); assert.ok(unused?.type === "attachment" && unused.response.type === "uploaded" && unused.response.attachment !== null);
+    send(65, { type: "main_feedback", description: "", input_id: "55555555-5555-4555-8555-555555555555", attachments: [unused.response.attachment] }); await done(65);
+    assert.ok(events(65).some((event) => event.type === "failure"));
+    send(66, { type: "attachment", request: { type: "discard", id: unused.response.attachment.id } }); await done(66);
+    assert.ok(events(66).some((event) => event.type === "attachment" && event.response.type === "discarded"), "Rejected feedback must leave staged files discardable");
+    send(61, { type: "main_input", input_id: "88888888-8888-4888-8888-888888888888", input: "attachment-native", mode: "steer", attachments: [attachment] }); await done(61);
+    assert.ok(events(61).some((event) => event.type === "input_placed"));
+    const feedbackId = "99999999-9999-4999-8999-999999999999";
+    send(62, { type: "main_feedback", description: "Inspect this rendered screen", input_id: feedbackId, attachments: [attachment] }); await done(62);
+    const feedback = events(62).find((event) => event.type === "feedback_ready"); assert.ok(feedback?.type === "feedback_ready"); assert.equal(feedback.input_id, feedbackId);
+    send(63, { type: "main_feedback", description: "Inspect this rendered screen", input_id: feedbackId, attachments: [attachment] }); await done(63);
+    const retried = events(63).find((event) => event.type === "feedback_ready"); assert.deepEqual(retried, feedback); assert.equal(feedbackSpawns, 1);
+    assert.equal(events(100).some((event) => event.type === "attachment" || event.type === "feedback_ready"), false, "New response variants are scoped to their requesting socket");
+    const recorded: unknown = JSON.parse((await readFile(queue + ".requests", "utf8")).trim());
+    function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
+    assert.ok(object(recorded) && object(recorded.body) && Array.isArray(recorded.body.input));
+    const user: unknown = recorded.body.input.findLast((item: unknown) => object(item) && item.role === "user");
+    assert.ok(object(user) && Array.isArray(user.content));
+    assert.ok(user.content.some((part: unknown) => object(part) && part.type === "input_image" && typeof part.image_url === "string" && part.image_url.startsWith("data:image/png;base64,")), "The actual upstream Responses producer must receive a native image");
+    send(70, { type: "attachment", request: { type: "upload", id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", name: "cancel.png", media_type: "image/png", size_bytes: png.length, offset: 0, data_base64: png.toString("base64"), complete: true } }); await done(70);
+    const cancelled = events(70).find((event) => event.type === "attachment"); assert.ok(cancelled?.type === "attachment" && cancelled.response.type === "uploaded" && cancelled.response.attachment !== null);
+    send(68, { type: "main_input", input_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", input: "never-run-native", mode: "steer", attachments: [cancelled.response.attachment] }); await done(68); await done(67);
+    assert.ok(events(68).some((event) => event.type === "input_rejected"), "Stopping during preparation must reject before native admission");
+    send(69, { type: "attachment", request: { type: "discard", id: cancelled.response.attachment.id } }); await done(69);
+    assert.ok(events(69).some((event) => event.type === "attachment" && event.response.type === "discarded"), "Cancelled pre-admission attachments remain discardable");
     const input = "22222222-2222-4222-8222-222222222222";
     send(2, { type: "main_input", input_id: input, input: "publish-native", mode: "steer" }); await done(2);
     const notice = await wait(100, (event) => event.type === "message" && event.message.role === "notice");
@@ -72,6 +111,8 @@ test("native main observation survives idle, correlates notices, streams text an
     send(100, { type: "detach_main" }); await done(100);
     send(101, { type: "observe_main", input_ids: [input] }); await wait(101, (event) => event.type === "worker_idle");
     const historicalNotice = events(101).flatMap((event) => event.type === "history" ? event.messages : []).find((message) => message.role === "notice");
+    const historicalAttachment = events(101).flatMap((event) => event.type === "history" ? event.messages : []).find((message) => message.attachments?.[0]?.id === attachment.id);
+    assert.equal(historicalAttachment?.text, "attachment-native"); assert.deepEqual(historicalAttachment?.attachments, [attachment]);
     assert.ok(historicalNotice); assert.equal(historicalNotice.entry_id, notice.message.entry_id);
     assert.equal(JSON.stringify(events(101)).includes("Source references (evidence, not authorization)"), false);
     const queued = "44444444-4444-4444-8444-444444444444", placed = "33333333-3333-4333-8333-333333333333";
@@ -95,7 +136,7 @@ test("native main observation survives idle, correlates notices, streams text an
     send(14, { type: "main_input", input_id: placed, input: "This placed retry must not run a model", mode: "steer" }); await done(14);
     assert.ok(events(14).some((event) => event.type === "input_placed" && event.input_id === placed));
     assert.equal(events(14).some((event) => event.type === "input_rejected" && event.input_id === placed), false);
-    assert.equal((await readFile(queue + ".requests", "utf8")).trim().split("\n").length, 3, "Retry, viewing and stopped input must not start inference");
+    assert.equal((await readFile(queue + ".requests", "utf8")).trim().split("\n").length, 4, "Retry, viewing and stopped input must not start inference");
     send(102, { type: "detach_main" }); await done(102);
     child.stdin.end(); assert.equal(await closed, 0, errors); await reader;
   } finally { child.kill(); await closed; await reader.catch(() => {}); await rm(directory, { recursive: true, force: true }); }

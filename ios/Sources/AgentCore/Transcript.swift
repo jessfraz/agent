@@ -16,10 +16,11 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
   public var tool: ToolHistory?
   public var delivery: Delivery?
   public var inputID: String?
+  public var attachments: [AttachmentRef]
 
   init(
     id: String, entryID: String? = nil, role: HistoryRole, text: String, tool: ToolHistory? = nil,
-    delivery: Delivery? = nil, inputID: String? = nil
+    delivery: Delivery? = nil, inputID: String? = nil, attachments: [AttachmentRef] = []
   ) {
     self.id = id
     self.entryID = entryID
@@ -29,6 +30,7 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
     self.tool = tool
     self.delivery = delivery
     self.inputID = inputID
+    self.attachments = attachments
   }
   mutating func replace(_ text: String) {
     self.text = text
@@ -68,7 +70,7 @@ struct Transcript: Sendable {
     rows.append(
       ChatRow(
         id: "input:\(request.inputId)", role: .user, text: request.text, delivery: delivery,
-        inputID: request.inputId))
+        inputID: request.inputId, attachments: request.attachments ?? []))
     bound()
   }
   mutating func delivery(_ id: String, _ state: Delivery, entryID: String? = nil) {
@@ -160,13 +162,17 @@ struct Transcript: Sendable {
       )
     {
       rows[index].replace(boundedText(rows[index].text + message.text))
+      for attachment in message.attachments ?? []
+      where !rows[index].attachments.contains(where: { $0.id == attachment.id }) {
+        rows[index].attachments.append(attachment)
+      }
     } else {
       let segment = segmentCounts[message.entryId, default: 0]
       segmentCounts[message.entryId] = segment + 1
       rows.append(
         ChatRow(
           id: "entry:\(message.entryId):\(segment)", entryID: message.entryId, role: message.role,
-          text: boundedText(message.text)))
+          text: boundedText(message.text), attachments: message.attachments ?? []))
     }
     if !historical { bound() }
   }

@@ -19,6 +19,9 @@ pub fn command(input: &str) -> Option<&str> {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct FeedbackContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub attachments: Option<Vec<crate::attachments::AttachmentRef>>,
     pub origin_host_id: String,
     pub cwd: String,
     pub conversation_id: Option<String>,
@@ -58,6 +61,7 @@ impl FeedbackContext {
         crate::protocol::RuntimeCommand::Feedback {
             description,
             context: self,
+            input_id: None,
         }
     }
 }
@@ -135,6 +139,7 @@ mod tests {
     #[test]
     fn the_real_feedback_request_bounds_unicode_input_before_transport() {
         let context = crate::feedback::FeedbackContext {
+            attachments: None,
             origin_host_id: "11111111-1111-4111-8111-111111111111".into(),
             cwd: "/example/project".into(),
             conversation_id: None,
@@ -152,6 +157,7 @@ mod tests {
         let crate::protocol::RuntimeCommand::Feedback {
             context,
             description,
+            ..
         } = command
         else {
             panic!("Wrong command")

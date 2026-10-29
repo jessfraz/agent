@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import { AttachmentStore, validateInput } from "./attachments.js";
+import type { AttachmentRef } from "./generated/AttachmentRef.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AssistantEntry, defineDoc, ROOT_CONVERSATION_ID, type Conversation, type ConversationId, type Cursor, type EntryRecord, type Extension, type Harness, type Tx } from "@earendil-works/pi-durable";
 import type { CoordinatorEnvironment } from "./environment.js";
@@ -44,7 +46,7 @@ export type WorkerSession = {
   rejected?(inputId: string, message: string): void;
 };
 type AttachedWorker = { revision: number; busy: boolean; admissions: number; attached: boolean; fenced: boolean; nativeActive: boolean; observer?: WorkerSession;
-  conversation?: Conversation; finished: Promise<void>; finish(): void; wake?: () => void; drained?: () => void; input: WorkerInput };
+  conversation?: Conversation; call?: HostCall; finished: Promise<void>; finish(): void; wake?: () => void; drained?: () => void; input: WorkerInput };
 const Tasks = defineDoc<TaskIndex>({
   kind: "agent.tasks", scope: "session", version: 1,
   initial: () => ({ tasks: [] }), checkpointWhen: () => true,
@@ -107,9 +109,25 @@ export class TaskStore {
   private outcomes: OutcomeSink | undefined;
   private environment: CoordinatorEnvironment | undefined;
   private histories: HistoryStore | undefined;
+  private attachments: AttachmentStore | undefined;
   constructor(readonly session: Harness, readonly inference = new ConversationModels()) { inference.bind(session); }
   useEnvironment(environment: CoordinatorEnvironment): void { this.environment = environment; }
   useHistory(history: HistoryStore): void { this.histories = history; }
+  useAttachments(attachments: AttachmentStore): void { this.attachments = attachments; }
+  async attachmentRefs(ids: readonly string[] = []): Promise<AttachmentRef[]> {
+    if (ids.length === 0) return [];
+    if (this.attachments === undefined) throw new TaskError("Attachment storage is unavailable");
+    return this.attachments.references(ids);
+  }
+  async openAttachment(id: string, call: HostCall): Promise<Awaited<ReturnType<AttachmentStore["input"]>>> {
+    if (this.attachments === undefined) throw new TaskError("Attachment storage is unavailable");
+    return this.attachments.input("", await this.attachmentRefs([id]), call);
+  }
+  private async prepareInput(text: string, refs: readonly AttachmentRef[] | undefined, call?: HostCall): Promise<Awaited<ReturnType<AttachmentStore["input"]>>> {
+    if (refs === undefined || refs.length === 0) return { content: text };
+    if (this.attachments === undefined || call === undefined) throw new TaskError("The attachment execution host is unavailable");
+    return this.attachments.input(text, refs, call);
+  }
   async saved(id: string): Promise<ImportedConversation | undefined> { return this.histories?.byConversation(id); }
   async instructions(project: string): Promise<string> { return this.environment?.instructions(project) ?? project; }
   async context(id: string): Promise<void> {
@@ -402,12 +420,12 @@ export class TaskStore {
     return this.get(result.id);
   }
   rememberConversation(id: ConversationId): void { this.nativeIds.set(id.toString(), id); }
-  async updateIn(tx: Tx, id: string, change: (task: TaskRecord) => void): Promise<void> {
+  async updateIn(tx: Tx, id: string, change: (task: TaskRecord) => void | Promise<void>): Promise<void> {
     const index = await tx.doc(Tasks);
     const task = index.tasks.find((task) => task.id === id);
     if (task === undefined) throw new TaskError("Unknown task");
     Object.assign(task, this.savedTask(task));
-    change(task);
+    await change(task);
     task.updated_at = Date.now();
   }
   async update(id: string, change: (task: TaskRecord) => void): Promise<TaskRecord> {
@@ -433,38 +451,45 @@ export class TaskStore {
     }, BACKGROUND_CONTEXT);
     return this.get(id);
   }
-  async enqueue(id: string, content: string, inputId: string = randomUUID(), delivered?: TaskOutcome, mode?: InputMode): Promise<TaskRecord> {
-    return this.enqueueActor(id, content, inputId, undefined, delivered, mode);
+  async enqueue(id: string, content: string, inputId: string = randomUUID(), delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[]): Promise<TaskRecord> {
+    return this.enqueueActor(id, content, inputId, undefined, delivered, mode, attachments);
   }
-  async input(input: WorkerInput, content: string, inputId: string, mode?: InputMode): Promise<TaskRecord> {
+  async input(input: WorkerInput, content: string, inputId: string, mode?: InputMode, attachments?: AttachmentRef[]): Promise<TaskRecord> {
     const active = this.running.get(this.actorKey(input.task_id, input.agent_id));
     if (active?.attached !== true || active.input !== input) throw new TaskError("This worker is no longer attached");
-    return this.enqueueActor(input.task_id, content, inputId, input.agent_id, undefined, mode);
+    return this.enqueueActor(input.task_id, content, inputId, input.agent_id, undefined, mode, attachments);
   }
-  async continueAgent(id: string, agentId: string, content: string, inputId: string, call?: HostCall, mode?: InputMode, admitted?: () => void): Promise<TaskRecord> {
+  async continueAgent(id: string, agentId: string, content: string, inputId: string, call?: HostCall, mode?: InputMode, admitted?: () => void, attachments?: AttachmentRef[]): Promise<TaskRecord> {
     const active = this.running.get(this.actorKey(id, agentId));
     const attached = active?.attached === true && active.observer?.signal.aborted !== true;
     if (!attached && call === undefined) throw new TaskError("This agent is no longer attached; its conversation is retained");
-    const task = await this.enqueueActor(id, content, inputId, agentId, undefined, mode);
+    const task = await this.enqueueActor(id, content, inputId, agentId, undefined, mode, attachments);
     admitted?.();
     const current = this.running.get(this.actorKey(id, agentId));
     return (current?.attached === true && current.observer?.signal.aborted !== true) || call === undefined ? task : this.dispatchAgent(id, agentId, call);
   }
-  private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome, mode?: InputMode): Promise<TaskRecord> {
-    if (content.trim().length === 0 || Buffer.byteLength(content, "utf8") > 65_536) throw new TaskError("Task input must contain 1 to 65536 UTF-8 bytes");
+  private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[]): Promise<TaskRecord> {
+    validateInput(content, attachments);
+    const store = this.attachments;
+    if (attachments !== undefined && attachments.length > 0) {
+      if (store === undefined) throw new TaskError("Attachment storage is unavailable");
+      attachments = await store.resolve(attachments);
+    }
     const active = this.running.get(this.actorKey(id, agentId));
     if (active !== undefined) active.admissions += 1;
     try {
       await this.resources?.attach(id);
       await this.session.commit(async (tx) => {
-      await this.updateIn(tx, id, (task) => {
+      await this.updateIn(tx, id, async (task) => {
         if (delivered !== undefined) this.assertSource(delivered.conversation_id);
         const actor = this.actor(task, agentId);
         const previous = actor.pending.find((input) => input.id === inputId);
-        if (previous !== undefined && (previous.content !== content || (previous.mode ?? "follow_up") !== (mode ?? "follow_up"))) {
+        if (previous !== undefined && (previous.content !== content || (previous.mode ?? "follow_up") !== (mode ?? "follow_up") ||
+          JSON.stringify(previous.attachments ?? []) !== JSON.stringify(attachments ?? []))) {
           throw new TaskError("A task input ID cannot be reused with different content or mode");
         }
-        if (previous === undefined) actor.pending.push({ id: inputId, content, ...(mode === undefined ? {} : { mode }) });
+        if (previous === undefined && store !== undefined && attachments !== undefined) await store.retain(attachments);
+        if (previous === undefined) actor.pending.push({ id: inputId, content, ...(mode === undefined ? {} : { mode }), ...(attachments === undefined ? {} : { attachments }) });
         actor.state = { state: "open" };
         task.state = { state: "open" };
       });
@@ -476,8 +501,12 @@ export class TaskStore {
         // the same native request ID instead of injecting the input twice.
         try {
           const queued = this.actor(await this.get(id), agentId).pending;
-          for (const input of queued) await active.conversation.submit({ type: "input", content: input.content, requestId: input.id,
-            whenBusy: input.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
+          for (const input of queued) {
+            const prepared = await this.prepareInput(input.content, input.attachments, active.call);
+            if (!active.attached || active.fenced || active.observer?.signal.aborted) break;
+            await active.conversation.submit({ type: "input", ...prepared, requestId: input.id,
+              whenBusy: input.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
+          }
         } catch { /* The durable outbox still owns admission through this actor. */ }
       }
     } finally {
@@ -487,10 +516,16 @@ export class TaskStore {
     if (active !== undefined) { active.revision += 1; active.wake?.(); }
     return task;
   }
-  async createAgent(taskId: string, input: { id: string; title: string; outcome: string; input: string; inputId: string; model?: ModelSelection }): Promise<TaskAgentRecord> {
+  async createAgent(taskId: string, input: { id: string; title: string; outcome: string; input: string; inputId: string; model?: ModelSelection; attachments?: AttachmentRef[] }): Promise<TaskAgentRecord> {
     if (input.title.trim().length === 0 || input.title.length > 80 || input.outcome.trim().length === 0 ||
-        input.outcome.length > 4000 || input.input.trim().length === 0 || Buffer.byteLength(input.input, "utf8") > 65_536) {
+        input.outcome.length > 4000) {
       throw new TaskError("An agent needs a title, bounded outcome, and instruction");
+    }
+    validateInput(input.input, input.attachments);
+    const store = this.attachments;
+    if (input.attachments !== undefined && input.attachments.length > 0) {
+      if (store === undefined) throw new TaskError("Attachment storage is unavailable");
+      input = { ...input, attachments: await store.resolve(input.attachments) };
     }
     const selected = input.model ?? await this.selection(taskId, DEFAULT_MODEL);
     const owner = await this.get(taskId);
@@ -503,10 +538,11 @@ export class TaskStore {
       task.agents ??= [];
       if (task.agents.some((agent) => agent.id === input.id)) return;
       if (task.agents.filter((agent) => agent.state.state === "open").length >= 8) throw new TaskError("This task already has eight unfinished agents");
+      if (store !== undefined && input.attachments !== undefined) await store.retain(input.attachments);
       const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
       task.agents.push({ id: input.id, model: selected, conversation_id: conversation.id.toString(), title: input.title.trim(),
         outcome: input.outcome.trim(), summary: "", state: { state: "open" }, worker: { state: "unassigned" },
-        pending: [{ id: input.inputId, content: input.input }], updated_at: Date.now() });
+        pending: [{ id: input.inputId, content: input.input, ...(input.attachments === undefined ? {} : { attachments: input.attachments }) }], updated_at: Date.now() });
       task.state = { state: "open" };
       task.updated_at = Date.now();
       return conversation.id;
@@ -848,7 +884,7 @@ export class TaskStore {
     let finish = () => {};
     const finished = new Promise<void>((resolve) => { finish = resolve; });
     const active: AttachedWorker = { revision: 0, busy: true, admissions: 0, attached: false, fenced: false, nativeActive: false, input, finished, finish,
-      ...(observer === undefined ? {} : { observer }) };
+      ...(observer === undefined ? {} : { observer }), ...(call === undefined ? {} : { call }) };
     const attemptId = randomUUID();
     this.running.set(actorKey, active);
     let unbind: (() => void) | undefined;
@@ -966,7 +1002,9 @@ export class TaskStore {
         await this.resources?.attach(input.task_id);
         await observer?.beforeTurn?.();
         if (active.fenced || observer?.signal.aborted) break;
-        const submission = await conversation.submit({ type: "input", content: next.content, requestId: next.id,
+        const prepared = await this.prepareInput(next.content, next.attachments, call);
+        if (active.fenced || observer?.signal.aborted) break;
+        const submission = await conversation.submit({ type: "input", ...prepared, requestId: next.id,
           whenBusy: next.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
         active.nativeActive = true;
         await this.update(task.id, (current) => {

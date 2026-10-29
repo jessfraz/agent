@@ -1,3 +1,4 @@
+import { validEvent } from "./protocol.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { JsonValue } from "@earendil-works/chord";
 import { CompactionEntry, watchEvents, type Conversation, type Cursor, type EntryRecord, type Harness } from "@earendil-works/pi-durable";
@@ -39,13 +40,22 @@ function* chunks(value: string): Generator<string> {
 }
 export function transcript(entry: EntryRecord): HistoryMessage[] {
   const messages: HistoryMessage[] = [];
+  let attachments: HistoryMessage["attachments"];
+  if (entry.kind === "agent.input" && object(entry.data) && entry.data.attachments !== undefined) {
+    const frame: unknown = { version: 1, id: 0, event: { type: "message", message: { entry_id: entry.id.toString(), role: "user", text: "", continuation: false, final_chunk: true, attachments: entry.data.attachments } } };
+    if (!validEvent(frame) || frame.event.type !== "message") throw new Error("Invalid durable input attachment metadata");
+    attachments = frame.event.message.attachments;
+  }
   const add = (role: HistoryRole, value: string, tool?: ToolHistory) => {
     let continuation = false, offset = 0;
-    for (const text of chunks(value)) {
+    for (const text of value.length === 0 && role === "user" && attachments !== undefined ? [""] : chunks(value)) {
       offset += text.length;
-      messages.push({ entry_id: entry.id.toString(), role, text, continuation, final_chunk: offset === value.length, ...(tool === undefined ? {} : { tool }) }); continuation = true;
+      messages.push({ entry_id: entry.id.toString(), role, text, continuation, final_chunk: offset === value.length, ...(tool === undefined ? {} : { tool }), ...(role === "user" && messages.length === 0 && attachments !== undefined ? { attachments } : {}) }); continuation = true;
     }
   };
+  if (attachments !== undefined && object(entry.data) && typeof entry.data.text === "string") {
+    add("user", entry.data.text); return messages;
+  }
   if (ImportedItemEntry.is(entry)) {
     const item = entry.data.item;
     // Old imports retain their original metadata. An absent phase is unknown,

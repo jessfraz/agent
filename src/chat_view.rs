@@ -141,7 +141,8 @@ pub(crate) async fn resume(
     query: String,
 ) -> Result<bool> {
     if let Some(current) = &ui.conversation_id {
-        ui.drafts.insert(current.clone(), ui.handle.draft().await?);
+        ui.drafts
+            .insert(current.clone(), ui.handle.composer_draft().await?);
     }
     let items = choices(client, query.clone()).await?;
     let selected = if !query.is_empty() {
@@ -207,14 +208,14 @@ pub(crate) async fn open(
         .get(&item.conversation_id)
         .filter(|draft| !draft.is_empty())
     {
-        ui.handle.set_draft(draft.clone())?;
+        ui.handle.set_composer(draft.clone())?;
     }
     let mut input_ids = Vec::new();
     for input in &ui.pending_admissions {
         if input.conversation_id == item.conversation_id && input.retained()? {
             input_ids.push(input.id.clone());
             ui.handle
-                .pending_input(input.id.clone(), input.text.clone(), input.mode)?;
+                .pending_composer(input.id.clone(), &input.input()?, input.mode)?;
             if input.stage()? == crate::chat_admission::Stage::Accepted {
                 ui.handle.event(RuntimeEventKind::InputAccepted {
                     input_id: input.id.clone(),

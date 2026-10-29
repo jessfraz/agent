@@ -228,6 +228,9 @@ pub struct RuntimeRequest {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeCommand {
+    Attachment {
+        request: crate::attachments::AttachmentRequest,
+    },
     RunBackground {
         settings: crate::background::BackgroundSettings,
     },
@@ -294,10 +297,19 @@ pub enum RuntimeCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         context: Option<MainInputContext>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        attachments: Option<Vec<crate::attachments::AttachmentRef>>,
     },
     MainInterrupt,
     MainFeedback {
         description: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        attachments: Option<Vec<crate::attachments::AttachmentRef>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        input_id: Option<String>,
     },
     /// Native clients share the authenticated local/tailnet transport.
     Native {
@@ -325,6 +337,9 @@ pub enum RuntimeCommand {
         origin_host_id: Option<String>,
         cwd: String,
         hosts: Vec<WorkerHost>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        attachments: Option<Vec<crate::attachments::AttachmentRef>>,
     },
     SearchTasks {
         query: String,
@@ -351,6 +366,9 @@ pub enum RuntimeCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         context: Option<MainInputContext>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        attachments: Option<Vec<crate::attachments::AttachmentRef>>,
     },
     ConversationInterrupt {
         conversation_id: String,
@@ -370,6 +388,9 @@ pub enum RuntimeCommand {
     Feedback {
         description: String,
         context: FeedbackContext,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        input_id: Option<String>,
     },
     ReadFeedback {
         id: Option<String>,
@@ -416,11 +437,17 @@ pub enum RuntimeCommand {
     WorkerInput {
         input_id: String,
         input: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        attachments: Option<Vec<crate::attachments::AttachmentRef>>,
     },
     SubmitInput {
         input_id: String,
         input: String,
         mode: InputMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        attachments: Option<Vec<crate::attachments::AttachmentRef>>,
     },
     DetachWorker,
     Interrupt,
@@ -638,6 +665,9 @@ pub struct TaskInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub mode: Option<InputMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub attachments: Option<Vec<crate::attachments::AttachmentRef>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -679,6 +709,12 @@ pub struct SourceState {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostCommand {
+    AttachmentWrite {
+        attachment: crate::attachments::AttachmentRef,
+        offset: u32,
+        data_base64: String,
+        complete: bool,
+    },
     Browser {
         host_id: String,
         request: crate::browser::BrowserRequest,
@@ -788,6 +824,10 @@ pub enum HostCommand {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostResult {
+    AttachmentWritten {
+        next_offset: u32,
+        path: Option<String>,
+    },
     Browser {
         response: crate::browser::BrowserResponse,
     },
@@ -864,6 +904,9 @@ pub struct RuntimeEvent {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEventKind {
+    Attachment {
+        response: crate::attachments::AttachmentResponse,
+    },
     JobRun {
         run: crate::background::JobRunReceipt,
     },
@@ -884,6 +927,9 @@ pub enum RuntimeEventKind {
     },
     FeedbackReady {
         receipt: FeedbackReceipt,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        input_id: Option<String>,
     },
     Feedback {
         bundle: Box<FeedbackBundle>,
@@ -1025,6 +1071,9 @@ pub struct HistoryMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub tool: Option<ToolHistory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub attachments: Option<Vec<crate::attachments::AttachmentRef>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
@@ -1261,6 +1310,7 @@ mod tests {
         assert!(legacy.tool.is_none());
         assert!(!legacy.final_chunk);
         let message = HistoryMessage {
+            attachments: None,
             entry_id: "result".into(),
             role: HistoryRole::Tool,
             text: "check failed".into(),

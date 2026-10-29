@@ -18,6 +18,7 @@ import type { WorkerRef } from "../src/generated/WorkerRef.js";
 import { ConversationModels } from "../src/models.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
 import { fixtureModel } from "./model.js";
+import { AttachmentStore } from "../src/attachments.js";
 
 const coordinator: AgentNode = { host_id: "11111111-1111-4111-8111-111111111111", name: "coordinator", rex_server: null,
   coordinator: null, home_directory: "/home/coordinator", agent_program: "/example/bin/agent",
@@ -36,12 +37,37 @@ async function open(directory: string) {
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(session, new ConversationModels(models));
+  const attachments = new AttachmentStore(directory); tasks.useAttachments(attachments);
   const environment = new CoordinatorEnvironment(session); tasks.useEnvironment(environment);
   await environment.configure({ settings: { model: fixtureModel, instructions: "Use the existing checkout.", context_repositories: [], sources: [] }, node: coordinator });
   await environment.register(linux); environment.setConnected([coordinator.host_id, linux.host_id]);
   const store = new FeedbackStore(directory, tasks);
-  return { session, tasks, environment, store, dispatcher: new FeedbackDispatcher(store, tasks, environment), faux };
+  return { session, tasks, environment, store, attachments, dispatcher: new FeedbackDispatcher(store, tasks, environment), faux };
 }
+
+test("feedback retries keep one durable report and attachment assignment before and after repair admission", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-feedback-identity-")); let app = await open(directory);
+  let spawns = 0;
+  const call: HostCall = async (command) => { assert.equal(command.type, "spawn_worker"); spawns += 1; return { type: "spawned", binding }; };
+  try {
+    const id = "88888888-8888-4888-8888-888888888888", attachmentId = "99999999-9999-4999-8999-999999999999";
+    const uploaded = await app.attachments.request({ type: "upload", id: attachmentId, name: "terminal.html", media_type: "text/html", size_bytes: 5, offset: 0, data_base64: Buffer.from("frame").toString("base64"), complete: true });
+    assert.ok(uploaded.type === "uploaded" && uploaded.attachment !== null);
+    const attachment = uploaded.attachment, input = { ...context, attachments: [attachment] };
+    const [first, second] = await Promise.all([app.store.capture("Inspect this rendering", input, id), app.store.capture("Inspect this rendering", input, id)]);
+    assert.deepEqual(first, second); assert.equal(first.id, id);
+    const receipt = await app.dispatcher.dispatch(first, call);
+    assert.deepEqual((await app.tasks.get(receipt.task_id)).pending[0]?.attachments, [attachment]);
+    app.environment.setConnected([coordinator.host_id]);
+    assert.deepEqual(await app.dispatcher.dispatch(second, call), receipt, "An uncertain reply retry returns the durable acknowledgment even if the worker is now offline");
+    assert.equal(spawns, 1); assert.equal((await app.tasks.get(receipt.task_id)).pending.length, 1);
+    await assert.rejects(app.store.capture("Changed report", input, id), /different content/);
+    await assert.rejects(app.store.capture("Inspect this rendering", { ...input, attachments: [] }, id), /different content/);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    assert.deepEqual(await app.store.capture("Inspect this rendering", input, id), first);
+    assert.deepEqual(await app.dispatcher.dispatch(first, call), receipt); assert.equal(spawns, 1);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
 
 test("feedback starts a Linux repair in its current Rex folder, reuses it, and publishes its answer in main", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-feedback-dispatch-")); let app = await open(directory);

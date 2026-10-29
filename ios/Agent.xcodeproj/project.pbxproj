@@ -10,9 +10,9 @@
         A00000000000000000000004 = {isa = PBXBuildFile; productRef = A00000000000000000000005; };
         A00000000000000000000005 = {isa = XCSwiftPackageProductDependency; package = A00000000000000000000006; productName = AgentUI; };
         A00000000000000000000006 = {isa = XCLocalSwiftPackageReference; relativePath = .; };
-        A00000000000000000000007 = {isa = PBXGroup; children = (A00000000000000000000008, A0000000000000000000001F, A00000000000000000000009, A00000000000000000000015); sourceTree = "<group>"; };
+        A00000000000000000000007 = {isa = PBXGroup; children = (A00000000000000000000008, A0000000000000000000001F, A00000000000000000000009, A00000000000000000000015, A0000000000000000000002C); sourceTree = "<group>"; };
         A00000000000000000000008 = {isa = PBXGroup; children = (A00000000000000000000002, A00000000000000000000016, A00000000000000000000018); path = AgentApp; sourceTree = "<group>"; };
-        A00000000000000000000009 = {isa = PBXGroup; children = (A00000000000000000000003, A0000000000000000000001C); name = Products; sourceTree = "<group>"; };
+        A00000000000000000000009 = {isa = PBXGroup; children = (A00000000000000000000003, A0000000000000000000001C, A0000000000000000000002B); name = Products; sourceTree = "<group>"; };
         A0000000000000000000000A = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000001); runOnlyForDeploymentPostprocessing = 0; };
         A0000000000000000000000B = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000004); runOnlyForDeploymentPostprocessing = 0; };
         A0000000000000000000000C = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000017, A00000000000000000000019); runOnlyForDeploymentPostprocessing = 0; };
@@ -41,7 +41,7 @@
             productRefGroup = A00000000000000000000009;
             projectDirPath = "";
             projectRoot = "";
-            targets = (A0000000000000000000000D, A00000000000000000000025);
+            targets = (A0000000000000000000000D, A00000000000000000000025, A00000000000000000000030);
         };
         A0000000000000000000000F = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000011, A00000000000000000000012); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
         A00000000000000000000010 = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000013, A00000000000000000000014); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
@@ -104,6 +104,35 @@
         A00000000000000000000028 = {
             isa = XCBuildConfiguration;
             buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.example.AgentRenderingTests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) AGENT_APP_HOST"; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Agent.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Agent"; };
+            name = Release;
+        };
+        A00000000000000000000029 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentUITests.swift; sourceTree = "<group>"; };
+        A0000000000000000000002A = {isa = PBXBuildFile; fileRef = A00000000000000000000029; };
+        A0000000000000000000002B = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = AgentUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+        A0000000000000000000002C = {isa = PBXGroup; children = (A00000000000000000000029); path = Tests/AgentUITests; sourceTree = "<group>"; };
+        A0000000000000000000002D = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A0000000000000000000002A); runOnlyForDeploymentPostprocessing = 0; };
+        A0000000000000000000002E = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+        A0000000000000000000002F = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+        A00000000000000000000030 = {
+            isa = PBXNativeTarget;
+            buildConfigurationList = A00000000000000000000031;
+            buildPhases = (A0000000000000000000002D, A0000000000000000000002E, A0000000000000000000002F);
+            buildRules = ();
+            dependencies = (A00000000000000000000024);
+            name = AgentUITests;
+            productName = AgentUITests;
+            productReference = A0000000000000000000002B;
+            productType = "com.apple.product-type.bundle.ui-testing";
+        };
+        A00000000000000000000031 = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000032, A00000000000000000000033); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+        A00000000000000000000032 = {
+            isa = XCBuildConfiguration;
+            buildSettings = {CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.example.AgentUITests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = Agent; };
+            name = Debug;
+        };
+        A00000000000000000000033 = {
+            isa = XCBuildConfiguration;
+            buildSettings = {CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.example.AgentUITests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = Agent; };
             name = Release;
         };
     };
