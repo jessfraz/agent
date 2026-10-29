@@ -330,12 +330,21 @@ publication lifecycle. External effects retain their existing reconciliation
 requirements. Migrating hosted schedules requires separate coverage and cutover
 verification; history import does not enable them.
 
-Manual job requests enter the same serialized job lane. Admission atomically
-creates the ordinary task record, admitted work and a receipt in that record.
-A stable request ID returns the original receipt after retries or restart,
+Each job lane retains one task and Pi conversation across timer and manual
+runs. Rex allocation follows that task's existing binding; titles do not
+establish ownership. Each admitted input retains its own workflow, model and
+directory snapshot, applied at its turn boundary.
+
+Manual admission atomically queues the run and saves its receipt in native
+metadata. A stable request ID returns that receipt after retries or restart,
 including after a catalog edit. Explicit manual runs remain separate queued
 requests; they do not move recurring deadlines or coalesce with scheduled
 occurrences. Native controls retain their submitted input identity on retries.
+
+An unanswered input retains its native status. A successful recovery can link
+`record_task.reconciles_input` to the original request ID so that occurrence
+settles after the linked recovery inputs finish and execution is idle, even
+while the task waits for external work.
 
 ### Cross-host recovery
 

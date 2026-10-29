@@ -294,12 +294,16 @@ Manual runs serialize with the job's scheduled runs without changing its next
 occurrence or any source timer. Each explicit request creates a run, including
 when that job already has work queued. Inspect it with `agent tasks read ID`.
 
+Timer and manual runs share the job's task, Pi conversation and Rex chat.
+An open chat is reused; a closed Rex session can reopen with the saved
+conversation. Audit individual inputs and outcomes rather than counting tasks
+or using a task's last-update time as a run boundary.
+
 Startup applies valid configured directories; validation errors retain the
 applied catalog and are reported in the coordinator log. Without configured
 directories it retains the last explicitly synced catalog. Jobs start with
-future occurrences;
-restarts coalesce missed ticks and serialize overlapping runs per job. Each
-admission retains its original prompt/model snapshot. Pi wakes the running
+future occurrences; restarts coalesce missed ticks and serialize runs per job.
+Each admission retains its original prompt/model snapshot. Pi wakes the running
 coordinator; offline time is reconciled when it returns. Existing hosted
 automations require a separate verified cutover.
 

@@ -9,6 +9,8 @@ recovery; [history](history.md) describes import and retrieval.
   verify real searches. Missing files stay explicit gaps.
 - [ ] Verify chat admission, steering, interruption, reopening and scrolling
   against a large live corpus while background work runs.
+- [ ] Pin and activate scheduled-chat reuse and recovery through Global Nix;
+  verify repeated runs reuse one chat and previously failed job lanes advance.
 - [x] Ship private lifecycle logs, `/machines`, local usage-reset times and
   countdowns, and the remaining viewport correction.
 
