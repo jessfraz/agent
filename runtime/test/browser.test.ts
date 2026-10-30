@@ -123,6 +123,40 @@ test("concurrent browser calls serialize per owner while another conversation pr
   } finally { finish?.(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("an uncertain browser can release its owned tabs after restart without replaying the interrupted action", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-browser-release-")); let app = await open(directory);
+  const owner = randomUUID(); let effects = 0, releases = 0;
+  try {
+    const opened = await app.browsers.perform(owner, { type: "open", url: "https://example.com/" }, "open", async command => ready(request(command)), hostId);
+    await app.browsers.perform(owner, { type: "run_code", tab_id: 7,
+      code: "async (page) => { await page.getByRole('button', { name: 'Save' }).click(); }" }, "uncertain", async command => {
+      const operation = request(command); effects += 1;
+      return { type: "browser", response: { type: "uncertain", session_id: operation.session_id,
+        message: "Output withheld because password capture could not be verified" } };
+    });
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    assert.equal((await app.browsers.binding(owner))?.pending_operation, "uncertain");
+    await assert.rejects(app.browsers.perform(owner, { type: "release" }, "foreign", async () => {
+      throw new Error("Cleanup must not transfer to another host");
+    }, otherHostId), /another host/);
+    const released = await app.browsers.perform(owner, { type: "release" }, "release", async command => {
+      const operation = request(command); releases += 1;
+      assert.equal(operation.action.type, "release");
+      assert.equal(operation.owner_id, owner);
+      assert.equal(operation.session_id, opened.session_id);
+      return { type: "browser", response: { type: "closed", session_id: operation.session_id,
+        tabs: [], output: "Owned fixture tabs closed" } };
+    });
+    assert.equal(released.state, "released");
+    assert.equal(released.pending_operation, null);
+    assert.equal(released.response?.type, "closed");
+    assert.equal(effects, 1);
+    assert.equal(releases, 1);
+    const reopened = await app.browsers.perform(owner, { type: "open", url: "https://example.com/" }, "reopen", async command => ready(request(command)), hostId);
+    assert.notEqual(reopened.session_id, opened.session_id);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("real Pi browser tools retain their host, reject worker overrides, and release only their connection", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-browser-tools-")); const app = await open(directory);
   try {

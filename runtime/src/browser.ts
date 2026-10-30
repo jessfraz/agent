@@ -43,7 +43,9 @@ export class BrowserStore {
         if (saved === undefined) throw new TaskError("Open a Chrome connection with browser_open first");
         if (hostId !== undefined && saved.host_id !== hostId) throw new TaskError("The browser belongs to another host");
         if (action.type !== "status" && action.type !== "open") {
-          if (saved.pending_operation !== null) throw new TaskError("A browser operation has no receipt. Inspect browser_status before continuing; do not repeat the interrupted action blindly.");
+          // Closing this connection's owned tabs does not replay the uncertain
+          // effect. The host serializes cleanup behind any issued operation.
+          if (saved.pending_operation !== null && action.type !== "release") throw new TaskError("A browser operation has no receipt. Inspect browser_status before continuing; do not repeat the interrupted action blindly.");
           saved.pending_operation = operationId;
         }
         return { ...saved };
@@ -158,7 +160,7 @@ export function createBrowserTools(browsers: BrowserStore, executions: Execution
         const execution = executions.get(api.conversationId.toString());
         return output(await browsers.perform(api.conversationId.toString(), { type: "run_code", tab_id: args.tab_id, code: args.code }, api.callId, execution.call));
       } }),
-    defineTool({ name: "browser_release", description: "Close this conversation's positively owned disposable Chrome tabs, then disconnect while leaving Chrome running. Retain and report anything whose ownership or closure cannot be verified.",
+    defineTool({ name: "browser_release", description: "Close this conversation's positively owned disposable Chrome tabs, including after an uncertain action, then disconnect while leaving Chrome running. Earlier effects still need provider verification. Retain and report anything whose ownership or closure cannot be verified.",
       parameters: Type.Object({}),
       async execute(_args, api) {
         const execution = executions.get(api.conversationId.toString());
