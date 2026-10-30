@@ -87,15 +87,18 @@ recovery; [history](history.md) describes import and retrieval.
 - [ ] Dreams and Dreams evals: inspect private logs nightly and propose useful
   improvements as reviewable diffs with before/after evidence. Learned changes
   take effect only after approval of that diff.
-- [ ] Connect Pi's native telemetry to the same diagnostics. Show token use,
+- [x] Connect Pi's native telemetry to the same diagnostics. Show token use,
   cache hits and estimated cost for every chat, separately from subscription
-  quota; keep estimates distinct from billed amounts.
+  quota; keep estimates distinct from billed amounts. Native tests and review
+  pass; deployment is pending.
 - [ ] Benchmark deferred tool discovery before adopting it for larger toolsets.
 
 ## Recovery
 
 - [ ] Reconcile Rex server restarts, terminal exits and reconnects without
   duplicate sessions or lost pending inputs.
+- [ ] Transfer direct worker execution to a daemon before its terminal client
+  exits, retaining ownership of pending host effects.
 - [ ] Tested coordinator backups and restoration, including retained assets.
 - [ ] Replicated coordinator state and failover, retaining one active owner so
   additional coordinators do not duplicate work or external effects.
@@ -110,7 +113,7 @@ and deployment are tracked separately above.
 | Durable conversations, submissions and task checkpoints | In use | Native Harness, SQLite storage and checkpointed documents own history and execution. |
 | Steering, follow-ups, abort and compaction | In use | Native input modes, abort and compaction events drive chat. |
 | Durable sleeps and wake notifications | In use | Sources, resources and jobs share Pi's persisted sleeps and scheduler. |
-| Typed telemetry and usage totals | Partial | Pi records usage, but Agent does not expose its totals or install a telemetry adapter. Wire these into diagnostics and status. |
+| Typed telemetry and usage totals | Implemented; deployment pending | Native UsageDoc supplies own-conversation totals and bounded request timings in `/status`; the private native SQLite recorder keeps payload-free diagnostics. Unknown prices remain unavailable; API-equivalent estimates are separate from bills and subscription quota. |
 | Image preparation workers | In use | Pi's Photon worker prepares attached images for native model input. Agent owns transfer and storage. |
 | Image-aware file readers | Not enabled | Agent owns its host file tools; reuse Pi's image-aware reads when extending them. |
 | Forks, child tasks and task graphs | Partial | Pi executes native model/tool task trees. Agent delegates use separate conversations; forks and graph views are not integrated. Evaluate native ownership while preserving delegates' durable lifetimes and Rex bindings. |

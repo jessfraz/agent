@@ -363,6 +363,9 @@ impl Trace {
             }
             | RuntimeCommand::ConversationInterrupt {
                 conversation_id, ..
+            }
+            | RuntimeCommand::ConversationUsage {
+                conversation_id, ..
             } => {
                 trace.conversation_id = token(conversation_id);
             }

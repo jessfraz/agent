@@ -5,6 +5,7 @@ mod cells;
 mod conversations;
 mod inline;
 mod markdown;
+mod pending;
 mod shell;
 mod transcript;
 
@@ -1617,7 +1618,9 @@ impl State {
         }
         self.changed = true;
         if self.exiting {
-            return None;
+            return matches!(event, Event::Key(key) if key.kind != KeyEventKind::Release
+                && key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            .then_some(TuiInput::Exit);
         }
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -1932,6 +1935,21 @@ impl State {
             Constraint::Length(1),
         ])
         .split(frame.area());
+        let pending_height = if self.output.view == View::Live && !self.help_open {
+            pending::Preview::new(&self.messages[self.output.cursor.min(self.messages.len())..])
+                .height(areas[0].width)
+        } else {
+            0
+        };
+        let body = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(
+                u16::try_from(pending_height)
+                    .unwrap_or(u16::MAX)
+                    .min(areas[0].height.saturating_sub(1)),
+            ),
+        ])
+        .split(areas[0]);
         if self.help_open {
             let mut lines = vec![Line::styled(
                 "Commands",
@@ -1968,10 +1986,10 @@ impl State {
             );
         } else if self.output.view == View::Live {
             let first = self.output.cursor;
-            let mut projection = activity::Projection::new(self, first, areas[0].width);
+            let mut projection = activity::Projection::new(self, first, body[0].width);
             let maximum = projection
                 .height
-                .saturating_sub(usize::from(areas[0].height));
+                .saturating_sub(usize::from(body[0].height));
             if self.scroll > 0 && self.previous_width == areas[0].width && !self.history_changed {
                 self.scroll = self
                     .scroll
@@ -1981,11 +1999,11 @@ impl State {
             self.previous_rows = projection.height;
             self.previous_width = areas[0].width;
             self.history_changed = false;
-            self.page = usize::from(areas[0].height).saturating_sub(1).max(1);
+            self.page = usize::from(body[0].height).saturating_sub(1).max(1);
             projection.draw(
                 &mut self.messages,
                 frame,
-                areas[0],
+                body[0],
                 maximum.saturating_sub(self.scroll),
             );
         } else {
@@ -2006,6 +2024,10 @@ impl State {
             self.page = visible.saturating_sub(1).max(1);
             let top = maximum.saturating_sub(self.scroll);
             self.draw_transcript(frame, areas[0], top + base);
+        }
+        if pending_height > 0 {
+            pending::Preview::new(&self.messages[self.output.cursor.min(self.messages.len())..])
+                .draw(frame, body[1]);
         }
         let files = self
             .attachments
@@ -2131,7 +2153,9 @@ impl State {
             Style::default().fg(Color::Green),
         ));
         frame.render_widget(Paragraph::new(Line::from(status)), areas[4]);
-        let hint = if self.completion.is_some() {
+        let hint = if self.exiting {
+            "ctrl+c again to force-close this client"
+        } else if self.completion.is_some() {
             "enter to run · tab to complete · esc to cancel"
         } else if self.working {
             "enter to steer · tab to queue · ? for shortcuts"
@@ -2266,7 +2290,7 @@ impl Shortcut {
             Self::Exit => (
                 "Ctrl+C",
                 "exit",
-                "Detach main chat; workers interrupt before exiting",
+                "Detach main/resumed chats; direct workers interrupt first",
             ),
             Self::Scroll => (
                 "PgUp/PgDn",
@@ -2449,6 +2473,146 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect()
     }
+    #[test]
+    fn multiple_pending_inputs_share_a_compact_preview_without_becoming_history() {
+        use crate::protocol::InputMode;
+        let mut view = state();
+        view.pending_input(
+            "first".into(),
+            "First quick correction".into(),
+            InputMode::Steer,
+        );
+        view.pending_input(
+            "second".into(),
+            "Second quick correction".into(),
+            InputMode::Steer,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(90)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .filter(|line| line.contains("Sending steering messages"))
+                .count(),
+            1
+        );
+        let first = rows
+            .iter()
+            .position(|line| line.contains("↳ First quick correction"))
+            .unwrap();
+        let second = rows
+            .iter()
+            .position(|line| line.contains("↳ Second quick correction"))
+            .unwrap();
+        assert_eq!(second, first + 1);
+        assert!(!rows.iter().any(|line| line.contains("sending…")));
+        assert_eq!(view.messages.len(), 2);
+        assert!(view.messages.iter().all(|message| message.id.is_none()
+            && message.output == crate::tui::inline::CellOutput::Mutable));
+    }
+
+    #[test]
+    fn repeated_control_c_emits_exit_without_changing_pending_identity_or_draft() {
+        use crate::protocol::InputMode;
+        let mut view = state();
+        view.pending_input(
+            "input".into(),
+            "Unconfirmed correction".into(),
+            InputMode::Steer,
+        );
+        view.input_uncertain("input");
+        view.editor.insert_str("An unsent draft");
+        for _ in 0..2 {
+            assert!(matches!(
+                view.input(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                Some(TuiInput::Exit)
+            ));
+            assert_eq!(view.editor.lines(), &["An unsent draft"]);
+            assert!(
+                matches!(&view.messages[0].kind, crate::tui::MessageKind::Input {
+                input_id, delivery: InputDelivery::Uncertain, ..
+            } if input_id == "input")
+            );
+        }
+        assert!(rendered(&mut view, 90, 24).contains("ctrl+c again to force-close this client"));
+    }
+
+    #[test]
+    fn compact_pending_groups_keep_modes_uncertainty_and_bounded_unicode_previews() {
+        use crate::protocol::InputMode;
+        use ratatui::style::Modifier;
+        let mut view = state();
+        let long = format!(
+            "{}\nsecond line\nthird line\nfourth retained line",
+            "界👩‍💻e\u{301}".repeat(80)
+        );
+        view.pending_input("steer".into(), long.clone(), InputMode::Steer);
+        view.event(RuntimeEventKind::InputAccepted {
+            input_id: "steer".into(),
+        });
+        view.pending_input(
+            "queue".into(),
+            "A queued follow-up".into(),
+            InputMode::FollowUp,
+        );
+        view.event(RuntimeEventKind::InputAccepted {
+            input_id: "queue".into(),
+        });
+        view.pending_input(
+            "uncertain".into(),
+            "A delivery to reconcile".into(),
+            InputMode::Steer,
+        );
+        view.input_uncertain("uncertain");
+        let mut terminal = Terminal::new(TestBackend::new(90, 35)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(90)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        for heading in [
+            "Steering messages, waiting",
+            "Queued follow-up inputs",
+            "Steering delivery unconfirmed; not resent",
+        ] {
+            assert_eq!(
+                rows.iter().filter(|row| row.contains(heading)).count(),
+                1,
+                "{heading}"
+            );
+        }
+        assert!(rows.iter().any(|line| line.trim() == "…"));
+        assert!(
+            !rows
+                .iter()
+                .any(|line| line.contains("fourth retained line"))
+        );
+        assert_eq!(view.messages[0].text, long);
+        let queued = rows
+            .iter()
+            .position(|row| row.contains("A queued follow-up"))
+            .unwrap();
+        assert!(
+            terminal.backend().buffer()[(4, u16::try_from(queued).unwrap())]
+                .modifier
+                .contains(Modifier::DIM | Modifier::ITALIC)
+        );
+        let narrow = rendered(&mut view, 20, 12);
+        assert!(narrow.contains("more pending"));
+        assert_eq!(view.messages.len(), 3);
+        view.output.view = crate::tui::inline::View::History;
+        assert!(rendered(&mut view, 90, 35).contains("fourth retained line"));
+    }
+
     #[test]
     fn connecting_paints_without_a_guessed_model_and_preserves_the_draft_when_ready() {
         let mut view = State::new(TuiInfo {
@@ -2761,12 +2925,12 @@ mod tests {
         history.event(RuntimeEventKind::InputAccepted {
             input_id: "next-input".into(),
         });
-        assert!(rendered(&mut history, 80, 20).contains("queued"));
+        assert!(rendered(&mut history, 80, 20).contains("Queued follow-up inputs"));
         history.event(RuntimeEventKind::InputPlaced {
             input_id: "next-input".into(),
             entry_id: "next-user".into(),
         });
-        assert!(!rendered(&mut history, 80, 20).contains("queued"));
+        assert!(!rendered(&mut history, 80, 20).contains("Queued follow-up inputs"));
         history.event(RuntimeEventKind::Message {
             message: HistoryMessage {
                 presentation: None,
@@ -3046,7 +3210,7 @@ mod tests {
         view.event(RuntimeEventKind::InputAccepted {
             input_id: "pending".into(),
         });
-        assert!(rendered(&mut view, 130, 35).contains("steering, waiting"));
+        assert!(rendered(&mut view, 130, 35).contains("Steering messages, waiting"));
         view.event(RuntimeEventKind::InputPlaced {
             input_id: "pending".into(),
             entry_id: "native".into(),
@@ -3607,7 +3771,7 @@ mod tests {
         assert_eq!(crate::tui::terminal_title(&info).chars().count(), 160);
     }
     #[test]
-    fn control_c_detaches_main_chat_while_escape_explicitly_stops_it() {
+    fn control_c_detaches_observers_and_preserves_direct_worker_execution_ownership() {
         let mut view = state();
         view.working(true);
         view.input(Event::Paste("Unsent correction".into()));
@@ -3616,7 +3780,20 @@ mod tests {
             Some(TuiInput::Exit)
         );
         assert!(!view.interrupting);
+        assert!(view.working);
         assert_eq!(view.editor.lines().join("\n"), "Unsent correction");
+        let mut view = state();
+        view.worker = true;
+        view.working(true);
+        assert_eq!(
+            view.input(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(TuiInput::Interrupt)
+        );
+        assert!(!view.exiting);
+        assert_eq!(
+            view.input(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(TuiInput::Exit)
+        );
         let mut view = state();
         view.working(true);
         assert_eq!(
@@ -4027,11 +4204,11 @@ mod tests {
             "Same correction".into(),
             crate::protocol::InputMode::Steer,
         );
-        assert!(rendered(&mut view, 100, 30).contains("sending…"));
+        assert!(rendered(&mut view, 100, 30).contains("Sending steering messages"));
         view.event(RuntimeEventKind::InputAccepted {
             input_id: "one".into(),
         });
-        assert!(rendered(&mut view, 100, 30).contains("steering, waiting…"));
+        assert!(rendered(&mut view, 100, 30).contains("Steering messages, waiting"));
         view.pending_input(
             "two".into(),
             "Same correction".into(),

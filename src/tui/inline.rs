@@ -402,7 +402,10 @@ impl State {
         }
         OutputRows {
             ready,
-            pending: activity::Projection::new(self, frontier, width).height,
+            pending: activity::Projection::new(self, frontier, width)
+                .height
+                .max(1)
+                + crate::tui::pending::Preview::new(&self.messages[frontier..]).height(width),
         }
     }
 
@@ -441,6 +444,101 @@ mod tests {
         });
         state.output.banner.ready();
         state
+    }
+
+    #[test]
+    fn pending_preview_retires_only_on_exact_placement_and_saved_prompts_print_once() {
+        let mut state = state();
+        state.pending_input(
+            "first".into(),
+            "A repeated correction".into(),
+            InputMode::Steer,
+        );
+        state.pending_input(
+            "second".into(),
+            "A repeated correction".into(),
+            InputMode::FollowUp,
+        );
+        let height = state.viewport_height(ratatui::layout::Size::new(90, 40), 39);
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(90, 40),
+            TerminalOptions {
+                viewport: Viewport::Inline(height),
+            },
+        )
+        .unwrap();
+        state.flush_output(&mut terminal, false).unwrap();
+        terminal.draw(|frame| state.draw(frame)).unwrap();
+        assert!(output(&terminal).contains("Sending steering messages"));
+        assert!(output(&terminal).contains("Sending follow-up inputs"));
+        for input_id in ["first", "second"] {
+            state.event(RuntimeEventKind::InputAccepted {
+                input_id: input_id.into(),
+            });
+        }
+        terminal.draw(|frame| state.draw(frame)).unwrap();
+        assert!(output(&terminal).contains("Queued follow-up inputs"));
+        let canonical = [
+            message(
+                "entry-first",
+                HistoryRole::User,
+                "A repeated correction",
+                false,
+                true,
+            ),
+            message(
+                "entry-second",
+                HistoryRole::User,
+                "A repeated correction",
+                false,
+                true,
+            ),
+        ];
+        // A reconnect history page can beat placement receipts. Identity, not
+        // the shared text, must merge each preview at its canonical position.
+        state.event(RuntimeEventKind::History {
+            conversation_id: "main".into(),
+            messages: canonical.to_vec(),
+            next_cursor: None,
+            page_complete: true,
+        });
+        for (input_id, entry_id) in [("second", "entry-second"), ("first", "entry-first")] {
+            state.event(RuntimeEventKind::InputPlaced {
+                input_id: input_id.into(),
+                entry_id: entry_id.into(),
+            });
+        }
+        state.flush_output(&mut terminal, false).unwrap();
+        terminal.draw(|frame| state.draw(frame)).unwrap();
+        let placed = output(&terminal);
+        assert_eq!(
+            placed.matches("A repeated correction").count(),
+            2,
+            "{placed}"
+        );
+        for label in [
+            "Sending steering messages",
+            "Queued follow-up inputs",
+            "sending…",
+        ] {
+            assert!(!placed.contains(label), "{placed}");
+        }
+        for saved in canonical {
+            state.event(RuntimeEventKind::Message { message: saved });
+        }
+        state.flush_output(&mut terminal, false).unwrap();
+        terminal.draw(|frame| state.draw(frame)).unwrap();
+        assert_eq!(
+            output(&terminal).matches("A repeated correction").count(),
+            2
+        );
+        assert_eq!(state.messages.len(), 2);
+        assert!(
+            state
+                .messages
+                .iter()
+                .all(|message| message.output == CellOutput::Printed)
+        );
     }
 
     fn terminal() -> Terminal<TestBackend> {

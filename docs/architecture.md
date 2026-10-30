@@ -174,6 +174,10 @@ Enter steers, Tab queues a separate turn, and Esc stops the current Pi turn and
 drains owned host operations. Tool results remain recorded; stopping cannot
 undo an external effect that already completed.
 
+Main and resumed views detach from coordinator-owned execution. Direct
+`RunTask` processes still own their host effects; transferring that execution
+to a daemon before their process exits remains recovery work.
+
 Persist allocation intent before creating a session or terminal. A missing
 creation receipt becomes uncertain and requires reconciliation. History sync
 must never create an execution. Find matching tasks regardless of process state.

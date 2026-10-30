@@ -1457,6 +1457,14 @@ impl UiSession {
                 return Ok(());
             }
             let next = tokio::select! {
+                input = self.inputs.recv() => {
+                    // A repeated exit abandons only the local receipt wait.
+                    // Recovery retains the original ID; server work stays owned.
+                    if matches!(input, Some(TuiInput::Exit) | None) {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 next = self.view_events.recv() => next,
                 _ = async {
                     if let Some(ready) = &mut readiness {
@@ -2105,6 +2113,75 @@ async fn conversation_usage(
     })
 }
 
+async fn native_conversation_usage(
+    client: ClientContext<'_>,
+    conversation_id: &str,
+) -> Result<agent_cli::protocol::ConversationUsage, NativeUsageFailure> {
+    let result = exchange(
+        client.config,
+        client.coordinator,
+        client.script,
+        client.directory,
+        RuntimeCommand::ConversationUsage {
+            conversation_id: conversation_id.to_owned(),
+        },
+    )
+    .await;
+    let cause = match result {
+        Ok(events) => match events.into_iter().find_map(|event| match event {
+            RuntimeEventKind::ConversationUsage { usage } => Some(usage),
+            _ => None,
+        }) {
+            Some(usage) => return Ok(usage),
+            None => NativeUsageFailure::MissingResponse,
+        },
+        Err(error) => match error.downcast_ref::<CoordinatorFailure>() {
+            Some(failure) => NativeUsageFailure::Coordinator {
+                code: failure.code.clone(),
+            },
+            None if chat_view::ViewError::is_transport(&error) => NativeUsageFailure::Transport,
+            None => NativeUsageFailure::InvalidResponse,
+        },
+    };
+    Err(cause)
+}
+
+#[derive(Debug)]
+enum NativeUsageFailure {
+    Coordinator {
+        code: agent_cli::protocol::ErrorCode,
+    },
+    Transport,
+    InvalidResponse,
+    MissingResponse,
+}
+impl std::fmt::Display for NativeUsageFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NativeUsageFailure::Coordinator { code } => write!(
+                formatter,
+                "coordinator returned {code:?}; see coordinator diagnostics"
+            )?,
+            NativeUsageFailure::Transport => write!(formatter, "coordinator connection failed")?,
+            NativeUsageFailure::InvalidResponse => {
+                write!(formatter, "invalid coordinator response")?
+            }
+            NativeUsageFailure::MissingResponse => {
+                write!(formatter, "coordinator returned no usage record")?
+            }
+        }
+        Ok(())
+    }
+}
+fn native_usage_text(
+    usage: &Result<agent_cli::protocol::ConversationUsage, NativeUsageFailure>,
+) -> String {
+    match usage {
+        Ok(usage) => usage::format_conversation(usage),
+        Err(error) => format!("Conversation usage unavailable: {error}"),
+    }
+}
+
 fn local_command_from_ui(
     config: &ClientConfig,
     coordinator: Option<&str>,
@@ -2197,8 +2274,21 @@ fn local_command_from_ui(
             };
             let mut text = settings_text(&command, &settings, &info, coordinator.as_deref());
             let provider = settings.model.provider;
+            let conversation_id = settings.conversation_id.clone();
             handle.event(RuntimeEventKind::ConversationSettings { settings })?;
             if matches!(command, ChatCommand::Status) {
+                let metrics = native_conversation_usage(
+                    ClientContext {
+                        config: &config,
+                        coordinator: coordinator.as_deref(),
+                        script: &script,
+                        directory: &directory,
+                    },
+                    &conversation_id,
+                )
+                .await;
+                text.push_str("\n\n");
+                text.push_str(&native_usage_text(&metrics));
                 let usage = conversation_usage(
                     ClientContext {
                         config: &config,
@@ -2401,8 +2491,42 @@ async fn local_command_plain(
     } else {
         None
     };
+    let metrics = if matches!(command, ChatCommand::Status) {
+        Some(
+            native_conversation_usage(
+                ClientContext {
+                    config: client.config,
+                    coordinator: client.coordinator,
+                    script: client.script,
+                    directory: client.directory,
+                },
+                &settings.conversation_id,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
     if json {
         display(&RuntimeEventKind::ConversationSettings { settings }, true)?;
+        if let Some(metrics) = metrics {
+            match metrics {
+                Ok(usage) => display(&RuntimeEventKind::ConversationUsage { usage }, true)?,
+                Err(error) => display(
+                    &RuntimeEventKind::Failure {
+                        code: match &error {
+                            NativeUsageFailure::Coordinator { code } => code.clone(),
+                            NativeUsageFailure::Transport => {
+                                agent_cli::protocol::ErrorCode::CoordinatorUnavailable
+                            }
+                            _ => agent_cli::protocol::ErrorCode::Internal,
+                        },
+                        message: format!("Conversation usage unavailable: {error}"),
+                    },
+                    true,
+                )?,
+            }
+        }
         if let Some(usage) = quota {
             display(&RuntimeEventKind::Usage { usage }, true)?;
         }
@@ -2417,6 +2541,13 @@ async fn local_command_plain(
             },
             client.coordinator,
         );
+        if matches!(command, ChatCommand::Status) {
+            text.push_str("\n\n");
+            text.push_str(&metrics.as_ref().map_or_else(
+                || "Conversation usage unavailable".into(),
+                native_usage_text,
+            ));
+        }
         if let Some(usage) = quota {
             text.push_str("\n\n");
             text.push_str(&usage::format_status(&usage, SystemTime::now()));
@@ -2737,6 +2868,18 @@ async fn read_tool_details(
         .context("The coordinator returned no tool details.")
 }
 
+#[derive(Debug)]
+struct CoordinatorFailure {
+    code: agent_cli::protocol::ErrorCode,
+    message: String,
+}
+impl std::fmt::Display for CoordinatorFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+impl std::error::Error for CoordinatorFailure {}
+
 async fn exchange(
     config: &ClientConfig,
     coordinator: Option<&str>,
@@ -2769,7 +2912,9 @@ async fn exchange(
                 return Ok(events);
             }
             RuntimeEventKind::Done => return Ok(events),
-            RuntimeEventKind::Failure { message, .. } => bail!(message),
+            RuntimeEventKind::Failure { code, message } => {
+                return Err(CoordinatorFailure { code, message }.into());
+            }
             RuntimeEventKind::HostCall { .. } => {
                 bail!("Coordinator unexpectedly delegated an owned effect to a CLI client")
             }
@@ -3843,6 +3988,9 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
         RuntimeEventKind::Usage { usage } => {
             print!("{}", usage::format_status(usage, SystemTime::now()))
         }
+        RuntimeEventKind::ConversationUsage { usage } => {
+            println!("{}", usage::format_conversation(usage))
+        }
         RuntimeEventKind::History { messages, .. } => {
             use agent_cli::protocol::HistoryRole;
             for message in messages {
@@ -4838,6 +4986,72 @@ mod tests {
                 };
                 assert_eq!(selection.resolve(&remote).unwrap(), expected);
             }
+        }
+    }
+    #[tokio::test]
+    async fn native_usage_failure_preserves_its_code_without_provider_content() {
+        use agent_cli::protocol::{ErrorCode, RuntimeCommand, RuntimeEventKind};
+        use tokio::{io::AsyncWriteExt, net::UnixListener};
+        for rejected in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader =
+                    agent_cli::runtime::FrameReader::new(tokio::io::BufReader::new(reader));
+                let bytes = reader.next_frame().await.unwrap().unwrap();
+                let command: RuntimeCommand = serde_json::from_slice(&bytes).unwrap();
+                assert!(
+                    matches!(command, RuntimeCommand::ConversationUsage { conversation_id } if conversation_id == "saved-conversation")
+                );
+                if rejected {
+                    let event = RuntimeEventKind::Failure {
+                        code: ErrorCode::StorageUnavailable,
+                        message: "PRIVATE_PROVIDER_BODY_MUST_NOT_BE_LOGGED".into(),
+                    };
+                    writer
+                        .write_all(&serde_json::to_vec(&event).unwrap())
+                        .await
+                        .unwrap();
+                    writer.write_all(b"\n").await.unwrap();
+                } else {
+                    writer
+                        .write_all(&serde_json::to_vec(&RuntimeEventKind::Done).unwrap())
+                        .await
+                        .unwrap();
+                    writer.write_all(b"\n").await.unwrap();
+                }
+            });
+            let config = agent_cli::config::ClientConfig::default();
+            let result = crate::native_conversation_usage(
+                crate::ClientContext {
+                    config: &config,
+                    coordinator: None,
+                    script: std::path::Path::new("unused-runtime"),
+                    directory: directory.path(),
+                },
+                "saved-conversation",
+            )
+            .await;
+            server.await.unwrap();
+            let visible = crate::native_usage_text(&result);
+            assert!(!visible.contains("PRIVATE_PROVIDER_BODY_MUST_NOT_BE_LOGGED"));
+            assert!(visible.contains(if rejected {
+                "StorageUnavailable"
+            } else {
+                "no usage record"
+            }));
+            assert!(if rejected {
+                matches!(
+                    result,
+                    Err(crate::NativeUsageFailure::Coordinator {
+                        code: ErrorCode::StorageUnavailable
+                    })
+                )
+            } else {
+                matches!(result, Err(crate::NativeUsageFailure::MissingResponse))
+            });
         }
     }
 }

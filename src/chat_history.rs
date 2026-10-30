@@ -33,15 +33,10 @@ impl Job {
         let directory: PathBuf = client.directory.into();
         Self {
             task: tokio::spawn(async move {
-                let mut cursor = match start {
-                    Start::Recent => None,
-                    Start::AfterAttach(ready) => {
-                        ready
-                            .await
-                            .context("The conversation view did not attach")?;
-                        None
-                    }
-                    Start::Older(cursor) => Some(cursor),
+                let (mut cursor, mut attaching) = match start {
+                    Start::Recent => (None, None),
+                    Start::AfterAttach(ready) => (None, Some(ready)),
+                    Start::Older(cursor) => (Some(cursor), None),
                 };
                 let mut seen: HashSet<String> = cursor.iter().cloned().collect();
                 loop {
@@ -88,6 +83,16 @@ impl Job {
                     }
                     ensure!(complete, "The saved history page did not complete");
                     replay.page(events)?;
+                    if let Some(ready) = attaching.take() {
+                        // Show a bounded recent preview without waiting for the
+                        // observer handshake. Read it again after attachment so
+                        // commits between the two connections cannot be missed.
+                        ready
+                            .await
+                            .context("The conversation view did not attach")?;
+                        cursor = None;
+                        continue;
+                    }
                     if let Some(next) = &cursor {
                         ensure!(
                             seen.insert(next.clone()),

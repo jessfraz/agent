@@ -62,6 +62,8 @@ shows registered machines and which are online.
 
 In the TUI, `agent` opens that same saved main conversation and attaches to
 ongoing work. `/exit` or Ctrl+C detaches main chat while the work continues.
+If closing waits on an input receipt, press Ctrl+C again to exit the client.
+Unconfirmed input keeps its original identity for recovery.
 Reopen it to see live progress, steer or queue more context. Saved messages load
 automatically in the background while the composer remains usable.
 
@@ -75,9 +77,11 @@ status. Enter steers active work; Tab queues a separate follow-up turn. Queued
 messages run in FIFO order. Esc stops, and Shift+Enter or Alt+Enter inserts a
 newline. Press `?` in an empty editor or use `/help` for commands and shortcuts,
 generated from the same definitions used to parse them.
+Pending messages share compact previews above the composer; each keeps its own
+delivery state and appears once in history when placed.
 Presentation follows the installed Codex CLI 0.165 conventions: prompt gutters,
 neutral Markdown replies, exposed reasoning summaries, bounded tool output,
-an unbordered composer and dim model/directory context. Live and restored
+an unbordered composer and colored model/directory context. Live and restored
 messages share the same typed cells. Ctrl+T opens the transcript; Enter on a
 saved tool reads its private arguments and output on demand.
 Esc returns to chat without stopping its work.
@@ -432,6 +436,24 @@ existing configuration; other sources and chat can continue.
 app-server, after verifying its signed-in account matches the agent's. This
 does not expose a separate quota for agent, and requires Codex independently.
 Reset dates use the client's local timezone and include the time remaining.
+
+`/status` also reads Pi Durable's own-conversation usage ledger: model/tool
+tokens, cache reads and writes, reported reasoning tokens, and recent request
+durations. Reasoning and one-hour cache writes are subsets, never extra tokens.
+Imported history has no measured spend; child/ancestor ledgers are not added to
+the selected conversation. Costs are Pi's recorded API-equivalent USD estimates,
+not invoices or ChatGPT subscription charges. Unknown prices stay unavailable.
+Timing samples cover the last 20 native entries; older or deferred responses may
+have no duration.
+
+The coordinator installs Pi's native buffered SQLite telemetry recorder at
+`<state_dir>/diagnostics/telemetry.sqlite`, with seven-day retention and at most
+2,048 queued spans or metric series. Status reports recorder availability and
+dropped counts. Native request/phase timing and identifiers remain private;
+prompt/response bodies, tool arguments, response IDs and error messages are
+excluded. Metrics include request and first-chunk latency, token categories,
+estimated cost and task phases. Nothing is exported to an external service.
+Recorder failure does not stop chat or its durable usage ledger.
 
 `/machines` reads the coordinator's host registry and refreshes supported online
 workers. It shows OS, CPU count, RAM, Tailscale IP and load averages. Unavailable

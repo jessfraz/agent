@@ -97,5 +97,22 @@ fn main() -> Result<()> {
         })
         .collect::<std::result::Result<Vec<_>, serde_json::Error>>()?;
     fs::write(fixtures.join("commands.ndjson"), commands.join("\n") + "\n")?;
+    // ts-rs can leave trailing spaces before a field's generated doc comment.
+    // Normalize at the producer so checked-in bindings regenerate cleanly.
+    for entry in fs::read_dir(&output)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|extension| extension == "ts") {
+            let source = fs::read_to_string(&path)?;
+            let formatted = source
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            if source != formatted {
+                fs::write(path, formatted)?;
+            }
+        }
+    }
     Ok(())
 }

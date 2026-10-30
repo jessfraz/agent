@@ -2356,6 +2356,22 @@
         {
           "type": "object",
           "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "conversation_usage"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "request": {
               "$ref": "#/$defs/AttachmentRequest"
             },

@@ -13,6 +13,81 @@ use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Pi's own-conversation ledger. Imported transcripts and fork ancestors are not
+/// billed again; reasoning and one-hour cache writes are subsets, not extra tokens.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct UsageTokens {
+    #[ts(type = "number")]
+    pub input: u64,
+    #[ts(type = "number")]
+    pub output: u64,
+    #[ts(type = "number")]
+    pub cache_read: u64,
+    #[ts(type = "number")]
+    pub cache_write: u64,
+    #[ts(type = "number | null")]
+    pub cache_write_1h: Option<u64>,
+    #[ts(type = "number | null")]
+    pub reasoning: Option<u64>,
+    #[ts(type = "number")]
+    pub total: u64,
+}
+
+/// Native SDK estimates are API-equivalent USD, never a provider invoice or
+/// ChatGPT subscription spend. A zero/unknown native price is unavailable.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UsageCost {
+    ApiEstimate {
+        input_usd: f64,
+        output_usd: f64,
+        cache_read_usd: f64,
+        cache_write_usd: f64,
+        total_usd: f64,
+    },
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct UsageBucket {
+    /// Pi's provider/model key, or tool name for the tool ledger.
+    pub name: String,
+    pub tokens: UsageTokens,
+    pub cost: UsageCost,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct RequestTiming {
+    pub entry_id: String,
+    pub provider: String,
+    pub model: String,
+    pub started_at_ms: f64,
+    /// Native monotonic request duration; absent in legacy/deferred entries.
+    pub duration_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct TelemetryStatus {
+    pub available: bool,
+    #[ts(type = "number")]
+    pub dropped_spans: u64,
+    #[ts(type = "number")]
+    pub dropped_measurements: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ConversationUsage {
+    pub conversation_id: String,
+    /// False means Pi has no ledger for this conversation, not measured zero.
+    pub recorded: bool,
+    pub models: Vec<UsageBucket>,
+    pub tools: Vec<UsageBucket>,
+    /// Samples from the last 20 native entries, not a lifetime duration total.
+    pub recent_requests: Vec<RequestTiming>,
+    pub recent_entry_limit: u32,
+    pub telemetry: TelemetryStatus,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ContextRepository {
     pub id: String,
@@ -228,6 +303,9 @@ pub struct RuntimeRequest {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeCommand {
+    ConversationUsage {
+        conversation_id: String,
+    },
     Attachment {
         request: crate::attachments::AttachmentRequest,
     },
@@ -949,6 +1027,9 @@ pub struct RuntimeEvent {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEventKind {
+    ConversationUsage {
+        usage: ConversationUsage,
+    },
     Attachment {
         response: crate::attachments::AttachmentResponse,
     },

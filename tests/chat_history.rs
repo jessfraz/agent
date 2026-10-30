@@ -68,6 +68,342 @@ async fn permanent_observer_domain_failure_stays_an_error_without_retrying() {
     observer_recovery(RecoveryCase::PermanentChief).await;
 }
 
+#[tokio::test]
+async fn repeated_control_c_detaches_while_admission_is_held_and_retains_its_original_id() {
+    use agent_cli::protocol::{InputMode, SavedConversation};
+    use tokio::io::AsyncReadExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let config = directory.path().join("config.toml");
+    fs::write(&config, "").unwrap();
+    let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();
+    let (admitted, mut admissions) = tokio::sync::mpsc::unbounded_channel();
+    let (detached, mut detachments) = tokio::sync::mpsc::unbounded_channel();
+    let (completed, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    let finish = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = finish.clone();
+    let server = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                socket = listener.accept() => {
+                    let (socket, _) = socket.unwrap();
+                    let admitted = admitted.clone();
+                    let detached = detached.clone();
+                    let completed = completed.clone();
+                    let finish = finish.clone();
+                    connections.spawn(async move {
+                        let (reader, mut writer) = socket.into_split();
+                        let mut reader = FrameReader::new(BufReader::new(reader));
+                        let Some(bytes) = reader.next_frame().await.unwrap() else { return; };
+                        let command: RuntimeCommand = serde_json::from_slice(&bytes).unwrap();
+                        let summary = SavedConversation {
+                            conversation_id: "saved-chief".into(), title: "Main agent".into(), updated_at: None,
+                            task_id: None, agent_id: None, host: None, source_thread_id: None,
+                        };
+                        let events = match command {
+                            RuntimeCommand::ConversationSettings { .. } => vec![RuntimeEventKind::ConversationSettings {
+                                settings: ConversationSettings { conversation_id: summary.conversation_id,
+                                    task_id: None, agent_id: None, model: ModelSelection::default(), catalog: vec![] },
+                            }],
+                            RuntimeCommand::AttachConversation { conversation_id, .. } => {
+                                assert_eq!(conversation_id, summary.conversation_id);
+                                write_events(&mut writer, [RuntimeEventKind::ConversationReady {
+                                    conversation: summary, model: ModelSelection::default(), cwd: "/example".into(), working: false,
+                                }]).await;
+                                retired_observer_closed(&mut reader).await.unwrap();
+                                return;
+                            }
+                            RuntimeCommand::ReadConversation { conversation_id, cursor: None } => vec![RuntimeEventKind::History {
+                                conversation_id, messages: vec![HistoryMessage {
+                                    entry_id: "saved-answer".into(), role: HistoryRole::Final,
+                                    text: "The saved chief transcript is ready.".into(), continuation: false,
+                                    final_chunk: true, tool: None, presentation: None, attachments: None,
+                                }], next_cursor: None, page_complete: true,
+                            }],
+                            RuntimeCommand::ConversationInput { conversation_id, input_id, input, mode, .. } => {
+                                assert_eq!(conversation_id, summary.conversation_id);
+                                assert_eq!(input, "Work retained by the coordinator");
+                                assert_eq!(mode, InputMode::Steer);
+                                admitted.send(input_id.clone()).unwrap();
+                                // The coordinator owns this input, but its receipt has not
+                                // reached the client. Closing the socket cannot stop that work.
+                                retired_observer_closed(&mut reader).await.unwrap();
+                                detached.send(()).unwrap();
+                                finish.acquire().await.unwrap().forget();
+                                completed.send(input_id).unwrap();
+                                return;
+                            }
+                            other => panic!("Closing cannot interrupt or resubmit coordinator work: {other:?}"),
+                        };
+                        write_events(&mut writer, events.into_iter().chain([RuntimeEventKind::Done])).await;
+                    });
+                }
+                done = connections.join_next(), if !connections.is_empty() => { done.unwrap().unwrap(); }
+            }
+        }
+    });
+    let binary =
+        std::env::var_os("AGENT_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_agent").into());
+    let fixture = std::path::Path::new(env!("CARGO_BIN_EXE_agent"))
+        .parent()
+        .unwrap()
+        .join("examples/terminal-fixture");
+    let mut child = Command::new(fixture)
+        .arg(binary)
+        .arg("--state-dir")
+        .arg(directory.path())
+        .arg("--config")
+        .arg(config)
+        .arg("chat")
+        .current_dir("/")
+        .env("TERM", "xterm-256color")
+        .env("AGENT_TEST_TERMINAL_REPLY", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
+    let mut bytes = Vec::new();
+    read_terminal_until(
+        &mut output,
+        &mut bytes,
+        "The saved chief transcript is ready.",
+    )
+    .await;
+    input
+        .write_all(b"Work retained by the coordinator\r")
+        .await
+        .unwrap();
+    let id = timeout(Duration::from_secs(3), admissions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    input.write_all(b"\x03").await.unwrap();
+    read_terminal_until(&mut output, &mut bytes, "Closing").await;
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "The first exit still waits for the admission receipt"
+    );
+    input.write_all(b"\x03").await.unwrap();
+    let exited = timeout(Duration::from_secs(3), async {
+        let (exited, drained) =
+            tokio::join!(child.wait_with_output(), output.read_to_end(&mut bytes));
+        drained.unwrap();
+        exited.unwrap()
+    })
+    .await
+    .expect(
+        "A repeated Ctrl+C must close only the local client without waiting for the coordinator",
+    );
+    assert!(
+        exited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exited.stderr)
+    );
+    timeout(Duration::from_secs(3), detachments.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(completions.try_recv().is_err());
+    assert!(
+        admissions.try_recv().is_err(),
+        "No second input was admitted"
+    );
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum Owner {
+        Conversation { conversation_id: String },
+    }
+    #[derive(serde::Deserialize)]
+    struct RetainedInput {
+        id: String,
+        input: agent_cli::tui::attachments::ComposerInput,
+        mode: InputMode,
+    }
+    #[derive(serde::Deserialize)]
+    struct Recovery {
+        owner: Owner,
+        queued_inputs: Vec<RetainedInput>,
+    }
+    let files = fs::read_dir(directory.path().join("recovery"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(files.len(), 1);
+    let recovery: Recovery = serde_json::from_slice(&fs::read(&files[0]).unwrap()).unwrap();
+    assert!(
+        matches!(recovery.owner, Owner::Conversation { conversation_id } if conversation_id == "saved-chief")
+    );
+    assert_eq!(recovery.queued_inputs.len(), 1);
+    assert_eq!(recovery.queued_inputs[0].id, id);
+    assert_eq!(
+        recovery.queued_inputs[0].input.text,
+        "Work retained by the coordinator"
+    );
+    assert_eq!(recovery.queued_inputs[0].mode, InputMode::Steer);
+    release.add_permits(1);
+    assert_eq!(
+        timeout(Duration::from_secs(3), completions.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        id
+    );
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn known_chief_history_renders_while_its_observer_readiness_is_held() {
+    use tokio::io::AsyncReadExt;
+    let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let config = directory.path().join("config.toml");
+    fs::write(&config, "").unwrap();
+    let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();
+    let hold = Arc::new(tokio::sync::Semaphore::new(0));
+    let observation = hold.clone();
+    let (ready, mut readiness) = tokio::sync::mpsc::unbounded_channel();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let server_reads = reads.clone();
+    let server = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                socket = listener.accept() => {
+                    let (socket, _) = socket.unwrap();
+                    let hold = hold.clone(); let ready = ready.clone(); let reads = server_reads.clone();
+                    connections.spawn(async move {
+                        let (reader, mut writer) = socket.into_split();
+                        let mut reader = FrameReader::new(BufReader::new(reader));
+                        let Some(bytes) = reader.next_frame().await.unwrap() else { return; };
+                        let command: RuntimeCommand = serde_json::from_slice(&bytes).unwrap();
+                        let summary = RecoveryCase::AcceptedChief.summary();
+                        let events = match command {
+                            RuntimeCommand::ConversationSettings { .. } => vec![RuntimeEventKind::ConversationSettings {
+                                settings: ConversationSettings { conversation_id: summary.conversation_id, task_id: None, agent_id: None,
+                                    model: ModelSelection::default(), catalog: vec![] },
+                            }],
+                            RuntimeCommand::AttachConversation { conversation_id, .. } => {
+                                assert_eq!(conversation_id, summary.conversation_id);
+                                hold.acquire().await.unwrap().forget();
+                                write_events(&mut writer, [RuntimeEventKind::ConversationReady {
+                                    conversation: summary, model: ModelSelection::default(), cwd: "/example".into(), working: false,
+                                }]).await;
+                                ready.send(()).unwrap();
+                                retired_observer_closed(&mut reader).await.unwrap();
+                                return;
+                            }
+                            RuntimeCommand::ReadConversation { conversation_id, cursor: None } => {
+                                let mut messages = vec![HistoryMessage {
+                                    entry_id: "saved-answer".into(), role: HistoryRole::Final,
+                                    text: "Saved conversation text can appear before observation is ready.".into(), continuation: false,
+                                    final_chunk: true, tool: None, presentation: None, attachments: None,
+                                }];
+                                if reads.fetch_add(1, Ordering::SeqCst) > 0 {
+                                    messages.push(HistoryMessage {
+                                        entry_id: "answer-during-attach".into(), role: HistoryRole::Final,
+                                        text: "The entry committed during attachment remains visible.".into(), continuation: false,
+                                        final_chunk: true, tool: None, presentation: None, attachments: None,
+                                    });
+                                }
+                                vec![RuntimeEventKind::History { conversation_id, messages,
+                                    next_cursor: None, page_complete: true }]
+                            }
+                            other => panic!("Opening saved history cannot submit model input or read a catalog: {other:?}"),
+                        };
+                        write_events(&mut writer, events.into_iter().chain([RuntimeEventKind::Done])).await;
+                    });
+                }
+                done = connections.join_next(), if !connections.is_empty() => { done.unwrap().unwrap(); }
+            }
+        }
+    });
+    let binary =
+        std::env::var_os("AGENT_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_agent").into());
+    let fixture = std::path::Path::new(env!("CARGO_BIN_EXE_agent"))
+        .parent()
+        .unwrap()
+        .join("examples/terminal-fixture");
+    let mut child = Command::new(fixture)
+        .arg(binary)
+        .arg("--state-dir")
+        .arg(directory.path())
+        .arg("--config")
+        .arg(config)
+        .arg("chat")
+        .current_dir("/")
+        .env("TERM", "xterm-256color")
+        .env("AGENT_TEST_TERMINAL_REPLY", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
+    let mut bytes = Vec::new();
+    read_terminal_until(
+        &mut output,
+        &mut bytes,
+        "Saved conversation text can appear before observation is ready.",
+    )
+    .await;
+    assert!(
+        readiness.try_recv().is_err(),
+        "Readiness remains held while actual history is visible"
+    );
+    input
+        .write_all(b"\x1b[200~Retained startup draft\x1b[201~")
+        .await
+        .unwrap();
+    read_terminal_until(&mut output, &mut bytes, "Retained startup draft").await;
+    observation.add_permits(1);
+    timeout(Duration::from_secs(3), readiness.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    read_terminal_until(
+        &mut output,
+        &mut bytes,
+        "The entry committed during attachment remains visible.",
+    )
+    .await;
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "The attached snapshot closes the preview's observation gap"
+    );
+    input.write_all(b"\x03").await.unwrap();
+    let exited = timeout(Duration::from_secs(3), async {
+        let (exited, drained) =
+            tokio::join!(child.wait_with_output(), output.read_to_end(&mut bytes));
+        drained.unwrap();
+        exited.unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        exited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exited.stderr)
+    );
+    assert_eq!(
+        terminal_history_text(&bytes)
+            .matches("Saved conversation text can appear before observation is ready.")
+            .count(),
+        1
+    );
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RecoveryCase {
     AcceptedChief,
@@ -464,10 +800,15 @@ async fn observer_recovery(case: RecoveryCase) {
             .unwrap();
         read_terminal_until(&mut output, &mut bytes, "A retained draft").await;
         disconnect.add_permits(1);
-        read_terminal_until(
+        read_terminal_observation(
             &mut output,
             &mut bytes,
-            "Synthetic saved conversation was removed.",
+            "the permanent error and retained editor draft",
+            |bytes| {
+                let visible = terminal_text(bytes);
+                visible.contains("Synthetic saved conversation was removed.")
+                    && visible.contains("A retained draft")
+            },
         )
         .await;
         assert!(!terminal_text(&bytes).contains("Reconnecting"));
@@ -484,7 +825,7 @@ async fn observer_recovery(case: RecoveryCase) {
     }
     input.write_all(b"One owned execution\r").await.unwrap();
     if case == RecoveryCase::WaitingWorker {
-        read_terminal_until(&mut output, &mut bytes, "sending…").await;
+        read_terminal_until(&mut output, &mut bytes, "Sending steering messages").await;
         assert!(inputs.lock().await.is_empty());
     } else {
         timeout(Duration::from_secs(3), async {
@@ -496,7 +837,7 @@ async fn observer_recovery(case: RecoveryCase) {
         .unwrap();
     }
     if case == RecoveryCase::AcceptedChief {
-        read_terminal_until(&mut output, &mut bytes, "steering, waiting…").await;
+        read_terminal_until(&mut output, &mut bytes, "Steering messages, waiting").await;
     }
     input
         .write_all(b"\x1b[200~A retained draft\x1b[201~")

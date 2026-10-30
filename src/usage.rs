@@ -1,4 +1,4 @@
-//! Read-only Codex-account quota metadata, not this application's allowance.
+//! Native conversation usage and separate read-only Codex-account quota metadata.
 //! Protocol: https://learn.chatgpt.com/docs/app-server#6-rate-limits-chatgpt
 
 use std::collections::BTreeMap;
@@ -18,6 +18,81 @@ use ts_rs::TS;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(25);
 const MAX_FRAME_BYTES: usize = 256 * 1024;
+
+/// Format Pi's own ledger without summing child conversations, reasoning/cache
+/// subsets, or API-equivalent estimates into a provider bill.
+pub fn format_conversation(usage: &crate::protocol::ConversationUsage) -> String {
+    use crate::protocol::UsageCost;
+    use std::fmt::Write;
+    let mut text = format!(
+        "Conversation usage · {} · Pi Durable\n",
+        usage.conversation_id
+    );
+    if !usage.recorded {
+        text.push_str(
+            "No native usage recorded; retained/imported history is not a measured zero.\n",
+        );
+    }
+    for (kind, buckets) in [("Model", &usage.models), ("Tool", &usage.tools)] {
+        for bucket in buckets {
+            let tokens = &bucket.tokens;
+            let _ = writeln!(
+                text,
+                "{kind} {}: {} total tokens · {} input · {} output · {} cache read · {} cache write",
+                bucket.name,
+                tokens.total,
+                tokens.input,
+                tokens.output,
+                tokens.cache_read,
+                tokens.cache_write
+            );
+            if let Some(reasoning) = tokens.reasoning {
+                let _ = writeln!(text, "  {reasoning} reasoning tokens (included in output)");
+            }
+            if let Some(cache) = tokens.cache_write_1h {
+                let _ = writeln!(
+                    text,
+                    "  {cache} one-hour cache-write tokens (included in cache write)"
+                );
+            }
+            match bucket.cost {
+                UsageCost::ApiEstimate { total_usd, .. } => {
+                    let _ = writeln!(text, "  API-equivalent estimate: ${total_usd:.6} USD");
+                }
+                UsageCost::Unavailable => text.push_str("  API cost estimate unavailable\n"),
+            }
+        }
+    }
+    if let Some(request) = usage.recent_requests.first() {
+        let duration = request
+            .duration_ms
+            .map_or_else(|| "unavailable".into(), |ms| format!("{:.2}s", ms / 1000.0));
+        let _ = writeln!(
+            text,
+            "Latest model request: {}/{} · {duration}",
+            request.provider, request.model
+        );
+    }
+    let _ = writeln!(
+        text,
+        "Timing sample: {} requests in the last {} native entries",
+        usage.recent_requests.len(),
+        usage.recent_entry_limit
+    );
+    text.push_str("Estimates use Pi's recorded prices, not billed spend or ChatGPT plan quota.\n");
+    let _ = write!(
+        text,
+        "Private telemetry: {} · {} dropped spans · {} dropped measurements",
+        if usage.telemetry.available {
+            "available"
+        } else {
+            "unavailable"
+        },
+        usage.telemetry.dropped_spans,
+        usage.telemetry.dropped_measurements
+    );
+    text
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
@@ -714,6 +789,67 @@ async fn frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, Usage
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_conversation_usage_preserves_subsets_and_separates_estimates_from_quota() {
+        use crate::protocol::{
+            ConversationUsage, RequestTiming, TelemetryStatus, UsageBucket, UsageCost, UsageTokens,
+        };
+        let usage = ConversationUsage {
+            conversation_id: "42".into(),
+            recorded: true,
+            models: vec![UsageBucket {
+                name: "provider/model".into(),
+                tokens: UsageTokens {
+                    input: 10,
+                    output: 20,
+                    cache_read: 30,
+                    cache_write: 40,
+                    cache_write_1h: Some(5),
+                    reasoning: Some(6),
+                    total: 100,
+                },
+                cost: UsageCost::ApiEstimate {
+                    input_usd: 0.1,
+                    output_usd: 0.2,
+                    cache_read_usd: 0.3,
+                    cache_write_usd: 0.4,
+                    total_usd: 1.0,
+                },
+            }],
+            tools: vec![],
+            recent_requests: vec![RequestTiming {
+                entry_id: "43".into(),
+                provider: "provider".into(),
+                model: "model".into(),
+                started_at_ms: 1.0,
+                duration_ms: Some(1250.0),
+            }],
+            recent_entry_limit: 20,
+            telemetry: TelemetryStatus {
+                available: true,
+                dropped_spans: 0,
+                dropped_measurements: 0,
+            },
+        };
+        let text = format_conversation(&usage);
+        assert!(text.contains("100 total tokens"));
+        assert!(text.contains("6 reasoning tokens (included in output)"));
+        assert!(text.contains("5 one-hour cache-write tokens (included in cache write)"));
+        assert!(text.contains("API-equivalent estimate: $1.000000 USD"));
+        assert!(text.contains("not billed spend or ChatGPT plan quota"));
+        assert!(text.contains("1.25s"));
+        let empty = ConversationUsage {
+            models: vec![],
+            recent_requests: vec![],
+            recorded: false,
+            ..usage
+        };
+        assert!(format_conversation(&empty).contains("not a measured zero"));
+        let wire = serde_json::to_string(&empty).unwrap();
+        let restored: ConversationUsage = serde_json::from_str(&wire).unwrap();
+        assert_eq!(format_conversation(&restored), format_conversation(&empty));
+    }
 
     fn fixed_time(seconds: i64, east: i32, zone: &str) -> Option<ResetTime> {
         let utc = chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0)?;

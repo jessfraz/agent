@@ -43,6 +43,11 @@ impl Projection {
         let mut cells = Vec::new();
         let mut height = 0;
         for (index, message) in messages.iter_mut().enumerate().skip(start) {
+            if matches!(message.kind, MessageKind::Input { ref delivery, .. }
+                if !matches!(delivery, crate::tui::InputDelivery::Placed { .. }))
+            {
+                continue;
+            }
             #[cfg(test)]
             {
                 state.layout_work.parsed_messages += usize::from(message.rendered.is_none());

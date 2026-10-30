@@ -39,6 +39,8 @@ import type { SourcePollCursor } from "./generated/SourcePollCursor.js";
 import { Notifications, NotificationError } from "./notifications.js";
 import type { ApnsConfig } from "./generated/ApnsConfig.js";
 import { annotateTranscript, TranscriptAnnotationError } from "./transcript_visibility.js";
+import { DiagnosticsTelemetry } from "./telemetry.js";
+import { conversationUsage } from "./usage.js";
 
 function notificationConfig(): ApnsConfig | undefined {
   const saved = process.env.AGENT_APNS_CONFIG;
@@ -98,14 +100,20 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
 }
 
 type Application = TriageApplication & { stopPlacements(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore; notifications: Notifications;
-  histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler };
+  histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler;
+  telemetry: DiagnosticsTelemetry };
 async function openApplication(): Promise<Application> {
   const database = await openNodeSqliteDatabase(join(state, "session.sqlite"));
   await database.exec("PRAGMA synchronous = FULL");
   const storage = await SqliteStorage.open(database);
   const registry = createRegistry();
-  const harness = await Harness.open(storage, { models, registry, identity: { attribution: null },
-    settings: { steeringMode: "all", followUpMode: "one-at-a-time" } }, BACKGROUND_CONTEXT);
+  const telemetry = await DiagnosticsTelemetry.open(state);
+  let harness: Harness;
+  try {
+    harness = await Harness.open(storage, { models, registry, identity: { attribution: null }, telemetry: telemetry.context,
+      settings: { steeringMode: "all", followUpMode: "one-at-a-time" } }, BACKGROUND_CONTEXT);
+  } catch (error) { await telemetry.close(); throw error; }
+  try {
   const notifications = new Notifications(harness, registry, notificationConfig());
   const tasks = new TaskStore(harness, inference);
   const attachments = new AttachmentStore(state); tasks.useAttachments(attachments);
@@ -142,7 +150,7 @@ async function openApplication(): Promise<Application> {
       if (conversation.id.toString() === conversationId && !ending.has(id)) emit(id, { type: "input_placed", input_id, entry_id });
     }
   });
-  const core = { stopPlacements, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, attachments, feedback, repairs, notifications };
+  const core = { stopPlacements, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, attachments, feedback, repairs, notifications, telemetry };
   const background = new BackgroundScheduler(harness, registry, tasks, {
     async plan(cadence, after, now) {
       const result = await backgroundCall({ type: "background", request: { type: "plan", cadence, after, now } });
@@ -175,6 +183,9 @@ async function openApplication(): Promise<Application> {
   const toolsets = createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools });
   if (await notifications.start()) harness.resume();
   return { ...core, background, toolsets };
+  } catch (error) {
+    await harness.close(BACKGROUND_CONTEXT).catch(() => {}); await telemetry.close(); throw error;
+  }
 }
 let application: ReturnType<typeof openApplication> | undefined;
 function app(): ReturnType<typeof openApplication> { return application ??= openApplication(); }
@@ -359,6 +370,12 @@ async function handle(request: RuntimeRequest): Promise<void> {
         break;
       }
       case "status": emit(id, { type: "auth_status", status: await auth.status() }); break;
+      case "conversation_usage": {
+        const application = await app();
+        emit(id, { type: "conversation_usage", usage: await conversationUsage(application.harness,
+          command.conversation_id, await application.telemetry.status()) });
+        break;
+      }
       case "usage": {
         if (command.provider !== "openai") {
           emit(id, { type: "usage", usage: { state: "unavailable", reason: "unsupported_provider" } }); break;
@@ -832,6 +849,10 @@ try {
 } finally {
   if (application !== undefined) {
     const opened = await application.catch(() => undefined);
-    if (opened !== undefined) { opened.notifications.close(); opened.stopPlacements(); await opened.retrieval.close(); await opened.harness.close(BACKGROUND_CONTEXT); }
+    if (opened !== undefined) {
+      opened.notifications.close(); opened.stopPlacements();
+      try { await opened.retrieval.close(); await opened.harness.close(BACKGROUND_CONTEXT); }
+      finally { await opened.telemetry.close(); }
+    }
   }
 }

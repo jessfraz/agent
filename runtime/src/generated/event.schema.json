@@ -1093,6 +1093,54 @@
         "catalog"
       ]
     },
+    "ConversationUsage": {
+      "type": "object",
+      "properties": {
+        "conversation_id": {
+          "type": "string"
+        },
+        "models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UsageBucket"
+          }
+        },
+        "recent_entry_limit": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "recent_requests": {
+          "description": "Samples from the last 20 native entries, not a lifetime duration total.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RequestTiming"
+          }
+        },
+        "recorded": {
+          "description": "False means Pi has no ledger for this conversation, not measured zero.",
+          "type": "boolean"
+        },
+        "telemetry": {
+          "$ref": "#/$defs/TelemetryStatus"
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UsageBucket"
+          }
+        }
+      },
+      "required": [
+        "conversation_id",
+        "recorded",
+        "models",
+        "tools",
+        "recent_requests",
+        "recent_entry_limit",
+        "telemetry"
+      ]
+    },
     "CoordinatorSettings": {
       "type": "object",
       "properties": {
@@ -3410,6 +3458,38 @@
       "description": "Canonical DTSTART/RRULE properties, with an explicit timezone and anchor.",
       "type": "string"
     },
+    "RequestTiming": {
+      "type": "object",
+      "properties": {
+        "duration_ms": {
+          "description": "Native monotonic request duration; absent in legacy/deferred entries.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "entry_id": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "started_at_ms": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "entry_id",
+        "provider",
+        "model",
+        "started_at_ms"
+      ]
+    },
     "ResourceRecord": {
       "type": "object",
       "properties": {
@@ -3585,6 +3665,22 @@
     },
     "RuntimeEventKind": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "conversation_usage"
+            },
+            "usage": {
+              "$ref": "#/$defs/ConversationUsage"
+            }
+          },
+          "required": [
+            "type",
+            "usage"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -5236,6 +5332,29 @@
         }
       ]
     },
+    "TelemetryStatus": {
+      "type": "object",
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "dropped_measurements": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "dropped_spans": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "available",
+        "dropped_spans",
+        "dropped_measurements"
+      ]
+    },
     "TimezoneId": {
       "type": "string"
     },
@@ -5429,6 +5548,80 @@
         }
       ]
     },
+    "UsageBucket": {
+      "type": "object",
+      "properties": {
+        "cost": {
+          "$ref": "#/$defs/UsageCost"
+        },
+        "name": {
+          "description": "Pi's provider/model key, or tool name for the tool ledger.",
+          "type": "string"
+        },
+        "tokens": {
+          "$ref": "#/$defs/UsageTokens"
+        }
+      },
+      "required": [
+        "name",
+        "tokens",
+        "cost"
+      ]
+    },
+    "UsageCost": {
+      "description": "Native SDK estimates are API-equivalent USD, never a provider invoice or\nChatGPT subscription spend. A zero/unknown native price is unavailable.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "cache_read_usd": {
+              "type": "number",
+              "format": "double"
+            },
+            "cache_write_usd": {
+              "type": "number",
+              "format": "double"
+            },
+            "input_usd": {
+              "type": "number",
+              "format": "double"
+            },
+            "output_usd": {
+              "type": "number",
+              "format": "double"
+            },
+            "total_usd": {
+              "type": "number",
+              "format": "double"
+            },
+            "type": {
+              "type": "string",
+              "const": "api_estimate"
+            }
+          },
+          "required": [
+            "type",
+            "input_usd",
+            "output_usd",
+            "cache_read_usd",
+            "cache_write_usd",
+            "total_usd"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
     "UsageSnapshot": {
       "type": "object",
       "properties": {
@@ -5473,6 +5666,60 @@
       "type": "string",
       "enum": [
         "codex_account"
+      ]
+    },
+    "UsageTokens": {
+      "description": "Pi's own-conversation ledger. Imported transcripts and fork ancestors are not\nbilled again; reasoning and one-hour cache writes are subsets, not extra tokens.",
+      "type": "object",
+      "properties": {
+        "cache_read": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cache_write": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cache_write_1h": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "input": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "output": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reasoning": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "total": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "input",
+        "output",
+        "cache_read",
+        "cache_write",
+        "total"
       ]
     },
     "UsageUnavailable": {
