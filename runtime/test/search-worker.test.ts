@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, symlink, unlink } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { MessageChannel, Worker } from "node:worker_threads";
 import { test } from "node:test";
 import { SearchIndex, type Embed, type PublishedSearch, type SearchRecord, type SearchResult } from "../src/search.js";
@@ -44,14 +44,18 @@ test("warm file-backed dense search services queued coordinator I/O before retur
 
 test("file-backed reader startup errors reject every waiter and a fresh owner can reopen the publication", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-search-reader-error-"));
-  const extension = process.env.AGENT_SQLITE_VEC; assert.ok(extension);
-  const locator = join(directory, basename(extension)); await symlink(extension, locator);
-  const path = join(directory, "search.sqlite"); let index = new SearchIndex(path, locator);
+  const publication = join(directory, "publication"), locator = join(directory, "reader");
+  await mkdir(publication); await symlink(publication, locator, "dir");
+  const path = join(locator, "search.sqlite"); let index = new SearchIndex(path);
   try {
     await index.upsert("service", "one", records(3), embed);
+    // Remove the reader's database locator, not a library the native loader may
+    // already retain from the writer in this process.
     await unlink(locator);
-    await Promise.all([assert.rejects(index.search("Automobile", embed)), assert.rejects(index.search("Automobile", embed))]);
-    await index.close(); await symlink(extension, locator); index = new SearchIndex(path, locator);
+    await Promise.all([assert.rejects(index.search("Automobile", embed), /unable to open database file/),
+      assert.rejects(index.search("Automobile", embed), /unable to open database file/)]);
+    await assert.rejects(index.search("Automobile", embed), /unable to open database file/);
+    await index.close(); await symlink(publication, locator, "dir"); index = new SearchIndex(path);
     assert.equal((await index.search("Automobile", embed)).candidates[0]?.conversation_id, "service");
   } finally { await index.close(); await rm(directory, { recursive: true, force: true }); }
 });
