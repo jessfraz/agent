@@ -120,6 +120,25 @@ async fn write_events(
     writer.write_all(&bytes).await.unwrap();
 }
 
+async fn retired_observer_closed<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut FrameReader<R>,
+) -> anyhow::Result<()> {
+    match reader.next_frame().await {
+        Ok(None) => Ok(()),
+        // A retiring client can close with unread readiness. Linux reports a
+        // reset for that close; other framing failures must still fail the test.
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset) =>
+        {
+            Ok(())
+        }
+        Ok(Some(_)) => anyhow::bail!("A retired observer sent another frame"),
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Clone)]
 struct RecoveryEndpoint {
     disconnect: Arc<tokio::sync::Semaphore>,
@@ -184,7 +203,7 @@ async fn recovery_connection(
                     }],
                 )
                 .await;
-                assert!(reader.next_frame().await.unwrap().is_none());
+                retired_observer_closed(&mut reader).await.unwrap();
                 return;
             }
             assert_eq!(conversation_id, summary.conversation_id);
@@ -1521,4 +1540,68 @@ async fn main_history(older: bool) {
     assert_eq!(settings_reads.load(Ordering::SeqCst), 2);
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn retired_observer_close_accepts_native_reset_without_hiding_frames_or_truncation() {
+    use std::io::ErrorKind;
+    use tokio::net::{TcpListener, TcpStream, UnixStream};
+
+    async fn reset_reader() -> FrameReader<BufReader<TcpStream>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        server
+            .write_all(b"Unread observer readiness\n")
+            .await
+            .unwrap();
+        client.set_zero_linger().unwrap();
+        drop(client);
+        FrameReader::new(BufReader::new(server))
+    }
+
+    // A retiring client can abandon unread readiness. Linux Unix sockets report
+    // reset rather than EOF; native TCP abortive close reproduces that error on
+    // both supported platforms without depending on scheduler timing.
+    let error = reset_reader().await.next_frame().await.unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        ErrorKind::ConnectionReset
+    );
+    timeout(
+        Duration::from_secs(3),
+        retired_observer_closed(&mut reset_reader().await),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let (peer, socket) = UnixStream::pair().unwrap();
+    drop(peer);
+    retired_observer_closed(&mut FrameReader::new(BufReader::new(socket)))
+        .await
+        .unwrap();
+
+    for frame in [b"{}\n".as_slice(), b"{".as_slice()] {
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        peer.write_all(frame).await.unwrap();
+        drop(peer);
+        let error = retired_observer_closed(&mut FrameReader::new(BufReader::new(socket)))
+            .await
+            .unwrap_err();
+        if frame.ends_with(b"\n") {
+            assert!(
+                error
+                    .to_string()
+                    .contains("A retired observer sent another frame")
+            );
+        } else {
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                ErrorKind::UnexpectedEof
+            );
+        }
+    }
 }
