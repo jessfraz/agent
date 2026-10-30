@@ -969,6 +969,7 @@ test("lost browser transport leaves a submitted mutation uncertain without repla
   const f = await fixture(t, { slowSubmit: true }), host = f.host, request = requests();
   const opened = (await host.execute(request({ type: "open", url: `${f.origin}/form` }))).response;
   assert.ok(opened.type === "ready", JSON.stringify(opened)); const tab = opened.tabs[0]; assert.ok(tab);
+  const native = (await f.client.pages()).find(page => page.url === tab.url); assert.ok(native);
   const operation = request({ type: "click", tab_id: tab.id, element_ref: elementRef(opened.output, "button", "Save") });
   const pending = host.execute(operation);
   await Promise.race([f.submitted, setTimeout(15_000, undefined, { ref: false }).then(() => { throw new Error("Fixture submission did not arrive"); })]);
@@ -977,8 +978,20 @@ test("lost browser transport leaves a submitted mutation uncertain without repla
   assert.equal((await host.execute(operation)).response.type, "failed"); assert.equal(f.count(), 1);
   f.finishSubmission();
   assert.equal((await host.execute(request({ type: "snapshot", tab_id: tab.id }))).response.type, "disconnected");
-  const pages = await f.client.pages();
-  assert.ok(pages.some(page => page.url.startsWith(f.origin) && page.url !== `${f.origin}/unrelated`));
+  // Releasing the response starts a redirect; it does not confirm its commit.
+  // Observe that completion on the same native target, rather than inferring
+  // tab closure from a transient navigation URL or matching another form.
+  const controller = new AbortController();
+  try {
+    const pages = await within((async () => {
+      for (;;) {
+        const pages = await f.client.pages();
+        if (pages.some(page => page.targetId === native.targetId && page.url === `${f.origin}/done`)) return pages;
+        await setTimeout(10, undefined, { signal: controller.signal });
+      }
+    })(), 5000, "The same submitted native tab must survive transport loss and finish its redirect");
+    assert.ok(pages.some(page => page.targetId === native.targetId && page.url === `${f.origin}/done`), JSON.stringify({ targetId: native.targetId, pages }));
+  } finally { controller.abort(); }
   assert.equal(f.browser.exitCode, null);
 });
 
