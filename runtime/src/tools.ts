@@ -249,6 +249,7 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
   const record = defineTool({ name: "record_task", description: "Save verified progress and the next actor/check or concrete resolution evidence.",
     parameters: Type.Object({ task_id: Type.Optional(Type.String()), summary: Type.String(), state: taskState,
       sources: Type.Optional(Type.Array(source)),
+      remove_sources: Type.Optional(Type.Array(source, { description: "Remove only exact source references verified stale. Other references and history stay intact. First relink or dismiss every event/version still linked to this task; never add and remove the same reference." })),
       reconciles_input: Type.Optional(Type.String({ minLength: 1,
         description: "Exact unanswered input request ID reconciled by this recovery turn. Verify prior effects first; this does not resolve ongoing work." })) }),
     async execute(args, api) {

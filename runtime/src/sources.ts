@@ -7,11 +7,12 @@ import type { SourceBatch } from "./generated/SourceBatch.js";
 import type { SourceCheckpoint } from "./generated/SourceCheckpoint.js";
 import type { SourceEvent } from "./generated/SourceEvent.js";
 import type { SourceKey } from "./generated/SourceKey.js";
+import type { SourceRef } from "./generated/SourceRef.js";
 import type { SourceState } from "./generated/SourceState.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { TaskOutcome } from "./generated/TaskOutcome.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
-import { publishMainNotice, TaskError, TaskStore } from "./tasks.js";
+import { publishMainNotice, sourceReference, TaskError, TaskStore } from "./tasks.js";
 import { Executions } from "./tools.js";
 
 type Decision = { type: "task"; task_id: string } | { type: "dismissed"; reason: string };
@@ -89,6 +90,13 @@ export class SourceJournal {
       JSON.stringify(record.outcome) === JSON.stringify(outcome));
     if (record !== undefined) record.decision = { type: "dismissed", reason: "Delivered to the parent task" };
   }
+  async assertSourceRemovalIn(tx: Tx, taskId: string, sources: readonly SourceRef[]): Promise<void> {
+    const refs = new Set(sources.map(sourceReference));
+    for (const record of (await tx.doc(Sources)).events) if (record.outcome === undefined && record.decision?.type === "task" &&
+        record.decision.task_id === taskId && refs.has(sourceReference(record.event.source))) {
+      throw new TaskError("Relink or dismiss every source event/version linked to this task before removing its source reference");
+    }
+  }
   private async settlePublished(): Promise<void> {
     const root = await this.session.root(BACKGROUND_CONTEXT);
     await this.session.commit(async (tx) => {
@@ -161,27 +169,47 @@ export class SourceJournal {
     if (state === undefined) throw new TaskError("Source admission lost its canonical state");
     return { ...result, state };
   }
-  async decide(keys: readonly string[], decision: Decision): Promise<void> {
+  async decide(keys: readonly string[], decision: Decision): Promise<{ unverified_source_links: { task_id: string; source: SourceRef }[] }> {
     if (keys.length === 0) throw new TaskError("Choose source events to account for");
     if (decision.type === "dismissed" && decision.reason.trim().length === 0) throw new TaskError("A no-action judgment needs a reason");
-    await this.session.commit(async (tx) => {
+    return this.session.commit(async (tx) => {
       const journal = await tx.doc(Sources);
       const records = keys.map((key) => {
         const record = journal.events.find((record) => record.key === key);
         if (record === undefined) throw new TaskError("Unknown source event");
         return record;
       });
-      if (decision.type === "task") {
-        await this.tasks.updateIn(tx, decision.task_id, (task) => {
-          for (const { event, outcome } of records) {
-            if (outcome !== undefined) continue;
-            if (!task.sources.some((source) => sameSource(source, event.source) && source.thread_id === event.source.thread_id)) {
-              task.sources.push(event.source);
-            }
-          }
-        });
+      if (decision.type === "task" && await this.tasks.findIn(tx, decision.task_id) === undefined) throw new TaskError("Unknown task");
+      const changes = new Map<string, { add: SourceRef[]; remove: SourceRef[] }>();
+      const correcting = records.some((record) => record.outcome === undefined && record.decision !== null);
+      const change = (id: string) => {
+        let value = changes.get(id);
+        if (value === undefined) { value = { add: [], remove: [] }; changes.set(id, value); }
+        return value;
+      };
+      for (const { event, outcome, decision: previous } of records) {
+        if (outcome !== undefined) continue;
+        if (decision.type === "task") change(decision.task_id).add.push(event.source);
+        if (previous?.type === "task" && (decision.type !== "task" || previous.task_id !== decision.task_id)) {
+          change(previous.task_id).remove.push(event.source);
+        }
       }
       for (const record of records) record.decision = decision;
+      // A different event/version may legitimately keep the same thread linked
+      // to the old task. Only release references whose last current owner moved.
+      const retained = new Set<string>();
+      if (correcting) {
+        for (const record of journal.events) if (record.outcome === undefined && record.decision?.type === "task") {
+          retained.add(JSON.stringify([record.decision.task_id, sourceReference(record.event.source)]));
+        }
+      }
+      for (const [id, { add, remove }] of changes) await this.tasks.relinkSourcesIn(tx, id, add,
+        remove.filter((source) => !retained.has(JSON.stringify([id, sourceReference(source)]))));
+      // Older decisions did not retain prior ownership. Flag matching leftovers
+      // rather than guessing whether an explicit/manual association is stale.
+      const links = correcting ? await this.tasks.sourceLinksIn(tx,
+        records.filter((record) => record.outcome === undefined).map((record) => record.event.source)) : [];
+      return { unverified_source_links: links.filter(({ task_id, source }) => !retained.has(JSON.stringify([task_id, sourceReference(source)]))) };
     }, BACKGROUND_CONTEXT);
   }
   async hasWork(): Promise<boolean> {
@@ -370,14 +398,16 @@ export function createSourceTools(journal: SourceJournal, executions: Executions
     defineTool({ name: "link_source_events", description: "Account for source events by linking them to an existing durable task.",
       parameters: Type.Object({ keys: Type.Array(Type.String(), { minItems: 1 }), task_id: Type.String() }),
       async execute(args, api) {
-        control(api.conversationId.toString()); await journal.decide(args.keys, { type: "task", task_id: args.task_id });
-        return output("Linked to the task.");
+        control(api.conversationId.toString()); const result = await journal.decide(args.keys, { type: "task", task_id: args.task_id });
+        return output(result.unverified_source_links.length === 0 ? "Linked to the task." : { ...result,
+          message: "Linked. Other matching task references have no current event ownership and were preserved. Inspect their provenance; use record_task.remove_sources only for verified stale references." });
       } }),
     defineTool({ name: "dismiss_source_events", description: "Record why these source events need no action. This does not change the provider's messages.",
       parameters: Type.Object({ keys: Type.Array(Type.String(), { minItems: 1 }), reason: Type.String({ minLength: 1 }) }),
       async execute(args, api) {
-        control(api.conversationId.toString()); await journal.decide(args.keys, { type: "dismissed", reason: args.reason });
-        return output("No-action judgment saved.");
+        control(api.conversationId.toString()); const result = await journal.decide(args.keys, { type: "dismissed", reason: args.reason });
+        return output(result.unverified_source_links.length === 0 ? "No-action judgment saved." : { ...result,
+          message: "Judgment saved. Other matching task references have no current event ownership and were preserved. Inspect their provenance; use record_task.remove_sources only for verified stale references." });
       } }),
     defineTool({ name: "notify", description: "Publish a brief useful outcome, concrete recommendation, or needed decision. Stay quiet without one; save ongoing decisions in task state first.",
       parameters: Type.Object({ keys: Type.Array(Type.String()), task_id: Type.Optional(Type.String()), text: Type.String({ minLength: 1 }) }),

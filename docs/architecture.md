@@ -236,6 +236,16 @@ explicit next actor/check, or resolution evidence. Brief updates include the
 proposed action when the user needs to decide; authorization already given in
 the conversation carries forward.
 
+Correcting or dismissing a settled event updates current task routing. Another
+event or version can keep the same source linked to its previous task. Original
+evidence stays intact; inert receipts refresh parent and child search provenance
+without rerunning work or reembedding unchanged text.
+Current routing owns exact-source search priority while the index catches up.
+Legacy links without event ownership remain explicit ambiguities rather than
+being swept away. After verifying a stale reference, use
+`record_task.remove_sources` to remove that exact reference; current linked
+events or versions must be corrected first.
+
 Sources exist to advance work. Take useful authorized actions and surface a
 concrete result, recommendation or necessary decision. Otherwise stay quiet:
 no inbox recaps, Slack summaries or "nothing to do" updates.

@@ -3,7 +3,7 @@ import type { TextContent } from "@earendil-works/pi-ai";
 import { AttachmentStore, validateInput } from "./attachments.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { AssistantEntry, defineDoc, GenerationTask, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID, ToolTask, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
+import { AssistantEntry, defineDoc, defineEntry, GenerationTask, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID, ToolTask, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
 import type { CoordinatorEnvironment } from "./environment.js";
 import { ConversationModels, DEFAULT_MODEL, ModelError, modelFailureMessage, savedHost, savedModel } from "./models.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
@@ -57,11 +57,16 @@ const Tasks = defineDoc<TaskIndex>({
   kind: "agent.tasks", scope: "session", version: 1,
   initial: () => ({ tasks: [] }), checkpointWhen: () => true,
 });
+const SourceLinksEntry = defineEntry<{ task_id: string; added: SourceRef[]; removed: SourceRef[] }>("agent.source_links");
+function conversationIdentity(value: unknown): value is ConversationId {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
 
 export class TaskError extends Error {}
 export type OutcomeSink = {
   recordIn(tx: Tx, outcome: TaskOutcome, settled: boolean, attemptId?: string): Promise<void>;
   deliveredIn(tx: Tx, outcome: TaskOutcome): Promise<void>;
+  assertSourceRemovalIn(tx: Tx, taskId: string, sources: readonly SourceRef[]): Promise<void>;
 };
 /** Only an explicit coordinator notification becomes user-visible context. */
 export async function publishMainNotice(session: Harness, conversation: Conversation, entry: EntryRecord,
@@ -181,8 +186,11 @@ export class TaskStore {
     } while (cursor !== undefined);
     throw new TaskError("Task outcome model provenance is unavailable");
   }
-  async record(id: string, input: { summary: string; state: TaskState; sources?: SourceRef[]; reconciles_input?: string },
+  async record(id: string, input: { summary: string; state: TaskState; sources?: SourceRef[]; remove_sources?: SourceRef[]; reconciles_input?: string },
     provenance: { conversation_id: string; call_id: string; settled: boolean; native_task_id?: NativeTaskId }): Promise<TaskRecord> {
+    if (input.sources?.some((source) => input.remove_sources?.some((removed) => related(source, removed)))) {
+      throw new TaskError("Choose separate source references to add and remove");
+    }
     this.assertSource(provenance.conversation_id);
     const conversation = await this.conversation(provenance.conversation_id);
     const origin = await this.origin(conversation, provenance.call_id);
@@ -228,8 +236,11 @@ export class TaskStore {
         reconciliation = { original: { request_id: input.reconciles_input, submission_id: original.id.toString() }, recovery_inputs: recoveryInputs };
       }
       if (input.state.state === "resolved" && !this.canResolve(task)) throw new TaskError("Wait for unfinished task agents before resolving the task");
+      if (input.remove_sources !== undefined && input.remove_sources.length > 0) {
+        await this.outcomes?.assertSourceRemovalIn(tx, id, input.remove_sources);
+      }
       task.summary = input.summary.slice(-4000); task.state = input.state; task.updated_at = Date.now();
-      for (const source of input.sources ?? []) if (!task.sources.some((saved) => related(saved, source))) task.sources.push(source);
+      await this.relinkSourcesIn(tx, id, input.sources ?? [], input.remove_sources ?? []);
       const outcome = this.outcome(task, provenance.conversation_id, origin.id.toString(), provenance.call_id);
       if (reconciliation !== undefined) outcome.reconciliation = reconciliation;
       await this.outcomes?.recordIn(tx, outcome, provenance.settled);
@@ -412,7 +423,13 @@ export class TaskStore {
         excerpt: candidate.matches.map((match) => match.text).join("\n").slice(0, 24_000), score: candidate.score,
         entry_ids: [...new Set(candidate.matches.map((match) => match.entry_id))],
         task_id: task?.id ?? imported?.adopted_task_id ?? null, imported }, rank);
-      if (candidate.matches.some((match) => match.source_refs.some((ref) => refs.has(ref)))) exact.add(candidate.conversation_id);
+      // Published chunks can lag a corrected task link. Current routing owns
+      // exact-source priority; retained Codex identity remains original evidence.
+      const currentRefs = task === undefined ? null : new Set(task.sources.map(sourceReference));
+      if (imported !== null) currentRefs?.add(sourceReference({ provider: "codex", account: "local", thread_id: imported.thread.id }));
+      if (candidate.matches.some((match) => match.source_refs.some((ref) => refs.has(ref) && (currentRefs === null || currentRefs.has(ref))))) {
+        exact.add(candidate.conversation_id);
+      }
     }
     for (const [rank, task] of (await this.rank(query, sources, limit, search === undefined)).entries()) add({
       conversation_id: task.conversation_id, title: task.title, excerpt: task.summary || task.outcome, entry_ids: [], score: 1, task_id: task.id, imported: null,
@@ -475,6 +492,10 @@ export class TaskStore {
     const task = (await tx.doc(Tasks)).tasks.find((task) => task.id === id);
     return task === undefined ? undefined : this.savedTask(task);
   }
+  async sourceLinksIn(tx: Tx, sources: readonly SourceRef[]): Promise<{ task_id: string; source: SourceRef }[]> {
+    return (await tx.doc(Tasks)).tasks.flatMap((task) => task.sources.filter((source) => sources.some((other) => related(source, other)))
+      .map((source) => ({ task_id: task.id, source: { ...source } })));
+  }
   /** Creation can share the admission commit with durable background work. */
   async createIn(tx: Tx, input: TaskCreate): Promise<{ id: TaskRecord["id"]; native?: ConversationId }> {
     const id = input.id ?? randomUUID();
@@ -503,6 +524,27 @@ export class TaskStore {
     Object.assign(task, this.savedTask(task));
     await change(task);
     task.updated_at = Date.now();
+  }
+  /** Journal decisions and current routing change atomically; immutable receipts advance every affected index tail. */
+  async relinkSourcesIn(tx: Tx, id: string, add: readonly SourceRef[], remove: readonly SourceRef[]): Promise<void> {
+    const task = (await tx.doc(Tasks)).tasks.find((task) => task.id === id);
+    if (task === undefined) throw new TaskError("Unknown task");
+    const added = add.filter((source, index) => !task.sources.some((saved) => related(saved, source)) &&
+      add.findIndex((other) => related(other, source)) === index).map((source) => ({ ...source }));
+    const removed = task.sources.filter((source) => remove.some((other) => related(other, source)))
+      .map((source) => ({ ...source }));
+    if (added.length === 0 && removed.length === 0) return;
+    const sources = task.sources.filter((source) => !removed.some((other) => related(other, source))).map((source) => ({ ...source }));
+    task.sources = [...sources, ...added]; task.updated_at = Date.now();
+    // Child records inherit their parent's source references. Each native tail
+    // must change so restart catchup also replaces its published provenance.
+    for (const value of [task.conversation_id, ...(task.agents ?? []).map((agent) => agent.conversation_id)]) {
+      const native: unknown = Number(value);
+      if (!conversationIdentity(native) || native.toString() !== value) {
+        throw new TaskError("Task conversation is unavailable");
+      }
+      await tx.appendEntry(SourceLinksEntry, native, { data: { task_id: id, added, removed } });
+    }
   }
   async update(id: string, change: (task: TaskRecord) => void): Promise<TaskRecord> {
     await this.session.commit((tx) => this.updateIn(tx, id, change), BACKGROUND_CONTEXT);
