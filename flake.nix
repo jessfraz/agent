@@ -10,6 +10,10 @@
     darwinModules.default = import ./nix/module.nix {inherit self;};
     packages = eachSystem (system: let
       pkgs = import nixpkgs {inherit system;};
+      embeddingRuntime = pkgs.llama-cpp.override {
+        vulkanSupport = pkgs.stdenv.hostPlatform.isLinux;
+        blasSupport = pkgs.stdenv.hostPlatform.isLinux;
+      };
       embeddingModel = pkgs.fetchurl {
         url = "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/370f27d7550e0def9b39c1f16d3fbaa13aa67728/Qwen3-Embedding-0.6B-Q8_0.gguf";
         hash = "sha256-BlB8e0JohGnE5ymLCh4W3v8GyvKRzwpbJ4wwgknD5Dk=";
@@ -52,6 +56,7 @@
         nativeBuildInputs = [pkgs.makeWrapper];
         nativeCheckInputs = [pkgs.nodejs_26 pkgs.git pkgs.lsof];
         AGENT_RUNTIME_PATH = "${runtime}/lib/agent-runtime/dist/src/bridge.js";
+        AGENT_SQLITE_VEC = "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
         preCheck = ''
           fixtureProfileFlags=()
           if [ "$cargoCheckType" != debug ]; then
@@ -63,7 +68,7 @@
         postInstall = ''
           wrapProgram "$out/bin/agent" \
             --set AGENT_RUNTIME_PATH "${runtime}/lib/agent-runtime/dist/src/bridge.js" \
-            --set AGENT_LLAMA_SERVER "${pkgs.llama-cpp}/bin/llama-server" \
+            --set AGENT_LLAMA_SERVER "${embeddingRuntime}/bin/llama-server" \
             --set AGENT_EMBEDDING_MODEL "${embeddingModel}" \
             --set AGENT_SQLITE_VEC "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}" \
             --prefix PATH : "${pkgs.lib.makeBinPath [pkgs.nodejs_26 pkgs.git pkgs.lsof pkgs.openssh]}" \
@@ -72,8 +77,7 @@
       };
     in {
       default = cli;
-      inherit runtime embeddingModel;
-      embeddingRuntime = pkgs.llama-cpp;
+      inherit runtime embeddingModel embeddingRuntime;
       sqliteVec = pkgs.sqlite-vec;
     });
     apps = eachSystem (system: {
@@ -88,7 +92,7 @@
     in {
       default = pkgs.mkShell {
         packages = with pkgs; [cargo rustc rustfmt clippy nodejs_26 pkg-config git lsof actionlint unzip];
-        AGENT_LLAMA_SERVER = "${pkgs.llama-cpp}/bin/llama-server";
+        AGENT_LLAMA_SERVER = "${self.packages.${system}.embeddingRuntime}/bin/llama-server";
         AGENT_EMBEDDING_MODEL = self.packages.${system}.embeddingModel;
         AGENT_SQLITE_VEC = "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
       };
