@@ -49,3 +49,25 @@ Add a scenario to the typed `Scenario` enum in `examples/cli_performance.rs` and
 seed its synthetic retained data in `runtime/test/fixtures/performance.ts`.
 The paired sampling and regression gate apply to every enum variant. Keep
 conversation text synthetic and test the real path the scenario is measuring.
+
+The same job measures native search and cached indexing against 16,384
+file-backed chunks with 1,024-dimensional synthetic vectors. Dense retrieval,
+full-text retrieval with hydration, and vector-cache reuse have separate paired
+measurements. Seeding and inference stay outside the clock; each sample checks
+ranking, hydrated text and provenance against the other revision. Query samples
+contain eight lookups; cached-index samples contain four updates. The same
+median gate applies, with raw results in `performance/search.json` and JSONL.
+
+Run that comparison after building both runtimes:
+
+```sh
+nix develop .#ci --command node runtime/dist/test/fixtures/search-performance.js \
+  --baseline /path/to/base/runtime/dist/src/search.js \
+  --candidate runtime/dist/src/search.js \
+  --output performance/search.json
+```
+
+Add native scenarios to `runtime/test/fixtures/search-performance.ts`. Keep
+setup outside timing and verify the actual result as well as its latency.
+These synthetic measurements complement live corpus latency and retrieval
+recall checks.

@@ -74,6 +74,13 @@ jobs:
             --terminal target/release/examples/terminal-fixture \
             --seed runtime/dist/test/fixtures/performance.js \
             --output performance/results.json
+      - name: Compare native search and cached indexing
+        working-directory: candidate
+        run: |
+          nix develop .#ci --command node runtime/dist/test/fixtures/search-performance.js \
+            --baseline ../baseline/runtime/dist/src/search.js \
+            --candidate runtime/dist/src/search.js \
+            --output performance/search.json
       - name: Upload raw samples
         if: always()
         uses: actions/upload-artifact@v6

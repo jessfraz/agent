@@ -164,4 +164,6 @@ nix build
 ```
 
 Rust generates TypeScript bindings and JSON schemas. CI runs behavior tests
-and package builds on Linux and macOS without personal accounts.
+and package builds on Linux and macOS without personal accounts. Paired
+[performance checks](docs/performance.md) cover history rendering, search and
+cached indexing.
