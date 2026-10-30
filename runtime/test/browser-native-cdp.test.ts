@@ -85,6 +85,7 @@ document.addEventListener('focusin', event => {
   const host = document.createElement('fixture-inline-menu');
   const frame = document.createElement('iframe'); frame.src = chrome.runtime.getURL('menu.html');
   host.attachShadow({mode:'closed'}).append(frame); document.documentElement.append(host);
+  queueMicrotask(() => frame.focus());
 });`);
   const inventedPassword = "Invented-native-password-42";
   const credentialCli = join(directory, "credential-cli.mjs");
@@ -177,14 +178,18 @@ document.addEventListener('focusin', event => {
       const { fields } = JSON.parse(stdout);
       const username = fields.find(field => field.id === 'username').value;
       const password = fields.find(field => field.id === 'password').value;
+      // Let the inline menu take focus before inserting credentials.
       const attached = page.waitForEvent('framenavigated', {predicate: frame => frame.url().startsWith('chrome-extension://'), timeout:5000});
-      await page.getByLabel('Name', {exact:true}).fill(username);
+      await page.getByLabel('Name', {exact:true}).focus();
       const foreign = await attached;
       if (!foreign || foreign.isDetached()) throw new Error('Foreign extension frame must remain attached');
-      await page.getByLabel('Name', {exact:true}).focus();
+      await foreign.waitForLoadState('domcontentloaded');
+      await page.getByLabel('Name', {exact:true}).fill(username);
       const ordinary = page.frameLocator('iframe[title="Result"]');
       await ordinary.getByLabel('Frame note').fill('Ordinary frame works');
       await page.getByLabel('Password', {exact:true}).fill(password);
+      if (await page.getByLabel('Name', {exact:true}).inputValue() !== username) throw new Error('Name field did not retain the filled credential');
+      if (await page.getByLabel('Password', {exact:true}).inputValue() !== password) throw new Error('Password field did not retain the filled credential');
       console.log(password);
       return { foreignFramePresent: !foreign.isDetached(), ordinaryFrameValue: await ordinary.getByLabel('Frame note').inputValue(), password };
     }` });
