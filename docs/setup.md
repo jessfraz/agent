@@ -172,8 +172,11 @@ Chrome's `chrome://inspect` connection mode requires approval for each new
 connection. Unattended native CDP requires Chrome's command-line debugging
 port with a nondefault user-data root. Moving an existing profile needs a
 separate migration and launch setup; pointing at an empty directory loses its
-signed-in context. Chrome's upcoming macOS encryption changes also make
-default-root cookies incompatible with custom roots. See Chrome's
+signed-in context. Launch setup must handle macOS restoring stock Chrome before
+the wrapper. Startup flags cannot be added to an existing process; any recovery
+restart must honor Chrome's normal unsaved-work checks. Chrome's upcoming macOS
+encryption changes also make default-root cookies incompatible with custom
+roots. See Chrome's
 [debugging requirements](https://developer.chrome.com/blog/remote-debugging-port)
 and the [cookie-key change](https://github.com/chromium/chromium/commit/c7ee20cc2303adf430ec7c1996afa8d20f2f8641).
 Migrating a disposable profile is not proof of personal account continuity.
