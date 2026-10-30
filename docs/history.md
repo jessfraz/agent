@@ -148,7 +148,10 @@ payload; historical hooks and compaction are inert markers. Authentication and
 system/developer instructions remain excluded. Missing originals stay visibly
 unavailable. Execution inputs and tool payloads stay in the shared, lazy detail
 reader. Command cells carry typed command text, exit status and a bounded output
-preview. Updating presentation does not rewrite retained imports or regenerate
+preview. Shell wrappers are decoded and highlighted for display; tool details
+retain the exact invocation. Coordination receipts name the receiving task or
+agent. Input delivery and finishing a wait do not imply that its work finished.
+Updating presentation does not rewrite retained imports or regenerate
 their vectors. Structured MCP results remain readable in previews and tool
 inspection. The phone retains the same metadata and fetches tool arguments only
 when expanded. Events an older importer discarded need a source backfill;

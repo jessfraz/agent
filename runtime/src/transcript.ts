@@ -10,7 +10,6 @@ import type { ModelActivity } from "./generated/ModelActivity.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ToolDetails } from "./generated/ToolDetails.js";
 import type { ToolDetailContent } from "./generated/ToolDetailContent.js";
-import type { MessagePresentation } from "./generated/MessagePresentation.js";
 import { HistoryError, HistoryStore, ImportedItemEntry, ImportedThreadEntry, isHistoryEntry } from "./history.js";
 import { codexDisplayMessage, codexMessage, codexToolOutput, historyToolId } from "./imported-history.js";
 import { field, piToolPresentation, piToolResult, string, type MessageContent } from "./message-presentation.js";
@@ -50,7 +49,7 @@ function* chunks(value: string): Generator<string> {
   }
 }
 export function visibleTranscript(entry: EntryRecord, visibility: Readonly<TranscriptVisibilityState> | undefined,
-  tools?: Map<string, MessagePresentation>): HistoryMessage[] {
+  tools?: Map<string, ToolCall>): HistoryMessage[] {
   return transcriptVisible(entry.id.toString(), visibility) ? nativeTranscript(entry, tools) : [];
 }
 function missingOriginal(error: unknown): boolean {
@@ -59,7 +58,7 @@ function missingOriginal(error: unknown): boolean {
 }
 /** Source adapters converge here, including verified cold originals retained by older imports. */
 export async function projectTranscript(entry: EntryRecord, originals: Pick<HistoryStore, "original">,
-  visibility?: Readonly<TranscriptVisibilityState>, revisions?: RevisionView, tools?: Map<string, MessagePresentation>): Promise<HistoryMessage[]> {
+  visibility?: Readonly<TranscriptVisibilityState>, revisions?: RevisionView, tools?: Map<string, ToolCall>): Promise<HistoryMessage[]> {
   if (!transcriptVisible(entry.id.toString(), visibility)) return [];
   if (!ImportedItemEntry.is(entry)) return nativeTranscript(entry, tools);
   const status = revisions === undefined ? "current" : revisionStatus(entry.id, revisions);
@@ -88,7 +87,7 @@ function messageRows(entry: EntryRecord, message: MessageContent): HistoryMessag
   });
 }
 export function transcript(entry: EntryRecord): HistoryMessage[] { return nativeTranscript(entry); }
-function nativeTranscript(entry: EntryRecord, tools?: Map<string, MessagePresentation>): HistoryMessage[] {
+function nativeTranscript(entry: EntryRecord, tools?: Map<string, ToolCall>): HistoryMessage[] {
   const messages: HistoryMessage[] = [];
   let attachments: HistoryMessage["attachments"];
   if (entry.kind === "agent.input" && object(entry.data) && entry.data.attachments !== undefined) {
@@ -125,7 +124,7 @@ function nativeTranscript(entry: EntryRecord, tools?: Map<string, MessagePresent
       else if (part.type === "thinking") add("thinking", part.thinking);
       else if (part.type === "toolCall") {
         const presentation = piToolPresentation(part, entry.conversationId.toString());
-        tools?.set(part.id, presentation);
+        tools?.set(part.id, part);
         messages.push(...messageRows(entry, { role: "tool", text: "", tool: { call_id: part.id, name: part.name, status: "running" }, presentation }));
       }
       else if (part.type === "image") add("user", "[image]");
@@ -149,7 +148,7 @@ export async function history(conversation: Conversation, value: string | null, 
   do {
     const page = await conversation.entries({ order: "descending", ...(maximum === undefined ? {} : { maxEntryId: maximum }) }, 20, next, BACKGROUND_CONTEXT);
     projected = [];
-    const tools = new Map<string, MessagePresentation>();
+    const tools = new Map<string, ToolCall>();
     for (const entry of [...page.items].reverse()) {
       let view: RevisionView | undefined;
       if (ImportedItemEntry.is(entry)) {
@@ -263,7 +262,7 @@ export async function activity(session: Harness, conversation: Conversation, emi
   const visibility = await observeTranscriptVisibility(session, conversation.id);
   const thinking = new Map<number, string>(), responding = new Map<number, string>();
   // Retain only typed headings while their native calls are pending, never arguments.
-  const tools = new Map<string, MessagePresentation>();
+  const tools = new Map<string, ToolCall>();
   let previous: Readonly<LiveState> | null = null, initialized = false, assistantOpen = false;
   let compacting = false;
   const compaction = (active: boolean, failed = false) => {

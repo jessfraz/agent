@@ -6,7 +6,10 @@ import { Type } from "typebox";
 import { Check } from "typebox/value";
 import { defineExtension, defineTool, ROOT_CONVERSATION_ID, type Extension, type Harness, type ToolExecutionResult } from "@earendil-works/pi-durable";
 import { DEFAULT_MODEL } from "./models.js";
-import { commandPresentation, outputPreview, type MessageContent } from "./message-presentation.js";
+import { agentPresentation, commandPresentation, outputPreview, type MessageContent } from "./message-presentation.js";
+import type { ToolCall } from "@earendil-works/pi-ai";
+import type { TaskRecord } from "./generated/TaskRecord.js";
+import type { TaskAgentRecord } from "./generated/TaskAgentRecord.js";
 import { recordDelegation } from "./delegation.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { HostCommand } from "./generated/HostCommand.js";
@@ -74,6 +77,10 @@ export class Executions {
 
 function output(value: unknown, isError = false): ToolExecutionResult {
   return { output: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value) ?? "" }], isError };
+}
+function agentOutput(name: string, args: ToolCall["arguments"], sender: string, value: TaskRecord | TaskAgentRecord[], targetAgentId?: string): ToolExecutionResult {
+  const details: MessageContent = { role: "tool", text: "", presentation: agentPresentation({ name, arguments: args }, sender, value, targetAgentId) };
+  return { ...output(value), details };
 }
 function hostOutput(result: HostResult) {
   return output(result, result.type === "failed" || result.type === "creation_uncertain" ||
@@ -382,7 +389,7 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
           : { kind: action, task_id: task.id, conversation_id: task.conversation_id });
         const inputId = await api.memo("input_id", randomUUID(), context);
         await tasks.enqueue(task.id, args.input, inputId, undefined, mode, await tasks.attachmentRefs(args.attachments));
-        return output(await tasks.dispatch(task.id, host, execution.call));
+        return agentOutput("delegate_task", args, api.conversationId.toString(), await tasks.dispatch(task.id, host, execution.call));
       } }),
     record,
   ] });
@@ -394,7 +401,7 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         const owner = await tasks.owner(api.conversationId.toString());
         if (owner.agent !== undefined) throw new TaskError("Only the parent worker may continue task agents");
         const inputId = await api.memo("agent_input_id", randomUUID(), context);
-        return output(await tasks.continueAgent(owner.task.id, args.agent_id, args.input, inputId, execution.call, args.mode ?? "steer", undefined, await tasks.attachmentRefs(args.attachments)));
+        return agentOutput("continue_agent", args, api.conversationId.toString(), await tasks.continueAgent(owner.task.id, args.agent_id, args.input, inputId, execution.call, args.mode ?? "steer", undefined, await tasks.attachmentRefs(args.attachments)));
       } });
   const spawnAgent = defineTool({ name: "spawn_agent", description: "Give a bounded assignment to a named terminal in this task's Rex session. The parent retains the overall outcome.",
       parameters: Type.Object({ title: Type.String({ minLength: 1, maxLength: 80 }),
@@ -406,12 +413,12 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         const id = await api.memo("agent_id", randomUUID(), context);
         const inputId = await api.memo("agent_input_id", randomUUID(), context);
         await tasks.createAgent(owner.task.id, { ...args, id, inputId, attachments: await tasks.attachmentRefs(args.attachments) });
-        return output(await tasks.dispatchAgent(owner.task.id, id, execution.call));
+        return agentOutput("spawn_agent", args, api.conversationId.toString(), await tasks.dispatchAgent(owner.task.id, id, execution.call), id);
       } });
   const readAgents = defineTool({ name: "read_agents", description: "Read this task's agent progress and results.", replay: "safe",
       parameters: Type.Object({}), async execute(_args, api) {
         executions.get(api.conversationId.toString());
-        return output((await tasks.owner(api.conversationId.toString())).task.agents);
+        return agentOutput("read_agents", {}, api.conversationId.toString(), (await tasks.owner(api.conversationId.toString())).task.agents);
       } });
   const waitAgents = defineTool({ name: "wait_agents", description: "Wait briefly for this task's agents, then read their progress and results.", replay: "safe",
       parameters: Type.Object({ timeout_seconds: Type.Optional(Type.Integer({ minimum: 0, maximum: 60 })) }),
@@ -419,7 +426,7 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         executions.get(api.conversationId.toString());
         const owner = await tasks.owner(api.conversationId.toString());
         if (owner.agent !== undefined) throw new TaskError("The parent worker waits for task agents");
-        return output(await tasks.waitAgents(owner.task.id, (args.timeout_seconds ?? 30) * 1000));
+        return agentOutput("wait_agents", args, api.conversationId.toString(), await tasks.waitAgents(owner.task.id, (args.timeout_seconds ?? 30) * 1000));
       } });
   const reportResult = defineTool({ name: "report_result", description: "Finish this agent's bounded assignment with evidence or a concrete failure. The parent still owns task resolution.",
       parameters: Type.Object({ summary: Type.String({ minLength: 1, maxLength: 4000 }), failure: Type.Optional(Type.String({ minLength: 1 })) }),
@@ -427,7 +434,7 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         executions.get(api.conversationId.toString());
         const owner = await tasks.owner(api.conversationId.toString());
         if (owner.agent === undefined) throw new TaskError("Only a task agent can report an agent result");
-        return output(await tasks.reportAgent(owner.task.id, owner.agent.id, args.summary, args.failure,
+        return agentOutput("report_result", args, api.conversationId.toString(), await tasks.reportAgent(owner.task.id, owner.agent.id, args.summary, args.failure,
           { conversation_id: api.conversationId.toString(), call_id: api.callId }));
       } });
   const worker = defineExtension({ name: "task-parent", tools: [record, searchTask, readTask, continueAgent, spawnAgent, readAgents, waitAgents] });

@@ -177,20 +177,24 @@ fn heading(
         Some(MessagePresentation::AgentCoordination {
             action,
             receiver_thread_ids,
+            agents,
             ..
         }) => (
             match action {
                 Some(AgentAction::Spawn) => {
                     verb(status, "Spawning agent", "Spawned agent", "Agent spawn")
                 }
-                Some(AgentAction::SendInput | AgentAction::SendMessage) => {
-                    verb(status, "Sending input", "Sent input", "Agent input")
-                }
+                Some(AgentAction::SendInput | AgentAction::SendMessage) => verb(
+                    status,
+                    "Sending input to",
+                    "Sent input to",
+                    "Agent input for",
+                ),
                 Some(AgentAction::Followup) => verb(
                     status,
-                    "Queueing input",
-                    "Queued input",
-                    "Queued agent input",
+                    "Queueing input for",
+                    "Queued input for",
+                    "Agent input for",
                 ),
                 Some(AgentAction::Resume) => {
                     verb(status, "Resuming agent", "Resumed agent", "Agent resume")
@@ -198,7 +202,7 @@ fn heading(
                 Some(AgentAction::Wait) => verb(
                     status,
                     "Waiting for agents",
-                    "Waited for agents",
+                    "Finished waiting",
                     "Agent wait",
                 ),
                 Some(AgentAction::Close) => {
@@ -221,7 +225,13 @@ fn heading(
                 ),
                 None => "Agent operation",
             },
-            receiver_thread_ids.join(", "),
+            receiver_thread_ids
+                .iter()
+                .filter_map(|id| agents.iter().find(|agent| &agent.thread_id == id))
+                .filter_map(|agent| agent.name.as_deref())
+                .filter(|name| !name.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(", "),
         ),
         Some(MessagePresentation::AgentActivity {
             agent_path, state, ..
@@ -289,6 +299,20 @@ fn heading(
         }
         None => (verb(status, "Calling", "Called", "Tool"), name.to_owned()),
     };
+    let detail = if detail.is_empty()
+        && matches!(
+            presentation,
+            Some(MessagePresentation::AgentCoordination {
+                action: Some(
+                    AgentAction::SendInput | AgentAction::SendMessage | AgentAction::Followup
+                ),
+                ..
+            })
+        ) {
+        "agent".to_owned()
+    } else {
+        detail
+    };
     Line::from(vec![
         Span::styled(action, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(if detail.is_empty() {
@@ -301,23 +325,62 @@ fn heading(
 
 fn tool(message: &Content<'_>, title: Line<'static>, status: ToolStatus) -> CachedText {
     let mut lines = vec![title];
-    if let Some(MessagePresentation::AgentCoordination { agents, .. }) = message.presentation {
+    if let Some(MessagePresentation::Command {
+        command: Some(command),
+        ..
+    }) = message.presentation
+    {
+        let script = crate::tui::shell::command_lines(command);
+        if let Some(first) = script.first() {
+            lines[0].spans.truncate(1);
+            lines[0].spans.push(Span::raw(" "));
+            lines[0].spans.extend(first.spans.clone());
+            for line in script.iter().skip(1).take(2) {
+                let mut spans = vec![Span::raw("  ")];
+                spans.extend(line.spans.clone());
+                lines.push(Line::from(spans));
+            }
+            if script.len() > 3 {
+                lines.push(Line::styled("  … more lines (ctrl+t to expand)", dim()));
+            }
+        }
+    }
+    if let Some(MessagePresentation::AgentCoordination { agents, action, .. }) =
+        message.presentation
+    {
         for (index, agent) in agents.iter().take(4).enumerate() {
+            if matches!(
+                action,
+                Some(
+                    AgentAction::Spawn
+                        | AgentAction::SendInput
+                        | AgentAction::SendMessage
+                        | AgentAction::Followup
+                )
+            ) {
+                // A delivery receipt names the recipient in the heading; it is
+                // not a second activity or a completed task.
+                continue;
+            }
             let state = match agent.state.as_ref() {
-                Some(AgentState::Pending) => "pending",
-                Some(AgentState::Running) => "running",
-                Some(AgentState::Interrupted) => "interrupted",
-                Some(AgentState::Completed) => "completed",
-                Some(AgentState::Failed) => "failed",
-                Some(AgentState::Shutdown) => "closed",
-                Some(AgentState::NotFound) => "not found",
-                None => "state unavailable",
+                Some(AgentState::Pending) => " · pending",
+                Some(AgentState::Running) => " · running",
+                Some(AgentState::Interrupted) => " · interrupted",
+                Some(AgentState::Completed) => " · completed",
+                Some(AgentState::Failed) => " · failed",
+                Some(AgentState::Shutdown) => " · closed",
+                Some(AgentState::NotFound) => " · not found",
+                None => "",
             };
             lines.push(Line::styled(
                 format!(
-                    "{}{} · {state}",
+                    "{}{}{state}",
                     if index == 0 { "└ " } else { "  " },
-                    markdown::plain(&agent.thread_id)
+                    agent
+                        .name
+                        .as_deref()
+                        .map(markdown::plain)
+                        .unwrap_or_else(|| format!("Agent {}", index + 1))
                 ),
                 dim(),
             ));
@@ -520,6 +583,53 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn delegation_receipts_hide_machine_ids_and_wait_completion_is_not_task_completion() {
+        let (_, queued) = draw(
+            MessagePresentation::AgentCoordination {
+                action: Some(AgentAction::Followup),
+                sender_thread_id: None,
+                receiver_thread_ids: vec!["894912".into()],
+                agents: vec![],
+            },
+            Some(ToolStatus::Finished),
+            "",
+            100,
+        );
+        assert!(queued.contains("Queued input for agent"), "{queued}");
+        assert!(!queued.contains("894912"), "{queued}");
+        let (_, waited) = draw(
+            MessagePresentation::AgentCoordination {
+                action: Some(AgentAction::Wait),
+                sender_thread_id: None,
+                receiver_thread_ids: vec![],
+                agents: vec![],
+            },
+            Some(ToolStatus::Finished),
+            "",
+            100,
+        );
+        assert!(waited.contains("Finished waiting"), "{waited}");
+        assert!(!waited.contains("Agent completed"), "{waited}");
+    }
+
+    #[test]
+    fn shell_invocations_render_the_script_without_wrapper_escaping() {
+        let (_, text) = draw(
+            MessagePresentation::Command {
+                command: Some("sh -c 'printf '\\''two words'\\'' | cat\nprintf done'".into()),
+                exit_code: Some(0),
+                duration_ms: None,
+            },
+            Some(ToolStatus::Finished),
+            "two wordsdone",
+            100,
+        );
+        assert!(text.contains("Ran printf 'two words' | cat"), "{text}");
+        assert!(text.contains("printf done"), "{text}");
+        assert!(!text.contains("sh -c") && !text.contains("'\\''"), "{text}");
     }
 
     #[test]

@@ -292,7 +292,8 @@ struct ActivityItemView: View {
         return value.command ?? commandInput?.display
           ?? "Command\(ordinal.map { " \($0)" } ?? "")"
       }
-      return presentation.activityTitle(toolName: model.row.tool?.name)
+      return presentation.activityTitle(
+        toolName: model.row.tool?.name, status: model.row.tool?.status)
     }
     if let tool = model.row.tool {
       if let commandInput { return commandInput.display }
@@ -333,16 +334,13 @@ struct ActivityItemView: View {
             .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
         }
       case .agentCoordination(let value):
-        ForEach(Array(value.agents.enumerated()), id: \.offset) { _, agent in
-          Text("\(agent.threadId) · \(agent.state?.rawValue ?? "state unavailable")")
+        ForEach(Array(value.activityAgentLines.enumerated()), id: \.offset) { _, line in
+          Text(line)
             .font(.caption).textSelection(.enabled)
-        }
-        if !value.receiverThreadIds.isEmpty {
-          ToolText(title: "Recipients", text: value.receiverThreadIds.joined(separator: "\n"))
         }
       case .agentActivity(let value):
         ToolText(
-          title: "Agent", text: value.agentPath.isEmpty ? value.agentThreadId : value.agentPath)
+          title: "Agent", text: value.agentPath.isEmpty ? "Agent" : value.agentPath)
         Text(value.state?.rawValue ?? "State unavailable").font(.caption)
       case .webSearch(let value):
         if !value.query.isEmpty { ToolText(title: "Query", text: value.query) }
@@ -406,19 +404,41 @@ struct ActivityItemView: View {
   }
 }
 
-extension MessagePresentation {
-  func activityTitle(toolName: String? = nil) -> String {
-    switch self {
-    case .command(let value): value.command ?? "Command"
-    case .fileChanges(let value):
-      value.changes.isEmpty ? "File changes" : value.changes.map(\.path).joined(separator: ", ")
-    case .tool(let value):
-      [value.namespace, toolName ?? "Tool"].compactMap { $0 }.joined(separator: ".")
-    case .agentCoordination(let value):
-      switch value.action {
+extension AgentStatePresentation {
+  var activityName: String {
+    let label = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return label.isEmpty ? "Agent" : label
+  }
+}
+
+extension MessagePresentationAgentCoordination {
+  private var activityAgentNames: [String] {
+    agents.isEmpty ? receiverThreadIds.map { _ in "Agent" } : agents.map(\.activityName)
+  }
+
+  var activityAgentLines: [String] {
+    // A successful input operation acknowledges delivery, not the target's
+    // completion. Legacy snapshots may still carry its previous task state.
+    switch action {
+    case .sendInput, .sendMessage, .followup: return activityAgentNames
+    default:
+      if agents.isEmpty { return activityAgentNames }
+      return agents.map {
+        let state =
+          $0.state?.rawValue.replacingOccurrences(of: "_", with: " ").capitalized
+          ?? "State unavailable"
+        return "\($0.activityName) · \(state)"
+      }
+    }
+  }
+
+  func activityTitle(status: ToolStatus?) -> String {
+    let label: String =
+      switch action {
       case .spawn: "Spawn agent"
-      case .sendInput, .sendMessage: "Send agent input"
-      case .followup: "Queue agent input"
+      case .sendInput: status == .finished ? "Sent input" : "Send agent input"
+      case .sendMessage: status == .finished ? "Sent message" : "Message agent"
+      case .followup: status == .finished ? "Queued input" : "Queue agent input"
       case .resume: "Resume agent"
       case .wait: "Wait for agents"
       case .close: "Close agent"
@@ -427,6 +447,21 @@ extension MessagePresentation {
       case .report: "Agent report"
       case nil: "Agent operation"
       }
+    let names = activityAgentNames
+    return names.isEmpty ? label : label + " · " + names.joined(separator: ", ")
+  }
+}
+
+extension MessagePresentation {
+  func activityTitle(toolName: String? = nil, status: ToolStatus? = nil) -> String {
+    switch self {
+    case .command(let value): value.command ?? "Command"
+    case .fileChanges(let value):
+      value.changes.isEmpty ? "File changes" : value.changes.map(\.path).joined(separator: ", ")
+    case .tool(let value):
+      [value.namespace, toolName ?? "Tool"].compactMap { $0 }.joined(separator: ".")
+    case .agentCoordination(let value):
+      value.activityTitle(status: status)
     case .agentActivity: "Agent activity"
     case .webSearch(let value):
       switch value.action {

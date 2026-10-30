@@ -1261,6 +1261,9 @@ pub enum AgentState {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct AgentStatePresentation {
     pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub name: Option<String>,
     pub state: Option<AgentState>,
 }
 

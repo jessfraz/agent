@@ -66,7 +66,7 @@ export function commandPresentation(program: string, args: readonly string[]): E
 function coordination(call: Pick<ToolCall, "name" | "arguments">): AgentAction | null | undefined {
   switch (call.name) {
     case "spawn_agent": return "spawn";
-    case "continue_agent": return "send_input";
+    case "continue_agent": return field(call.arguments, "mode") === "follow_up" ? "followup" : "send_input";
     case "read_agents": return "list";
     case "wait_agents": return "wait";
     case "report_result": return "report";
@@ -105,42 +105,59 @@ function hostResult(result: ToolResultMessage) {
   const frame: unknown = { version: 1, id: 0, command: { type: "host_reply", call_id: result.toolCallId, result: decodedOutput(result) } };
   return validRequest(frame) && frame.command.type === "host_reply" ? frame.command.result : undefined;
 }
-function savedCommand(result: ToolResultMessage): MessageContent | undefined {
+function savedPresentation(result: ToolResultMessage): MessageContent | undefined {
   // Pi's UI-only details retain the same Rust-owned message fields, not arbitrary arguments.
   if (!object(result.details)) return undefined;
   const frame: unknown = { version: 1, id: 0, event: { type: "message", message: { ...result.details, entry_id: "0",
     continuation: false, final_chunk: true } } };
   const message = validEvent(frame) && frame.event.type === "message" ? frame.event.message : undefined;
-  return message?.role === "tool" && message.presentation?.type === "command" ? message : undefined;
+  return message?.role === "tool" && (message.presentation?.type === "command" || message.presentation?.type === "agent_coordination") ? message : undefined;
 }
-function agentStates(value: unknown): AgentStatePresentation[] {
+
+/** The same receipt metadata is persisted by real tools and read by live/reopened views. */
+export function agentPresentation(call: Pick<ToolCall, "name" | "arguments">, sender: string, output: unknown, targetAgentId?: string): Extract<MessagePresentation, { type: "agent_coordination" }> {
+  let agents: AgentStatePresentation[];
+  if (call.name === "delegate_task") agents = agentStates([output], false);
+  else if (call.name === "spawn_agent" || call.name === "continue_agent") {
+    const id = targetAgentId ?? field(call.arguments, "agent_id"), title = field(call.arguments, "title");
+    const targets = list(field(output, "agents")).filter((agent) =>
+      typeof id === "string" ? field(agent, "id") === id : typeof title === "string" && field(agent, "title") === title);
+    agents = targets.length === 1 ? agentStates(targets, false) : [];
+  } else if (call.name === "report_result") {
+    agents = agentStates(list(field(output, "agents")).filter((agent) => field(agent, "conversation_id") === sender));
+  } else agents = agentStates(Array.isArray(output) ? output : field(output, "agents"));
+  const receivers = call.name === "read_agents" || call.name === "wait_agents" ? [] : agents.map((agent) => agent.thread_id);
+  return { type: "agent_coordination", action: coordination(call) ?? null, sender_thread_id: sender, receiver_thread_ids: receivers, agents };
+}
+function agentStates(value: unknown, includeState = true): AgentStatePresentation[] {
   return list(value).slice(0, 16).flatMap((agent) => {
     const id = string(field(agent, "conversation_id"));
     if (id === null) return [];
     const stored = field(field(agent, "state"), "state");
-    const state: AgentStatePresentation["state"] = stored === "done" ? "completed" : stored === "failed" ? "failed" : null;
-    return [{ thread_id: id, state }];
+    const state: AgentStatePresentation["state"] = !includeState ? null : stored === "done" ? "completed" : stored === "failed" ? "failed" : null;
+    const name = string(field(agent, "title"))?.trim();
+    return [{ thread_id: id, ...(name ? { name: bounded(name, 1024) } : {}), state }];
   });
 }
 
 /** Native result identity/status/timing are authoritative; bodies contain no heading prefixes. */
-export function piToolResult(result: ToolResultMessage, sender: string, previous?: MessagePresentation): MessageContent {
+export function piToolResult(result: ToolResultMessage, sender: string, call?: ToolCall): MessageContent {
+  const previous = call === undefined ? undefined : piToolPresentation(call, sender);
   let presentation: MessagePresentation = previous ?? { type: "tool", namespace: null }, text = content(result.content);
   const action = coordination({ name: result.toolName, arguments: {} });
   if (result.toolName === "exec") {
     const native = hostResult(result);
-    const saved = savedCommand(result), metadata = saved?.presentation?.type === "command" ? saved.presentation : undefined;
+    const saved = savedPresentation(result), metadata = saved?.presentation?.type === "command" ? saved.presentation : undefined;
     const command = metadata?.command ?? (previous?.type === "command" ? previous.command : undefined);
     presentation = { type: "command", ...(command === undefined ? {} : { command }),
       exit_code: native?.type === "process" ? native.exit_code : metadata?.exit_code ?? null, duration_ms: milliseconds(result.durationMs) };
     text = saved === undefined ? (native?.type === "process" ? bounded([native.stdout, native.stderr].filter((part) => part.length > 0).join("\n"))
       : native?.type === "failed" ? bounded(native.message) : content(result.content)) : outputPreview(saved.text);
   } else if (action !== undefined) {
-    const output = decodedOutput(result);
-    const agents = agentStates(Array.isArray(output) ? output : field(output, "agents"));
-    const receiver = result.toolName === "delegate_task" ? string(field(output, "conversation_id")) : null;
-    presentation = { type: "agent_coordination", action: previous?.type === "agent_coordination" ? previous.action : action,
-      sender_thread_id: sender, receiver_thread_ids: receiver === null ? [] : [receiver], agents };
+    // Delegation returns the parent TaskRecord, including unrelated old children.
+    // Input delivery is not completion of that task or any of those children.
+    const saved = savedPresentation(result)?.presentation;
+    presentation = saved?.type === "agent_coordination" ? saved : agentPresentation(call ?? { name: result.toolName, arguments: {} }, sender, decodedOutput(result));
     text = result.isError ? content(result.content) : "";
   } else if (result.toolName === "write_file" || result.toolName === "edit_file") {
     presentation = previous?.type === "file_changes" ? previous : { type: "file_changes", changes: [] };

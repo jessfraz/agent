@@ -4,6 +4,68 @@ import Testing
 @testable import AgentCore
 @testable import AgentUI
 
+@MainActor @Test func namedCoordinationSurvivesNativeWireLiveHistoryAndReopen() throws {
+  let event = try JSONDecoder().decode(
+    NativeEvent.self,
+    from: Data(
+      #"{"type":"message","message":{"entry_id":"coordination-result","role":"tool","text":"","continuation":false,"final_chunk":true,"tool":{"call_id":"coordination-call","name":"delegate_task","status":"finished"},"presentation":{"type":"agent_coordination","action":"followup","sender_thread_id":null,"receiver_thread_ids":["opaque-target"],"agents":[{"thread_id":"opaque-target","name":"Supplier drawing review","state":null}]}}}"#
+        .utf8))
+  guard case .message(let value) = event else {
+    Issue.record("Expected a native coordination message")
+    return
+  }
+  var live = Transcript()
+  live.activity(.toolStarted(.init(callId: "coordination-call", name: "delegate_task")))
+  live.message(value.message)
+  var reopened = Transcript()
+  reopened.history(.init(messages: [value.message], nextCursor: nil, pageComplete: true))
+  #expect(live.rows == reopened.rows)
+  let row = try #require(live.rows.first)
+  let title = try #require(row.presentation?.activityTitle(toolName: row.tool?.name))
+  #expect(title.contains("Supplier drawing review"))
+  #expect(!title.contains("opaque-target"))
+}
+
+@MainActor @Test func inputDeliveryNeverDisplaysAPreviousTaskCompletion() {
+  for (action, heading) in [
+    (AgentAction.sendInput, "Sent input"), (.sendMessage, "Sent message"),
+    (.followup, "Queued input"),
+  ] {
+    let coordination = MessagePresentationAgentCoordination(
+      action: action,
+      agents: [
+        .init(name: "Supplier drawing review", state: .completed, threadId: "opaque-target")
+      ],
+      receiverThreadIds: ["opaque-target"])
+    let presentation = MessagePresentation.agentCoordination(coordination)
+    #expect(
+      presentation.activityTitle(status: .finished) == heading + " · Supplier drawing review")
+    #expect(coordination.activityAgentLines == ["Supplier drawing review"])
+    #expect(!presentation.activityTitle(status: .failed).contains(heading + " ·"))
+  }
+}
+
+@MainActor @Test func agentQueriesUseNamesAndKnownStatesWithoutExposingNativeIDs() {
+  let named = MessagePresentationAgentCoordination(
+    action: .wait,
+    agents: [
+      .init(name: "Drawing review", state: .running, threadId: "opaque-active"),
+      .init(name: "  ", state: .completed, threadId: "opaque-completed"),
+      .init(state: nil, threadId: "opaque-unknown"),
+    ], receiverThreadIds: ["opaque-active", "opaque-completed", "opaque-unknown"])
+  #expect(
+    named.activityTitle(status: .finished) == "Wait for agents · Drawing review, Agent, Agent")
+  #expect(
+    named.activityAgentLines == [
+      "Drawing review · Running", "Agent · Completed", "Agent · State unavailable",
+    ])
+  #expect(named.agents.map(\.threadId) == ["opaque-active", "opaque-completed", "opaque-unknown"])
+  let legacy = MessagePresentationAgentCoordination(
+    action: .sendInput, agents: [], receiverThreadIds: ["opaque-old"])
+  #expect(legacy.activityTitle(status: .finished) == "Sent input · Agent")
+  #expect(legacy.activityAgentLines == ["Agent"])
+}
+
 @MainActor @Test func rustProducedPresentationsReachNativeRowsAndActivityHeadings() throws {
   let bytes = try Data(
     contentsOf: #require(
@@ -69,7 +131,7 @@ import Testing
     ),
     (
       .agentCoordination(.init(action: .followup, agents: [], receiverThreadIds: ["child"])), "",
-      "Queue agent input"
+      "Queue agent input · Agent"
     ),
     (.webSearch(.init(action: .openPage, query: "schema")), "https://example.invalid", "Open page"),
     (.media(.init(operation: .generate, status: "inProgress")), "", "Image generation"),

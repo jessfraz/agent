@@ -32,13 +32,16 @@ public enum AgentState: String, Codable, Sendable, Equatable {
 }
 
 public struct AgentStatePresentation: Codable, Sendable, Equatable {
+    public var `name`: String?
     public var `state`: AgentState?
     public var `threadId`: String
-    public init(`state`: AgentState? = nil, `threadId`: String) {
+    public init(`name`: String? = nil, `state`: AgentState? = nil, `threadId`: String) {
+        self.`name` = `name`
         self.`state` = `state`
         self.`threadId` = `threadId`
     }
     enum CodingKeys: String, CodingKey {
+        case `name` = "name"
         case `state` = "state"
         case `threadId` = "thread_id"
     }

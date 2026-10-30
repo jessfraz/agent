@@ -113,7 +113,7 @@ test("real file/coordination tools normalize known fields while arbitrary tool a
     await (await conversation.submit({ type: "input", content: "Inspect the fixture" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT); await stop(); stop = async () => {};
     const completed = live.find((message) => message.tool?.call_id === agents.id && message.tool.status === "finished"); assert.ok(completed);
     assert.deepEqual(completed.presentation, { type: "agent_coordination", action: "list", sender_thread_id: conversation.id.toString(),
-      receiver_thread_ids: [], agents: [{ thread_id: child.conversation_id, state: null }] });
+      receiver_thread_ids: [], agents: [{ thread_id: child.conversation_id, name: "Review", state: null }] });
     assert.equal(completed.text, "", "Agent records must not become transcript JSON receipts");
     const changed = live.find((message) => message.tool?.call_id === edit.id && message.tool.status === "finished"); assert.ok(changed);
     assert.deepEqual(changed.presentation, { type: "file_changes", changes: [{ path: "example.rs", operation: "update" }] });
@@ -175,15 +175,21 @@ test("native Pi output limits cannot erase the owned command's typed exit or bou
 test("actual delegation queues follow-ups and steers with matching live and reopened coordination actions", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-delegation-presentation-")); let app = await fixture(directory);
   let stop = async () => {}, unbind = () => {};
+  let splitNextResult = false;
   try {
     const host = { host_id: null, rex_server: null, coordinator: null, name: "fixture", cwd: "/example", agent_program: "/fixture/agent" };
     const binding = { host_id: "11111111-1111-4111-8111-111111111111", session_id: "session:22222222-2222-4222-8222-222222222222",
       window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" };
     const task = await app.tasks.create({ title: "Existing work", outcome: "Continue this outcome", model: fixtureModel });
+    const oldChild = await app.tasks.createAgent(task.id, { id: "previous-review", title: "Previous review", outcome: "Review the previous pass", input: "Inspect", inputId: "previous-input", model: fixtureModel });
+    await app.tasks.reportAgent(task.id, oldChild.id, "Previous review is done");
     await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
     const root = await app.session.root(BACKGROUND_CONTEXT); app.registry.install(app.tools.main);
     unbind = app.executions.bind(root.id.toString(), { cwd: host.cwd, hosts: [host], model: fixtureModel, call: async (command) => {
-      assert.equal(command.type, "resume_worker"); return { type: "written" };
+      assert.equal(command.type, "resume_worker");
+      if (splitNextResult) for (let index = 0; index < 25; index += 1) await root.commit((tx) => tx.appendEntry(root.id,
+        { kind: "fixture.page-boundary", data: { index } }), BACKGROUND_CONTEXT);
+      return { type: "written" };
     } });
     await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.tools.main] }, BACKGROUND_CONTEXT);
     const queued = fauxToolCall("delegate_task", { task_id: task.id, input: "Queue the next pass", mode: "follow_up" }),
@@ -201,11 +207,104 @@ test("actual delegation queues follow-ups and steers with matching live and reop
         assert.equal(row.presentation?.type, "agent_coordination");
         if (row.presentation?.type === "agent_coordination") assert.equal(row.presentation.action, action);
       }
+      const result = rows.find((row) => row.tool?.status === "finished"); assert.ok(result);
+      assert.deepEqual(result.presentation, { type: "agent_coordination", action, sender_thread_id: root.id.toString(),
+        receiver_thread_ids: [task.conversation_id], agents: [{ thread_id: task.conversation_id, name: "Existing work", state: null }] },
+        "Delivering input names its actual recipient, never an unrelated child's old completion");
     }
     const saved = (await history(root, null, app.session)).flatMap((frame) => frame.messages);
     assert.deepEqual(saved.filter((message) => message.role === "tool"), live.filter((message) => message.role === "tool"));
+    splitNextResult = true;
+    const isolated = fauxToolCall("delegate_task", { task_id: task.id, input: "Queue a pass across the page boundary", mode: "follow_up" });
+    app.faux.setResponses([fauxAssistantMessage(isolated, { stopReason: "toolUse" }), fauxAssistantMessage("Queued")]);
+    await (await root.submit({ type: "input", content: "Queue another pass" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+    const paged = (await history(root, null, app.session)).flatMap((frame) => frame.messages);
+    const receipt = paged.find((message) => message.tool?.call_id === isolated.id); assert.ok(receipt);
+    assert.equal(receipt.tool?.status, "finished");
+    assert.deepEqual(receipt.presentation, { type: "agent_coordination", action: "followup", sender_thread_id: root.id.toString(),
+      receiver_thread_ids: [task.conversation_id], agents: [{ thread_id: task.conversation_id, name: "Existing work", state: null }] },
+      "A result-only native page retains its exact input mode and recipient without loading the older call");
     unbind(); await app.session.close(BACKGROUND_CONTEXT); app = await fixture(directory);
-    assert.deepEqual((await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((frame) => frame.messages), saved);
+    assert.deepEqual((await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((frame) => frame.messages), paged);
     assert.equal(app.faux.state.callCount, 0);
   } finally { await stop(); unbind(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
+
+const agentReceiptCases: { tool: "spawn_agent" | "continue_agent"; name: string }[] = [
+  { tool: "spawn_agent", name: "native spawn receipt selects the new child when an earlier child has the same title" },
+  { tool: "continue_agent", name: "native queued child input retains its recipient and mode on a result-only page" },
+];
+for (const scenario of agentReceiptCases) {
+  test(scenario.name, { timeout: 10_000 }, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-child-receipt-")); let app = await fixture(directory);
+    let stop = async () => {}, unbind = () => {};
+    try {
+      const host = { host_id: null, rex_server: null, coordinator: null, name: "fixture", cwd: "/example", agent_program: "/fixture/agent" };
+      const binding = { host_id: "11111111-1111-4111-8111-111111111111", session_id: "session:22222222-2222-4222-8222-222222222222",
+        window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" };
+      const childBinding = { ...binding, window_id: "window:55555555-5555-4555-8555-555555555555",
+        block_id: "block:66666666-6666-4666-8666-666666666666" };
+      const task = await app.tasks.create({ title: "Current work", outcome: "Finish after the new review", model: fixtureModel });
+      const previous = await app.tasks.createAgent(task.id, { id: "previous-review", title: "Review", outcome: "Review the earlier change",
+        input: "Inspect the earlier pass", inputId: "previous-input", model: fixtureModel });
+      await app.tasks.reportAgent(task.id, previous.id, "The earlier review is complete");
+      await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+      let targetId: string | undefined;
+      if (scenario.tool === "continue_agent") {
+        const current = await app.tasks.createAgent(task.id, { id: "current-review", title: "Review", outcome: "Review the current change",
+          input: "Inspect the current pass", inputId: "current-input", model: fixtureModel });
+        targetId = current.id;
+        await app.tasks.dispatchAgent(task.id, current.id, async () => ({ type: "spawned", binding: childBinding }));
+      }
+      const conversation = await app.tasks.conversation(task.conversation_id);
+      let hostCalls = 0;
+      unbind = app.executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [host], model: fixtureModel, call: async (command) => {
+        hostCalls += 1;
+        if (scenario.tool === "spawn_agent") {
+          assert.equal(command.type, "spawn_subagent");
+          if (command.type !== "spawn_subagent") throw new Error("Expected the new child allocation");
+          targetId = command.agent_id;
+          assert.equal(command.title, "Review"); assert.equal(command.parent.session_id, binding.session_id);
+        } else {
+          assert.equal(command.type, "on_node");
+          if (command.type !== "on_node") throw new Error("Expected the existing child's presence check");
+          assert.equal(command.command.type, "inspect_worker");
+        }
+        // Force the actual call and its result onto separate native history pages.
+        for (let index = 0; index < 25; index += 1) await conversation.commit((tx) => tx.appendEntry(conversation.id,
+          { kind: "fixture.page-boundary", data: { index } }), BACKGROUND_CONTEXT);
+        return scenario.tool === "spawn_agent" ? { type: "spawned", binding: childBinding }
+          : { type: "worker_presence", presence: { state: "present", running: true } };
+      } });
+      await conversation.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.tools.worker] }, BACKGROUND_CONTEXT);
+      let call: ReturnType<typeof fauxToolCall>;
+      if (scenario.tool === "spawn_agent") {
+        call = fauxToolCall("spawn_agent", { title: "Review", outcome: "Review the current change", input: "Inspect the current pass" });
+      } else {
+        assert.ok(targetId);
+        call = fauxToolCall("continue_agent", { agent_id: targetId, input: "Review the next pass separately", mode: "follow_up" });
+      }
+      app.faux.setResponses([fauxAssistantMessage(call, { stopReason: "toolUse" }), fauxAssistantMessage("The review input is retained")]);
+      const live: HistoryMessage[] = []; stop = await activity(app.session, conversation, () => {}, (message) => live.push(message));
+      assert.equal((await (await conversation.submit({ type: "input", content: "Arrange the current review" }, BACKGROUND_CONTEXT))
+        .wait(BACKGROUND_CONTEXT)).status, "done");
+      await stop(); stop = async () => {};
+      const saved = await app.tasks.get(task.id), target = saved.agents.find((agent) => agent.id === targetId);
+      assert.ok(target); assert.notEqual(target.id, previous.id); assert.equal(saved.agents.length, 2); assert.equal(hostCalls, 1);
+      if (scenario.tool === "continue_agent") assert.equal(target.pending.at(-1)?.mode, "follow_up");
+      const result = live.find((message) => message.tool?.call_id === call.id && message.tool.status === "finished"); assert.ok(result);
+      assert.deepEqual(result.presentation, { type: "agent_coordination", action: scenario.tool === "spawn_agent" ? "spawn" : "followup",
+        sender_thread_id: conversation.id.toString(), receiver_thread_ids: [target.conversation_id],
+        agents: [{ thread_id: target.conversation_id, name: "Review", state: null }] },
+        "A receipt names only the exact current child, without its older namesake's completion");
+      const frames = await history(conversation, null, app.session), rows = frames.flatMap((frame) => frame.messages);
+      assert.ok(frames.at(-1)?.next_cursor);
+      assert.deepEqual(rows.filter((message) => message.tool?.call_id === call.id), [result],
+        "The result-only page is identical to the live receipt without reading its older call");
+      unbind(); await app.session.close(BACKGROUND_CONTEXT); app = await fixture(directory);
+      assert.deepEqual((await history(await app.tasks.conversation(task.conversation_id), null, app.session))
+        .flatMap((frame) => frame.messages), rows);
+      assert.equal(app.faux.state.callCount, 0, "Reopening receipts never executes another model turn");
+    } finally { await stop(); unbind(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+}

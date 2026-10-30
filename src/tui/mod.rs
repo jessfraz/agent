@@ -5,6 +5,7 @@ mod cells;
 mod conversations;
 mod inline;
 mod markdown;
+mod shell;
 mod transcript;
 
 use crate::tui::{
@@ -2074,7 +2075,9 @@ impl State {
                     if self.observation == Some(ObservationState::Disconnected) {
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
                     },
                 ),
             ];
@@ -2105,21 +2108,29 @@ impl State {
             Rect::new(areas[3].x, areas[3].y + 1, 1, 1),
         );
         let mut status = vec![Span::raw("  ")];
+        // Codex's ANSI status-line accents keep model/mode cyan and paths green.
+        let model_style = Style::default().fg(Color::Cyan);
         if let Some(model) = &self.info.model {
-            status.push(Span::raw(markdown::plain(&model.model_id)));
+            status.push(Span::styled(markdown::plain(&model.model_id), model_style));
             if let Some(reasoning) = model.reasoning {
-                status.push(Span::raw(format!(" {}", reasoning.as_str())));
+                status.push(Span::styled(
+                    format!(" {}", reasoning.as_str()),
+                    model_style,
+                ));
             }
             if model.fast {
-                status.push(Span::raw(" fast"));
+                status.push(Span::styled(" fast", model_style));
             }
-            status.push(Span::raw(" · "));
+            status.push(Span::styled(
+                " · ",
+                Style::default().add_modifier(Modifier::DIM),
+            ));
         }
-        status.push(Span::raw(markdown::plain(&self.info.cwd)));
-        frame.render_widget(
-            Paragraph::new(Line::from(status)).style(Style::default().add_modifier(Modifier::DIM)),
-            areas[4],
-        );
+        status.push(Span::styled(
+            markdown::plain(&self.info.cwd),
+            Style::default().fg(Color::Green),
+        ));
+        frame.render_widget(Paragraph::new(Line::from(status)), areas[4]);
         let hint = if self.completion.is_some() {
             "enter to run · tab to complete · esc to cancel"
         } else if self.working {
@@ -3473,22 +3484,65 @@ mod tests {
         assert!(!small.help_open);
     }
     #[test]
-    fn footer_uses_codex_terminal_foreground_and_dim_context() {
-        use ratatui::style::Color;
+    fn footer_uses_codex_model_and_path_accents_with_dim_separators_and_hints() {
+        use ratatui::style::{Color, Modifier};
         let mut view = state();
+        view.info.model.as_mut().unwrap().fast = true;
         let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
         terminal.draw(|frame| view.draw(frame)).unwrap();
         let buffer = terminal.backend().buffer();
         let footer = (0..110)
             .map(|x| buffer[(x, 22)].symbol())
             .collect::<String>();
-        for text in ["gpt-6.1-sol", "high", "/workspace/example"] {
+        for (text, color) in [
+            ("gpt-6.1-sol", Color::Cyan),
+            ("high", Color::Cyan),
+            ("fast", Color::Cyan),
+            ("/workspace/example", Color::Green),
+        ] {
             let column = footer[..footer.find(text).unwrap()].chars().count();
             let cell = &buffer[(u16::try_from(column).unwrap(), 22)];
-            assert_eq!(cell.fg, Color::Reset);
-            assert!(cell.modifier.contains(ratatui::style::Modifier::DIM));
+            assert_eq!(cell.fg, color, "{text}");
+            assert!(!cell.modifier.contains(Modifier::DIM), "{text}");
         }
+        let separator = footer[..footer.find('·').unwrap()].chars().count();
+        let separator = &buffer[(u16::try_from(separator).unwrap(), 22)];
+        assert_eq!(separator.fg, Color::Reset);
+        assert!(separator.modifier.contains(Modifier::DIM));
         assert_eq!(buffer[(2, 23)].fg, Color::Reset);
+        assert!(buffer[(2, 23)].modifier.contains(Modifier::DIM));
+    }
+    #[test]
+    fn status_accent_preserves_reconnect_and_disconnect_emphasis() {
+        use crate::tui::ObservationState;
+        use ratatui::style::{Color, Modifier};
+        let mut view = state();
+        view.working(true);
+        for (observation, status, color) in [
+            (ObservationState::Connected, "Working", Color::Cyan),
+            (ObservationState::Reconnecting, "Reconnecting", Color::Cyan),
+            (ObservationState::Disconnected, "Disconnected", Color::Red),
+        ] {
+            view.observation = Some(observation);
+            let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .windows(status.len())
+                    .any(|cells| {
+                        cells.iter().zip(status.chars()).all(|(cell, ch)| {
+                            cell.symbol() == ch.to_string()
+                                && cell.fg == color
+                                && cell.modifier.contains(Modifier::BOLD)
+                                && !cell.modifier.contains(Modifier::DIM)
+                        })
+                    }),
+                "{status}"
+            );
+        }
     }
     #[test]
     fn authoritative_worker_settings_replace_launch_defaults_without_replacing_its_context() {
@@ -4716,8 +4770,8 @@ mod tests {
             assert!(!row.contains(['┌', '┐', '└', '┘', '─', '│']));
         }
         assert!(rows[30].contains("gpt-6.1-sol high · /workspace/example"));
-        assert_eq!(buffer[(2, 30)].fg, Color::Reset);
-        assert!(buffer[(2, 30)].modifier.contains(Modifier::DIM));
+        assert_eq!(buffer[(2, 30)].fg, Color::Cyan);
+        assert!(!buffer[(2, 30)].modifier.contains(Modifier::DIM));
         assert!(!rows.iter().any(|line| line.contains("Activity ·")
             || line.trim() == "You"
             || line.trim() == "Agent"));
@@ -4862,12 +4916,13 @@ mod tests {
                     sender_thread_id: None,
                     receiver_thread_ids: vec![],
                     agents: vec![AgentStatePresentation {
+                        name: Some("Review geometry".into()),
                         thread_id: "child-a".into(),
                         state: Some(AgentState::Completed),
                     }],
                 },
                 "",
-                "child-a · completed",
+                "Review geometry · completed",
             ),
             (
                 MessagePresentation::Plan,
