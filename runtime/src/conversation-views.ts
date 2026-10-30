@@ -38,8 +38,7 @@ export class ConversationViews {
   }
   close(): void { for (const id of this.views.keys()) this.detach(id); }
   private async summary(app: ConversationServices, id: string): Promise<SavedConversation> {
-    const page = await app.catalog.list(id, null, 100);
-    const item = page.items.find((item) => item.conversation_id === id);
+    const item = await app.catalog.get(id);
     if (item === undefined) throw new TaskError("Choose an existing saved conversation");
     return item;
   }

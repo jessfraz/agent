@@ -10,11 +10,14 @@ terminal's visible cells. A `vt100` screen parser applies cursor movement,
 clearing and wrapping. A menu, composer, ANSI-stripped byte match, or text already
 scrolled offscreen does not satisfy the measurement.
 
-Current scenarios open the chief's 40-message history and resume a saved
-5,000-message conversation. Both use real Pi/SQLite storage, the coordinator,
-native history pagination and the regular TUI. Each version runs its own Rust
+Current scenarios open the chief's 40-message history with cold and warm
+coordinators, and resume a saved 5,000-message conversation. The corpus also
+contains 3,000 unrelated saved discussions. All use real Pi/SQLite storage,
+the coordinator, native history pagination and the regular TUI. Each version
+runs its own Rust
 coordinator and TypeScript runtime. Seeding and coordinator startup
-are outside the timed interval. Every CLI launch is fresh; services stay running.
+are outside the timed interval. Every CLI launch is fresh. The cold scenario
+also starts a fresh service for each sample; other scenarios retain theirs.
 The first pair warms the services and is recorded but excluded from the gate.
 The isolated environment exposes only Node on PATH, and provider requests are
 rejected. No model, credentials, network provider or Rex is involved. `/resume`

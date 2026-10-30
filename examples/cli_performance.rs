@@ -46,6 +46,7 @@ struct Arguments {
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum Scenario {
+    ChiefCold,
     Chief,
     LongHistory,
 }
@@ -53,7 +54,7 @@ enum Scenario {
 impl Scenario {
     fn sentence(self) -> &'static str {
         match self {
-            Self::Chief => "Stored chief conversation is ready.",
+            Self::ChiefCold | Self::Chief => "Stored chief conversation is ready.",
             Self::LongHistory => "Stored long conversation is ready.",
         }
     }
@@ -98,6 +99,7 @@ struct Report {
     terminal_rows: u16,
     terminal_columns: u16,
     long_history_messages: u32,
+    unrelated_saved_conversations: u32,
     relative_allowance: f64,
     absolute_allowance_ms: f64,
     samples: Vec<Sample>,
@@ -413,7 +415,7 @@ async fn run(mut options: Arguments) -> Result<()> {
     let mut command = Command::new("node");
     command.arg(&options.seed).arg(snapshot.path());
     isolated(&mut command, snapshot.path())?;
-    let seeded = timeout(DEADLINE, command.output())
+    let seeded = timeout(Duration::from_secs(60), command.output())
         .await
         .context("Synthetic history seeding did not finish")??;
     ensure!(
@@ -459,20 +461,38 @@ async fn run(mut options: Arguments) -> Result<()> {
                     [Version::Candidate, Version::Baseline]
                 };
                 for version in order {
-                    let (coordinator, binary) = match version {
-                        Version::Baseline => (&baseline, &options.baseline),
-                        Version::Candidate => (&candidate, &options.candidate),
+                    let (coordinator, binary, runtime) = match version {
+                        Version::Baseline => {
+                            (&baseline, &options.baseline, &options.baseline_runtime)
+                        }
+                        Version::Candidate => {
+                            (&candidate, &options.candidate, &options.candidate_runtime)
+                        }
                     };
-                    let sample = sample(
+                    let cold = if *scenario == Scenario::ChiefCold {
+                        Some(
+                            Coordinator::start(binary, &options.seed, runtime, snapshot.path())
+                                .await?,
+                        )
+                    } else {
+                        None
+                    };
+                    let measured = sample(
                         &options,
-                        coordinator,
+                        cold.as_ref().unwrap_or(coordinator),
                         binary,
                         *scenario,
                         &seed,
                         version,
                         pair,
                     )
-                    .await?;
+                    .await;
+                    let closed = match cold {
+                        Some(coordinator) => coordinator.close().await,
+                        None => Ok(()),
+                    };
+                    let sample = measured?;
+                    closed?;
                     serde_json::to_writer(&mut raw, &sample)?;
                     raw.write_all(b"\n")?;
                     raw.flush()?;
@@ -494,6 +514,7 @@ async fn run(mut options: Arguments) -> Result<()> {
         terminal_rows: 32,
         terminal_columns: 100,
         long_history_messages: 5_000,
+        unrelated_saved_conversations: 3_000,
         relative_allowance: 0.25,
         absolute_allowance_ms: 20.0,
         comparisons: comparisons(&samples),

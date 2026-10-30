@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
+import { setImmediate } from "node:timers/promises";
 import type { EmbeddingBatch } from "./generated/EmbeddingBatch.js";
 import type { EmbeddingPurpose } from "./generated/EmbeddingPurpose.js";
 import type { EmbeddingSpace } from "./generated/EmbeddingSpace.js";
@@ -181,6 +182,9 @@ export class SearchIndex {
             if (written.changes !== 1) throw new Error("Search source repeated an entry part");
           }
         });
+        // Cache hits need no external I/O. Keep queued chat requests moving
+        // between durable batches instead of monopolizing the event loop.
+        await setImmediate();
       };
       // Completed batches survive failure. Only rows observed in this attempt
       // become visible; cached rows removed from the source keep their old tag.

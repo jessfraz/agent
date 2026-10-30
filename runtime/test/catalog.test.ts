@@ -59,6 +59,9 @@ test("native catalog preserves imported clocks and provenance beside task, child
     assert.equal(first.items.find((item) => item.conversation_id === old.conversation.conversation_id)?.updated_at, 1_600_000_000_000);
     assert.equal(first.items.find((item) => item.conversation_id === root.id.toString())?.updated_at, rootTime);
     assert.equal(first.items.some((item) => item.conversation_id === hidden.id.toString()), false, "Internal conversations do not become resume candidates");
+    for (const item of first.items) assert.deepEqual(await app.catalog.get(item.conversation_id), item);
+    assert.equal(await app.catalog.get(hidden.id.toString()), undefined);
+    assert.equal(await app.catalog.get("not-present"), undefined);
     assert.equal(first.items.find((item) => item.conversation_id === child.conversation_id)?.agent_id, child.id);
     assert.equal(first.items.find((item) => item.conversation_id === child.conversation_id)?.task_id, task.id);
     assert.equal(JSON.stringify(first).includes("TRANSCRIPT_BODY_MUST_NOT_APPEAR"), false);
@@ -77,6 +80,7 @@ test("native catalog preserves imported clocks and provenance beside task, child
     assert.equal(adoptedPage.items[0]?.task_id, adopted.id);
     assert.equal(adoptedPage.items[0]?.conversation_id, old.conversation.conversation_id);
     assert.equal(adoptedPage.items[0]?.source_thread_id, "old-source-id");
+    assert.deepEqual(await app.catalog.get(old.conversation.conversation_id), adoptedPage.items[0]);
     app.catalog.close(); await app.session.close(BACKGROUND_CONTEXT); closed = true;
     app = await open(join(directory, "session.sqlite")); closed = false;
     const reopened = await app.catalog.list("old-source-id", null, 10);

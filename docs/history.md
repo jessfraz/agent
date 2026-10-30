@@ -166,6 +166,8 @@ missed notifications cannot permanently hide a conversation. Internal feed
 judgment transcripts are retained in Pi but are not retrieval candidates.
 Search reads published results while an owned import catches up; it reports
 incomplete coverage rather than waiting for a full corpus rebuild.
+Cached batches yield to coordinator I/O. Readers retain the previous complete
+publication until its replacement commits atomically.
 
 Keep useful user/assistant text and bounded meaningful tool content searchable.
 Respect message boundaries and retain entry/asset provenance for every chunk.
@@ -224,6 +226,8 @@ fencing the old allocation. A transport or permission failure retains ownership.
 
 Reopening restores saved messages, pending inputs and task settings. Recent
 history loads first; older pages load automatically while chat stays usable.
+Known identities use direct metadata lookups. Live views observe Pi's typed
+live document and new entries without hydrating the full model context.
 `/resume` selects a saved conversation in place. Browsing does not create a
 duplicate conversation, execute work or submit old messages to the model.
 Imported history gets its first task/session only on adoption. Cross-host

@@ -25,11 +25,15 @@ import { fixtureModel } from "./model.js";
 
 const binding: WorkerRef = { host_id: "11111111-1111-4111-8111-111111111111", session_id: "session:22222222-2222-4222-8222-222222222222",
   window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" };
+class CountedHistory extends HistoryStore {
+  lookups = 0;
+  override async byConversation(id: string) { this.lookups += 1; return super.byConversation(id); }
+}
 async function open(directory: string) {
   const models = createModels(), faux = fauxProvider({ provider: "openai", api: "openai-responses", models: [{ id: "fixture", reasoning: true }], tokensPerSecond: 1_000_000 }); models.setProvider(faux.provider);
   const harness = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
-  const inference = new ConversationModels(models), tasks = new TaskStore(harness, inference), histories = new HistoryStore(harness);
+  const inference = new ConversationModels(models), tasks = new TaskStore(harness, inference), histories = new CountedHistory(harness);
   tasks.useHistory(histories);
   const environment = new CoordinatorEnvironment(harness); tasks.useEnvironment(environment);
   await environment.configure({ node: { host_id: binding.host_id, name: "fixture", rex_server: null, coordinator: null,
@@ -60,6 +64,35 @@ function input(conversation_id: string, input_id: string, text: string): Extract
   return { type: "conversation_input", conversation_id, input_id, input: text, mode: "steer" };
 }
 function local(command: HostCommand): HostCommand { while (command.type === "on_node") command = command.command; return command; }
+
+test("opening a known conversation never inventories unrelated saved history", { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-direct-conversation-view-")); let app = await open(directory);
+  try {
+    const root = await app.harness.root(BACKGROUND_CONTEXT);
+    const imported = await app.imported();
+    const task = await app.tasks.create({ title: "Inspect the fixture", outcome: "Read the saved context", model: fixtureModel });
+    const child = await app.tasks.createAgent(task.id, { id: "fixture-observer-child", title: "Inspect one detail", outcome: "Read one detail",
+      input: "Inspect this fixture", inputId: "fixture-observer-input" });
+    await app.harness.commit(async (tx) => {
+      for (let index = 0; index < 2_000; index += 1) await tx.createConversation({ ownership: { kind: "ownerless" } });
+    }, BACKGROUND_CONTEXT);
+    app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT);
+    app = await open(directory);
+    for (const [id, title] of [[root.id.toString(), "Main agent"], [imported.conversation_id, "Saved hardware work"],
+      [task.conversation_id, task.title], [child.conversation_id, child.title]]) {
+      assert.ok(id && title);
+      app.histories.lookups = 0;
+      const view = observe(app, 1, id);
+      try {
+        await view.until(() => view.frames.some((frame) => frame.type === "conversation_ready"));
+        const ready = view.frames.find((frame) => frame.type === "conversation_ready");
+        assert.ok(ready?.type === "conversation_ready"); assert.equal(ready.conversation.title, title);
+        assert.ok(app.histories.lookups <= 2, `An exact view made ${app.histories.lookups} unrelated history lookups`);
+      } finally { await view.detach(); }
+    }
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { app.views.close(); app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
 
 test("a stopped worker keeps its placed input on retry and SQLite reopen while its unplaced input returns as a draft", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-worker-stopped-input-")); let app = await open(directory);

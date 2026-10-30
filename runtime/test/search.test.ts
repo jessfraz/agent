@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { MessageChannel } from "node:worker_threads";
 import { test } from "node:test";
 import { SearchIndex, type Embed, type SearchRecord, type SearchWatermark } from "../src/search.js";
 import type { EmbeddingSpace } from "../src/generated/EmbeddingSpace.js";
@@ -18,6 +19,31 @@ function vector(text: string): number[] {
   return [0, 0, 1];
 }
 const embed: Embed = async (texts) => ({ space, vectors: texts.map(vector) });
+
+test("cached corpus indexing serves queued I/O against the prior publication before replacing it", async () => {
+  const index = new SearchIndex(":memory:"), channel = new MessageChannel();
+  try {
+    const data = Array.from({ length: 512 }, (_, ordinal) => record(`e${ordinal}`, `Automobile maintenance record ${ordinal}`, ordinal));
+    await index.upsert("service", "one", records(data), embed);
+    let served = false;
+    const response = new Promise<void>((resolve, reject) => {
+      channel.port1.once("message", () => {
+        served = true;
+        try {
+          assert.deepEqual(index.checkpoint("service"), { watermark: "one", dirty: true });
+          void index.search("Automobile", undefined, [], 1, "keyword").then((result) => {
+            assert.equal(result.candidates[0]?.conversation_id, "service"); resolve();
+          }).catch(reject);
+        } catch (error) { reject(error); }
+      });
+    });
+    channel.port2.postMessage("queued foreground read");
+    await index.upsert("service", "two", records(data), async () => { throw new Error("Cached text must not invoke embedding again"); });
+    assert.equal(served, true, "Cached indexing must yield to ready I/O before finishing the corpus");
+    await response;
+    assert.deepEqual(index.checkpoint("service"), { watermark: "two", dirty: false });
+  } finally { channel.port1.close(); channel.port2.close(); index.close(); }
+});
 
 test("native dense retrieval finds vocabulary mismatches independently and groups several conversations", async () => {
   const index = new SearchIndex(":memory:");

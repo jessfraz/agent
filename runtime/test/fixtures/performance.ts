@@ -30,6 +30,12 @@ if (runtime !== undefined) {
       }] } }, BACKGROUND_CONTEXT);
     }
     const histories = new HistoryStore(session);
+    // Known-chat startup must stay independent of an unrelated retained corpus.
+    for (let index = 0; index < 3_000; index += 1) {
+      await histories.import({ host_id: "performance-fixture", thread: { id: `unrelated-${index}`, title: `Unrelated saved discussion ${index}`,
+        cwd: directory, created_at: 1, updated_at: 2, version: "v1", version_reliable: true, archived: true,
+        forked_from_id: null, parent_thread_id: null }, items: [], next_cursor: null, gaps: [], complete: true });
+    }
     const items: HistoryItem[] = Array.from({ length: 5_000 }, (_, index) => {
       const text = index === 4_999 ? "Stored long conversation is ready."
         : `Synthetic retained conversation message ${index}. A previous task has context that remains readable after its terminal closes.`;

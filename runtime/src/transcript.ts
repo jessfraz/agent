@@ -1,8 +1,9 @@
 import { validEvent } from "./protocol.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { JsonValue } from "@earendil-works/chord";
-import type { ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
-import { CompactionEntry, watchEvents, type Conversation, type Cursor, type EntryId, type EntryRecord, type Harness } from "@earendil-works/pi-durable";
+import type { AssistantMessage, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
+import { CompactionEntry, LiveDoc, type Conversation, type Cursor, type DocumentWatch, type EntryId, type EntryRecord,
+  type Harness, type JsonObject, type LiveState } from "@earendil-works/pi-durable";
 import type { HistoryMessage } from "./generated/HistoryMessage.js";
 import type { HistoryRole } from "./generated/HistoryRole.js";
 import type { ModelActivity } from "./generated/ModelActivity.js";
@@ -247,102 +248,155 @@ export async function toolDetails(conversation: Conversation, value: string, cal
     status: result === undefined ? "running" : result.isError ? "failed" : "finished", input, output };
 }
 
-/** Forward exposed activity and native compaction status, without summary payloads. */
+/** Forward live state and new native entries without mounting historical model context. */
 export async function activity(session: Harness, conversation: Conversation, emit: (event: ModelActivity) => void,
   message?: (message: HistoryMessage) => void, text?: (delta: string) => void,
   observer?: { includeFinal: true; working(value: boolean): void }): Promise<() => Promise<void>> {
   const visibility = await observeTranscriptVisibility(session, conversation.id);
-  const stream = await watchEvents(session, conversation.id, BACKGROUND_CONTEXT).catch((error: unknown) => { visibility.close(); throw error; });
-  const thinking = new Map<number, string>();
-  const responding = new Map<number, string>();
-  const compactions = new Set<string>();
-  let compacting = false, compactionFailure = stream.snapshot.compactionFailure?.taskId.toString();
-  const reportCompaction = (failed = false) => {
-    const active = compactions.size > 0;
+  const thinking = new Map<number, string>(), responding = new Map<number, string>();
+  let previous: Readonly<LiveState> | null = null, initialized = false, assistantOpen = false;
+  let compacting = false;
+  const compaction = (active: boolean, failed = false) => {
     if (active !== compacting || failed) { compacting = active; emit({ type: "compaction", active, failed }); }
   };
-  for (const status of stream.snapshot.compactions) compactions.add(status.taskId.toString());
-  reportCompaction();
-  observer?.working(stream.snapshot.run !== undefined);
-  const seen = observer?.includeFinal ? new Set(stream.snapshot.entries.map((entry) => entry.id.toString())) : undefined;
+  const update = (parts: Map<number, string>, index: number, value: string, deliver: (value: string) => void) => {
+    const before = parts.get(index) ?? "";
+    const append = value.startsWith(before) ? value.slice(before.length) : "\n" + value;
+    parts.set(index, value);
+    for (const chunk of chunks(append)) deliver(chunk);
+  };
+  const partial = (content: AssistantMessage["content"]) => {
+    if (!assistantOpen) { thinking.clear(); responding.clear(); assistantOpen = true; }
+    content.forEach((part, index) => {
+      if (part.type === "thinking") update(thinking, index, part.thinking, (value) => emit({ type: "thinking", text: value }));
+      else if (part.type === "text") update(responding, index, part.text, (value) => text?.(value));
+    });
+  };
   const committed = (entry: EntryRecord) => {
-    if (seen?.has(entry.id.toString())) return;
-    seen?.add(entry.id.toString());
+    const notice = isUserNotice(entry) || entry.kind === "agent.notice";
+    if (!notice && transcriptVisible(entry.id.toString(), visibility.state())) for (const value of entry.model ?? []) {
+      if (value.role !== "assistant") continue;
+      if (!assistantOpen) { thinking.clear(); responding.clear(); }
+      value.content.forEach((part, index) => {
+        if (part.type === "thinking") update(thinking, index, part.thinking, (value) => emit({ type: "thinking", text: value }));
+        else if (part.type === "text") {
+          update(responding, index, part.text, (value) => text?.(value));
+        }
+      });
+    }
     for (const item of visibleTranscript(entry, visibility.state())) if (item.role === "user" || item.role === "commentary" || item.tool !== undefined
       || (observer?.includeFinal && item.role !== "thinking")) message?.(item);
+    if (!notice && entry.model?.some((value) => value.role === "assistant")) assistantOpen = false;
   };
-  let assistantOpen = stream.snapshot.generation?.message !== undefined;
-  const update = (index: number, text: string) => {
-    const previous = thinking.get(index) ?? "";
-    const append = text.startsWith(previous) ? text.slice(previous.length) : "\n" + text;
-    thinking.set(index, text);
-    for (const chunk of chunks(append)) emit({ type: "thinking", text: chunk });
-  };
-  const updateText = (index: number, value: string) => {
-    const previous = responding.get(index) ?? "";
-    const append = value.startsWith(previous) ? value.slice(previous.length) : "\n" + value;
-    responding.set(index, value);
-    for (const chunk of chunks(append)) text?.(chunk);
-  };
-  for (const [index, part] of (stream.snapshot.generation?.message?.content ?? []).entries()) {
-    if (part.type === "thinking") update(index, part.thinking);
-    else if (part.type === "text") updateText(index, part.text);
-  }
-  stream.start(async (events) => {
-    for (const event of events) {
-      if (event.type === "snapshot") {
-        observer?.working(event.run !== undefined);
-        if (observer?.includeFinal) for (const entry of event.entries) committed(entry);
-        compactions.clear();
-        for (const status of event.compactions) compactions.add(status.taskId.toString());
-        const failure = event.compactionFailure?.taskId.toString();
-        reportCompaction(failure !== undefined && failure !== compactionFailure);
-        compactionFailure = failure;
-      } else if (event.type === "run_start" || event.type === "run_end") {
-        observer?.working(event.type === "run_start");
-      } else if (event.type === "compaction_start") {
-        compactions.add(event.taskId.toString()); reportCompaction();
-      } else if (event.type === "compaction_end") {
-        compactions.delete(event.taskId.toString());
-        if (event.error !== undefined) compactionFailure = event.taskId.toString();
-        reportCompaction(event.error !== undefined);
-      } else if (event.type === "message_start") {
-        if (event.message.role === "assistant") {
-          if (!assistantOpen) { thinking.clear(); responding.clear(); }
-          assistantOpen = true;
-          event.message.content.forEach((part, index) => { if (part.type === "thinking") update(index, part.thinking); else if (part.type === "text") updateText(index, part.text); });
-        }
-      } else if (event.type === "message_update") {
-        const whole = new Set(event.changes.flatMap((change) => (change.type === "thinking_start" || change.type === "block") && change.block.type === "thinking" ? [change.contentIndex] : []));
-        const wholeText = new Set(event.changes.flatMap((change) => (change.type === "text_start" || change.type === "block") && change.block.type === "text" ? [change.contentIndex] : []));
-        for (const change of event.changes) {
-          if (change.type === "text_delta" && !wholeText.has(change.contentIndex)) updateText(change.contentIndex, (responding.get(change.contentIndex) ?? "") + change.delta);
-          else if ((change.type === "text_start" || change.type === "block") && change.block.type === "text") updateText(change.contentIndex, change.block.text);
-          if (change.type === "thinking_delta" && !whole.has(change.contentIndex)) update(change.contentIndex, (thinking.get(change.contentIndex) ?? "") + change.delta);
-          else if ((change.type === "thinking_start" || change.type === "block") && change.block.type === "thinking") update(change.contentIndex, change.block.thinking);
-          else if (change.type === "message") change.message.content.forEach((part, index) => {
-            if (part.type === "thinking") update(index, part.thinking);
-            else if (part.type === "text") updateText(index, part.text);
-          });
-        }
-      } else if (event.type === "message_end") {
-        for (const message of transcriptVisible(event.entry.id.toString(), visibility.state()) ? event.entry.model ?? [] : []) if (message.role === "assistant") message.content.forEach((part, index) => {
-          if (part.type === "thinking") update(index, part.thinking);
-        });
-        committed(event.entry);
-        if (event.entry.model?.some((message) => message.role === "assistant")) assistantOpen = false;
-      } else if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
-        emit({ type: event.type === "tool_execution_start" ? "tool_started" : "tool_finished",
-          call_id: event.toolCallId, name: event.toolName });
+  const live = (value: Readonly<LiveState> | null) => {
+    if (value === null) assistantOpen = false;
+    const idle = initialized && previous?.run !== undefined && value?.run === undefined;
+    if (!initialized || (previous?.run === undefined && value?.run !== undefined)) observer?.working(value?.run !== undefined);
+    const before = [...previous?.tools ?? [], ...previous?.nestedTools ?? []];
+    const next = [...value?.tools ?? [], ...value?.nestedTools ?? []];
+    if (initialized) {
+      for (const slot of next) if (slot.status === "running" && before.find((old) => old.callId === slot.callId)?.status !== "running") {
+        emit({ type: "tool_started", call_id: slot.callId, name: slot.name });
+      }
+      for (const slot of [...before].reverse()) if (slot.status !== "done" && (next.find((item) => item.callId === slot.callId)?.status ?? "done") === "done") {
+        emit({ type: "tool_finished", call_id: slot.callId, name: slot.name });
+      }
+      for (const slot of next) if (slot.status === "done" && !before.some((old) => old.callId === slot.callId)) {
+        emit({ type: "tool_finished", call_id: slot.callId, name: slot.name });
       }
     }
-  });
-  return async () => {
-    try { await stream.stop(); }
-    finally {
-      visibility.close();
-      // Detaching ends this status observation, not Pi's compaction task.
-      compactions.clear(); reportCompaction();
+    const failure = value?.compactionFailure?.taskId;
+    compaction((value?.compactions?.length ?? 0) > 0, initialized && failure !== undefined && failure !== previous?.compactionFailure?.taskId);
+    if (value?.generation?.message !== undefined) partial(value.generation.message.content);
+    previous = value; initialized = true;
+    return idle;
+  };
+
+  type Frame = { entries: EntryRecord[]; expected?: JsonObject | null };
+  const pending: Frame[] = [];
+  let watch: DocumentWatch<LiveState> | undefined, acquiring: Promise<void> | undefined;
+  let ready = false, stopped = false, failure: unknown, cutoff = 0;
+  const drain = () => {
+    if (!ready || stopped) return;
+    while (pending[0]?.expected === undefined) {
+      const frame = pending.shift(); if (frame === undefined) break;
+      for (const entry of frame.entries) if (entry.id > cutoff) committed(entry);
     }
   };
+  const accept = (value: Readonly<LiveState> | null, initial = false) => {
+    if (stopped) return;
+    // Pinned Pi 1.4 publishes the same immutable value to commit subscribers
+    // and typed document watches. Joining those identities keeps final thinking
+    // ahead of its canonical entry without decoding or casting Pi's state.
+    const index = pending.findIndex((frame) => frame.expected === value);
+    if (index < 0) { if (initial && live(value)) observer?.working(false); return; }
+    for (const frame of pending.splice(0, index + 1)) {
+      const idle = frame.expected === value && live(value);
+      for (const entry of frame.entries) if (entry.id > cutoff) committed(entry);
+      // Pi's answer and endRun share a commit. Canonical identity must reach
+      // the renderer before idle releases its unbound reasoning preview.
+      if (idle) observer?.working(false);
+    }
+    drain();
+  };
+  let unsubscribe = () => {}, unsubscribeClose = () => {};
+  const close = async () => {
+    if (stopped) return;
+    stopped = true; unsubscribe(); unsubscribeClose(); visibility.close(); pending.length = 0;
+    const owned = watch, loading = acquiring; watch = undefined;
+    await owned?.stop();
+    await loading?.catch(() => {});
+    compaction(false);
+  };
+  const failed = (error: unknown) => { failure = error; void close(); };
+  const acquire = (): Promise<void> => {
+    if (acquiring !== undefined) return acquiring;
+    const operation = (async () => {
+      const owned = await session.watchDoc(LiveDoc, conversation.id, BACKGROUND_CONTEXT);
+      if (stopped) { await owned?.stop(); return; }
+      watch = owned;
+      if (owned === undefined) {
+        // Creation and retirement may both precede acquisition. Canonical
+        // entries remain available even when that transient incarnation is gone.
+        accept(null, true); drain(); return;
+      }
+      accept(owned.value, true);
+      owned.start(async (value) => {
+        accept(value);
+        if (value === null && watch === owned) {
+          watch = undefined;
+          queueMicrotask(() => { if (!stopped) void acquire().catch(failed); });
+        }
+      });
+      void owned.closed.then((result) => { if (result.reason === "listener_error") failed(result.error); });
+    })();
+    acquiring = operation;
+    void operation.finally(() => {
+      if (acquiring === operation) acquiring = undefined;
+      if (!stopped && watch === undefined && pending.some((frame) => frame.expected !== undefined && frame.expected !== null)) {
+        queueMicrotask(() => { if (!stopped) void acquire().catch(failed); });
+      }
+    }).catch(() => {});
+    return operation;
+  };
+  unsubscribe = session.subscribeCommits((publication) => {
+    const entries = publication.changes.flatMap((change) => change.type === "entry" && change.value.conversationId === conversation.id ? [change.value] : []);
+    const changed = publication.changes.find((change) => change.type === "document" && change.record.kind === LiveDoc.definition.kind && change.conversationId === conversation.id);
+    if (entries.length === 0 && changed === undefined) return;
+    if (pending.length >= 512) { failed(new Error("Activity observation fell behind; reconnect to recover saved history.")); return; }
+    const expected = changed?.type === "document" && (changed.ops.length > 0 || changed.value === null || changed.record.createdAt === publication.seq) ? changed.value : undefined;
+    pending.push({ entries, ...(expected === undefined ? {} : { expected }) });
+    drain();
+    if (watch === undefined && acquiring === undefined && expected !== undefined && expected !== null) {
+      queueMicrotask(() => { if (!stopped) void acquire().catch(failed); });
+    }
+  });
+  unsubscribeClose = session.subscribeClose(() => { void close(); });
+  try {
+    // One bounded native tail, not the active transcript/model-context mount.
+    cutoff = (await conversation.entries({ order: "descending" }, 1, undefined, BACKGROUND_CONTEXT)).items[0]?.id ?? 0;
+    await acquire(); ready = true; drain();
+    if (failure !== undefined) throw failure;
+  } catch (error) { await close(); throw error; }
+  return async () => { await close(); if (failure !== undefined) throw failure; };
 }

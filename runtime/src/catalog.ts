@@ -20,6 +20,11 @@ function order(left: Anchor, right: Anchor): number {
     (right.updated_at ?? -Infinity) - (left.updated_at ?? -Infinity) || left.conversation_id.localeCompare(right.conversation_id);
 }
 function anchor(value: Candidate): Anchor { return { conversation_id: value.item.conversation_id, updated_at: value.item.updated_at, exact: value.exact }; }
+function imported(id: string, thread: HistoryThread): SavedConversation {
+  // Codex's native thread clock is seconds; native agent metadata uses milliseconds.
+  return { conversation_id: id, title: thread.title, updated_at: timestamp(thread.updated_at * 1000), source_thread_id: thread.id,
+    task_id: null, agent_id: null, host: null };
+}
 function decode(cursor: string, query: string): Anchor {
   if (cursor.length > 4096) throw new Error("Saved conversation cursor is invalid");
   let value: unknown;
@@ -57,12 +62,10 @@ export class ConversationCatalog {
   }
   close(): void { this.unsubscribe(); this.unsubscribeClose(); }
   private retain(id: string, thread: HistoryThread, seeding = false): void {
-    // Codex's native thread clock is seconds; native agent metadata uses milliseconds.
-    const updated_at = timestamp(thread.updated_at * 1000), previous = this.imported.get(id);
+    const item = imported(id, thread), previous = this.imported.get(id), updated_at = item.updated_at;
     if (previous !== undefined && previous.updated_at !== null &&
       (updated_at === null || previous.updated_at > updated_at || (seeding && previous.updated_at === updated_at))) return;
-    this.imported.set(id, { conversation_id: id, title: thread.title, updated_at, source_thread_id: thread.id,
-      task_id: null, agent_id: null, host: null });
+    this.imported.set(id, item);
   }
   private async seed(): Promise<void> {
     if (this.ready) return;
@@ -88,6 +91,32 @@ export class ConversationCatalog {
     })().finally(() => { this.loading = undefined; });
     return this.loading;
   }
+  private async includeTasks(items: Map<string, SavedConversation>, only?: string): Promise<void> {
+    for (const task of await this.tasks.list()) {
+      for (const actor of [task, ...task.agents]) {
+        if (only !== undefined && actor.conversation_id !== only) continue;
+        const saved = items.get(actor.conversation_id);
+        items.set(actor.conversation_id, { conversation_id: actor.conversation_id, title: actor.title,
+          updated_at: latest(saved?.updated_at ?? null, timestamp(actor.updated_at)), source_thread_id: saved?.source_thread_id ?? null,
+          task_id: task.id, agent_id: actor === task ? null : actor.id, host: actor.worker.state === "unassigned" ? null : actor.worker.host.name });
+      }
+    }
+  }
+  /** A known view needs one identity, not a cold scan of the resume picker. */
+  async get(id: string): Promise<SavedConversation | undefined> {
+    if (id === ROOT_CONVERSATION_ID.toString()) {
+      const root = await this.session.conversation(ROOT_CONVERSATION_ID, BACKGROUND_CONTEXT);
+      if (root === undefined) return undefined;
+      const tail = await root.entries({ order: "descending" }, 1, undefined, BACKGROUND_CONTEXT);
+      let updated_at = this.rootUpdatedAt;
+      for (const entry of tail.items) updated_at = latest(updated_at, messageTime(entry));
+      return { conversation_id: id, title: "Main agent", updated_at, source_thread_id: null, task_id: null, agent_id: null, host: null };
+    }
+    const saved = await this.histories.byConversation(id), items = new Map<string, SavedConversation>();
+    if (saved !== undefined) items.set(id, imported(id, saved.thread));
+    await this.includeTasks(items, id);
+    return items.get(id);
+  }
   async list(query: string, cursor: string | null, limit: number): Promise<{ items: SavedConversation[]; next_cursor: string | null }> {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 || query.length > 512) throw new Error("Choose 1 to 100 saved conversations and a bounded search");
     const search = key(query), after = cursor === null ? undefined : decode(cursor, search);
@@ -95,14 +124,7 @@ export class ConversationCatalog {
     const items = new Map(this.imported);
     if (this.root) items.set(ROOT_CONVERSATION_ID.toString(), { conversation_id: ROOT_CONVERSATION_ID.toString(), title: "Main agent",
       updated_at: this.rootUpdatedAt, source_thread_id: null, task_id: null, agent_id: null, host: null });
-    for (const task of await this.tasks.list()) {
-      for (const actor of [task, ...task.agents]) {
-        const saved = items.get(actor.conversation_id);
-        items.set(actor.conversation_id, { conversation_id: actor.conversation_id, title: actor.title,
-          updated_at: latest(saved?.updated_at ?? null, timestamp(actor.updated_at)), source_thread_id: saved?.source_thread_id ?? null,
-          task_id: task.id, agent_id: actor === task ? null : actor.id, host: actor.worker.state === "unassigned" ? null : actor.worker.host.name });
-      }
-    }
+    await this.includeTasks(items);
     const matches: Candidate[] = [];
     for (const item of items.values()) {
       const identities = [item.conversation_id, item.agent_id, item.source_thread_id,
