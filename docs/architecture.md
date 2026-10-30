@@ -215,9 +215,11 @@ checkpoint and coverage. The coordinator rediscovers configured accounts and
 polls bounded pages, with separate cursors and coverage per account.
 Admit events durably before advancing a cursor. Partial reads never
 pretend to be complete, and repeated event versions do not create duplicate
-work. New batches rotate across provider/account streams, oldest first within
-each account. The batch boundary persists across restarts so busy sources
-cannot starve quieter accounts. Retries keep their exact claimed batch and
+work. New batches rotate across provider/account streams and alternate oldest
+and newest pending events within each account. A large backlog cannot hide new
+arrivals, and new arrivals cannot starve old work. Account rotation and each
+account's selection direction persist across restarts, including accounts that
+receive only one slot per batch. Retries keep their exact claimed batch and
 admitted input.
 
 Messages reads use Rex Server's existing macOS permission identity. A short
