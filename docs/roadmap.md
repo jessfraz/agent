@@ -27,9 +27,11 @@ recovery; [history](history.md) describes import and retrieval.
   open-page and find-in-page check. Other providers need their own integration.
 - [ ] Verify unattended Chrome tasks through completed sign-in and real task
   outcomes in the selected host's existing profile. Native CDP and private
-  1Password CLI reads are implemented. Live acceptance must cover enabled
-  autofill, fresh tasks, service restarts, OS reboots, ordinary browser relaunch,
-  no recurring consent, owned tab cleanup and interruption recovery.
+  1Password CLI reads and independent page initialization are implemented.
+  Packaged runtimes passed fresh password/TOTP sign-in on both macOS hosts.
+  Remaining deployment acceptance includes service restarts, OS reboots,
+  ordinary browser relaunch, no recurring consent, owned tab cleanup and
+  interruption recovery with autofill enabled.
 - [ ] Deliver browser screenshot attachments.
 - [x] A phone client for the main conversation, using the same submission,
   steering and queueing path as the CLI. The native iPhone app fulfills the
