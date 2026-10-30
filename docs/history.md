@@ -146,6 +146,9 @@ reimport or index reset. Unknown kinds retain their original payload; historical
 hooks and compaction are inert markers. Authentication and system/developer
 instructions remain excluded. Missing originals stay visibly unavailable.
 Execution inputs and tool payloads stay in the shared, lazy detail reader.
+Command cells carry typed command text, exit status and a bounded output
+preview. Updating presentation does not rewrite retained imports or regenerate
+their vectors.
 Events an older importer discarded need a source backfill; retained tool rows do
 not.
 

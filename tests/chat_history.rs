@@ -435,7 +435,7 @@ async fn observer_recovery(case: RecoveryCase) {
     let mut input = child.stdin.take().unwrap();
     let mut output = child.stdout.take().unwrap();
     let mut bytes = Vec::new();
-    read_terminal_until(&mut output, &mut bytes, "Message the agent").await;
+    read_terminal_until(&mut output, &mut bytes, "Ask Agent to do anything").await;
     if matches!(
         case,
         RecoveryCase::WaitingWorker | RecoveryCase::UncertainWorker
@@ -484,7 +484,7 @@ async fn observer_recovery(case: RecoveryCase) {
     }
     input.write_all(b"One owned execution\r").await.unwrap();
     if case == RecoveryCase::WaitingWorker {
-        read_terminal_until(&mut output, &mut bytes, "You · sending").await;
+        read_terminal_until(&mut output, &mut bytes, "sending…").await;
         assert!(inputs.lock().await.is_empty());
     } else {
         timeout(Duration::from_secs(3), async {
@@ -496,7 +496,7 @@ async fn observer_recovery(case: RecoveryCase) {
         .unwrap();
     }
     if case == RecoveryCase::AcceptedChief {
-        read_terminal_until(&mut output, &mut bytes, "You · steering, waiting").await;
+        read_terminal_until(&mut output, &mut bytes, "steering, waiting…").await;
     }
     input
         .write_all(b"\x1b[200~A retained draft\x1b[201~")
@@ -892,7 +892,7 @@ async fn chief_startup(mode: ChiefStartup) {
     let mut bytes = Vec::new();
     timeout(Duration::from_secs(1), async {
         let mut chunk = [0; 4096];
-        while !String::from_utf8_lossy(&bytes).contains("Message the agent") {
+        while !String::from_utf8_lossy(&bytes).contains("Ask Agent to do anything") {
             let count = output.read(&mut chunk).await.unwrap();
             assert!(count > 0);
             bytes.extend_from_slice(&chunk[..count]);

@@ -297,13 +297,16 @@ public enum MediaOperation: String, Codable, Sendable, Equatable {
 }
 
 public struct MessagePresentationCommand: Codable, Sendable, Equatable {
+    public var `command`: String?
     public var `durationMs`: Int?
     public var `exitCode`: Int?
-    public init(`durationMs`: Int? = nil, `exitCode`: Int? = nil) {
+    public init(`command`: String? = nil, `durationMs`: Int? = nil, `exitCode`: Int? = nil) {
+        self.`command` = `command`
         self.`durationMs` = `durationMs`
         self.`exitCode` = `exitCode`
     }
     enum CodingKeys: String, CodingKey {
+        case `command` = "command"
         case `durationMs` = "duration_ms"
         case `exitCode` = "exit_code"
     }

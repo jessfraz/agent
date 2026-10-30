@@ -50,7 +50,9 @@ test("native history pagination stays on one conversation, survives reopen and n
     assert.equal(visible.filter((message) => message.role === "user").length, 45);
     assert.equal(new Set(visible.filter((message) => message.role === "user").map((message) => message.text)).size, 45);
     assert.ok(visible.some((message) => message.role === "thinking" && message.text === "Public provider summary"));
-    assert.deepEqual(visible.filter((message) => message.role === "tool").map((message) => message.text), ["exec"]);
+    const tools = visible.filter((message) => message.role === "tool");
+    assert.deepEqual(tools.map((message) => message.text), [""]);
+    assert.deepEqual(tools[0]?.presentation, { type: "command", exit_code: null, duration_ms: null });
     assert.equal(JSON.stringify(visible).includes("opaque-signature"), false);
     assert.equal(JSON.stringify(visible).includes("private-argument"), false);
     const other = await session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT);
@@ -251,9 +253,10 @@ for (const failed of [false, true]) test(`native tool identity survives a mid-ru
     stop = await activity(session, root, () => {});
     const running = await root.submit({ type: "input", content: "Check the stored identity" }, BACKGROUND_CONTEXT);
     await started;
+    const presentation = { type: "tool", namespace: null };
     const partial = (await history(root, null, session)).flatMap((frame) => frame.messages);
     assert.deepEqual(partial.filter((message) => message.role === "tool").map((message) => ({ ...message, entry_id: "native-entry" })),
-      [{ entry_id: "native-entry", role: "tool", text: "check", continuation: false, final_chunk: true, tool: { call_id: call.id, name: "check", status: "running" } }]);
+      [{ entry_id: "native-entry", role: "tool", text: "", continuation: false, final_chunk: true, presentation, tool: { call_id: call.id, name: "check", status: "running" } }]);
     await stop(); stop = undefined;
     assert.deepEqual((await history(root, null, session)).flatMap((frame) => frame.messages), partial, "Opening history while the tool is held must retain its native identity");
     const live: HistoryMessage[] = [];
@@ -261,12 +264,13 @@ for (const failed of [false, true]) test(`native tool identity survives a mid-ru
     release(); assert.equal((await running.wait(BACKGROUND_CONTEXT)).status, "done");
     await root.waitForIdle(BACKGROUND_CONTEXT); await stop(); stop = undefined;
     const result = { call_id: call.id, name: "check", status: failed ? "failed" : "finished" };
+    const output = failed ? "The check failed" : "Checked";
     assert.deepEqual(live.filter((message) => message.role === "tool").map((message) => ({ ...message, entry_id: "native-entry" })),
-      [{ entry_id: "native-entry", role: "tool", text: `check ${failed ? "failed" : "finished"}`, continuation: false, final_chunk: true, tool: result }]);
+      [{ entry_id: "native-entry", role: "tool", text: output, continuation: false, final_chunk: true, presentation, tool: result }]);
     const completed = (await history(root, null, session)).flatMap((frame) => frame.messages);
     assert.deepEqual(completed.filter((message) => message.role === "tool").map((message) => ({ ...message, entry_id: "native-entry" })),
-      [{ entry_id: "native-entry", role: "tool", text: "check", continuation: false, final_chunk: true, tool: { call_id: call.id, name: "check", status: "running" } },
-        { entry_id: "native-entry", role: "tool", text: `check ${failed ? "failed" : "finished"}`, continuation: false, final_chunk: true, tool: result }]);
+      [{ entry_id: "native-entry", role: "tool", text: "", continuation: false, final_chunk: true, presentation, tool: { call_id: call.id, name: "check", status: "running" } },
+        { entry_id: "native-entry", role: "tool", text: output, continuation: false, final_chunk: true, presentation, tool: result }]);
     await session.close(BACKGROUND_CONTEXT); session = await open();
     assert.deepEqual((await history(await session.root(BACKGROUND_CONTEXT), null, session)).flatMap((frame) => frame.messages), completed);
     assert.equal(faux.state.callCount, 2, "Reading or reopening tool history must not run another generation");

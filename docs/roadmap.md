@@ -9,6 +9,8 @@ recovery; [history](history.md) describes import and retrieval.
   verify real searches. Missing files stay explicit gaps.
 - [ ] Verify chat admission, steering, interruption, reopening and scrolling
   against a large live corpus while background work runs.
+- [x] Use shared typed cells for live and imported messages, with Codex-style
+  terminal formatting and retained command output on reopen.
 - [x] Pin and activate scheduled-chat reuse, recovery and shared worktree
   controls through Global Nix. Background, CLI and main-agent collection have
   passed live checks, preserving active and dirty work.

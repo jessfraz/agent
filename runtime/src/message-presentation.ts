@@ -1,17 +1,24 @@
 import type { HistoryMessage } from "./generated/HistoryMessage.js";
 import type { MessagePresentation } from "./generated/MessagePresentation.js";
 import type { AgentAction } from "./generated/AgentAction.js";
+import type { ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
+import type { AgentStatePresentation } from "./generated/AgentStatePresentation.js";
+import { validEvent, validRequest } from "./protocol.js";
 
 export type MessageContent = Pick<HistoryMessage, "role" | "text" | "tool" | "presentation">;
 export function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
 export function field(value: unknown, key: string): unknown { return object(value) ? value[key] : undefined; }
 export function string(value: unknown): string | null { return typeof value === "string" ? value : null; }
 export function list(value: unknown): unknown[] { return Array.isArray(value) ? value : []; }
-export function bounded(value: string, maximum = 32_768): string {
+export function bounded(value: string, maximum = 32_768, suffix = "\n[Excerpt; full original retained]"): string {
   if (value.length <= maximum) return value;
   let end = maximum; const last = value.charCodeAt(end - 1);
   if (last >= 0xd800 && last <= 0xdbff) end -= 1;
-  return value.slice(0, end) + "\n[Excerpt; full original retained]";
+  return value.slice(0, end) + suffix;
+}
+export function outputPreview(value: string): string {
+  const maximum = 32_768, suffix = "\n[Output preview truncated]";
+  return value.length <= maximum ? value : bounded(value, maximum - suffix.length, suffix);
 }
 export function label(value: unknown, fallback = ""): string { return bounded(string(value) ?? fallback, 1024); }
 export function content(value: unknown): string {
@@ -22,7 +29,7 @@ export function content(value: unknown): string {
 const actions: Record<AgentAction, string> = { spawn: "Spawn agent", send_input: "Send agent input", resume: "Resume agent", wait: "Wait for agents",
   close: "Close agent", send_message: "Message agent", followup: "Follow up with agent", interrupt: "Interrupt agent", list: "List agents", report: "Agent report" };
 
-/** Live Pi and retained-history adapters share this formatter and canonical metadata. */
+/** Legacy flattened text stays stable; display clients render typed headings separately. */
 export function renderMessage(message: MessageContent): string {
   const p = message.presentation;
   const status = message.tool?.status === "unknown" ? "status unavailable" : message.tool?.status;
@@ -51,12 +58,97 @@ export function renderMessage(message: MessageContent): string {
   return bounded(title.trimEnd() + (message.text.trim().length === 0 ? "" : "\n" + message.text));
 }
 
-/** Execution inputs stay in the shared, lazy tool-details reader. */
-export function piToolPresentation(name: string): MessagePresentation | undefined {
-  if (name === "exec") return { type: "command", exit_code: null, duration_ms: null };
-  const action: AgentAction | undefined = name === "spawn_agent" || name === "delegate_task" ? "spawn" : name === "continue_task" ? "send_input"
-    : name === "report_result" ? "report" : undefined;
-  if (action !== undefined) return { type: "agent_coordination", action, sender_thread_id: null, receiver_thread_ids: [], agents: [] };
-  if (name === "edit") return { type: "file_changes", changes: [] };
-  return undefined;
+export function milliseconds(value: unknown): number | null { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null; }
+function quoted(value: string): string { return /^[\w./:=+,-]+$/u.test(value) ? value : "'" + value.replace(/'/gu, "'\\''") + "'"; }
+export function commandPresentation(program: string, args: readonly string[]): Extract<MessagePresentation, { type: "command" }> {
+  return { type: "command", command: bounded([quoted(program), ...args.map(quoted)].join(" "), 1024), exit_code: null, duration_ms: null };
+}
+function coordination(call: Pick<ToolCall, "name" | "arguments">): AgentAction | null | undefined {
+  switch (call.name) {
+    case "spawn_agent": return "spawn";
+    case "continue_agent": return "send_input";
+    case "read_agents": return "list";
+    case "wait_agents": return "wait";
+    case "report_result": return "report";
+    case "delegate_task": {
+      if (typeof field(call.arguments, "task_id") === "string" || typeof field(call.arguments, "conversation_id") === "string") {
+        return field(call.arguments, "mode") === "follow_up" ? "followup" : "send_input";
+      }
+      return field(call.arguments, "new_task") === true ? "spawn" : null;
+    }
+    default: return undefined;
+  }
+}
+
+/** Only declared, human-readable fields become headings; arbitrary inputs remain lazy. */
+export function piToolPresentation(call: ToolCall, sender: string): MessagePresentation {
+  if (call.name === "exec") {
+    const program = field(call.arguments, "program"), args = field(call.arguments, "args");
+    return typeof program === "string" && Array.isArray(args) && args.every((arg: unknown) => typeof arg === "string")
+      ? commandPresentation(program, args) : { type: "command", exit_code: null, duration_ms: null };
+  }
+  const action = coordination(call);
+  if (action !== undefined) return { type: "agent_coordination", action, sender_thread_id: sender, receiver_thread_ids: [], agents: [] };
+  if (call.name === "write_file" || call.name === "edit_file") {
+    const path = string(field(call.arguments, "path"));
+    return { type: "file_changes", changes: path === null ? [] : [{ path: bounded(path, 1024), operation: call.name === "edit_file" ? "update" : null }] };
+  }
+  if (call.name === "read_attachment") return { type: "media", operation: "attachment", status: null, path: null };
+  return { type: "tool", namespace: null };
+}
+function decodedOutput(result: ToolResultMessage): unknown {
+  const first = result.content[0];
+  if (first?.type !== "text") return undefined;
+  try { const value: unknown = JSON.parse(first.text); return value; } catch { return undefined; }
+}
+function hostResult(result: ToolResultMessage) {
+  const frame: unknown = { version: 1, id: 0, command: { type: "host_reply", call_id: result.toolCallId, result: decodedOutput(result) } };
+  return validRequest(frame) && frame.command.type === "host_reply" ? frame.command.result : undefined;
+}
+function savedCommand(result: ToolResultMessage): MessageContent | undefined {
+  // Pi's UI-only details retain the same Rust-owned message fields, not arbitrary arguments.
+  if (!object(result.details)) return undefined;
+  const frame: unknown = { version: 1, id: 0, event: { type: "message", message: { ...result.details, entry_id: "0",
+    continuation: false, final_chunk: true } } };
+  const message = validEvent(frame) && frame.event.type === "message" ? frame.event.message : undefined;
+  return message?.role === "tool" && message.presentation?.type === "command" ? message : undefined;
+}
+function agentStates(value: unknown): AgentStatePresentation[] {
+  return list(value).slice(0, 16).flatMap((agent) => {
+    const id = string(field(agent, "conversation_id"));
+    if (id === null) return [];
+    const stored = field(field(agent, "state"), "state");
+    const state: AgentStatePresentation["state"] = stored === "done" ? "completed" : stored === "failed" ? "failed" : null;
+    return [{ thread_id: id, state }];
+  });
+}
+
+/** Native result identity/status/timing are authoritative; bodies contain no heading prefixes. */
+export function piToolResult(result: ToolResultMessage, sender: string, previous?: MessagePresentation): MessageContent {
+  let presentation: MessagePresentation = previous ?? { type: "tool", namespace: null }, text = content(result.content);
+  const action = coordination({ name: result.toolName, arguments: {} });
+  if (result.toolName === "exec") {
+    const native = hostResult(result);
+    const saved = savedCommand(result), metadata = saved?.presentation?.type === "command" ? saved.presentation : undefined;
+    const command = metadata?.command ?? (previous?.type === "command" ? previous.command : undefined);
+    presentation = { type: "command", ...(command === undefined ? {} : { command }),
+      exit_code: native?.type === "process" ? native.exit_code : metadata?.exit_code ?? null, duration_ms: milliseconds(result.durationMs) };
+    text = saved === undefined ? (native?.type === "process" ? bounded([native.stdout, native.stderr].filter((part) => part.length > 0).join("\n"))
+      : native?.type === "failed" ? bounded(native.message) : content(result.content)) : outputPreview(saved.text);
+  } else if (action !== undefined) {
+    const output = decodedOutput(result);
+    const agents = agentStates(Array.isArray(output) ? output : field(output, "agents"));
+    const receiver = result.toolName === "delegate_task" ? string(field(output, "conversation_id")) : null;
+    presentation = { type: "agent_coordination", action: previous?.type === "agent_coordination" ? previous.action : action,
+      sender_thread_id: sender, receiver_thread_ids: receiver === null ? [] : [receiver], agents };
+    text = result.isError ? content(result.content) : "";
+  } else if (result.toolName === "write_file" || result.toolName === "edit_file") {
+    presentation = previous?.type === "file_changes" ? previous : { type: "file_changes", changes: [] };
+    const native = hostResult(result);
+    text = native?.type === "failed" ? bounded(native.message) : result.isError ? content(result.content) : "";
+  } else if (result.toolName === "read_attachment") {
+    presentation = { type: "media", operation: "attachment", status: null, path: null };
+    text = content(result.content);
+  }
+  return { role: "tool", text, presentation, tool: { call_id: result.toolCallId, name: result.toolName, status: result.isError ? "failed" : "finished" } };
 }

@@ -50,9 +50,14 @@ fn parse(source: &str) -> Document {
                         prefix: "│ ".repeat(quote) + &"  ".repeat(lists.len()),
                     });
                 }
-                Tag::Heading { .. } => {
+                Tag::Heading { level, .. } => {
                     flush(&mut lines, &mut line);
-                    styles.push(current.fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                    styles.push(current.add_modifier(match level {
+                        pulldown_cmark::HeadingLevel::H1 => Modifier::BOLD | Modifier::UNDERLINED,
+                        pulldown_cmark::HeadingLevel::H2 => Modifier::BOLD,
+                        pulldown_cmark::HeadingLevel::H3 => Modifier::BOLD | Modifier::ITALIC,
+                        _ => Modifier::ITALIC,
+                    }));
                 }
                 Tag::Emphasis => styles.push(current.add_modifier(Modifier::ITALIC)),
                 Tag::Strong => styles.push(current.add_modifier(Modifier::BOLD)),
@@ -67,7 +72,7 @@ fn parse(source: &str) -> Document {
                 Tag::CodeBlock(_) => {
                     flush(&mut lines, &mut line);
                     code = true;
-                    styles.push(current.fg(Color::Yellow));
+                    styles.push(current);
                 }
                 Tag::BlockQuote(_) => {
                     flush(&mut lines, &mut line);
@@ -88,10 +93,7 @@ fn parse(source: &str) -> Document {
                         }
                         _ => "• ".into(),
                     };
-                    line.push(Span::styled(
-                        indent + &bullet,
-                        Style::default().fg(Color::DarkGray),
-                    ));
+                    line.push(Span::styled(indent + &bullet, current));
                 }
                 _ => {}
             },
@@ -176,7 +178,7 @@ fn parse(source: &str) -> Document {
                 if let Some(link) = &mut link {
                     link.label.push_str(&value);
                 }
-                line.push(Span::styled(value.to_string(), current.fg(Color::Yellow)))
+                line.push(Span::styled(value.to_string(), current))
             }
             Event::SoftBreak => {
                 if let Some(link) = &mut link {
@@ -330,9 +332,7 @@ impl Table {
                         };
                         line.spans.push(Span::raw(" ".repeat(before)));
                         let style = if index == 0 {
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD)
+                            Style::default().add_modifier(Modifier::BOLD)
                         } else {
                             Style::default()
                         };
@@ -524,7 +524,7 @@ mod tests {
         assert_eq!(row(3), "Wire  │    3");
         assert!(buffer[(0, 0)].modifier.contains(Modifier::BOLD));
         assert!(buffer[(0, 2)].modifier.contains(Modifier::BOLD));
-        assert_eq!(buffer[(10, 2)].fg, ratatui::style::Color::Yellow);
+        assert_eq!(buffer[(10, 2)].fg, ratatui::style::Color::Reset);
     }
 
     #[test]

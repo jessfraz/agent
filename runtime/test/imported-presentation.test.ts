@@ -72,10 +72,15 @@ test("all nineteen native kinds and future originals project through canonical m
     const rows = new Map(retained.filter(ImportedItemEntry.is).map((entry) => [entry.data.item.kind, messages.find((message) => message.entry_id === entry.id.toString())]));
     assert.equal(rows.get("userMessage")?.role, "user"); assert.equal(rows.get("agentMessage")?.role, "final"); assert.equal(rows.get("reasoning")?.role, "thinking");
     assert.equal(rows.get("commandExecution")?.presentation?.type, "command"); assert.equal(rows.get("commandExecution")?.tool?.status, "declined");
-    assert.equal(rows.get("fileChange")?.presentation?.type, "file_changes"); assert.match(rows.get("fileChange")?.text ?? "", /example\.rs/);
+    const changes = rows.get("fileChange")?.presentation; assert.equal(changes?.type, "file_changes");
+    if (changes?.type === "file_changes") assert.equal(changes.changes[0]?.path, "example.rs");
+    assert.equal(rows.get("fileChange")?.text, "Original diff");
+    assert.equal(rows.get("commandExecution")?.text, "Original command output");
     assert.equal(rows.get("mcpToolCall")?.tool?.status, "failed"); assert.equal(rows.get("dynamicToolCall")?.tool?.status, "unknown");
     assert.equal(rows.get("collabAgentToolCall")?.tool?.status, "interrupted"); assert.equal(rows.get("subAgentActivity")?.presentation?.type, "agent_activity");
-    assert.match(rows.get("subAgentActivity")?.text ?? "", /completed/); assert.equal(rows.get("webSearch")?.presentation?.type, "web_search");
+    const agent = rows.get("subAgentActivity")?.presentation;
+    if (agent?.type === "agent_activity") assert.equal(agent.state, "completed");
+    assert.equal(rows.get("webSearch")?.presentation?.type, "web_search");
     assert.equal(rows.get("imageView")?.presentation?.type, "media"); assert.equal(rows.get("imageGeneration")?.presentation?.type, "media");
     assert.doesNotMatch(rows.get("imageGeneration")?.text ?? "", /SYNTHETIC_ENCODED_IMAGE_BYTES/);
     assert.equal(rows.get("sleep")?.presentation?.type, "sleep"); assert.equal(rows.get("hookPrompt")?.presentation?.type, "hook_prompt");
@@ -83,7 +88,7 @@ test("all nineteen native kinds and future originals project through canonical m
     assert.equal(rows.get("contextCompaction")?.presentation?.type, "compaction"); assert.equal(rows.get("futureNativeItem")?.presentation?.type, "unknown");
     assert.equal(rows.get("plan")?.presentation?.type, "plan"); assert.equal(rows.get("enteredReviewMode")?.presentation?.type, "review");
     assert.equal(rows.get("exitedReviewMode")?.presentation?.type, "review"); assert.equal(rows.get("functionCallOutput")?.tool?.name, "inspect");
-    assert.ok(messages.every((message) => message.text.trim().length > 0));
+    assert.ok(messages.every((message) => message.text.trim().length > 0 || message.presentation !== undefined));
     assert.deepEqual((await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items, retained);
     assert.deepEqual((await conversation.context(BACKGROUND_CONTEXT)).messages, []);
     assert.equal(app.faux.state.callCount, 0);
@@ -105,13 +110,13 @@ test("verified cold originals supply canonical details and deleted evidence rema
     const imported = await app.store.import(batch([saved])), id = imported.conversation.conversation_id;
     const conversation = await app.store.conversation(id); assert.ok(conversation);
     const before = (await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items;
-    let rows = await read(app, id); assert.equal(rows[0]?.presentation?.type, "file_changes"); assert.match(rows[0]?.text ?? "", /restored\.rs/);
+    let rows = await read(app, id); assert.equal(rows[0]?.presentation?.type, "file_changes"); assert.match(rows[0]?.text ?? "", /Original native diff/);
     assert.ok(rows[0]?.tool);
     const details = await toolDetails(conversation, rows[0].entry_id, rows[0].tool.call_id, app.session);
     assert.equal(details.type, "available");
     if (details.type === "available") { assert.equal(details.status, "finished"); assert.equal(details.input.type, "text"); if (details.input.type === "text") assert.equal(details.input.truncated, true); }
     await rm(path); rows = await read(app, id);
-    assert.equal(rows[0]?.presentation?.type, "unavailable"); assert.match(rows[0]?.text ?? "", /original unavailable/);
+    assert.equal(rows[0]?.presentation?.type, "unavailable"); assert.equal(rows[0]?.text, "");
     await writeFile(path, bytes, { mode: 0o600 }); rows = await read(app, id); assert.equal(rows[0]?.presentation?.type, "file_changes");
     assert.deepEqual((await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items, before);
     assert.equal(app.faux.state.callCount, 0);

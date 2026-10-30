@@ -75,9 +75,16 @@ status. Enter steers active work; Tab queues a separate follow-up turn. Queued
 messages run in FIFO order. Esc stops, and Shift+Enter or Alt+Enter inserts a
 newline. Press `?` in an empty editor or use `/help` for commands and shortcuts,
 generated from the same definitions used to parse them.
-Reasoning and tool calls stay in compact activity rows. Ctrl+T opens the
-activity viewer; Enter expands a group or a saved tool's arguments and output.
+Presentation follows the installed Codex CLI 0.165 conventions: prompt gutters,
+neutral Markdown replies, exposed reasoning summaries, bounded tool output,
+an unbordered composer and dim model/directory context. Live and restored
+messages share the same typed cells. Ctrl+T opens the transcript; Enter on a
+saved tool reads its private arguments and output on demand.
 Esc returns to chat without stopping its work.
+
+The reference implementations are Codex's [message cells](https://github.com/openai/codex/blob/rust-v0.165.0/codex-rs/tui/src/history_cell/messages.rs),
+[tool cells](https://github.com/openai/codex/blob/rust-v0.165.0/codex-rs/tui/src/exec_cell/render.rs)
+and [composer](https://github.com/openai/codex/blob/rust-v0.165.0/codex-rs/tui/src/bottom_pane/chat_composer.rs).
 
 In chat, input sent after Esc waits for its stop receipt; editing and
 other chats stay responsive. If stopping cannot be confirmed, the input stays

@@ -6,9 +6,8 @@ import type { AgentState } from "./generated/AgentState.js";
 import type { AgentActivityState } from "./generated/AgentActivityState.js";
 import type { FileOperation } from "./generated/FileOperation.js";
 import type { WebSearchAction } from "./generated/WebSearchAction.js";
-import { bounded, content, field, label, list, object, string, type MessageContent } from "./message-presentation.js";
+import { bounded, content, field, label, list, milliseconds, object, string, type MessageContent } from "./message-presentation.js";
 
-function duration(value: unknown): number | null { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null; }
 function exitCode(value: unknown): number | null { return typeof value === "number" && Number.isInteger(value) && value >= -2_147_483_648 && value <= 2_147_483_647 ? value : null; }
 function status(value: unknown): ToolStatus {
   switch (value) { case "inProgress": return "running"; case "completed": return "finished"; case "failed": return "failed";
@@ -43,8 +42,11 @@ export function codexMessage(item: HistoryItem, data: unknown, entryId: string):
         text: bounded(string(field(data, "text")) ?? item.text) };
     }
     case "reasoning": return { role: "thinking", text: [content(field(data, "summary")), content(field(data, "content"))].filter((part) => part.trim().length > 0).join("\n") || item.text };
-    case "commandExecution": return tool("exec", { type: "command", exit_code: exitCode(field(data, "exitCode")),
-      duration_ms: duration(field(data, "durationMs")) });
+    case "commandExecution": {
+      const command = string(field(data, "command"));
+      return tool("exec", { type: "command", ...(command === null ? {} : { command: bounded(command, 1024) }), exit_code: exitCode(field(data, "exitCode")),
+        duration_ms: milliseconds(field(data, "durationMs")) });
+    }
     case "fileChange": return tool("edit", { type: "file_changes", changes: list(field(data, "changes")).slice(0, 16).map((change) =>
       ({ path: label(field(change, "path")), operation: operation(field(field(change, "kind"), "type")) })) }, list(field(data, "changes")).length > 16 ? "[More changes in retained original]" : "");
     case "functionCallOutput": return tool(label(field(data, "name"), "Tool output"), { type: "tool", namespace: string(field(data, "namespace")) });
@@ -62,12 +64,25 @@ export function codexMessage(item: HistoryItem, data: unknown, entryId: string):
       label(field(field(data, "action"), "url")), "unknown");
     case "imageView": return { role: "tool", text: "", presentation: { type: "media", operation: "view", status: null, path: string(field(data, "path")) } };
     case "imageGeneration": return { role: "tool", text: "", presentation: { type: "media", operation: "generate", status: string(field(data, "status")), path: string(field(data, "savedPath")) } };
-    case "sleep": return { role: "tool", text: "", presentation: { type: "sleep", duration_ms: duration(field(data, "durationMs")) } };
+    case "sleep": return { role: "tool", text: "", presentation: { type: "sleep", duration_ms: milliseconds(field(data, "durationMs")) } };
     case "plan": return { role: item.role, text: string(field(data, "text")) ?? item.text, presentation: { type: "plan" } };
     case "enteredReviewMode": return { role: item.role, text: string(field(data, "review")) ?? item.text, presentation: { type: "review", stage: "started" } };
     case "exitedReviewMode": return { role: item.role, text: string(field(data, "review")) ?? item.text, presentation: { type: "review", stage: "finished" } };
     case "hookPrompt": return { role: "tool", text: "", presentation: { type: "hook_prompt" } };
     case "contextCompaction": return { role: "tool", text: "", presentation: { type: "compaction" } };
     default: return { role: "tool", text: "", presentation: { type: "unknown", kind: item.kind } };
+  }
+}
+
+/** Display bodies are separate from the stable legacy formatter and indexed native excerpts. */
+export function codexDisplayMessage(item: HistoryItem, data: unknown, entryId: string): MessageContent {
+  const message = codexMessage(item, data, entryId);
+  switch (message.presentation?.type) {
+    case "command": return { ...message, text: content(field(data, "aggregatedOutput")) };
+    case "file_changes": return { ...message, text: bounded([...list(field(data, "changes")).slice(0, 16)
+      .flatMap((change) => { const diff = string(field(change, "diff")); return diff === null ? [] : [bounded(diff)]; }), message.text].filter((part) => part.length > 0).join("\n")) };
+    case "tool": return { ...message, text: content(field(data, "output")) || content(field(data, "result")) ||
+      content(field(data, "contentItems")) || content(field(field(data, "error"), "message")) };
+    default: return message;
   }
 }

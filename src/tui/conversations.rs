@@ -5,9 +5,9 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, List, ListItem, ListState, Padding, Paragraph},
 };
 use ratatui_textarea::TextArea;
 use tokio::sync::oneshot;
@@ -28,7 +28,7 @@ impl ConversationPicker {
     ) -> Self {
         let mut editor = editor();
         editor.insert_str(query);
-        editor.set_block(Block::default().borders(Borders::ALL).title("Search"));
+        editor.set_block(Block::default().padding(Padding::new(2, 1, 1, 1)));
         editor.set_placeholder_text("Conversation title or ID");
         let mut picker = Self {
             choices,
@@ -142,9 +142,7 @@ impl ConversationPicker {
         frame.render_widget(
             Line::styled(
                 "Resume conversation",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().add_modifier(Modifier::BOLD),
             ),
             areas[0],
         );
@@ -171,23 +169,21 @@ impl ConversationPicker {
                         .join(" · ");
                     ListItem::new(vec![
                         Line::raw(choice.title.clone()),
-                        Line::styled(detail, Style::default().fg(Color::DarkGray)),
+                        Line::styled(detail, Style::default().add_modifier(Modifier::DIM)),
                     ])
                 })
                 .collect::<Vec<_>>();
             frame.render_stateful_widget(
-                List::new(items).highlight_symbol("› ").highlight_style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                List::new(items)
+                    .highlight_symbol("› ")
+                    .highlight_style(Style::default().add_modifier(Modifier::BOLD)),
                 areas[2],
                 &mut self.list,
             );
         }
         frame.render_widget(
             Line::from(vec![
-                Span::styled("↑↓", Style::default().fg(Color::Yellow)),
+                Span::styled("↑↓", Style::default().add_modifier(Modifier::DIM)),
                 Span::raw(" choose · Enter resume · Esc cancel"),
             ]),
             areas[3],

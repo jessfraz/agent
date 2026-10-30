@@ -1,6 +1,7 @@
 //! Terminal presentation only. Request ownership, model calls and durable input stay outside this module.
 pub mod activity;
 pub mod attachments;
+mod cells;
 mod conversations;
 mod inline;
 mod markdown;
@@ -29,10 +30,16 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear as ClearWidget, Paragraph, Widget, Wrap},
+    widgets::{Block, Clear as ClearWidget, Padding, Paragraph, Widget, Wrap},
 };
 use ratatui_textarea::{DataCursor, TextArea, WrapMode};
-use std::{io::IsTerminal, path::Path, sync::mpsc, thread, time::Duration};
+use std::{
+    io::IsTerminal,
+    path::Path,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 #[derive(Clone, Debug)]
@@ -384,14 +391,6 @@ impl Role {
             Self::Failure => "Error",
         }
     }
-    fn color(self) -> Color {
-        match self {
-            Self::User => Color::Cyan,
-            Self::Agent | Self::PartialAnswer => Color::Green,
-            Self::Failure => Color::Red,
-            _ => Color::DarkGray,
-        }
-    }
 }
 struct Message {
     id: Option<String>,
@@ -401,6 +400,9 @@ struct Message {
     kind: MessageKind,
     output: CellOutput,
     attachments: Vec<AttachmentLabel>,
+    presentation: Option<Box<crate::protocol::MessagePresentation>>,
+    tool_name: String,
+    body_entry: Option<String>,
 }
 
 #[derive(Clone)]
@@ -578,6 +580,9 @@ impl Message {
             kind: MessageKind::Text,
             output: CellOutput::Ready,
             attachments: Vec::new(),
+            presentation: None,
+            tool_name: String::new(),
+            body_entry: None,
         }
     }
     fn with_output(mut self, output: CellOutput) -> Self {
@@ -585,62 +590,15 @@ impl Message {
         self
     }
     fn cached(&mut self) -> &mut CachedText {
-        self.rendered.get_or_insert_with(|| {
-            if let MessageKind::Tool { status, .. } = &self.kind {
-                return CachedText::new(vec![
-                    Line::styled(
-                        format!(
-                            "{} {}",
-                            match status {
-                                ToolStatus::Running => "•",
-                                ToolStatus::Finished => "✓",
-                                ToolStatus::Failed => "✗",
-                                ToolStatus::Declined => "⊘",
-                                ToolStatus::Interrupted => "■",
-                                ToolStatus::Unknown => "?",
-                            },
-                            markdown::plain(&self.text)
-                        ),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Line::default(),
-                ]);
-            }
-            let label = if let MessageKind::Input { mode, delivery, .. } = &self.kind {
-                match (mode, delivery) {
-                    (_, InputDelivery::Submitting) => "You · sending",
-                    (_, InputDelivery::Uncertain) => "You · delivery unconfirmed; not resent",
-                    (InputMode::Steer, InputDelivery::Waiting) => "You · steering, waiting",
-                    (InputMode::FollowUp, InputDelivery::Waiting) => "You · queued",
-                    (_, InputDelivery::Placed { .. }) => "You",
-                }
-            } else {
-                self.role.label()
-            };
-            let header = Line::styled(
-                label,
-                Style::default()
-                    .fg(self.role.color())
-                    .add_modifier(Modifier::BOLD),
-            );
-            let style = if matches!(self.role, Role::Thinking | Role::Tool | Role::Commentary) {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-            let mut rendered = CachedText::markdown(header, &self.text, style);
-            for file in &self.attachments {
-                rendered.append_line(Line::styled(
-                    format!(
-                        "Attachment: {} · {} bytes",
-                        markdown::plain(&file.name),
-                        file.size_bytes
-                    ),
-                    Style::default().fg(Color::Cyan),
-                ));
-            }
-            rendered
-        })
+        let content = cells::Content {
+            role: self.role,
+            text: &self.text,
+            kind: &self.kind,
+            presentation: self.presentation.as_deref(),
+            tool_name: &self.tool_name,
+            attachments: &self.attachments,
+        };
+        self.rendered.get_or_insert_with(|| cells::render(content))
     }
     fn append(&mut self, text: &str) {
         self.text.push_str(text);
@@ -675,6 +633,7 @@ struct State {
     unbound_thinking: Vec<u64>,
     next_thinking: u64,
     working: bool,
+    working_started: Option<Instant>,
     compacting: bool,
     interrupting: bool,
     exiting: bool,
@@ -718,6 +677,7 @@ impl State {
             unbound_thinking: Vec::new(),
             next_thinking: 0,
             working: false,
+            working_started: None,
             compacting: false,
             interrupting: false,
             exiting: false,
@@ -771,6 +731,12 @@ impl State {
         self.dirty_from = Some(self.dirty_from.map_or(index, |dirty| dirty.min(index)));
     }
     fn working(&mut self, working: bool) {
+        if working && !self.working {
+            self.working_started = Some(Instant::now());
+        }
+        if !working {
+            self.working_started = None;
+        }
         self.working = working;
         if !working {
             let pending = std::mem::take(&mut self.unbound_thinking);
@@ -802,18 +768,11 @@ impl State {
         } else {
             CellOutput::Mutable
         };
-        if let Some(tool) = message.tool {
-            let specific = message.presentation.as_deref().is_some_and(|presentation| {
-                !matches!(
-                    presentation,
-                    crate::protocol::MessagePresentation::Tool { namespace: None }
-                )
-            });
-            let label =
-                specific.then(|| message.text.lines().next().unwrap_or(&tool.name).to_owned());
-            self.tool_message(message.entry_id, tool, historical, label);
+        if let Some(tool) = message.tool.take() {
+            self.tool_message(tool, message, historical);
             return;
         }
+        let presentation = message.presentation.take();
         let role = Role::from_history(&message.role);
         if !historical && role == Role::User
             && self.messages.iter().any(|saved| matches!(&saved.kind,
@@ -947,6 +906,16 @@ impl State {
             saved.rendered = None;
             self.invalidate(index);
         }
+        if presentation.is_some()
+            && let Some(index) = self
+                .messages
+                .iter()
+                .rposition(|saved| saved.id.as_ref() == Some(&entry_id) && saved.role == role)
+        {
+            self.messages[index].presentation = presentation;
+            self.messages[index].rendered = None;
+            self.invalidate(index);
+        }
         self.changed = true;
     }
     fn finish_thinking(&mut self) {
@@ -1061,35 +1030,58 @@ impl State {
                 || (matches!(&message.kind, MessageKind::Tool { status: ToolStatus::Finished, .. }) && matches!(status, ToolStatus::Running | ToolStatus::Finished)) {
                 return;
             }
-            message.text = name;
+            message.tool_name = name;
             message.kind = MessageKind::Tool { call_id, status };
             if message.output != CellOutput::Printed { message.output = CellOutput::Mutable; }
             message.rendered = None;
             self.invalidate(index);
         } else {
-            self.push(Role::Tool, name);
-            if let Some(message) = self.messages.last_mut() { message.kind = MessageKind::Tool { call_id, status }; message.output = CellOutput::Mutable; }
+            self.push(Role::Tool, String::new());
+            if let Some(message) = self.messages.last_mut() { message.tool_name = name; message.kind = MessageKind::Tool { call_id, status }; message.output = CellOutput::Mutable; }
         }
     }
     fn tool_message(
         &mut self,
-        entry_id: String,
         tool: crate::protocol::ToolHistory,
+        message: HistoryMessage,
         historical: bool,
-        label: Option<String>,
     ) {
+        let HistoryMessage {
+            entry_id,
+            text,
+            presentation,
+            continuation,
+            final_chunk,
+            ..
+        } = message;
+        let label = (presentation.is_some() || continuation).then_some(text);
         let identity = tool.call_id.clone();
-        let terminal = tool.status != ToolStatus::Running;
+        let name = tool.name.clone();
+        let terminal = tool.status != ToolStatus::Running && final_chunk;
         let index = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Tool { call_id, .. } if call_id == &tool.call_id));
+        let stale = index.is_some_and(|index| match self.messages[index].kind {
+            MessageKind::Tool { status, .. } => {
+                (status != ToolStatus::Running
+                    && status != ToolStatus::Unknown
+                    && tool.status == ToolStatus::Running)
+                    || (matches!(
+                        status,
+                        ToolStatus::Failed | ToolStatus::Declined | ToolStatus::Interrupted
+                    ) && status != tool.status)
+            }
+            _ => false,
+        });
         if let Some(index) = index {
             let call = matches!(tool.status, ToolStatus::Running);
-            let name = label
-                .clone()
-                .unwrap_or_else(|| self.messages[index].text.clone());
-            self.tool(tool.call_id, name, tool.status);
-            if let Some(label) = label {
-                self.messages[index].text = label;
-                self.messages[index].rendered = None;
+            self.tool(tool.call_id, name.clone(), tool.status);
+            if let Some(label) = label.filter(|_| !stale) {
+                if continuation && self.messages[index].body_entry.as_ref() == Some(&entry_id) {
+                    self.messages[index].append(&label);
+                } else {
+                    self.messages[index].text = label;
+                    self.messages[index].body_entry = Some(entry_id.clone());
+                    self.messages[index].rendered = None;
+                }
                 self.invalidate(index);
             }
             if historical && call && self.messages[index].id.as_ref() != Some(&entry_id) {
@@ -1104,7 +1096,8 @@ impl State {
                 self.messages[index].id = Some(entry_id);
             }
         } else {
-            let mut message = Message::new(Some(entry_id), Role::Tool, label.unwrap_or(tool.name));
+            let mut message = Message::new(Some(entry_id), Role::Tool, label.unwrap_or_default());
+            message.body_entry = message.id.clone();
             message.output = if historical && self.loading_history.is_some() {
                 CellOutput::Retained
             } else {
@@ -1138,10 +1131,11 @@ impl State {
             }
         }
         if let Some(message) = self.messages.iter_mut().find(|message| matches!(&message.kind, MessageKind::Tool { call_id, .. } if call_id == &identity))
-            && !matches!(message.output, CellOutput::Printed | CellOutput::Retained)
-            && terminal
         {
-            message.output = CellOutput::Ready;
+            message.presentation = merge_tool_presentation(message.presentation.take(), presentation, stale);
+            message.tool_name = name;
+            message.rendered = None;
+            if terminal && !matches!(message.output, CellOutput::Printed | CellOutput::Retained) { message.output = CellOutput::Ready; }
         }
         self.history_changed |= historical;
     }
@@ -1210,7 +1204,7 @@ impl State {
             }
             RuntimeEventKind::Activity { activity } => match activity {
                 ModelActivity::Thinking { text } => {
-                    self.working = true;
+                    self.working(true);
                     if let Some(index) = self.messages.iter().position(|message| matches!(message.kind, MessageKind::Thinking(id) if Some(id) == self.thinking)) {
                         self.messages[index].append(&text);
                         self.invalidate(index);
@@ -1224,11 +1218,11 @@ impl State {
                     }
                 }
                 ModelActivity::ToolStarted { call_id, name } => {
-                    self.working = true;
+                    self.working(true);
                     self.tool(call_id, name, ToolStatus::Running);
                 }
                 ModelActivity::ToolFinished { call_id, name } => {
-                    self.working = true;
+                    self.working(true);
                     self.tool(call_id, name, ToolStatus::Finished);
                 }
                 ModelActivity::Compaction { active, failed } => {
@@ -1805,7 +1799,7 @@ impl State {
                             if key.code == KeyCode::Tab {
                                 return Some(TuiInput::Queue(input));
                             }
-                            self.working = true;
+                            self.working(true);
                             return Some(TuiInput::Submit(input));
                         }
                     }
@@ -1915,18 +1909,23 @@ impl State {
             return;
         }
         self.prepare_editor();
+        let status_height = u16::from(self.status() != "Ready");
         let attachment_height = u16::try_from(self.attachment_count()).unwrap_or(u16::MAX);
         let height = self.editor_height(
             frame.area().width,
             frame
                 .area()
                 .height
-                .saturating_sub(5u16.saturating_add(attachment_height))
+                .saturating_sub(
+                    5u16.saturating_add(attachment_height)
+                        .saturating_add(status_height),
+                )
                 .clamp(1, 6),
         );
         let areas = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(attachment_height),
+            Constraint::Length(status_height),
             Constraint::Length(height),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -1935,13 +1934,11 @@ impl State {
         if self.help_open {
             let mut lines = vec![Line::styled(
                 "Commands",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().add_modifier(Modifier::BOLD),
             )];
             for (command, description) in command_help() {
                 lines.push(Line::from(vec![
-                    Span::styled(command, Style::default().fg(Color::Cyan)),
+                    Span::styled(command, Style::default().add_modifier(Modifier::BOLD)),
                     Span::raw("  "),
                     Span::raw(description),
                 ]));
@@ -1949,13 +1946,11 @@ impl State {
             lines.push(Line::default());
             lines.push(Line::styled(
                 "Keyboard",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().add_modifier(Modifier::BOLD),
             ));
             for (key, action) in shortcuts() {
                 lines.push(Line::from(vec![
-                    Span::styled(key, Style::default().fg(Color::Yellow)),
+                    Span::styled(key, Style::default().add_modifier(Modifier::DIM)),
                     Span::raw("  "),
                     Span::raw(action),
                 ]));
@@ -2021,7 +2016,7 @@ impl State {
                 Line::from(vec![
                     Span::styled(
                         format!("[{}] ", index + 1),
-                        Style::default().fg(Color::Cyan),
+                        Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(markdown::plain(name)),
                     Span::styled(
@@ -2032,7 +2027,6 @@ impl State {
             })
             .collect::<Vec<_>>();
         frame.render_widget(Paragraph::new(files), areas[1]);
-        frame.render_widget(&self.editor, areas[2]);
         if let Some(menu) = &self.completion {
             let height = usize::from(areas[0].height).min(6).min(menu.items.len());
             let start = menu.selected.saturating_sub(height.saturating_sub(1));
@@ -2046,11 +2040,11 @@ impl State {
                     Line::from(vec![
                         Span::styled(
                             if index == menu.selected { "› " } else { "  " },
-                            Style::default().fg(Color::Cyan),
+                            Style::default().add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
                             item.label.clone(),
-                            Style::default().fg(Color::Cyan).add_modifier(
+                            Style::default().add_modifier(Modifier::BOLD).add_modifier(
                                 if index == menu.selected {
                                     Modifier::BOLD
                                 } else {
@@ -2072,100 +2066,80 @@ impl State {
             frame.render_widget(ClearWidget, area);
             frame.render_widget(Paragraph::new(lines), area);
         }
-        let mut status = Vec::new();
-        if let Some(model) = &self.info.model {
-            let reasoning = model
-                .reasoning
-                .map(|value| value.as_str())
-                .unwrap_or("default");
-            status.extend([
+        if status_height > 0 {
+            let mut spans = vec![
+                Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
                 Span::styled(
-                    markdown::plain(&model.model_id),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-                Span::styled(reasoning, Style::default().fg(Color::Magenta)),
-                Span::styled(
-                    if model.fast { " · fast" } else { "" },
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-            ]);
-        }
-        status.extend([
-            Span::styled(
-                markdown::plain(&self.info.cwd),
-                Style::default().fg(Color::Blue),
-            ),
-            Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                self.status(),
-                Style::default().fg(
+                    self.status(),
                     if self.observation == Some(ObservationState::Disconnected) {
-                        Color::Red
-                    } else if self.observation == Some(ObservationState::Reconnecting)
-                        || self.interrupting
-                    {
-                        Color::Yellow
-                    } else if self.working || self.compacting || self.info.model.is_none() {
-                        Color::Cyan
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                     } else {
-                        Color::Green
+                        Style::default().add_modifier(Modifier::BOLD)
                     },
                 ),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(Line::from(status)), areas[3]);
+            ];
+            if self.working {
+                let elapsed = self
+                    .working_started
+                    .map_or(0, |started| started.elapsed().as_secs());
+                let elapsed = if elapsed < 60 {
+                    format!("{elapsed}s")
+                } else {
+                    format!("{}m {:02}s", elapsed / 60, elapsed % 60)
+                };
+                spans.push(Span::styled(
+                    format!(" ({elapsed} • esc to interrupt)"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), areas[2]);
+        }
+        // Codex keeps the input unbordered, with one prompt gutter and padded
+        // rows. Terminal foreground/background own the theme, not role colors.
+        frame.render_widget(&self.editor, areas[3]);
         frame.render_widget(
-            Paragraph::new(Line::from(
-                [
-                    Shortcut::Steer,
-                    Shortcut::Queue,
-                    Shortcut::Help,
-                    Shortcut::RemoveFile,
-                ]
-                .into_iter()
-                .filter(|shortcut| {
-                    !matches!(shortcut, Shortcut::RemoveFile) || self.attachment_count() > 0
-                })
-                .enumerate()
-                .flat_map(|(index, shortcut)| {
-                    let (key, hint, _) = shortcut.definition();
-                    let hint = if self.completion.is_some() {
-                        match shortcut {
-                            Shortcut::Steer => "run",
-                            Shortcut::Queue => "complete",
-                            _ => hint,
-                        }
-                    } else {
-                        hint
-                    };
-                    [
-                        Span::raw(if index == 0 { "" } else { " · " }),
-                        Span::styled(key, Style::default().fg(Color::Yellow)),
-                        Span::raw(format!(" {hint}")),
-                    ]
-                })
-                .collect::<Vec<_>>(),
-            ))
-            .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(Line::styled(
+                "›",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Rect::new(areas[3].x, areas[3].y + 1, 1, 1),
+        );
+        let mut status = vec![Span::raw("  ")];
+        if let Some(model) = &self.info.model {
+            status.push(Span::raw(markdown::plain(&model.model_id)));
+            if let Some(reasoning) = model.reasoning {
+                status.push(Span::raw(format!(" {}", reasoning.as_str())));
+            }
+            if model.fast {
+                status.push(Span::raw(" fast"));
+            }
+            status.push(Span::raw(" · "));
+        }
+        status.push(Span::raw(markdown::plain(&self.info.cwd)));
+        frame.render_widget(
+            Paragraph::new(Line::from(status)).style(Style::default().add_modifier(Modifier::DIM)),
             areas[4],
+        );
+        let hint = if self.completion.is_some() {
+            "enter to run · tab to complete · esc to cancel"
+        } else if self.working {
+            "enter to steer · tab to queue · ? for shortcuts"
+        } else if self.attachment_count() > 0 {
+            "enter to send · backspace to remove file · ? for shortcuts"
+        } else if self.editor.lines().iter().any(|line| !line.is_empty()) {
+            "enter to send · shift+enter for newline"
+        } else {
+            "? for shortcuts"
+        };
+        frame.render_widget(
+            Paragraph::new(format!("  {hint}")).style(Style::default().add_modifier(Modifier::DIM)),
+            areas[5],
         );
         self.changed = false;
     }
     fn prepare_editor(&mut self) {
         self.editor
-            .set_block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(if self.exiting {
-                        Color::DarkGray
-                    } else {
-                        Color::Cyan
-                    })),
-            );
+            .set_block(Block::default().padding(Padding::new(2, 1, 1, 1)));
     }
     fn editor_height(&mut self, width: u16, maximum: u16) -> u16 {
         // Use the editor's native WordOrGlyph map, including borders and tabs.
@@ -2187,12 +2161,59 @@ impl State {
         }
     }
 }
+fn merge_tool_presentation(
+    saved: Option<Box<crate::protocol::MessagePresentation>>,
+    incoming: Option<Box<crate::protocol::MessagePresentation>>,
+    stale: bool,
+) -> Option<Box<crate::protocol::MessagePresentation>> {
+    use crate::protocol::MessagePresentation;
+    match (saved.map(|value| *value), incoming.map(|value| *value)) {
+        (
+            Some(MessagePresentation::Command {
+                command,
+                exit_code,
+                duration_ms,
+            }),
+            Some(MessagePresentation::Command {
+                command: next_command,
+                exit_code: next_exit,
+                duration_ms: next_duration,
+            }),
+        ) => {
+            let (command, exit_code, duration_ms) = if stale {
+                (
+                    command.or(next_command),
+                    exit_code.or(next_exit),
+                    duration_ms.or(next_duration),
+                )
+            } else {
+                (
+                    next_command.or(command),
+                    next_exit.or(exit_code),
+                    next_duration.or(duration_ms),
+                )
+            };
+            Some(Box::new(MessagePresentation::Command {
+                command,
+                exit_code,
+                duration_ms,
+            }))
+        }
+        (saved, incoming) => if stale {
+            saved.or(incoming)
+        } else {
+            incoming.or(saved)
+        }
+        .map(Box::new),
+    }
+}
 fn editor() -> TextArea<'static> {
     let mut editor = TextArea::default();
     editor.set_wrap_mode(WrapMode::WordOrGlyph);
     editor.set_cursor_line_style(Style::default());
     editor.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
-    editor.set_placeholder_text("Message the agent…");
+    editor.set_placeholder_text("Ask Agent to do anything");
+    editor.set_placeholder_style(Style::default().add_modifier(Modifier::DIM));
     editor
 }
 
@@ -2294,6 +2315,7 @@ fn run(
     inputs: UnboundedSender<TuiInput>,
     mut state: State,
 ) -> Result<()> {
+    let mut tick = Instant::now();
     loop {
         if inputs.is_closed() {
             return screen.finish(&mut state);
@@ -2364,6 +2386,10 @@ fn run(
                     state.reset_conversation(info);
                 }
             }
+        }
+        if state.working && tick.elapsed() >= Duration::from_secs(1) {
+            state.changed = true;
+            tick = Instant::now();
         }
         if state.changed {
             screen.draw(&mut state)?;
@@ -2597,7 +2623,7 @@ mod tests {
         let text = rendered(&mut view, 100, 20);
         assert!(text.contains("saved-model"));
         assert!(text.contains("/workspace/selected"));
-        assert!(text.contains("Ready"));
+        assert_eq!(view.status(), "Ready");
     }
 
     #[test]
@@ -2692,7 +2718,7 @@ mod tests {
             after_live.measured_messages + 1_001
         );
         view.input(key(KeyCode::End, KeyModifiers::CONTROL));
-        assert!(rendered(&mut view, 80, 20).contains("Activity ·"));
+        assert!(rendered(&mut view, 80, 20).contains("New live context"));
         view.output.view = crate::tui::inline::View::History;
         assert!(rendered(&mut view, 80, 20).contains("New live context"));
 
@@ -2724,12 +2750,12 @@ mod tests {
         history.event(RuntimeEventKind::InputAccepted {
             input_id: "next-input".into(),
         });
-        assert!(rendered(&mut history, 80, 20).contains("You · queued"));
+        assert!(rendered(&mut history, 80, 20).contains("queued"));
         history.event(RuntimeEventKind::InputPlaced {
             input_id: "next-input".into(),
             entry_id: "next-user".into(),
         });
-        assert!(!rendered(&mut history, 80, 20).contains("You · queued"));
+        assert!(!rendered(&mut history, 80, 20).contains("queued"));
         history.event(RuntimeEventKind::Message {
             message: HistoryMessage {
                 presentation: None,
@@ -2839,23 +2865,23 @@ mod tests {
             },
         });
         let compact = rendered(&mut state, 110, 24);
-        assert_eq!(compact.matches("Activity ·").count(), 1);
-        assert!(!compact.contains("First second"));
+        assert_eq!(compact.matches("First second").count(), 1);
+        assert!(compact.contains("Called read_file"));
         state.output.view = crate::tui::inline::View::History;
         let before = rendered(&mut state, 110, 24);
-        assert_eq!(before.matches("Thinking").count(), 1);
+        assert_eq!(before.matches("First second").count(), 1);
         assert!(before.contains("First second"));
-        assert!(before.contains("✓ read_file"));
+        assert!(before.contains("Called read_file"));
         state.event(RuntimeEventKind::Answer {
             entry_id: None,
             conversation_id: "one".into(),
             text: "## Done\n\n- fixed **it**\n\n```rust\nlet ready = true;\n```".into(),
         });
         let after = rendered(&mut state, 110, 30);
-        assert_eq!(after.matches("Thinking").count(), 1);
+        assert_eq!(after.matches("First second").count(), 1);
         assert!(after.contains("• fixed it"));
-        assert!(after.contains("gpt-6.1-sol · high"));
-        assert!(after.contains("/workspace/example · Ready"));
+        assert!(after.contains("gpt-6.1-sol high"));
+        assert!(after.contains("/workspace/example"));
         assert!(after.contains("let ready = true;"));
     }
     #[test]
@@ -2870,8 +2896,10 @@ mod tests {
         });
         let compacting = rendered(&mut state, 110, 24);
         assert_eq!(compacting.matches("Compacting context").count(), 1);
-        assert!(compacting.contains("gpt-6.1-sol · high"));
-        assert!(compacting.contains("/workspace/example · Compacting context"));
+        assert!(compacting.contains("gpt-6.1-sol high"));
+        assert!(
+            compacting.contains("/workspace/example") && compacting.contains("Compacting context")
+        );
         state.event(RuntimeEventKind::Answer {
             entry_id: None,
             conversation_id: "one".into(),
@@ -3168,10 +3196,13 @@ mod tests {
             .map(|x| buffer[(x, 28)].symbol())
             .collect::<String>();
         assert!(!footer.contains("Ready"));
-        let column = footer[..footer.find("Disconnected").unwrap()]
-            .chars()
-            .count();
-        assert_eq!(buffer[(u16::try_from(column).unwrap(), 28)].fg, Color::Red);
+        assert!(buffer.content.windows("Disconnected".len()).any(|cells| {
+            cells
+                .iter()
+                .zip("Disconnected".chars())
+                .all(|(cell, ch)| cell.symbol() == ch.to_string())
+                && cells[0].fg == Color::Red
+        }));
         let text = rendered(&mut view, 130, 35);
         assert!(text.contains("Coordinator connection lost"), "{text}");
         assert!(text.contains("/resume saved-chief"), "{text}");
@@ -3383,7 +3414,7 @@ mod tests {
         assert!(!state.interrupting);
         assert!(!state.exiting);
         assert!(state.editor.lines().iter().all(String::is_empty));
-        assert!(rendered(&mut state, 120, 20).contains("Tab queue"));
+        assert!(rendered(&mut state, 120, 20).contains("tab to queue"));
     }
     #[test]
     fn help_and_local_controls_keep_active_work_and_drafts_owned_by_the_editor() {
@@ -3442,7 +3473,7 @@ mod tests {
         assert!(!small.help_open);
     }
     #[test]
-    fn footer_uses_distinct_model_context_status_and_key_colors() {
+    fn footer_uses_codex_terminal_foreground_and_dim_context() {
         use ratatui::style::Color;
         let mut view = state();
         let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
@@ -3451,16 +3482,13 @@ mod tests {
         let footer = (0..110)
             .map(|x| buffer[(x, 22)].symbol())
             .collect::<String>();
-        assert_eq!(buffer[(0, 22)].fg, Color::Cyan);
-        for (text, color) in [
-            ("high", Color::Magenta),
-            ("/workspace/example", Color::Blue),
-            ("Ready", Color::Green),
-        ] {
+        for text in ["gpt-6.1-sol", "high", "/workspace/example"] {
             let column = footer[..footer.find(text).unwrap()].chars().count();
-            assert_eq!(buffer[(u16::try_from(column).unwrap(), 22)].fg, color);
+            let cell = &buffer[(u16::try_from(column).unwrap(), 22)];
+            assert_eq!(cell.fg, Color::Reset);
+            assert!(cell.modifier.contains(ratatui::style::Modifier::DIM));
         }
-        assert_eq!(buffer[(0, 23)].fg, Color::Yellow);
+        assert_eq!(buffer[(2, 23)].fg, Color::Reset);
     }
     #[test]
     fn authoritative_worker_settings_replace_launch_defaults_without_replacing_its_context() {
@@ -3501,7 +3529,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(text.contains("updated-model · off · fast"));
+        assert!(text.contains("updated-model off fast"));
         assert!(text.contains("Review device configuration"));
     }
     #[test]
@@ -3750,10 +3778,10 @@ mod tests {
                 .unwrap()[0]
                 .fg
         };
-        assert_eq!(body_color("PROGRESS_BODY"), Color::DarkGray);
+        assert_eq!(body_color("PROGRESS_BODY"), Color::Reset);
         assert_ne!(body_color("FINAL_BODY"), Color::DarkGray);
         assert_ne!(body_color("PARTIAL_BODY"), Color::DarkGray);
-        assert!(rendered(&mut view, 100, 30).contains("Agent · partial"));
+        assert!(rendered(&mut view, 100, 30).contains("Response incomplete"));
         view.input(key(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(view.editor.lines().join("\n"), "Actual user request");
     }
@@ -3945,11 +3973,11 @@ mod tests {
             "Same correction".into(),
             crate::protocol::InputMode::Steer,
         );
-        assert!(rendered(&mut view, 100, 30).contains("You · sending"));
+        assert!(rendered(&mut view, 100, 30).contains("sending…"));
         view.event(RuntimeEventKind::InputAccepted {
             input_id: "one".into(),
         });
-        assert!(rendered(&mut view, 100, 30).contains("You · steering, waiting"));
+        assert!(rendered(&mut view, 100, 30).contains("steering, waiting…"));
         view.pending_input(
             "two".into(),
             "Same correction".into(),
@@ -4070,7 +4098,7 @@ mod tests {
         let text = rendered(&mut view, 100, 40);
         let positions = [
             "EARLY_THOUGHT",
-            "✓ earlier_tool",
+            "Called earlier_tool",
             "LATER_NOTICE",
             "NEW_CORRECTION",
             "LATER_THOUGHT",
@@ -4083,7 +4111,7 @@ mod tests {
             text: "FINAL_ANSWER".into(),
         });
         let text = rendered(&mut view, 100, 40);
-        assert!(text.find("✓ earlier_tool").unwrap() < text.find("FINAL_ANSWER").unwrap());
+        assert!(text.find("Called earlier_tool").unwrap() < text.find("FINAL_ANSWER").unwrap());
         assert_eq!(text.matches("earlier_tool").count(), 1);
     }
     #[test]
@@ -4147,7 +4175,7 @@ mod tests {
         });
         let text = rendered(&mut view, 100, 30);
         assert_eq!(text.matches("read_source").count(), 1);
-        assert!(text.find("✗ read_source").unwrap() < text.find("NEW_REQUEST").unwrap());
+        assert!(text.find("• Tool read_source").unwrap() < text.find("NEW_REQUEST").unwrap());
         assert!(!text.contains("✓ read_source"));
     }
     #[test]
@@ -4517,6 +4545,7 @@ mod tests {
                     status: ToolStatus::Running,
                 }),
                 presentation: Some(Box::new(MessagePresentation::Command {
+                    command: Some("printf fixture".into()),
                     exit_code: None,
                     duration_ms: None,
                 })),
@@ -4549,7 +4578,9 @@ mod tests {
                 },
             });
             assert_eq!(view.messages.len(), 1);
-            assert_eq!(view.messages[0].text, "$ printf fixture");
+            assert!(
+                matches!(view.messages[0].presentation.as_deref(), Some(MessagePresentation::Command { command: Some(command), .. }) if command == "printf fixture")
+            );
             assert!(matches!(
                 view.messages[0].kind,
                 MessageKind::Tool {
@@ -4560,7 +4591,7 @@ mod tests {
             view.input(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
             view.input(key(KeyCode::Enter, KeyModifiers::NONE));
             let screen = rendered(&mut view, 120, 28);
-            assert!(screen.contains("$ printf fixture"), "{screen}");
+            assert!(screen.contains("Ran printf fixture"), "{screen}");
         }
     }
     #[test]
@@ -4593,6 +4624,318 @@ mod tests {
             assert!(
                 matches!(&view.messages[0].kind, MessageKind::Tool { status: saved, .. } if *saved == status)
             );
+        }
+    }
+
+    #[test]
+    fn codex_prompt_gutters_and_neutral_composer_match_live_and_reopened_messages() {
+        use crate::protocol::{ToolHistory, ToolStatus};
+        use ratatui::style::{Color, Modifier};
+        let messages = [
+            (HistoryRole::User, "Literal **user** markup\nSecond prompt line"),
+            (HistoryRole::Thinking, "**Checking the boundary**\n\nExposed reasoning."),
+            (HistoryRole::Commentary, "Checking the saved change."),
+            (HistoryRole::Tool, ""),
+            (HistoryRole::Final, "## Result\n\nA **bold** result with `code`.\n\n- The saved history remains available."),
+        ].into_iter().enumerate().map(|(index, (role, text))| HistoryMessage {
+            entry_id: index.to_string(), role, text: text.into(), continuation: false, final_chunk: true,
+            presentation: None, attachments: None,
+            tool: (index == 3).then(|| ToolHistory { call_id: "native-call".into(), name: "read_file".into(), status: ToolStatus::Finished }),
+        }).collect::<Vec<_>>();
+        let mut live = state();
+        for message in messages.clone() {
+            live.event(RuntimeEventKind::Message { message });
+        }
+        live.event(RuntimeEventKind::ConversationState { working: false });
+        let mut reopened = state();
+        reopened.event(RuntimeEventKind::History {
+            conversation_id: "saved".into(),
+            messages,
+            next_cursor: None,
+            page_complete: true,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        terminal.draw(|frame| live.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..32)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter()
+                .any(|line| line.contains("Literal **user** markup")),
+            "Submitted prompts must retain literal Markdown, as in Codex:\n{}",
+            rows.join("\n")
+        );
+        let user = rows
+            .iter()
+            .position(|line| line.contains("Literal **user** markup"))
+            .unwrap();
+        assert!(
+            rows[user].starts_with("› Literal **user** markup"),
+            "{}",
+            rows.join("\n")
+        );
+        assert!(rows[user + 1].starts_with("  Second prompt line"));
+        let reasoning = rows
+            .iter()
+            .position(|line| line.contains("Checking the boundary"))
+            .unwrap();
+        assert!(rows[reasoning].starts_with("• Checking the boundary"));
+        assert!(
+            buffer[(2, u16::try_from(reasoning).unwrap())]
+                .modifier
+                .contains(Modifier::ITALIC | Modifier::DIM)
+        );
+        let tool = rows
+            .iter()
+            .position(|line| line.contains("Called read_file"))
+            .unwrap();
+        assert!(rows[tool].starts_with("• Called read_file"));
+        assert_eq!(buffer[(0, u16::try_from(tool).unwrap())].fg, Color::Green);
+        let composer = rows
+            .iter()
+            .position(|line| line.contains("Ask Agent to do anything"))
+            .unwrap();
+        assert_eq!(buffer[(0, u16::try_from(composer).unwrap())].symbol(), "›");
+        assert_eq!(
+            buffer[(3, u16::try_from(composer).unwrap())].fg,
+            Color::Reset
+        );
+        assert!(
+            buffer[(3, u16::try_from(composer).unwrap())]
+                .modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(rows[composer - 1].trim().is_empty());
+        assert!(rows[composer + 1].trim().is_empty());
+        for row in &rows[composer - 1..] {
+            assert!(!row.contains(['┌', '┐', '└', '┘', '─', '│']));
+        }
+        assert!(rows[30].contains("gpt-6.1-sol high · /workspace/example"));
+        assert_eq!(buffer[(2, 30)].fg, Color::Reset);
+        assert!(buffer[(2, 30)].modifier.contains(Modifier::DIM));
+        assert!(!rows.iter().any(|line| line.contains("Activity ·")
+            || line.trim() == "You"
+            || line.trim() == "Agent"));
+        terminal.draw(|frame| reopened.draw(frame)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer(),
+            &buffer,
+            "Live and restored native messages must use the same cells"
+        );
+    }
+
+    #[test]
+    fn working_status_keeps_elapsed_time_from_input_through_native_activity() {
+        use std::time::{Duration, Instant};
+        let mut view = state();
+        view.input(Event::Paste("Inspect the fixture".into()));
+        assert!(matches!(
+            view.input(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(TuiInput::Submit(_))
+        ));
+        assert!(view.working_started.is_some());
+        let started = Instant::now() - Duration::from_secs(65);
+        view.working_started = Some(started);
+        view.event(RuntimeEventKind::Activity {
+            activity: ModelActivity::Thinking {
+                text: "Checking fixture".into(),
+            },
+        });
+        assert_eq!(view.working_started, Some(started));
+        assert!(rendered(&mut view, 100, 20).contains("Working (1m 05s • esc to interrupt)"));
+        view.event(RuntimeEventKind::ConversationState { working: false });
+        assert!(!rendered(&mut view, 100, 20).contains("esc to interrupt"));
+    }
+
+    #[test]
+    fn typed_tool_output_keeps_every_chunk_and_late_call_metadata_without_reverting_completion() {
+        use crate::protocol::{MessagePresentation, ToolHistory, ToolStatus};
+        let mut view = state();
+        let result = |text: &str, continuation, final_chunk| HistoryMessage {
+            entry_id: "result-entry".into(),
+            role: HistoryRole::Tool,
+            text: text.into(),
+            continuation,
+            final_chunk,
+            presentation: (!continuation).then(|| {
+                Box::new(MessagePresentation::Command {
+                    command: None,
+                    exit_code: Some(0),
+                    duration_ms: Some(12),
+                })
+            }),
+            tool: Some(ToolHistory {
+                call_id: "command-call".into(),
+                name: "exec".into(),
+                status: ToolStatus::Finished,
+            }),
+            attachments: None,
+        };
+        view.event(RuntimeEventKind::Message {
+            message: result("FIRST stdout line\n", false, false),
+        });
+        assert_eq!(
+            view.messages[0].output,
+            crate::tui::inline::CellOutput::Mutable
+        );
+        view.event(RuntimeEventKind::Message {
+            message: result("LAST stdout line", true, true),
+        });
+        assert_eq!(view.messages[0].text, "FIRST stdout line\nLAST stdout line");
+        view.event(RuntimeEventKind::History {
+            conversation_id: "saved".into(),
+            messages: vec![HistoryMessage {
+                entry_id: "call-entry".into(),
+                role: HistoryRole::Tool,
+                text: String::new(),
+                continuation: false,
+                final_chunk: true,
+                presentation: Some(Box::new(MessagePresentation::Command {
+                    command: Some("printf fixture".into()),
+                    exit_code: None,
+                    duration_ms: None,
+                })),
+                tool: Some(ToolHistory {
+                    call_id: "command-call".into(),
+                    name: "exec".into(),
+                    status: ToolStatus::Running,
+                }),
+                attachments: None,
+            }],
+            next_cursor: None,
+            page_complete: true,
+        });
+        let text = rendered(&mut view, 100, 24);
+        for expected in [
+            "Ran printf fixture",
+            "FIRST stdout line",
+            "LAST stdout line",
+        ] {
+            assert_eq!(text.matches(expected).count(), 1, "{text}");
+        }
+        assert_eq!(view.messages.len(), 1);
+        assert!(matches!(
+            view.messages[0].kind,
+            MessageKind::Tool {
+                status: ToolStatus::Finished,
+                ..
+            }
+        ));
+        assert!(
+            matches!(view.messages[0].presentation.as_deref(), Some(MessagePresentation::Command { command: Some(command), exit_code: Some(0), duration_ms: Some(12) }) if command == "printf fixture")
+        );
+    }
+
+    #[test]
+    fn typed_non_command_cells_keep_file_diffs_plans_agents_and_unknown_history_visible() {
+        use crate::protocol::{
+            AgentAction, AgentState, AgentStatePresentation, FileChangePresentation, FileOperation,
+            MessagePresentation, ToolHistory, ToolStatus, WebSearchAction,
+        };
+        let cases = vec![
+            (
+                MessagePresentation::FileChanges {
+                    changes: vec![FileChangePresentation {
+                        path: "sample.rs".into(),
+                        operation: Some(FileOperation::Update),
+                    }],
+                },
+                "+new line\n-old line",
+                "Updated sample.rs",
+            ),
+            (
+                MessagePresentation::WebSearch {
+                    query: "native geometry".into(),
+                    action: Some(WebSearchAction::Search),
+                },
+                "Found sources",
+                "Searched web native geometry",
+            ),
+            (
+                MessagePresentation::AgentCoordination {
+                    action: Some(AgentAction::List),
+                    sender_thread_id: None,
+                    receiver_thread_ids: vec![],
+                    agents: vec![AgentStatePresentation {
+                        thread_id: "child-a".into(),
+                        state: Some(AgentState::Completed),
+                    }],
+                },
+                "",
+                "child-a · completed",
+            ),
+            (
+                MessagePresentation::Plan,
+                "1. **Keep** existing context.",
+                "Updated plan",
+            ),
+            (
+                MessagePresentation::HookPrompt,
+                "Original hook text",
+                "Historical hook prompt inert",
+            ),
+            (
+                MessagePresentation::Unknown {
+                    kind: "future_record".into(),
+                },
+                "",
+                "Unknown history item future_record",
+            ),
+        ];
+        let mut view = state();
+        for (index, (presentation, text, _)) in cases.iter().enumerate() {
+            view.event(RuntimeEventKind::Message {
+                message: HistoryMessage {
+                    entry_id: index.to_string(),
+                    role: HistoryRole::Tool,
+                    text: (*text).into(),
+                    continuation: false,
+                    final_chunk: true,
+                    presentation: Some(Box::new(presentation.clone())),
+                    attachments: None,
+                    tool: Some(ToolHistory {
+                        call_id: format!("call-{index}"),
+                        name: "fixture".into(),
+                        status: ToolStatus::Finished,
+                    }),
+                },
+            });
+        }
+        let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for (_, _, expected) in cases {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(text.contains("Keep existing context") && !text.contains("**Keep**"));
+        for (needle, color) in [
+            ("+new line", ratatui::style::Color::Green),
+            ("-old line", ratatui::style::Color::Red),
+        ] {
+            let cells = terminal
+                .backend()
+                .buffer()
+                .content
+                .windows(needle.chars().count())
+                .find(|cells| {
+                    cells
+                        .iter()
+                        .zip(needle.chars())
+                        .all(|(cell, ch)| cell.symbol() == ch.to_string())
+                })
+                .unwrap();
+            assert_eq!(cells[0].fg, color);
         }
     }
 }

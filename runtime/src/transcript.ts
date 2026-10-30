@@ -10,9 +10,10 @@ import type { ModelActivity } from "./generated/ModelActivity.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ToolDetails } from "./generated/ToolDetails.js";
 import type { ToolDetailContent } from "./generated/ToolDetailContent.js";
+import type { MessagePresentation } from "./generated/MessagePresentation.js";
 import { HistoryError, HistoryStore, ImportedItemEntry, ImportedThreadEntry, isHistoryEntry } from "./history.js";
-import { codexMessage, historyToolId } from "./imported-history.js";
-import { content, field, piToolPresentation, renderMessage, string, type MessageContent } from "./message-presentation.js";
+import { codexDisplayMessage, codexMessage, historyToolId } from "./imported-history.js";
+import { content, field, piToolPresentation, piToolResult, string, type MessageContent } from "./message-presentation.js";
 import { observeTranscriptVisibility, readTranscriptVisibility, transcriptVisible, type TranscriptVisibilityState } from "./transcript_visibility.js";
 import { REVISION_AMBIGUOUS, REVISION_PENDING, revisionStatus, type RevisionView } from "./history-revisions.js";
 
@@ -48,8 +49,9 @@ function* chunks(value: string): Generator<string> {
     yield value.slice(offset, end); offset = end;
   }
 }
-export function visibleTranscript(entry: EntryRecord, visibility: Readonly<TranscriptVisibilityState> | undefined): HistoryMessage[] {
-  return transcriptVisible(entry.id.toString(), visibility) ? transcript(entry) : [];
+export function visibleTranscript(entry: EntryRecord, visibility: Readonly<TranscriptVisibilityState> | undefined,
+  tools?: Map<string, MessagePresentation>): HistoryMessage[] {
+  return transcriptVisible(entry.id.toString(), visibility) ? nativeTranscript(entry, tools) : [];
 }
 function missingOriginal(error: unknown): boolean {
   return error instanceof HistoryError || (error instanceof Error && "code" in error &&
@@ -57,13 +59,13 @@ function missingOriginal(error: unknown): boolean {
 }
 /** Source adapters converge here, including verified cold originals retained by older imports. */
 export async function projectTranscript(entry: EntryRecord, originals: Pick<HistoryStore, "original">,
-  visibility?: Readonly<TranscriptVisibilityState>, revisions?: RevisionView): Promise<HistoryMessage[]> {
+  visibility?: Readonly<TranscriptVisibilityState>, revisions?: RevisionView, tools?: Map<string, MessagePresentation>): Promise<HistoryMessage[]> {
   if (!transcriptVisible(entry.id.toString(), visibility)) return [];
-  if (!ImportedItemEntry.is(entry)) return transcript(entry);
+  if (!ImportedItemEntry.is(entry)) return nativeTranscript(entry, tools);
   const status = revisions === undefined ? "current" : revisionStatus(entry.id, revisions);
   if (status === "superseded" || status === "outside_snapshot") return [];
   let message: MessageContent;
-  try { message = codexMessage(entry.data.item, await originals.original(entry), entry.id.toString()); }
+  try { message = codexDisplayMessage(entry.data.item, await originals.original(entry), entry.id.toString()); }
   catch (error) {
     if (!missingOriginal(error)) throw error;
     message = { role: entry.data.item.role, text: entry.data.item.role === "tool" ? "" : entry.data.item.text,
@@ -76,8 +78,8 @@ export async function projectTranscript(entry: EntryRecord, originals: Pick<Hist
   return rows;
 }
 function messageRows(entry: EntryRecord, message: MessageContent): HistoryMessage[] {
-  const value = renderMessage(message); let offset = 0, continuation = false;
-  return [...chunks(value)].map((text) => {
+  const value = message.text; let offset = 0, continuation = false;
+  return (value.length === 0 && message.presentation !== undefined ? [""] : [...chunks(value)]).map((text) => {
     offset += text.length;
     const row: HistoryMessage = { entry_id: entry.id.toString(), role: message.role, text, continuation, final_chunk: offset === value.length,
       ...(message.tool === undefined ? {} : { tool: message.tool }),
@@ -85,7 +87,8 @@ function messageRows(entry: EntryRecord, message: MessageContent): HistoryMessag
     continuation = true; return row;
   });
 }
-export function transcript(entry: EntryRecord): HistoryMessage[] {
+export function transcript(entry: EntryRecord): HistoryMessage[] { return nativeTranscript(entry); }
+function nativeTranscript(entry: EntryRecord, tools?: Map<string, MessagePresentation>): HistoryMessage[] {
   const messages: HistoryMessage[] = [];
   let attachments: HistoryMessage["attachments"];
   if (entry.kind === "agent.input" && object(entry.data) && entry.data.attachments !== undefined) {
@@ -105,14 +108,14 @@ export function transcript(entry: EntryRecord): HistoryMessage[] {
     add("user", entry.data.text); return messages;
   }
   if (ImportedItemEntry.is(entry)) {
-    return messageRows(entry, codexMessage(entry.data.item, entry.data.item.data, entry.id.toString()));
+    return messageRows(entry, codexDisplayMessage(entry.data.item, entry.data.item.data, entry.id.toString()));
   }
   if (ImportedThreadEntry.is(entry) || CompactionEntry.is(entry)) return messages;
   for (const message of entry.model ?? []) {
     if (message.role === "system") continue;
     if (message.role === "toolResult") {
-      const status = message.isError ? "failed" : "finished";
-      messages.push(...messageRows(entry, { role: "tool", text: `${message.toolName} ${status}`, tool: { call_id: message.toolCallId, name: message.toolName, status } })); continue;
+      messages.push(...messageRows(entry, piToolResult(message, entry.conversationId.toString(), tools?.get(message.toolCallId))));
+      tools?.delete(message.toolCallId); continue;
     }
     const role: HistoryRole = message.role !== "assistant" ? message.role : (isUserNotice(entry) || entry.kind === "agent.notice") ? "notice"
       : message.stopReason === "toolUse" ? "commentary" : message.stopReason === "stop" ? "final" : "assistant";
@@ -121,9 +124,9 @@ export function transcript(entry: EntryRecord): HistoryMessage[] {
       if (part.type === "text" && !noticeMetadata(entry, index, message.content.length, part.text)) add(role, part.text);
       else if (part.type === "thinking") add("thinking", part.thinking);
       else if (part.type === "toolCall") {
-        const presentation = piToolPresentation(part.name);
-        messages.push(...messageRows(entry, { role: "tool", text: presentation === undefined ? part.name : "", tool: { call_id: part.id, name: part.name, status: "running" },
-          ...(presentation === undefined ? {} : { presentation }) }));
+        const presentation = piToolPresentation(part, entry.conversationId.toString());
+        tools?.set(part.id, presentation);
+        messages.push(...messageRows(entry, { role: "tool", text: "", tool: { call_id: part.id, name: part.name, status: "running" }, presentation }));
       }
       else if (part.type === "image") add("user", "[image]");
     }
@@ -146,6 +149,7 @@ export async function history(conversation: Conversation, value: string | null, 
   do {
     const page = await conversation.entries({ order: "descending", ...(maximum === undefined ? {} : { maxEntryId: maximum }) }, 20, next, BACKGROUND_CONTEXT);
     projected = [];
+    const tools = new Map<string, MessagePresentation>();
     for (const entry of [...page.items].reverse()) {
       let view: RevisionView | undefined;
       if (ImportedItemEntry.is(entry)) {
@@ -156,7 +160,7 @@ export async function history(conversation: Conversation, value: string | null, 
           revisions.set(entry.data.thread_id, view);
         }
       }
-      const rows = await projectTranscript(entry, originals, visibility, view);
+      const rows = await projectTranscript(entry, originals, visibility, view, tools);
       if (rows.length > 0 && view !== undefined && !view.ready && ImportedItemEntry.is(entry) && !pending.has(entry.data.thread_id)) {
         projected.push({ entry_id: entry.id.toString(), role: "notice", text: REVISION_PENDING, continuation: false, final_chunk: true }); pending.add(entry.data.thread_id);
       }
@@ -254,6 +258,8 @@ export async function activity(session: Harness, conversation: Conversation, emi
   observer?: { includeFinal: true; working(value: boolean): void }): Promise<() => Promise<void>> {
   const visibility = await observeTranscriptVisibility(session, conversation.id);
   const thinking = new Map<number, string>(), responding = new Map<number, string>();
+  // Retain only typed headings while their native calls are pending, never arguments.
+  const tools = new Map<string, MessagePresentation>();
   let previous: Readonly<LiveState> | null = null, initialized = false, assistantOpen = false;
   let compacting = false;
   const compaction = (active: boolean, failed = false) => {
@@ -284,7 +290,7 @@ export async function activity(session: Harness, conversation: Conversation, emi
         }
       });
     }
-    for (const item of visibleTranscript(entry, visibility.state())) if (item.role === "user" || item.role === "commentary" || item.tool !== undefined
+    for (const item of visibleTranscript(entry, visibility.state(), tools)) if (item.role === "user" || item.role === "commentary" || item.tool !== undefined
       || (observer?.includeFinal && item.role !== "thinking")) message?.(item);
     if (!notice && entry.model?.some((value) => value.role === "assistant")) assistantOpen = false;
   };
@@ -342,7 +348,7 @@ export async function activity(session: Harness, conversation: Conversation, emi
   let unsubscribe = () => {}, unsubscribeClose = () => {};
   const close = async () => {
     if (stopped) return;
-    stopped = true; unsubscribe(); unsubscribeClose(); visibility.close(); pending.length = 0;
+    stopped = true; unsubscribe(); unsubscribeClose(); visibility.close(); pending.length = 0; tools.clear();
     const owned = watch, loading = acquiring; watch = undefined;
     await owned?.stop();
     await loading?.catch(() => {});

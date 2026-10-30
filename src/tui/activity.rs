@@ -3,22 +3,17 @@
 use crate::{
     native::{ToolDetailContent, ToolDetailUnavailable, ToolDetails},
     protocol::{RuntimeCommand, TaskId, ToolStatus},
-    tui::{
-        Message, MessageKind, Role, State, inline::CellOutput, markdown, transcript::CachedText,
-    },
+    tui::{Message, MessageKind, State, markdown, transcript::CachedText},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::Line,
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Paragraph},
 };
-use std::{
-    collections::{HashMap, HashSet},
-    ops::Range,
-};
+use std::collections::HashMap;
 
 /// The UI owns the local identity; the coordinator owns the tool identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,92 +33,8 @@ impl ToolDetailRequest {
     }
 }
 
-pub(super) fn is_activity(message: &Message) -> bool {
-    matches!(message.role, Role::Thinking | Role::Tool)
-}
-
-pub(super) fn group(messages: &[Message], start: usize) -> Option<Range<usize>> {
-    if !messages.get(start).is_some_and(is_activity) {
-        return None;
-    }
-    let end = start
-        + messages[start..]
-            .iter()
-            .take_while(|message| is_activity(message))
-            .count();
-    Some(start..end)
-}
-
-pub(super) fn summary(messages: &[Message], range: Range<usize>) -> String {
-    let mut tools = 0;
-    let mut reasoning = 0;
-    let mut events = 0;
-    let mut failed = 0;
-    let mut running = 0;
-    for message in messages.get(range).unwrap_or_default() {
-        match &message.kind {
-            MessageKind::Tool { status, .. } => {
-                tools += 1;
-                failed += usize::from(*status == ToolStatus::Failed);
-                running += usize::from(*status == ToolStatus::Running);
-            }
-            _ if message.role == Role::Thinking => reasoning += 1,
-            _ if message.role == Role::Tool => events += 1,
-            _ => {}
-        }
-    }
-    let mut parts = Vec::new();
-    if reasoning > 0 {
-        parts.push(format!(
-            "{reasoning} reasoning {}",
-            if reasoning == 1 { "block" } else { "blocks" }
-        ));
-    }
-    if tools > 0 {
-        parts.push(format!(
-            "{tools} tool {}",
-            if tools == 1 { "call" } else { "calls" }
-        ));
-    }
-    if events > 0 {
-        parts.push(format!(
-            "{events} {}",
-            if events == 1 { "event" } else { "events" }
-        ));
-    }
-    if running > 0 {
-        parts.push(format!("{running} running"));
-    }
-    if failed > 0 {
-        parts.push(format!("{failed} failed"));
-    }
-    format!("Activity · {}", parts.join(" · "))
-}
-
-pub(super) fn compact(messages: &[Message], range: Range<usize>) -> CachedText {
-    CachedText::new(vec![
-        Line::styled(
-            summary(messages, range),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Line::default(),
-    ])
-}
-
-// A terminal cannot revise scrollback. Keep a live group mutable until its
-// boundary closes, then emit one summary while retaining every source message.
-pub(super) fn ready(messages: &[Message], range: &Range<usize>, working: bool) -> bool {
-    (range.end < messages.len() || !working)
-        && messages[range.clone()].iter().all(|message| {
-            matches!(
-                message.output,
-                CellOutput::Ready | CellOutput::Printed | CellOutput::Retained
-            )
-        })
-}
-
 pub(super) struct Projection {
-    cells: Vec<(usize, Option<CachedText>, usize)>,
+    cells: Vec<(usize, usize)>,
     pub(super) height: usize,
 }
 impl Projection {
@@ -131,29 +42,19 @@ impl Projection {
         let messages = &mut state.messages;
         let mut cells = Vec::new();
         let mut height = 0;
-        let mut index = start;
-        while index < messages.len() {
-            let mut text = group(messages, index).map(|range| compact(messages, range));
-            let rows = match &mut text {
-                Some(text) => text.layout(width),
-                None => {
-                    #[cfg(test)]
-                    {
-                        state.layout_work.parsed_messages +=
-                            usize::from(messages[index].rendered.is_none());
-                    }
-                    let cached = messages[index].cached();
-                    #[cfg(test)]
-                    {
-                        state.layout_work.measured_messages +=
-                            usize::from(cached.width() != Some(width));
-                    }
-                    cached.layout(width)
-                }
-            };
-            cells.push((index, text, rows));
+        for (index, message) in messages.iter_mut().enumerate().skip(start) {
+            #[cfg(test)]
+            {
+                state.layout_work.parsed_messages += usize::from(message.rendered.is_none());
+            }
+            let cached = message.cached();
+            #[cfg(test)]
+            {
+                state.layout_work.measured_messages += usize::from(cached.width() != Some(width));
+            }
+            let rows = cached.layout(width);
+            cells.push((index, rows));
             height += rows;
-            index = group(messages, index).map_or(index + 1, |range| range.end);
         }
         Self { cells, height }
     }
@@ -166,13 +67,10 @@ impl Projection {
     ) {
         let mut start = 0;
         let mut drawn = 0_u16;
-        for (index, text, rows) in &mut self.cells {
+        for (index, rows) in &mut self.cells {
             if start + *rows > top {
                 let remaining = Rect::new(area.x, area.y + drawn, area.width, area.height - drawn);
-                let cache = match text {
-                    Some(text) => text,
-                    None => messages[*index].cached(),
-                };
+                let cache = messages[*index].cached();
                 drawn += u16::try_from(cache.draw(frame, remaining, top.saturating_sub(start)))
                     .unwrap_or(remaining.height);
                 if drawn == area.height {
@@ -187,7 +85,6 @@ impl Projection {
 #[derive(Default)]
 pub(super) struct ActivityPanel {
     open: bool,
-    expanded: HashSet<String>,
     selected: Option<String>,
     reveal: bool,
     scroll: usize,
@@ -206,15 +103,13 @@ pub(super) enum PanelAction {
     Cancel,
     PassThrough,
 }
-enum Row {
-    Group { key: String, range: Range<usize> },
-    Message { key: String, index: usize },
+struct Row {
+    key: String,
+    index: usize,
 }
 impl Row {
     fn key(&self) -> &str {
-        match self {
-            Self::Group { key, .. } | Self::Message { key, .. } => key,
-        }
+        &self.key
     }
 }
 
@@ -260,33 +155,11 @@ impl ActivityPanel {
         }
     }
     fn rows(&self, messages: &[Message]) -> Vec<Row> {
-        let keys = keys(messages);
-        let mut rows = Vec::new();
-        let mut index = 0;
-        while index < messages.len() {
-            let Some(range) = group(messages, index) else {
-                index += 1;
-                continue;
-            };
-            let key = format!("group:{}", keys.get(index).map_or("", String::as_str));
-            let expanded = self.expanded.contains(&key);
-            rows.push(Row::Group {
-                key,
-                range: range.clone(),
-            });
-            if expanded {
-                for item in range.clone() {
-                    if let Some(key) = keys.get(item) {
-                        rows.push(Row::Message {
-                            key: key.clone(),
-                            index: item,
-                        });
-                    }
-                }
-            }
-            index = range.end;
-        }
-        rows
+        keys(messages)
+            .into_iter()
+            .enumerate()
+            .map(|(index, key)| Row { key, index })
+            .collect()
     }
     fn selection(&self, rows: &[Row]) -> usize {
         self.selected
@@ -322,29 +195,8 @@ impl ActivityPanel {
             KeyCode::PageDown => self.scroll = self.scroll.saturating_add(self.page.max(1)),
             KeyCode::Home => self.scroll = 0,
             KeyCode::End => self.scroll = usize::MAX,
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char(' ') => match rows.get(selected) {
-                Some(Row::Group { key, range }) => {
-                    self.selected = Some(key.clone());
-                    let collapsed = self.expanded.remove(key);
-                    if !collapsed {
-                        self.expanded.insert(key.clone());
-                    }
-                    self.reveal = true;
-                    if collapsed
-                        && self.detail.as_ref().is_some_and(|detail| {
-                            keys(messages)[range.clone()].contains(&detail.key)
-                        })
-                    {
-                        let pending = self
-                            .detail
-                            .take()
-                            .is_some_and(|detail| detail.request.is_some());
-                        if pending {
-                            return PanelAction::Cancel;
-                        }
-                    }
-                }
-                Some(Row::Message { key, index }) => {
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char(' ') => {
+                if let Some(Row { key, index }) = rows.get(selected) {
                     let Some(message) = messages.get(*index) else {
                         return PanelAction::Consumed;
                     };
@@ -397,8 +249,7 @@ impl ActivityPanel {
                     });
                     return PanelAction::Request(request);
                 }
-                None => {}
-            },
+            }
             _ => {}
         }
         PanelAction::Consumed
@@ -441,34 +292,16 @@ impl ActivityPanel {
         }
         detail.content = CachedText::new(lines);
     }
-    fn header(&self, messages: &[Message], range: Range<usize>, key: &str) -> CachedText {
-        let marker = if self.expanded.contains(key) {
-            "▾"
-        } else {
-            "▸"
-        };
-        CachedText::new(vec![
-            Line::styled(
-                format!("{marker} {}", summary(messages, range)),
-                Style::default().fg(Color::Cyan),
-            ),
-            Line::default(),
-        ])
-    }
     fn height(&mut self, row: &Row, messages: &mut [Message], width: u16) -> usize {
-        match row {
-            Row::Group { key, range } => self.header(messages, range.clone(), key).layout(width),
-            Row::Message { key, index } => {
-                let base = messages
-                    .get_mut(*index)
-                    .map_or(0, |message| message.cached().layout(width));
-                base + self
-                    .detail
-                    .as_mut()
-                    .filter(|detail| &detail.key == key)
-                    .map_or(0, |detail| detail.content.layout(width))
-            }
-        }
+        let Row { key, index } = row;
+        let base = messages
+            .get_mut(*index)
+            .map_or(0, |message| message.cached().layout(width));
+        base + self
+            .detail
+            .as_mut()
+            .filter(|detail| &detail.key == key)
+            .map_or(0, |detail| detail.content.layout(width))
     }
     fn paint(
         &mut self,
@@ -478,34 +311,27 @@ impl ActivityPanel {
         area: Rect,
         top: usize,
     ) {
-        match row {
-            Row::Group { key, range } => {
-                self.header(messages, range.clone(), key)
-                    .draw(frame, area, top);
-            }
-            Row::Message { key, index } => {
-                let Some(message) = messages.get_mut(*index) else {
-                    return;
-                };
-                let cache = message.cached();
-                let height = cache.layout(area.width);
-                let drawn = cache.draw(frame, area, top);
-                if drawn < usize::from(area.height)
-                    && let Some(detail) = self.detail.as_mut().filter(|detail| &detail.key == key)
-                {
-                    let consumed = u16::try_from(drawn).unwrap_or(area.height);
-                    detail.content.draw(
-                        frame,
-                        Rect::new(
-                            area.x,
-                            area.y + consumed,
-                            area.width,
-                            area.height - consumed,
-                        ),
-                        top.saturating_sub(height),
-                    );
-                }
-            }
+        let Row { key, index } = row;
+        let Some(message) = messages.get_mut(*index) else {
+            return;
+        };
+        let cache = message.cached();
+        let height = cache.layout(area.width);
+        let drawn = cache.draw(frame, area, top);
+        if drawn < usize::from(area.height)
+            && let Some(detail) = self.detail.as_mut().filter(|detail| &detail.key == key)
+        {
+            let consumed = u16::try_from(drawn).unwrap_or(area.height);
+            detail.content.draw(
+                frame,
+                Rect::new(
+                    area.x,
+                    area.y + consumed,
+                    area.width,
+                    area.height - consumed,
+                ),
+                top.saturating_sub(height),
+            );
         }
     }
     pub(super) fn draw(&mut self, frame: &mut Frame<'_>, area: Rect, messages: &mut [Message]) {
@@ -513,9 +339,13 @@ impl ActivityPanel {
             frame.render_widget(Paragraph::new("Enlarge the terminal"), area);
             return;
         }
-        let block = Block::new().borders(Borders::ALL).title("Activity");
+        let block = Block::new().padding(ratatui::widgets::Padding::top(2));
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new("  Transcript").style(Style::default().add_modifier(Modifier::BOLD)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
         let body = Rect::new(
             inner.x + 1,
             inner.y,
@@ -525,7 +355,7 @@ impl ActivityPanel {
         self.page = usize::from(body.height);
         let rows = self.rows(messages);
         if rows.is_empty() {
-            frame.render_widget(Paragraph::new("No activity in this conversation."), body);
+            frame.render_widget(Paragraph::new("No messages in this conversation."), body);
             return;
         }
         let selected = self.selection(&rows);
@@ -550,7 +380,7 @@ impl ActivityPanel {
                 let height = u16::try_from(visible).unwrap_or(body.height);
                 if index == selected {
                     frame.render_widget(
-                        Paragraph::new("›").style(Style::default().fg(Color::Cyan)),
+                        Paragraph::new("›").style(Style::default().add_modifier(Modifier::BOLD)),
                         Rect::new(inner.x, body.y + y, 1, height),
                     );
                 }
@@ -696,8 +526,11 @@ mod tests {
     }
     fn request(state: &mut State) -> ToolDetailRequest {
         open(state);
-        key(state, KeyCode::Enter); // group
-        key(state, KeyCode::Down); // tool
+        key(state, KeyCode::Home);
+        // Native selection starts at the last row; use the first retained call.
+        for _ in 0..state.messages.len() {
+            key(state, KeyCode::Up);
+        }
         let Some(TuiInput::ToolDetails(Some(request))) = key(state, KeyCode::Enter) else {
             panic!("tool expansion must request native details")
         };
@@ -752,14 +585,17 @@ mod tests {
             ],
         );
         let text = draw(&mut view, 120, 28);
-        assert_eq!(text.matches("Activity ·").count(), 2, "{text}");
+        assert!(
+            text.contains("Called exec") && text.contains("Tool read_file"),
+            "{text}"
+        );
         assert!(
             text.contains("Checking the remaining configuration.")
                 && text.contains("Final answer."),
             "{text}"
         );
         assert!(
-            text.contains("1 failed") && !text.contains("Complete retained reasoning"),
+            text.contains("└ Failed") && text.contains("Complete retained reasoning"),
             "{text}"
         );
         assert_eq!(view.messages[0].text, "Complete retained reasoning");
@@ -849,8 +685,6 @@ mod tests {
             },
         });
         open(&mut view);
-        key(&mut view, KeyCode::Enter);
-        key(&mut view, KeyCode::Down);
         assert!(key(&mut view, KeyCode::Enter).is_none());
         assert!(draw(&mut view, 120, 24).contains("pending a saved entry"));
         let mut view = state();
@@ -926,7 +760,10 @@ mod tests {
         )
         .unwrap();
         view.flush_output(&mut terminal, false).unwrap();
-        assert_eq!(view.output.cursor, 0, "open activity must stay mutable");
+        assert_eq!(
+            view.output.cursor, 2,
+            "Only canonically completed activity may reach scrollback"
+        );
         view.event(RuntimeEventKind::Message {
             message: message("answer", HistoryRole::Final, "Visible answer.", None),
         });
@@ -940,9 +777,9 @@ mod tests {
             .chain(terminal.backend().buffer().content.iter())
             .map(|cell| cell.symbol())
             .collect();
-        assert_eq!(text.matches("Activity ·").count(), 1, "{text}");
+        assert_eq!(text.matches("Called exec").count(), 1, "{text}");
         assert!(
-            text.contains("Visible answer.") && !text.contains("Last retained paragraph"),
+            text.contains("Visible answer.") && text.contains("Last retained paragraph"),
             "{text}"
         );
         assert!(

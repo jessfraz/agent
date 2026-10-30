@@ -252,7 +252,7 @@ test("real CLI, coordinator and worker retain main history across an offline lap
       await script(input, [held(path), { tool: "delegate_task", args: { task_id: old.id, input: workerInput } }, { text: answer }]);
       await script(workerInput, [{ text: workerAnswer }]);
       const terminal = start(host, [], undefined, {}, false, true);
-      await until(async () => terminal.output().includes("Message the agent"), "The native main TUI did not start");
+      await until(async () => terminal.output().includes("Ask Agent to do anything"), "The native main TUI did not start");
       terminal.child.stdin.write(input + "\r");
       await until(async () => stat(path + ".started").then(() => true, () => false), "The real coordinator action did not start");
       terminal.child.stdin.write(key);
@@ -307,7 +307,7 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     const stopPath = join(directory, "explicit-stop"), stopAnswer = "An explicitly stopped action must not finish.";
     await script("fixture-explicit-stop", [held(stopPath), { text: stopAnswer }]);
     const detachedStop = start(0, [], undefined, {}, false, true);
-    await until(async () => detachedStop.output().includes("Message the agent"));
+    await until(async () => detachedStop.output().includes("Ask Agent to do anything"));
     detachedStop.child.stdin.write("fixture-explicit-stop\r");
     await until(async () => stat(stopPath + ".started").then(() => true, () => false));
     detachedStop.child.stdin.write("/exit\r"); assert.equal(await detachedStop.exited, 0, detachedStop.errors());

@@ -1157,6 +1157,9 @@ pub enum ToolStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessagePresentation {
     Command {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        command: Option<String>,
         exit_code: Option<i32>,
         #[ts(type = "number | null")]
         duration_ms: Option<u64>,

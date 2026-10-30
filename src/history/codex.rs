@@ -2500,8 +2500,12 @@ try{
  const conversation=await store.conversation(receipt.conversation.conversation_id);assert.ok(conversation);
  const frames=await history(conversation,null,session);for(const frame of frames)assert.ok(validEvent({version:1,id:1,event:frame}));
  const messages=frames.flatMap(frame=>frame.messages);assert.equal(messages.length,20);
- assert.ok(messages.every(message=>message.text.trim().length>0));
- assert.ok(messages.some(message=>message.presentation?.type==='command'));
+ assert.ok(messages.every(message=>message.text.trim().length>0||message.presentation!==undefined));
+ const command=messages.find(message=>message.presentation?.type==='command');assert.ok(command);
+ assert.deepEqual(command.presentation,{type:'command',command:'printf fixture',exit_code:0,duration_ms:null});
+ assert.equal(command.text,'');
+ assert.equal(messages.find(message=>message.presentation?.type==='file_changes')?.text,'retained diff');
+ assert.equal(messages.find(message=>message.tool?.name==='inspect'&&message.text==='Verified')?.text,'Verified');
  assert.ok(messages.some(message=>message.presentation?.type==='hook_prompt'));
  assert.ok(messages.some(message=>message.presentation?.type==='compaction'));
  assert.ok(messages.some(message=>message.presentation?.type==='unknown'));

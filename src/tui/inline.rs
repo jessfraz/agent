@@ -16,13 +16,13 @@ use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::{Backend, CrosstermBackend},
     layout::{Position, Size},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Widget,
 };
 use std::{collections::HashSet, io::Stdout};
 
-const BANNER_ROWS: u16 = 2;
+const BANNER_ROWS: u16 = 4;
 const OUTPUT_CELLS_PER_FRAME: usize = 32;
 
 struct OutputRows {
@@ -244,6 +244,7 @@ impl State {
         let chrome = self
             .editor_height(size.width, 6)
             .saturating_add(2)
+            .saturating_add(u16::from(self.status() != "Ready"))
             .saturating_add(u16::try_from(self.attachment_count()).unwrap_or(u16::MAX));
         let minimum = u16::try_from(body)
             .unwrap_or(u16::MAX)
@@ -271,14 +272,25 @@ impl State {
         }
         if matches!(self.output.banner, Banner::Ready) {
             terminal.insert_before(BANNER_ROWS, |buffer| {
-                Line::from(vec![
-                    Span::styled(
-                        "agent ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
+                ratatui::widgets::Paragraph::new(vec![
+                    Line::default(),
+                    Line::from(vec![
+                        Span::raw("  >_ "),
+                        Span::styled("Agent", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            format!(
+                                " (v{}) · {}",
+                                env!("CARGO_PKG_VERSION"),
+                                crate::tui::markdown::plain(&self.info.title)
+                            ),
+                            Style::default().add_modifier(Modifier::DIM),
+                        ),
+                    ]),
+                    Line::styled(
+                        format!("     {}", crate::tui::markdown::plain(&self.info.cwd)),
+                        Style::default().add_modifier(Modifier::DIM),
                     ),
-                    Span::raw(crate::tui::markdown::plain(&self.info.title)),
+                    Line::default(),
                 ])
                 .render(buffer.area, buffer);
             })?;
@@ -295,25 +307,6 @@ impl State {
                 CellOutput::Printed | CellOutput::Retained
             ) {
                 self.output.cursor += 1;
-                continue;
-            }
-            if let Some(range) = activity::group(&self.messages, self.output.cursor) {
-                if emitted == OUTPUT_CELLS_PER_FRAME
-                    || (!ending && !activity::ready(&self.messages, &range, self.working))
-                {
-                    break;
-                }
-                let mut cached = activity::compact(&self.messages, range.clone());
-                let rows = cached.layout(width);
-                let height = u16::try_from(rows).unwrap_or(u16::MAX);
-                terminal.insert_before(height, |buffer| {
-                    cached.draw_buffer(buffer, 0);
-                })?;
-                for message in &mut self.messages[range.clone()] {
-                    message.output = CellOutput::Printed;
-                }
-                self.output.cursor = range.end;
-                emitted += 1;
                 continue;
             }
             let message = &mut self.messages[self.output.cursor];
@@ -358,10 +351,7 @@ impl State {
                 CellOutput::Printed | CellOutput::Retained
             )
         });
-        first.is_some_and(|index| match activity::group(&self.messages, index) {
-            Some(range) => activity::ready(&self.messages, &range, self.working),
-            None => self.messages[index].output == CellOutput::Ready,
-        })
+        first.is_some_and(|index| self.messages[index].output == CellOutput::Ready)
     }
 
     pub(super) fn live_base(&self) -> usize {
@@ -402,19 +392,11 @@ impl State {
                 if cells == OUTPUT_CELLS_PER_FRAME {
                     break;
                 }
-                if let Some(range) = activity::group(&self.messages, frontier) {
-                    if !activity::ready(&self.messages, &range, self.working) {
-                        break;
-                    }
-                    ready += activity::compact(&self.messages, range.clone()).layout(width);
-                    frontier = range.end;
-                } else {
-                    if self.messages[frontier].output != CellOutput::Ready {
-                        break;
-                    }
-                    ready += self.messages[frontier].cached().layout(width);
-                    frontier += 1;
+                if self.messages[frontier].output != CellOutput::Ready {
+                    break;
                 }
+                ready += self.messages[frontier].cached().layout(width);
+                frontier += 1;
                 cells += 1;
             }
         }
@@ -516,7 +498,8 @@ mod tests {
         terminal.draw(|frame| state.draw(frame)).unwrap();
         let visible = text(terminal.backend().buffer());
         assert!(
-            visible.lines().last().unwrap().contains("Enter steer"),
+            visible.lines().last().unwrap().contains("shortcuts")
+                || visible.lines().last().unwrap().contains("shift+enter"),
             "{visible}"
         );
         assert_eq!(terminal.get_frame().area().bottom(), size.height);
@@ -818,7 +801,7 @@ mod tests {
         );
         state.flush_output(&mut terminal, false).unwrap();
         let initial = output(&terminal);
-        assert!(!initial.contains("Inspecting current evidence."));
+        assert_eq!(initial.matches("Inspecting current evidence.").count(), 1);
         assert_eq!(
             retained(&state)
                 .matches("Inspecting current evidence.")
@@ -850,8 +833,11 @@ mod tests {
         state.event(RuntimeEventKind::Message { message: canonical });
         state.flush_output(&mut terminal, false).unwrap();
         let finished = output(&terminal);
-        assert_eq!(finished.matches("1 failed").count(), 1);
-        assert!(finished.find("Activity ·").unwrap() < finished.find("Later notice").unwrap());
+        assert_eq!(finished.matches("└ Failed").count(), 1);
+        assert!(
+            finished.find("Tool inspect repository").unwrap()
+                < finished.find("Later notice").unwrap()
+        );
         assert!(!finished.contains("Use the new context"));
         state.event(RuntimeEventKind::InputPlaced {
             input_id: "steer".into(),
@@ -1034,7 +1020,7 @@ mod tests {
         });
         state.event(RuntimeEventKind::Message { message: result });
         state.flush_output(&mut terminal, false).unwrap();
-        assert_eq!(output(&terminal).matches("1 failed").count(), 1);
+        assert_eq!(output(&terminal).matches("└ Failed").count(), 1);
         assert!(!output(&terminal).contains("• run check"));
     }
 
@@ -1101,10 +1087,10 @@ mod tests {
         state.event(RuntimeEventKind::Message { message: result });
         state.flush_output(&mut terminal, false).unwrap();
         let saved = output(&terminal);
-        assert_eq!(saved.matches("1 failed").count(), 1);
+        assert_eq!(saved.matches("└ Failed").count(), 1);
         assert_eq!(saved.matches("Completed answer").count(), 1);
         assert!(!saved.contains("✓ run check"));
-        assert!(saved.find("Activity ·").unwrap() < saved.find("Completed answer").unwrap());
+        assert!(saved.find("Tool run check").unwrap() < saved.find("Completed answer").unwrap());
     }
 
     #[test]
@@ -1613,17 +1599,17 @@ mod tests {
         state.working(true);
         terminal.draw(|frame| state.draw(frame)).unwrap();
         let rendered = output(&terminal);
-        let banner = rendered.find("agent Main agent").unwrap();
+        let banner = rendered.find("Agent (v0.1.0) · Main agent").unwrap();
         let saved = rendered.find("Saved question").unwrap();
         let answer = rendered.find("Saved answer").unwrap();
         let pending = rendered.find("Continue this task").unwrap();
-        let composer = rendered.find("Message the agent").unwrap();
+        let composer = rendered.find("Ask Agent to do anything").unwrap();
         assert!(banner < saved, "{rendered}");
         assert!(
             saved < answer && answer < pending && pending < composer,
             "{rendered}"
         );
-        assert_eq!(rendered.matches("agent Main agent").count(), 1);
+        assert_eq!(rendered.matches("Agent (v0.1.0) · Main agent").count(), 1);
         assert_eq!(rendered.matches("Working").count(), 1, "{rendered}");
     }
 
@@ -1653,7 +1639,15 @@ mod tests {
         state.flush_output(&mut terminal, false).unwrap();
         terminal.draw(|frame| state.draw(frame)).unwrap();
         let visible = text(terminal.backend().buffer());
-        assert!(visible.starts_with("agent Main agent\n"), "{visible}");
+        assert!(
+            visible
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap()
+                .trim_start()
+                .starts_with(">_ Agent"),
+            "{visible}"
+        );
         assert!(visible.contains("Saved answer"));
         assert!(!visible.contains("Previous command"));
         assert!(!visible.contains("Previous connection error"));
@@ -1662,10 +1656,12 @@ mod tests {
         assert_eq!(retained.matches("Previous connection error").count(), 1);
         let rendered = output(&terminal);
         assert!(
-            rendered.find("Previous command").unwrap() < rendered.find("agent Main agent").unwrap()
+            rendered.find("Previous command").unwrap()
+                < rendered.find("Agent (v0.1.0) · Main agent").unwrap()
         );
         assert!(
-            rendered.find("agent Main agent").unwrap() < rendered.find("Saved answer").unwrap()
+            rendered.find("Agent (v0.1.0) · Main agent").unwrap()
+                < rendered.find("Saved answer").unwrap()
         );
     }
 
@@ -1687,7 +1683,7 @@ mod tests {
         state.working(false);
         state.flush_output(&mut terminal, false).unwrap();
         let rendered = output(&terminal);
-        assert_eq!(rendered.matches("agent Review device settings").count(), 1);
+        assert_eq!(rendered.matches("Review device settings").count(), 1);
         assert!(!rendered.contains("Connecting to task"));
     }
 
@@ -1719,7 +1715,8 @@ mod tests {
         state.flush_output(&mut terminal, false).unwrap();
         let rendered = output(&terminal);
         assert!(
-            rendered.find("agent Main agent").unwrap() < rendered.find("Saved question").unwrap()
+            rendered.find("Agent (v0.1.0) · Main agent").unwrap()
+                < rendered.find("Saved question").unwrap()
         );
         assert!(
             rendered.find("Saved question").unwrap()
@@ -1745,7 +1742,7 @@ mod tests {
         assert!(loading.contains("Saved question"));
         state.event(RuntimeEventKind::Done);
         let restored = draw_inline(&mut state, &mut terminal);
-        assert!(restored.contains("agent Main agent"));
+        assert!(restored.contains("Agent (v0.1.0) · Main agent"));
         assert!(restored.contains("Saved question") && restored.contains("Saved answer"));
         let saved = output(&terminal);
         for _ in 0..3 {

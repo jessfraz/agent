@@ -6,27 +6,35 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::Style,
-    text::Line,
+    text::{Line, Span},
     widgets::{Paragraph, Widget, Wrap},
 };
+use std::ops::Range;
 
 struct MarkdownBody {
-    header: Line<'static>,
+    heading: Option<Line<'static>>,
     content: markdown::Document,
     style: Style,
 }
 
 impl MarkdownBody {
     fn paragraphs(&self, width: u16) -> Vec<Paragraph<'static>> {
-        std::iter::once(self.header.clone())
-            .chain(self.content.lines(width).into_iter().map(|line| {
+        let mut lines = self.content.lines(width);
+        while lines.last().is_some_and(|line| line.width() == 0) {
+            lines.pop();
+        }
+        lines.push(Line::default());
+        self.heading
+            .clone()
+            .into_iter()
+            .chain(lines)
+            .map(|line| {
                 if self.style == Style::default() {
                     line
                 } else {
                     line.style(self.style)
                 }
-            }))
-            .chain(std::iter::once(Line::default()))
+            })
             .map(|line| Paragraph::new(line).wrap(Wrap { trim: false }))
             .collect()
     }
@@ -38,6 +46,13 @@ pub(super) struct CachedText {
     trailing: Vec<Paragraph<'static>>,
     row_ends: Vec<usize>,
     width: Option<u16>,
+    gutter: Option<Span<'static>>,
+    marker_row: usize,
+    preview: Option<Preview>,
+}
+struct Preview {
+    body: Range<usize>,
+    notice: usize,
 }
 
 impl CachedText {
@@ -51,12 +66,31 @@ impl CachedText {
             trailing: Vec::new(),
             row_ends: Vec::new(),
             width: None,
+            gutter: None,
+            marker_row: 0,
+            preview: None,
         }
     }
 
-    pub(super) fn markdown(header: Line<'static>, source: &str, style: Style) -> Self {
+    pub(super) fn markdown(marker: Span<'static>, source: &str, style: Style) -> Self {
+        Self::styled_markdown(None, marker, source, style)
+    }
+    pub(super) fn markdown_heading(
+        heading: Line<'static>,
+        marker: Span<'static>,
+        source: &str,
+        style: Style,
+    ) -> Self {
+        Self::styled_markdown(Some(heading), marker, source, style)
+    }
+    fn styled_markdown(
+        heading: Option<Line<'static>>,
+        marker: Span<'static>,
+        source: &str,
+        style: Style,
+    ) -> Self {
         let body = MarkdownBody {
-            header,
+            heading,
             content: markdown::Document::parse(source),
             style,
         };
@@ -73,7 +107,46 @@ impl CachedText {
             trailing: Vec::new(),
             row_ends: Vec::new(),
             width: None,
+            gutter: Some(marker),
+            marker_row: 0,
+            preview: None,
         }
+    }
+
+    pub(super) fn prompt(source: &str) -> Self {
+        let mut result = Self::new(
+            std::iter::once(Line::default())
+                .chain(
+                    markdown::plain(source)
+                        .split('\n')
+                        .map(|line| Line::from(line.to_owned())),
+                )
+                .chain(std::iter::once(Line::default()))
+                .collect(),
+        );
+        result.gutter = Some(Span::styled(
+            "› ",
+            Style::default()
+                .add_modifier(ratatui::style::Modifier::DIM | ratatui::style::Modifier::BOLD),
+        ));
+        result.marker_row = 1;
+        result
+    }
+
+    pub(super) fn indented(lines: Vec<Line<'static>>, marker: Span<'static>) -> Self {
+        let mut result = Self::new(lines);
+        result.gutter = Some(marker);
+        result
+    }
+    pub(super) fn tool_preview(
+        lines: Vec<Line<'static>>,
+        marker: Span<'static>,
+        body: Range<usize>,
+        notice: usize,
+    ) -> Self {
+        let mut result = Self::indented(lines, marker);
+        result.preview = Some(Preview { body, notice });
+        result
     }
 
     pub(super) fn append_line(&mut self, line: Line<'static>) {
@@ -93,14 +166,27 @@ impl CachedText {
 
     pub(super) fn layout(&mut self, width: u16) -> usize {
         if self.width != Some(width) {
+            let content_width = width.saturating_sub(if self.gutter.is_some() { 2 } else { 0 });
             if let Some(body) = &self.markdown {
-                self.paragraphs = body.paragraphs(width);
+                self.paragraphs = body.paragraphs(content_width);
                 self.paragraphs.extend(self.trailing.iter().cloned());
             }
             self.row_ends.clear();
             let mut total = 0;
-            for paragraph in &self.paragraphs {
-                total += paragraph.line_count(width);
+            let mut remaining = 5;
+            let mut truncated = false;
+            for (index, paragraph) in self.paragraphs.iter().enumerate() {
+                let mut rows = paragraph.line_count(content_width);
+                if let Some(preview) = &self.preview {
+                    if preview.body.contains(&index) {
+                        truncated |= rows > remaining;
+                        rows = rows.min(remaining);
+                        remaining = remaining.saturating_sub(rows);
+                    } else if index == preview.notice && !truncated {
+                        rows = 0;
+                    }
+                }
+                total += rows;
                 self.row_ends.push(total);
             }
             self.width = Some(width);
@@ -126,6 +212,21 @@ impl CachedText {
         top: usize,
         mut draw: impl FnMut(&Paragraph<'static>, Rect),
     ) -> usize {
+        let gutter = u16::from(self.gutter.is_some()) * 2;
+        if let Some(marker) = &self.gutter
+            && self.marker_row >= top
+            && self.marker_row < top + usize::from(area.height)
+        {
+            draw(
+                &Paragraph::new(Line::from(marker.clone())),
+                Rect::new(
+                    area.x,
+                    area.y + u16::try_from(self.marker_row - top).unwrap_or(0),
+                    gutter.min(area.width),
+                    1,
+                ),
+            );
+        }
         let first = self.row_ends.partition_point(|end| *end <= top);
         let mut start = first.checked_sub(1).map_or(0, |index| self.row_ends[index]);
         let mut drawn = 0;
@@ -138,7 +239,8 @@ impl CachedText {
                 .saturating_sub(offset)
                 .min(usize::from(area.height) - drawn);
             if rows == 0 {
-                break;
+                start = *end;
+                continue;
             }
             // Moving the owned widget changes its viewport without cloning its text.
             *paragraph =
@@ -147,9 +249,9 @@ impl CachedText {
             draw(
                 &*paragraph,
                 Rect::new(
-                    area.x,
+                    area.x.saturating_add(gutter).min(area.right()),
                     area.y + u16::try_from(drawn).unwrap_or(0),
-                    area.width,
+                    area.width.saturating_sub(gutter),
                     height,
                 ),
             );
@@ -172,6 +274,43 @@ mod tests {
         text::Line,
         widgets::{Paragraph, Wrap},
     };
+
+    #[test]
+    fn prompt_gutters_keep_literal_unicode_wrapping_and_paged_offsets_aligned_with_native_widgets()
+    {
+        use ratatui::{
+            style::{Modifier, Style},
+            text::Span,
+            widgets::{Block, Padding, Widget},
+        };
+        let source = "Literal **markup** with 界界, 👩‍💻 and e\u{301} across wrapped lines.\nA second prompt line.";
+        let mut cached = CachedText::prompt(source);
+        for width in [12, 23, 48, 12] {
+            let rows = cached.layout(width);
+            for top in [0, 1, rows / 2, rows.saturating_sub(4)] {
+                let mut actual =
+                    ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, width, 4));
+                cached.draw_buffer(&mut actual, top);
+                let mut expected = ratatui::buffer::Buffer::empty(actual.area);
+                Paragraph::new(format!("\n{source}\n"))
+                    .block(Block::default().padding(Padding::left(2)))
+                    .wrap(Wrap { trim: false })
+                    .scroll((u16::try_from(top).unwrap(), 0))
+                    .render(expected.area, &mut expected);
+                if top <= 1 {
+                    Paragraph::new(Line::from(Span::styled(
+                        "› ",
+                        Style::default().add_modifier(Modifier::DIM | Modifier::BOLD),
+                    )))
+                    .render(
+                        ratatui::layout::Rect::new(0, u16::try_from(1 - top).unwrap(), 2, 1),
+                        &mut expected,
+                    );
+                }
+                assert_eq!(actual, expected, "width {width}, top {top}");
+            }
+        }
+    }
 
     #[test]
     fn viewport_matches_native_wrapping_with_styles_whitespace_and_wide_unicode() {

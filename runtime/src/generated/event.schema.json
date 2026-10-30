@@ -2776,6 +2776,12 @@
         {
           "type": "object",
           "properties": {
+            "command": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "duration_ms": {
               "type": [
                 "integer",

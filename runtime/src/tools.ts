@@ -6,6 +6,7 @@ import { Type } from "typebox";
 import { Check } from "typebox/value";
 import { defineExtension, defineTool, ROOT_CONVERSATION_ID, type Extension, type Harness, type ToolExecutionResult } from "@earendil-works/pi-durable";
 import { DEFAULT_MODEL } from "./models.js";
+import { commandPresentation, outputPreview, type MessageContent } from "./message-presentation.js";
 import { recordDelegation } from "./delegation.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { HostCommand } from "./generated/HostCommand.js";
@@ -203,8 +204,15 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         if (args.host !== undefined && chosen === undefined) throw new TaskError("Choose a connected worker host.");
         const command: HostCommand = { type: "exec", program: args.program, args: args.args,
           cwd: args.cwd ?? chosen?.cwd ?? execution.default_host?.cwd ?? execution.cwd, timeout_seconds: args.timeout_seconds ?? 900 };
-        return hostOutput(await execution.call(chosen?.host_id === null || chosen?.host_id === undefined ? command
-          : { type: "on_node", host_id: chosen.host_id, command }));
+        const result = await execution.call(chosen?.host_id === null || chosen?.host_id === undefined ? command
+          : { type: "on_node", host_id: chosen.host_id, command });
+        const body = result.type === "process" ? [result.stdout, result.stderr, ...(result.truncated ? ["[Output truncated by host]"] : [])]
+          .filter((part) => part.length > 0).join("\n") : result.type === "failed" ? result.message : "";
+        // Pi bounds model output before persisting it. UI details keep a safe,
+        // self-contained preview even when that truncates the legacy JSON.
+        const details: MessageContent = { role: "tool", text: outputPreview(body),
+          presentation: { ...commandPresentation(args.program, args.args), exit_code: result.type === "process" ? result.exit_code : null } };
+        return { ...hostOutput(result), details };
       } }),
     defineTool({ name: "read_context", replay: "safe", description: "Read a bounded file from a named shared context repository on the coordinator.",
       parameters: Type.Object({ repository_id: Type.String(), path: Type.String(),
