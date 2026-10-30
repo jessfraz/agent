@@ -383,7 +383,7 @@ public struct MainChatView: View {
               Text("Waiting for this device's Apple registration.").font(.footnote)
             }
           } header: {
-            Text("Notifications").foregroundStyle(.primary)
+            Text("Notifications").foregroundStyle(Color.primary)
           }
         }
         Button("Connect") {

@@ -2,11 +2,20 @@ import XCTest
 
 @MainActor
 final class AgentUITests: XCTestCase {
-  private func launch() -> XCUIApplication {
+  private enum Appearance: String, CaseIterable {
+    case light = "Light"
+    case dark = "Dark"
+  }
+
+  private func launch(appearance: Appearance? = nil, smallText: Bool = false) -> XCUIApplication {
     continueAfterFailure = false
     executionTimeAllowance = 60
     let app = XCUIApplication()
+    if smallText {
+      app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryXS"]
+    }
     app.launch()
+    if let appearance { XCUIDevice.shared.appearance = appearance == .dark ? .dark : .light }
     if !app.navigationBars["Connection"].waitForExistence(timeout: 3) {
       app.buttons["Connection"].tap()
     }
@@ -77,21 +86,40 @@ final class AgentUITests: XCTestCase {
   }
 
   func testConnectionAndEmptyMainAccessibility() throws {
-    let app = launch()
-    try audit(app)
-    capture("connection-accessibility-audit", app: app)
-    app.buttons["Done"].tap()
-    try audit(app)
-    capture("main-accessibility-audit", app: app)
+    let previous = XCUIDevice.shared.appearance
+    defer { XCUIDevice.shared.appearance = previous }
+    for appearance in Appearance.allCases {
+      let app = launch(appearance: appearance)
+      defer { app.terminate() }
+      try audit(app)
+      capture("connection-accessibility-\(appearance.rawValue)", app: app)
+      app.buttons["Done"].tap()
+      try audit(app)
+      capture("main-accessibility-\(appearance.rawValue)", app: app)
+    }
   }
 
-  private func audit(_ app: XCUIApplication) throws {
+  func testConnectionHeaderContrastAtSmallText() throws {
+    let previous = XCUIDevice.shared.appearance
+    defer { XCUIDevice.shared.appearance = previous }
+    for appearance in Appearance.allCases {
+      let app = launch(appearance: appearance, smallText: true)
+      defer { app.terminate() }
+      try audit(app, types: .contrast)
+      capture("connection-small-text-\(appearance.rawValue)", app: app)
+    }
+  }
+
+  private func audit(
+    _ app: XCUIApplication,
+    types: XCUIAccessibilityAuditType = [
+      .contrast, .hitRegion, .sufficientElementDescription, .textClipped,
+    ]
+  ) throws {
     let previous = continueAfterFailure
     continueAfterFailure = true
     defer { continueAfterFailure = previous }
-    try app.performAccessibilityAudit(for: [
-      .contrast, .hitRegion, .sufficientElementDescription, .textClipped,
-    ]) { issue in
+    try app.performAccessibilityAudit(for: types) { issue in
       // WCAG 1.4.3 excludes inactive controls from text-contrast requirements.
       // https://www.w3.org/WAI/WCAG21/Understanding/contrast-minimum#inactive-user-interface-components
       if issue.auditType == .contrast, issue.element?.isEnabled == false { return true }
