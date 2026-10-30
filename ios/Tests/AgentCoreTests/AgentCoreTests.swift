@@ -524,6 +524,8 @@ func withCoordinator(
     Task {
       do { try await fixture.accept(socket) } catch ConnectionError.closed {
         // A completed transfer releases its owned socket.
+      } catch let error as NWError where error == .posix(.ECANCELED) {
+        // Fixture teardown cancels receives on its remaining connections.
       } catch { Issue.record(error) }
     }
   }
