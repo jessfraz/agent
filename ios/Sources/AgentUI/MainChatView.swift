@@ -24,6 +24,7 @@ public struct MainChatView: View {
   #endif
   @AppStorage("coordinatorAddress") private var host = ""
   @AppStorage("coordinatorPort") private var port = "43187"
+  @AppStorage(AppAppearance.preferenceKey) private var appearance = AppAppearance.system
   @Environment(\.scenePhase) private var scenePhase
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.colorScheme) private var colorScheme
@@ -90,7 +91,9 @@ public struct MainChatView: View {
             .tint(.primary)
         }
       }
-      .sheet(isPresented: $settings) { connectionSettings }
+      .sheet(isPresented: $settings) {
+        connectionSettings.preferredColorScheme(appearance.colorScheme)
+      }
       .fileImporter(
         isPresented: $importingFiles, allowedContentTypes: [.item], allowsMultipleSelection: true
       ) { result in
@@ -134,6 +137,8 @@ public struct MainChatView: View {
       .onChange(of: model.connection) { _, state in
         if state == .connected, let registration = notifications?.registration {
           Task { await model.connectNotifications(registration) }
+        } else {
+          notifications?.registration.disconnect()
         }
       }
       .onChange(of: notifications?.openedTarget) { _, target in
@@ -143,6 +148,7 @@ public struct MainChatView: View {
         }
       }
     }
+    .preferredColorScheme(appearance.colorScheme)
   }
   private var transcript: some View {
     ScrollViewReader { scroll in
@@ -187,6 +193,9 @@ public struct MainChatView: View {
         }
         .padding().frame(maxWidth: 720).frame(maxWidth: .infinity)
       }
+      .accessibilityIdentifier("transcript")
+      .scrollDismissesKeyboard(.interactively)
+      .scrollBounceBehavior(.always, axes: .vertical)
       .defaultScrollAnchor(initialScrollTarget == nil ? .bottom : .top, for: .initialOffset)
       .task {
         if let initialScrollTarget {
@@ -339,6 +348,12 @@ public struct MainChatView: View {
         Section {
           LabeledContent("Status", value: model.connection.label)
           LabeledContent("Model", value: model.model)
+          Picker("Appearance", selection: $appearance) {
+            ForEach(AppAppearance.allCases) { appearance in
+              Text(appearance.label).tag(appearance)
+            }
+          }
+          .pickerStyle(.menu).tint(.primary).accessibilityIdentifier("appearancePicker")
         }
         Section {
           VStack(alignment: .leading, spacing: 8) {
@@ -360,32 +375,6 @@ public struct MainChatView: View {
           }
         }
         if let error = model.error { Text(error).foregroundStyle(.red) }
-        if let registration = notifications?.registration {
-          Section {
-            Toggle(
-              "Main-chat updates",
-              isOn: Binding(
-                get: { registration.enabled },
-                set: { value in Task { await registration.setEnabled(value) } }
-              )
-            )
-            .disabled(registration.busy || model.connection != .connected)
-            if let error = registration.error {
-              Text(error).font(.footnote).foregroundStyle(.red)
-              if !registration.enabled, registration.registered {
-                Button("Retry removing this device") {
-                  Task { await registration.setEnabled(false) }
-                }.disabled(registration.busy)
-              }
-            } else if !registration.configured {
-              Text("APNs setup is required on the coordinator.").font(.footnote)
-            } else if registration.enabled, !registration.registered {
-              Text("Waiting for this device's Apple registration.").font(.footnote)
-            }
-          } header: {
-            Text("Notifications").foregroundStyle(Color.primary)
-          }
-        }
         Button("Connect") {
           Task {
             await model.connect(host: host, port: port)
@@ -396,6 +385,34 @@ public struct MainChatView: View {
           Task { await model.stop() }
           settings = false
         }.disabled(model.connection == .disconnected)
+        if let registration = notifications?.registration {
+          Section {
+            Toggle(
+              "Main-chat updates",
+              isOn: Binding(
+                get: { registration.enabled },
+                set: { value in Task { await registration.setEnabled(value) } }
+              )
+            )
+            .disabled(registration.busy)
+            if let error = registration.error {
+              Text(error).font(.footnote).foregroundStyle(.primary)
+              if !registration.enabled, registration.registered {
+                Button("Retry removing this device") {
+                  Task { await registration.setEnabled(false) }
+                }.disabled(registration.busy)
+              }
+            } else if model.connection != .connected {
+              Text("Connect to the coordinator to receive updates.").font(.footnote)
+            } else if !registration.configured {
+              Text("APNs setup is required on the coordinator.").font(.footnote)
+            } else if registration.enabled, !registration.registered {
+              Text("Waiting for this device's Apple registration.").font(.footnote)
+            }
+          } header: {
+            Text("Notifications").foregroundStyle(Color.primary)
+          }
+        }
       }
       .navigationTitle("Connection")
       .toolbar {

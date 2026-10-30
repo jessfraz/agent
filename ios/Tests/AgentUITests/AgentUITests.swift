@@ -1,3 +1,4 @@
+import UIKit
 import XCTest
 
 @MainActor
@@ -14,12 +15,32 @@ final class AgentUITests: XCTestCase {
     if smallText {
       app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryXS"]
     }
-    app.launch()
+    // XCTest removes this monitor at test completion. Handle only Agent's
+    // native permission prompt, leaving unexpected system alerts as failures.
+    addUIInterruptionMonitor(withDescription: "Agent notification permission") { alert in
+      guard alert.label == "“Agent” Would Like to Send You Notifications",
+        alert.buttons["Allow"].exists
+      else { return false }
+      let receipt = XCTAttachment(screenshot: alert.screenshot())
+      receipt.name = "notification-permission-allowed"
+      receipt.lifetime = .keepAlways
+      self.add(receipt)
+      alert.buttons["Allow"].tap()
+      XCTAssertTrue(alert.waitForNonExistence(timeout: 3))
+      return true
+    }
     if let appearance { XCUIDevice.shared.appearance = appearance == .dark ? .dark : .light }
+    app.launch()
     if !app.navigationBars["Connection"].waitForExistence(timeout: 3) {
       app.buttons["Connection"].tap()
     }
     XCTAssertTrue(app.navigationBars["Connection"].waitForExistence(timeout: 5))
+    // Interruption monitors run on interaction, not on existence queries.
+    app.navigationBars["Connection"].tap()
+    if let appearance {
+      chooseAppearance(appearance.rawValue, app: app)
+      assertBackground(appearance, app: app)
+    }
     return app
   }
 
@@ -83,6 +104,103 @@ final class AgentUITests: XCTestCase {
     XCTAssertFalse(app.buttons["Queue follow-up"].isEnabled)
     XCTAssertEqual(composer.value as? String, "Synthetic draft kept safely offline.")
     capture("offline-follow-up", app: app)
+  }
+
+  func testTranscriptDragDismissesKeyboardWithoutLosingDraft() {
+    let app = launch()
+    app.buttons["Done"].tap()
+    let composer = app.descendants(matching: .any).matching(
+      identifier: "Message the coordinator"
+    ).firstMatch
+    XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    composer.tap()
+    let draft = "Synthetic draft survives a transcript drag."
+    composer.typeText(draft)
+    XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+    XCTAssertTrue(app.staticTexts["No messages yet"].exists)
+    let transcript = app.scrollViews.containing(.staticText, identifier: "No messages yet")
+      .firstMatch
+    XCTAssertTrue(transcript.waitForExistence(timeout: 3))
+    transcript.swipeDown()
+    XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 3))
+    XCTAssertEqual(composer.value as? String, draft)
+    XCTAssertTrue(app.staticTexts["No messages yet"].exists)
+    XCTAssertFalse(app.buttons["Send message"].isEnabled)
+    capture("transcript-drag-preserves-draft", app: app)
+  }
+
+  func testAppearanceExplicitOverridesPersistAcrossRelaunch() {
+    let previous = XCUIDevice.shared.appearance
+    defer { XCUIDevice.shared.appearance = previous }
+    let app = launch(appearance: .dark)
+    chooseAppearance("Light", app: app)
+    app.buttons["Done"].tap()
+    assertBackground(.light, app: app)
+    capture("explicit-light-appearance", app: app)
+
+    let composer = app.descendants(matching: .any).matching(
+      identifier: "Message the coordinator"
+    ).firstMatch
+    let draft = "Synthetic draft survives appearance changes."
+    composer.tap()
+    composer.typeText(draft)
+    XCUIDevice.shared.appearance = .light
+    app.buttons["Connection"].tap()
+    chooseAppearance("Dark", app: app)
+    app.buttons["Done"].tap()
+    assertBackground(.dark, app: app)
+    XCTAssertEqual(composer.value as? String, draft)
+    capture("explicit-dark-appearance", app: app)
+
+    app.terminate()
+    app.launch()
+    XCTAssertTrue(app.navigationBars["Connection"].waitForExistence(timeout: 5))
+    app.buttons["Done"].tap()
+    assertBackground(.dark, app: app)
+    app.buttons["Connection"].tap()
+    chooseAppearance("System", app: app)
+    app.buttons["Done"].tap()
+    assertBackground(.light, app: app)
+  }
+
+  private func chooseAppearance(_ label: String, app: XCUIApplication) {
+    let picker = app.descendants(matching: .any).matching(identifier: "appearancePicker").firstMatch
+    XCTAssertTrue(picker.waitForExistence(timeout: 3))
+    picker.tap()
+    let choice = app.buttons[label]
+    XCTAssertTrue(choice.waitForExistence(timeout: 3))
+    choice.tap()
+  }
+
+  private func assertBackground(_ appearance: Appearance, app: XCUIApplication) {
+    let predicate = NSPredicate { [self] _, _ in
+      guard let brightness = backgroundBrightness(app) else { return false }
+      return appearance == .light ? brightness > 0.8 : brightness < 0.2
+    }
+    let rendered = XCTNSPredicateExpectation(predicate: predicate, object: nil)
+    XCTAssertEqual(XCTWaiter.wait(for: [rendered], timeout: 3), .completed)
+  }
+
+  private func backgroundBrightness(_ app: XCUIApplication) -> Double? {
+    let screenshot = app.screenshot().image
+    guard let image = screenshot.cgImage,
+      let sample = image.cropping(
+        to: CGRect(
+          x: Double(image.width) * 0.12, y: Double(image.height) * 0.4, width: 1, height: 1))
+    else { return nil }
+    var pixel: [UInt8] = [0, 0, 0, 0]
+    let measured = pixel.withUnsafeMutableBytes { bytes -> Double? in
+      guard
+        let context = CGContext(
+          data: bytes.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+          space: CGColorSpaceCreateDeviceRGB(),
+          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+      else { return nil }
+      context.draw(sample, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+      let values = bytes.bindMemory(to: UInt8.self)
+      return Double(Int(values[0]) + Int(values[1]) + Int(values[2])) / 765
+    }
+    return measured
   }
 
   func testConnectionAndEmptyMainAccessibility() throws {

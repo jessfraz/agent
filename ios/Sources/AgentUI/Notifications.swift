@@ -25,11 +25,21 @@ public final class AppNotifications: NSObject {
     defaults.set(identifier.uuidString, forKey: "notificationInstallationID")
     registration = NotificationRegistration(
       installationID: identifier,
-      enabled: defaults.bool(forKey: "notificationsEnabled"),
+      enabled: defaults.object(forKey: "notificationsEnabled") == nil
+        || defaults.bool(forKey: "notificationsEnabled"),
       permission: {
-        try await UNUserNotificationCenter.current().requestAuthorization(options: [
-          .alert, .sound,
-        ])
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        switch settings.authorizationStatus {
+        case .notDetermined:
+          return try await center.requestAuthorization(options: [.alert, .sound])
+        case .authorized, .provisional: return true
+        #if os(iOS)
+          case .ephemeral: return true
+        #endif
+        case .denied: return false
+        @unknown default: return false
+        }
       },
       register: {
         #if os(iOS)
@@ -55,6 +65,7 @@ public final class AppNotifications: NSObject {
       didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
       UNUserNotificationCenter.current().delegate = self
+      Task { await registration.start() }
       return true
     }
 

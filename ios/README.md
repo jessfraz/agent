@@ -38,9 +38,11 @@ Apple manages signing. The linked setup covers repository access, build numbers
 and the first verified upload. `TestFlightExport.plist` supports a manual
 internal-only upload when needed.
 
-Optional main-chat alerts require the one-time
-[APNs setup](../docs/notifications.md).
-Enable **Main-chat updates** in Connection after configuring the coordinator.
+Main-chat alerts require the one-time [APNs setup](../docs/notifications.md).
+They start enabled: allow the notification prompt on first opening, then connect
+to register automatically. Disable **Main-chat updates** in Connection anytime.
+**Connection → Appearance** follows the system by default. Choose **Light** or
+**Dark** to keep a saved override.
 
 For a direct development install, sign in to the developer account in Xcode
 Settings, connect the phone, and select it as the `Agent` scheme's run

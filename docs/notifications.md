@@ -35,9 +35,9 @@ suppresses foreground banners; the app has no persistent background socket.
    APNs settings are excluded from managed settings and machine announcements.
    Keep both configuration and key outside repositories and the Nix store.
    Restart the coordinator after configuring it.
-4. Install the signed app on the iPhone. Connect to the coordinator over
-   Tailscale, open **Connection → Notifications**, enable **Main-chat updates**,
-   and allow Apple's notification prompt.
+4. Install and open the signed app on the iPhone. Main-chat updates are enabled
+   by default; allow Apple's notification prompt. Connect to the coordinator
+   over Tailscale to register the device automatically.
 
 Debug signing uses Apple's development entitlement and requires
 `environment = "sandbox"`. TestFlight and Release signing use production.
@@ -52,6 +52,11 @@ saved on the phone. The coordinator retains registrations and delivery state in
 private Pi storage. Disabling alerts removes that installation; token changes
 supersede its queued deliveries. Enrollment starts at the current conversation
 boundary, without alerting for old history.
+
+Turn alerts off in **Connection → Notifications**. That choice and a denied
+permission remain off across launches, without repeated permission prompts.
+To enable alerts after denying permission, allow Agent notifications in iPhone
+Settings and turn **Main-chat updates** back on in Agent.
 
 Each installation/message pair has one durable delivery identity. APNs
 acceptance is not proof that the phone displayed an alert. A lost provider
