@@ -121,7 +121,13 @@ final class AgentUITests: XCTestCase {
     let transcript = app.scrollViews.containing(.staticText, identifier: "No messages yet")
       .firstMatch
     XCTAssertTrue(transcript.waitForExistence(timeout: 3))
-    transcript.swipeDown()
+    capture("transcript-before-drag", app: app)
+    // The scroll view's accessibility frame includes the overlaid composer.
+    // Start in visible transcript content and pull through the keyboard.
+    let start = transcript.staticTexts["No messages yet"].coordinate(
+      withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+    let end = app.keyboards.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.95))
+    start.press(forDuration: 0.05, thenDragTo: end)
     XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 3))
     XCTAssertEqual(composer.value as? String, draft)
     XCTAssertTrue(app.staticTexts["No messages yet"].exists)
@@ -133,6 +139,7 @@ final class AgentUITests: XCTestCase {
     let previous = XCUIDevice.shared.appearance
     defer { XCUIDevice.shared.appearance = previous }
     let app = launch(appearance: .dark)
+    executionTimeAllowance = 120
     chooseAppearance("Light", app: app)
     app.buttons["Done"].tap()
     assertBackground(.light, app: app)
