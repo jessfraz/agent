@@ -1073,7 +1073,10 @@ test("password capture redacts real snapshots, scripts, logs, errors and URLs be
     await page.goto(new URL("/retained", page.url()).href);
     throw new Error("x".repeat(8160) + JSON.stringify(secret));
   });
-  assert.ok(failed.type === "uncertain", JSON.stringify(failed)); privateOutput(failed); assert.ok(failed.message.includes("[redacted]"));
+  assert.ok(failed.type === "uncertain", JSON.stringify(failed)); privateOutput(failed);
+  const withheld = "Failure stage: browser_operation. Browser output was withheld because password capture could not be verified. "
+    + "Earlier effects were not replayed; inspect Chrome before continuing.";
+  assert.ok(failed.message.includes("[redacted]") || failed.message === withheld, JSON.stringify(failed));
   const released = (await host.execute(request({ type: "release" }))).response;
   assert.ok(released.type === "closed", JSON.stringify(released)); privateOutput(released);
 });
