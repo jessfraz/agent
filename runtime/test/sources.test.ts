@@ -10,7 +10,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
-import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type TranscriptContext } from "@earendil-works/pi-ai";
 import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { createRegistry, Harness, UserEntry } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
@@ -51,6 +51,128 @@ async function open(directory: string) {
   }
   return { session, tasks, executions, sources, tools, sourceTools, notices, faux, triage };
 }
+
+function stream(provider: string, account: string, count: number): SourceBatch {
+  return { ...batch([], "one", account), source: { provider, account }, events: Array.from({ length: count }, (_, index) => {
+    const value = event(String(index), account); return { ...value, source: { ...value.source, provider } };
+  }) };
+}
+function selectedKeys(input: TranscriptContext): string[] {
+  const last = input.messages.findLast((message) => message.role === "user"); assert.ok(last?.role === "user");
+  const text = typeof last.content === "string" ? last.content : last.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n");
+  const value: unknown = JSON.parse(text.slice(text.indexOf("\n") + 1));
+  assert.ok(value !== null && typeof value === "object" && "events" in value && Array.isArray(value.events));
+  return value.events.map((record: unknown) => {
+    assert.ok(record !== null && typeof record === "object" && "key" in record && typeof record.key === "string"); return record.key;
+  });
+}
+async function accountForBatch(app: Awaited<ReturnType<typeof open>>): Promise<string[]> {
+  let selected: string[] = [];
+  app.faux.setResponses([
+    (input) => { selected = selectedKeys(input); return fauxAssistantMessage(fauxToolCall("dismiss_source_events", {
+      keys: selected, reason: "Fixture source work verified and accounted for",
+    }), { stopReason: "toolUse" }); },
+    fauxAssistantMessage(""),
+  ]);
+  await app.triage(); return selected;
+}
+async function claimedRecords(app: Awaited<ReturnType<typeof open>>, keys: string[]) {
+  const records = new Map((await app.sources.events({ keys, limit: 100 })).map((record) => [record.key, record]));
+  return keys.map((key) => { const record = records.get(key); assert.ok(record); return record; });
+}
+
+test("source batches fairly interleave account streams beside a large noisy backlog and preserve each FIFO", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-fairness-")); const app = await open(directory);
+  try {
+    await app.sources.admit(stream("chat", "alpha", 2048), null);
+    for (const [provider, account] of [["mail", "alpha"], ["mail", "beta"], ["calendar", "alpha"]]) {
+      assert.ok(provider && account); await app.sources.admit(stream(provider, account, 3), null);
+    }
+    const selected = await claimedRecords(app, await accountForBatch(app));
+    assert.equal(selected.length, 20);
+    assert.deepEqual(selected.slice(0, 4).map((record) => [record.event.source.provider, record.event.source.account]),
+      [["calendar", "alpha"], ["chat", "alpha"], ["mail", "alpha"], ["mail", "beta"]]);
+    const seen = new Map<string, number[]>();
+    for (const record of selected) {
+      const source = JSON.stringify([record.event.source.provider, record.event.source.account]);
+      const ids = seen.get(source) ?? []; ids.push(Number(record.event.id)); seen.set(source, ids);
+    }
+    assert.equal(seen.size, 4);
+    for (const ids of seen.values()) assert.deepEqual(ids, Array.from({ length: ids.length }, (_, index) => index));
+    assert.equal(selected.filter((record) => record.event.source.provider === "mail").length, 6,
+      "A busy chat account must not hide either mail account behind thousands of older events");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("rotation survives legacy-journal reopen and serves more accounts than one batch even when the cursor account drains", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-rotation-")); let app = await open(directory);
+  try {
+    for (let index = 0; index < 41; index += 1) await app.sources.admit(stream("mail", `account${String(index).padStart(2, "0")}`, index === 19 ? 1 : 2), null);
+    // Admission uses the unchanged version-one journal with no rotation field.
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    assert.equal((await app.sources.states()).length, 42);
+    const first = await claimedRecords(app, await accountForBatch(app));
+    assert.deepEqual(first.map((record) => record.event.source.account), Array.from({ length: 20 }, (_, index) => `account${String(index).padStart(2, "0")}`));
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const second = await claimedRecords(app, await accountForBatch(app));
+    assert.deepEqual(second.map((record) => record.event.source.account), Array.from({ length: 20 }, (_, index) => `account${String(index + 20).padStart(2, "0")}`),
+      "Continue past the persisted boundary instead of restarting at still-busy earlier accounts");
+    const third = await claimedRecords(app, await accountForBatch(app));
+    assert.equal(third[0]?.event.source.account, "account40");
+    const all = [...first, ...second, ...third];
+    assert.equal(new Set(all.map((record) => record.event.source.account)).size, 41);
+    for (let index = 0; index < 41; index += 1) {
+      const records = all.filter((record) => record.event.source.account === `account${String(index).padStart(2, "0")}`);
+      assert.deepEqual(records.map((record) => Number(record.event.id)), Array.from({ length: records.length }, (_, order) => order));
+    }
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a failed claimed batch retains exact events across new arrivals and reopen without advancing rotation again", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-fair-retry-")); let app = await open(directory);
+  try {
+    for (let index = 0; index < 25; index += 1) await app.sources.admit(stream("mail", `account${String(index).padStart(2, "0")}`, 2), null);
+    let first: string[] = [];
+    app.faux.setResponses([(input) => { first = selectedKeys(input); return fauxAssistantMessage("No source decision was committed"); }]);
+    await assert.rejects(app.triage(), /unaccounted/);
+    await app.sources.admit(stream("calendar", "new-account", 1), null);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    assert.deepEqual(await accountForBatch(app), first, "A retry must not replace the admitted batch with later arrivals or a fresh rotation");
+    const next = await claimedRecords(app, await accountForBatch(app));
+    assert.equal(next[0]?.event.source.account, "account20", "Only a new claim advances the persistent account boundary");
+    assert.ok(next.some((record) => record.event.source.provider === "calendar"));
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("concurrent triage calls retain one owned batch while new accounts wait for the next fair claim", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-fair-concurrent-")); const app = await open(directory);
+  let release = () => {}, entered = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; }), started = new Promise<void>((resolve) => { entered = resolve; });
+  try {
+    for (const account of ["alpha", "beta", "gamma"]) await app.sources.admit(stream("mail", account, 10), null);
+    let first: string[] = [];
+    app.faux.setResponses([
+      async (input) => { first = selectedKeys(input); entered(); await held; return fauxAssistantMessage(fauxToolCall("dismiss_source_events", {
+        keys: first, reason: "This exact owned batch is accounted for",
+      }), { stopReason: "toolUse" }); },
+      fauxAssistantMessage(""),
+    ]);
+    const running = app.triage(); await started;
+    await app.sources.admit(stream("calendar", "new-account", 1), null);
+    await app.triage(); assert.equal(app.faux.state.callCount, 1, "A concurrent tick must not start another judgment or claim");
+    const other = new SourceJournal(app.session, app.tasks);
+    let attached = () => {};
+    const bound = new Promise<void>((resolve) => { attached = resolve; });
+    const concurrent = other.triage(command, () => { attached(); return () => {}; }, [app.tools.host, app.tools.main, app.sourceTools.main]);
+    await bound;
+    release(); await Promise.all([running, concurrent]);
+    assert.equal(app.faux.state.callCount, 2);
+    const next = await claimedRecords(app, await accountForBatch(app));
+    assert.equal(next[0]?.event.source.account, "gamma");
+    assert.ok(next.some((record) => record.event.source.provider === "calendar"));
+    assert.equal(await app.sources.hasWork(), false);
+  } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
 
 test("source admission advances two successive checkpoints, deduplicates exact versions and isolates accounts", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-")); let app = await open(directory);

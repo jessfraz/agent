@@ -215,7 +215,10 @@ checkpoint and coverage. The coordinator rediscovers configured accounts and
 polls bounded pages, with separate cursors and coverage per account.
 Admit events durably before advancing a cursor. Partial reads never
 pretend to be complete, and repeated event versions do not create duplicate
-work. Exact triage input survives interrupted requests.
+work. New batches rotate across provider/account streams, oldest first within
+each account. The batch boundary persists across restarts so busy sources
+cannot starve quieter accounts. Retries keep their exact claimed batch and
+admitted input.
 
 Messages reads use Rex Server's existing macOS permission identity. A short
 action starts a headless Rust helper; subsequent calls collect bounded chunks.
