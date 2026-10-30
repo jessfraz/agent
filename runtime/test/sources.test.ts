@@ -81,7 +81,46 @@ async function claimedRecords(app: Awaited<ReturnType<typeof open>>, keys: strin
   return keys.map((key) => { const record = records.get(key); assert.ok(record); return record; });
 }
 
-test("source batches fairly interleave account streams beside a large noisy backlog and preserve each FIFO", { timeout: 30_000 }, async () => {
+test("new mail is reviewed beside an existing account backlog without dropping old work across reopen", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-current-mail-")); let app = await open(directory);
+  try {
+    await app.sources.admit(stream("mail", "alpha", 1000), null);
+    await app.sources.admit(batch([event("current")], "two"), { value: "one" });
+    const first = await claimedRecords(app, await accountForBatch(app));
+    assert.ok(first.some((record) => record.event.id === "current"), "Current mail must not wait for all 1,000 earlier messages");
+    assert.ok(first.some((record) => record.event.id === "0"), "Fresh mail must not starve the oldest pending work");
+    assert.equal(new Set(first.map((record) => record.key)).size, 20);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    await app.sources.admit(batch([event("next-current")], "three"), { value: "two" });
+    const second = await claimedRecords(app, await accountForBatch(app));
+    assert.ok(second.some((record) => record.event.id === "next-current"));
+    assert.ok(second.some((record) => record.event.id === "10"), "Old work continues from the previous batch rather than restarting");
+    assert.ok(second.every((record) => !first.some((prior) => prior.key === record.key)));
+    assert.equal((await app.sources.events({ keys: [first[0]!.key] }))[0]?.decision?.type, "dismissed");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("accounts with one slot per batch alternate new arrivals and old work across reopen", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-one-slot-")); let app = await open(directory);
+  try {
+    const accounts = Array.from({ length: 40 }, (_, index) => `account${String(index).padStart(2, "0")}`);
+    for (const account of accounts) await app.sources.admit(stream("mail", account, 3), null);
+    assert.ok((await claimedRecords(app, await accountForBatch(app))).every((record) => record.event.id === "0"));
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    for (const account of accounts.slice(0, 20)) await app.sources.admit(batch([event("current", account)], "two", account), { value: "one" });
+    await accountForBatch(app);
+    const current = await claimedRecords(app, await accountForBatch(app));
+    assert.equal(current.length, 20);
+    assert.ok(current.every((record) => record.event.id === "current"));
+    for (const account of accounts.slice(0, 20)) await app.sources.admit(batch([event("newer", account)], "three", account), { value: "two" });
+    await accountForBatch(app);
+    const older = await claimedRecords(app, await accountForBatch(app));
+    assert.equal(older.length, 20);
+    assert.ok(older.every((record) => record.event.id === "1"), "Continuous arrivals must not starve an account's older work");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("source batches fairly interleave accounts while advancing both ends of a noisy backlog", { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-fairness-")); const app = await open(directory);
   try {
     await app.sources.admit(stream("chat", "alpha", 2048), null);
@@ -98,7 +137,12 @@ test("source batches fairly interleave account streams beside a large noisy back
       const ids = seen.get(source) ?? []; ids.push(Number(record.event.id)); seen.set(source, ids);
     }
     assert.equal(seen.size, 4);
-    for (const ids of seen.values()) assert.deepEqual(ids, Array.from({ length: ids.length }, (_, index) => index));
+    const noisy = seen.get(JSON.stringify(["chat", "alpha"])); assert.ok(noisy);
+    assert.ok(noisy.includes(0) && noisy.includes(2047), "Both old and recently admitted chat work advance");
+    assert.equal(new Set(noisy).size, noisy.length);
+    for (const [source, ids] of seen) {
+      if (source !== JSON.stringify(["chat", "alpha"])) assert.deepEqual(ids.toSorted((left, right) => left - right), [0, 1, 2]);
+    }
     assert.equal(selected.filter((record) => record.event.source.provider === "mail").length, 6,
       "A busy chat account must not hide either mail account behind thousands of older events");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }

@@ -19,7 +19,7 @@ type StoredEvent = { key: string; event: SourceEvent; decision: Decision | null;
 type DueTask = { id: string; next_check: string };
 type TriageWork = { id: string; events: string[]; due: DueTask[]; attempt: number; content: string | null; model?: ModelSelection };
 type Journal = { sources: SourceState[]; events: StoredEvent[]; conversation_id: string | null; active: TriageWork | null;
-  last_claimed_source?: SourceKey };
+  last_claimed_source?: SourceKey; next_event?: Record<string, "oldest" | "newest"> };
 const OUTCOMES: SourceKey = { provider: "task_outcomes", account: "local" };
 function outcomeState(): SourceState { return { source: OUTCOMES, checkpoint: null, coverage: { status: "complete" }, checked_at: 0 }; }
 const Sources = defineDoc<Journal>({
@@ -203,32 +203,41 @@ export class SourceJournal {
     await this.session.commit(async (tx) => {
       const journal = await tx.doc(Sources);
       if (journal.active !== null) return;
-      const streams = new Map<string, { source: SourceKey; keys: string[]; offset: number }>();
+      const streams = new Map<string, { source: SourceKey; keys: string[]; oldest: number; newest: number }>();
       for (const record of journal.events) {
         if (!this.ready(record)) continue;
         const { provider, account } = record.event.source, id = JSON.stringify([provider, account]);
         let stream = streams.get(id);
-        if (stream === undefined) { stream = { source: { provider, account }, keys: [], offset: 0 }; streams.set(id, stream); }
+        if (stream === undefined) { stream = { source: { provider, account }, keys: [], oldest: 0, newest: -1 }; streams.set(id, stream); }
         stream.keys.push(record.key);
+        stream.newest += 1;
       }
       const order = [...streams.keys()].sort();
       const last = journal.last_claimed_source;
       const after = last === undefined ? -1 : order.findIndex((id) => id > JSON.stringify([last.provider, last.account]));
       const start = after < 0 ? 0 : after;
       const events: string[] = [];
+      const next: Record<string, "oldest" | "newest"> = { ...journal.next_event };
       // Stable account order and a persisted boundary keep small streams and
       // accounts beyond this batch reachable, including when its last account drains.
+      // Alternate within each account so new arrivals and old pending work both
+      // advance, even when an account gets only one slot in a batch.
       while (events.length < 20) {
         const before = events.length;
         for (let index = 0; index < order.length && events.length < 20; index += 1) {
-          const stream = streams.get(order[(start + index) % order.length]!);
-          const key = stream?.keys[stream.offset];
-          if (stream === undefined || key === undefined) continue;
-          stream.offset += 1; events.push(key); journal.last_claimed_source = stream.source;
+          const id = order[(start + index) % order.length]!;
+          const stream = streams.get(id);
+          if (stream === undefined || stream.oldest > stream.newest) continue;
+          const newest = next[id] === "newest";
+          const key = stream.keys[newest ? stream.newest-- : stream.oldest++];
+          if (key === undefined) continue;
+          next[id] = newest ? "oldest" : "newest";
+          events.push(key); journal.last_claimed_source = stream.source;
         }
         if (events.length === before) break;
       }
       if (events.length === 0 && due.length === 0) return;
+      journal.next_event = next;
       if (journal.conversation_id === null) {
         const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
         journal.conversation_id = conversation.id.toString();
