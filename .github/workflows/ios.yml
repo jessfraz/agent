@@ -22,3 +22,11 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - name: Check Swift and iOS
         run: bash ios/scripts/check.sh
+      - name: Retain native test results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ios-validation-${{ github.run_attempt }}
+          path: target/ios-validation/run.*/ios-*
+          if-no-files-found: warn
+          retention-days: 7
