@@ -21,9 +21,9 @@ agent history classify CONVERSATION_ID ENTRY_ID --as visible
 `tasks send` targets the existing task directly and leaves main chat quiet.
 Steering is the default; queueing waits for the next turn. Retain the input ID
 when retrying an uncertain delivery. `history classify` hides confirmed internal
-receipts or maintenance controls by exact native entry ID; `visible` reverses the
-classification. Originals stay intact. Reloaded views use the classification;
-already printed terminal scrollback cannot be rewritten.
+receipts or maintenance controls by exact native entry ID; `visible` reverses
+the classification. Originals stay intact. Reloaded views use the
+classification; already printed terminal scrollback cannot be rewritten.
 
 Run import again to catch up. Completed reliable source versions are skipped;
 partial reads resume their committed cursor. Once a transcript scan reaches its
@@ -31,22 +31,22 @@ end, missing attachments retry only their affected source pages. Changed or
 unreliable sources are scanned again; older partial checkpoints reconcile once
 before using targeted retries. Unchanged transcripts still reconcile corrected
 lineage without duplicating messages or regenerating vectors. A reader upgrade
-that retains additional event kinds rescans source history once, reusing item
-identities and cached vectors. Retained text is indexed alongside source
-scanning and catches up again afterward, so neither a large vector backlog nor
-attachment retries block the other work. Interrupted or failed final indexing
-resumes from the retained corpus before the next fresh import. Explicit
-`--host` selection starts a fresh walk of those hosts when no import is active.
-Concurrent commands join the running import; closing its CLI leaves it running.
-`--embedding-host` accepts an announced name or native host ID. Source reads and
-the Pi/search databases stay with their existing owners. Indexing uses that
-worker while connected, falls back to coordinator compute when unavailable,
-and uses the worker again after it returns. Vector-space validation remains
-unchanged. The option applies to a new import, not an already running one.
-A native thread maps to one conversation across hosts; each item version is
-saved once. Neither importing nor
-searching opens Rex sessions. Opening a historical conversation adopts it into
-one task using current settings, then opens its named interactive session.
+that retains additional event kinds or media references rescans source history
+once, reusing item identities and cached vectors. Retained text is indexed
+alongside source scanning and catches up again afterward, so neither a large
+vector backlog nor attachment retries block the other work. Interrupted or
+failed final indexing resumes from the retained corpus before the next fresh
+import. Explicit `--host` selection starts a fresh walk of those hosts when no
+import is active. Concurrent commands join the running import; closing its CLI
+leaves it running. `--embedding-host` accepts an announced name or native host
+ID. Source reads and the Pi/search databases stay with their existing owners.
+Indexing uses that worker while connected, falls back to coordinator compute
+when unavailable, and uses the worker again after it returns. Vector-space
+validation remains unchanged. The option applies to a new import, not an already
+running one. A native thread maps to one conversation across hosts; each item
+version is saved once. Neither importing nor searching opens Rex sessions.
+Opening a historical conversation adopts it into one task using current
+settings, then opens its named interactive session.
 
 ```text
   registered online hosts
@@ -105,7 +105,8 @@ Recovery matches the full original item and its native context, preserving the
 existing message while retaining each asset's evidence version. Excerpts never
 establish that two items are the same; genuine content edits remain distinct.
 An unavailable full payload remains incomplete; its excerpt is not a substitute
-for the original.
+for the original. Remote attachment IDs without retained bytes stay explicit
+media gaps.
 
 Original revisions stay immutable. Normal history and search share a projection
 selected by native timestamps and causally ordered reliable snapshots on the
@@ -138,19 +139,20 @@ digest before requesting source bytes again. Render these data entries alongside
 Pi model messages.
 
 Live Pi messages and imported Codex items use the same Rust-owned message,
-tool-status and presentation types, with generated TypeScript and Swift bindings.
-Source adapters normalize commands, file changes, agent coordination, media and
-other native events before the shared renderer. Existing imports are projected
-from their retained originals, including verified cold payloads, without a source
-reimport or index reset. Unknown kinds retain their original payload; historical
-hooks and compaction are inert markers. Authentication and system/developer
-instructions remain excluded. Missing originals stay visibly unavailable.
-Execution inputs and tool payloads stay in the shared, lazy detail reader.
-Command cells carry typed command text, exit status and a bounded output
+tool-status and presentation types, with generated TypeScript and Swift
+bindings. Source adapters normalize commands, file changes, agent coordination,
+media and other native events before the shared renderer. Existing imports are
+projected from their retained originals, including verified cold payloads,
+without a source reimport or index reset. Unknown kinds retain their original
+payload; historical hooks and compaction are inert markers. Authentication and
+system/developer instructions remain excluded. Missing originals stay visibly
+unavailable. Execution inputs and tool payloads stay in the shared, lazy detail
+reader. Command cells carry typed command text, exit status and a bounded output
 preview. Updating presentation does not rewrite retained imports or regenerate
-their vectors.
-Events an older importer discarded need a source backfill; retained tool rows do
-not.
+their vectors. Structured MCP results remain readable in previews and tool
+inspection. The phone retains the same metadata and fetches tool arguments only
+when expanded. Events an older importer discarded need a source backfill;
+retained tool rows do not.
 
 ## One derived search index
 

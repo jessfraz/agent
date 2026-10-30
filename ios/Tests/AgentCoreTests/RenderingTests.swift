@@ -15,12 +15,33 @@
   // Hosted captures share one scene and must own its key window serially.
   @Suite(.serialized) struct NativeRenderingTests {
     @MainActor private func renderRows(
-      _ rows: [ChatRow], size: DynamicTypeSize = .large, scheme: ColorScheme = .light
+      _ rows: [ChatRow], size: DynamicTypeSize = .large, scheme: ColorScheme = .light,
+      expandedActivity: Bool = false, inspection: ToolDetailsAvailable? = nil
     ) async throws -> CGImage {
       let models = rows.map(RowModel.init)
       let content = VStack(alignment: .leading, spacing: 22) {
-        ForEach(models) { model in
-          MessageRow(model: model, retry: { _ in }, restore: { _ in })
+        if expandedActivity {
+          ForEach(TranscriptItem.grouped(models)) { item in
+            switch item {
+            case .activity(let group):
+              ActivityGroupView(
+                group: group,
+                expansion: .constant(
+                  ActivityExpansion(groups: [group.id], items: Set(group.rows.map(\.id)))),
+                details: { row in .unavailable(.init(callId: row.tool?.callId ?? "")) })
+            case .message(let model):
+              MessageRow(model: model, retry: { _ in }, restore: { _ in })
+            }
+          }
+        } else {
+          ForEach(models) { model in
+            MessageRow(model: model, retry: { _ in }, restore: { _ in })
+          }
+        }
+        if let inspection {
+          ToolContent(
+            title: "Output", content: inspection.output, name: inspection.name,
+            preview: rows.first?.presentation == nil ? nil : rows.first?.text)
         }
       }
       .padding(16)
@@ -113,6 +134,66 @@
         }
         return try #require(bitmap.cgImage)
       #endif
+    }
+
+    @MainActor @Test func typedActivityRendersWithoutPrivateDetailsInLightAndDark() async throws {
+      var transcript = Transcript()
+      for (index, presentation, body) in [
+        (
+          0,
+          MessagePresentation.command(
+            .init(command: "printf 'literal output'", durationMs: 12, exitCode: 7)),
+          "Literal **stdout**\nA second output line"
+        ),
+        (
+          1, .fileChanges(.init(changes: [.init(operation: .update, path: "example.rs")])),
+          "+new line\n-old line"
+        ),
+        (
+          2,
+          .agentCoordination(
+            .init(
+              action: .followup, agents: [.init(state: .completed, threadId: "child")],
+              receiverThreadIds: ["child"])), ""
+        ),
+        (3, .plan, "1. **Keep** the existing conversation."),
+      ] {
+        transcript.message(
+          .init(
+            continuation: false, entryId: "typed-\(index)", finalChunk: true,
+            presentation: presentation, role: index == 3 ? .assistant : .tool, text: body,
+            tool: index < 3
+              ? .init(
+                callId: "typed-\(index)", name: "exec", status: index == 0 ? .failed : .finished)
+              : nil))
+      }
+      for scheme in [ColorScheme.light, .dark] {
+        let image = try await renderRows(transcript.rows, scheme: scheme, expandedActivity: true)
+        #expect(image.width >= 390)
+        #expect(image.height > 400)
+        Attachment.record(image, named: "typed-activity-\(scheme)", as: .png)
+      }
+    }
+
+    @MainActor @Test func richerLazyOutputRendersBeyondANonemptyTypedPreview() async throws {
+      let preview = "Bounded preview\n[Output preview truncated]"
+      var transcript = Transcript()
+      transcript.message(
+        .init(
+          continuation: false, entryId: "retained", finalChunk: true,
+          presentation: .tool(.init(namespace: "fixture")), role: .tool, text: preview,
+          tool: .init(callId: "retained", name: "inspect", status: .finished)))
+      let original = (0..<24).map { "Additional retained output line \($0)" }.joined(
+        separator: "\n")
+      let same = ToolDetailsAvailable(
+        callId: "retained", input: .unavailable(.init(reason: .notRecorded)), name: "inspect",
+        output: .text(.init(text: preview, truncated: false)), status: .finished)
+      var richer = same
+      richer.output = .text(.init(text: preview + "\n" + original, truncated: false))
+      let collapsed = try await renderRows(transcript.rows, inspection: same)
+      let expanded = try await renderRows(transcript.rows, inspection: richer)
+      #expect(expanded.height > collapsed.height + 120)
+      Attachment.record(expanded, named: "richer-retained-tool-output", as: .png)
     }
 
     @MainActor @Test func supportedMessageRowsRenderInLightAndDarkAppearance() async throws {

@@ -501,11 +501,17 @@ struct MessageRow: View {
         Label(title, systemImage: symbol).font(.caption.weight(.semibold)).foregroundStyle(
           .secondary)
       }
-      if model.row.tool != nil || model.row.role == .thinking {
+      if model.row.tool != nil || model.row.role == .thinking
+        || (model.row.role == .tool && model.row.presentation != nil)
+      {
         ActivityItemView(
           model: model, expanded: $expanded,
           details: { row in .unavailable(.init(callId: row.tool?.callId ?? "")) })
       } else {
+        if let presentation = model.row.presentation {
+          Text(presentation.activityTitle()).font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+        }
         RichMessage(blocks: model.row.blocks)
       }
       ForEach(model.row.attachments, id: \.id) { reference in

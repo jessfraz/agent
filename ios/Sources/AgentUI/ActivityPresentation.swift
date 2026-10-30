@@ -52,7 +52,9 @@ enum TranscriptItem: Identifiable {
       activity = []
     }
     for row in rows {
-      if row.row.tool != nil || row.row.role == .thinking {
+      if row.row.tool != nil || row.row.role == .thinking
+        || (row.row.role == .tool && row.row.presentation != nil)
+      {
         activity.append(row)
       } else {
         flush()
@@ -82,6 +84,9 @@ struct ActivityGroup: Identifiable {
     let declined = rows.filter { $0.row.tool?.status == .declined }.count
     let interrupted = rows.filter { $0.row.tool?.status == .interrupted }.count
     let unknown = rows.filter { $0.row.tool?.status == .unknown }.count
+    let events = rows.filter {
+      $0.row.presentation != nil && $0.row.tool == nil && $0.row.role != .thinking
+    }.count
     return [
       failures == 0 ? nil : "\(failures) failed",
       active == 0 ? nil : "\(active) running",
@@ -90,6 +95,7 @@ struct ActivityGroup: Identifiable {
       unknown == 0 ? nil : "\(unknown) unknown",
       tools == 0 ? nil : "\(tools) tool \(tools == 1 ? "call" : "calls")",
       thoughts == 0 ? nil : "\(thoughts) \(thoughts == 1 ? "thought" : "thoughts")",
+      events == 0 ? nil : "\(events) \(events == 1 ? "event" : "events")",
     ].compactMap { $0 }.joined(separator: " · ")
   }
 }
@@ -186,7 +192,7 @@ private struct ActivityStatus: View {
       }
     }
     .font(.caption).frame(width: 18, height: 18)
-    .accessibilityLabel(status?.rawValue.capitalized ?? "Thinking")
+    .accessibilityLabel(status?.rawValue.capitalized ?? "Activity")
   }
 }
 
@@ -214,7 +220,7 @@ struct ActivityItemView: View {
             Image(systemName: "text.alignleft").font(.caption).frame(width: 18)
           }
           Text(title).lineLimit(1).truncationMode(.middle).multilineTextAlignment(.leading)
-            .font(commandInput == nil ? .footnote : .system(.footnote, design: .monospaced))
+            .font(isCommand ? .system(.footnote, design: .monospaced) : .footnote)
           Image(systemName: expanded ? "chevron.down" : "chevron.right").font(.caption2)
         }
         .font(.footnote).foregroundStyle(.secondary)
@@ -223,7 +229,16 @@ struct ActivityItemView: View {
       .buttonStyle(.plain).accessibilityIdentifier("activity-item:\(model.id)")
       .accessibilityValue(expanded ? "Expanded" : "Collapsed")
       if expanded {
-        Group {
+        VStack(alignment: .leading, spacing: 8) {
+          presentationDetails
+          if !model.row.text.isEmpty {
+            if model.row.tool != nil {
+              ToolText(title: "Output", text: model.row.text)
+            } else {
+              RichMessage(blocks: model.row.blocks, textStyle: .callout, compact: true)
+                .foregroundStyle(.primary.opacity(0.75))
+            }
+          }
           if model.row.tool != nil {
             VStack(alignment: .leading, spacing: 8) { toolDetails }
               .padding(12)
@@ -234,9 +249,6 @@ struct ActivityItemView: View {
                     ? Color.red.opacity(0.2) : Color.primary.opacity(0.08),
                   lineWidth: 0.5)
               }
-          } else {
-            RichMessage(blocks: model.row.blocks, textStyle: .callout, compact: true)
-              .foregroundStyle(.primary.opacity(0.75))
           }
         }
         .padding(.leading, 26).padding(.bottom, 8)
@@ -246,10 +258,13 @@ struct ActivityItemView: View {
     .contextMenu {
       ShareLink(item: model.row.text) { Label("Share text", systemImage: "square.and.arrow.up") }
     }
-    .task(id: "\(model.row.entryID ?? ""):\(model.row.tool?.status.rawValue ?? ""):\(reload)") {
-      guard model.row.tool != nil else { return }
+    .task(
+      id:
+        "\(expanded):\(model.row.entryID ?? ""):\(model.row.tool?.status.rawValue ?? ""):\(reload)"
+    ) {
       loaded = nil
       error = nil
+      guard expanded, model.row.tool != nil else { return }
       do {
         let value = try await details(model.row)
         guard !Task.isCancelled else { return }
@@ -266,7 +281,19 @@ struct ActivityItemView: View {
     return CommandInput.decode(value.input)
   }
 
+  private var commandPreview: String? {
+    guard case .command(let value)? = model.row.presentation else { return nil }
+    return value.command
+  }
+
   private var title: String {
+    if let presentation = model.row.presentation {
+      if case .command(let value) = presentation {
+        return value.command ?? commandInput?.display
+          ?? "Command\(ordinal.map { " \($0)" } ?? "")"
+      }
+      return presentation.activityTitle(toolName: model.row.tool?.name)
+    }
     if let tool = model.row.tool {
       if let commandInput { return commandInput.display }
       if tool.name == "exec" { return "Command\(ordinal.map { " \($0)" } ?? "")" }
@@ -284,6 +311,53 @@ struct ActivityItemView: View {
     return "Thinking"
   }
 
+  private var isCommand: Bool {
+    if case .command? = model.row.presentation { return true }
+    return commandInput != nil
+  }
+
+  @ViewBuilder private var presentationDetails: some View {
+    if let presentation = model.row.presentation {
+      switch presentation {
+      case .command(let value):
+        if let command = value.command { ToolText(title: "Command", text: command) }
+        if let code = value.exitCode {
+          Text("Exit code \(code)").font(.caption).foregroundStyle(.secondary)
+        }
+        if let duration = value.durationMs {
+          Text("\(duration) ms").font(.caption).foregroundStyle(.secondary)
+        }
+      case .fileChanges(let value):
+        ForEach(Array(value.changes.enumerated()), id: \.offset) { _, change in
+          Text("\(change.operation?.rawValue ?? "change") \(change.path)")
+            .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+        }
+      case .agentCoordination(let value):
+        ForEach(Array(value.agents.enumerated()), id: \.offset) { _, agent in
+          Text("\(agent.threadId) · \(agent.state?.rawValue ?? "state unavailable")")
+            .font(.caption).textSelection(.enabled)
+        }
+        if !value.receiverThreadIds.isEmpty {
+          ToolText(title: "Recipients", text: value.receiverThreadIds.joined(separator: "\n"))
+        }
+      case .agentActivity(let value):
+        ToolText(
+          title: "Agent", text: value.agentPath.isEmpty ? value.agentThreadId : value.agentPath)
+        Text(value.state?.rawValue ?? "State unavailable").font(.caption)
+      case .webSearch(let value):
+        if !value.query.isEmpty { ToolText(title: "Query", text: value.query) }
+      case .media(let value):
+        if let path = value.path { ToolText(title: "File", text: path) }
+        if let status = value.status { Text(status).font(.caption) }
+      case .sleep(let value):
+        if let duration = value.durationMs { Text("\(duration) ms").font(.caption) }
+      case .hookPrompt:
+        Text("Retained historical instructions stay inert.").font(.caption)
+      default: EmptyView()
+      }
+    }
+  }
+
   @ViewBuilder private var toolDetails: some View {
     if let error {
       Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
@@ -298,7 +372,9 @@ struct ActivityItemView: View {
           Text(value.status.rawValue.capitalized).font(.caption.weight(.medium))
             .foregroundStyle(value.status == .failed ? .red : .secondary)
           if value.name == "exec", let command = CommandInput.decode(value.input) {
-            ToolText(title: "Command", text: command.display)
+            if commandPreview == nil {
+              ToolText(title: "Command", text: command.display)
+            }
             if let cwd = command.cwd { ToolText(title: "Working directory", text: cwd) }
             if let host = command.host { ToolText(title: "Host", text: host) }
             if let seconds = command.timeoutSeconds {
@@ -319,23 +395,58 @@ struct ActivityItemView: View {
           } else {
             ToolContent(title: "Input", content: value.input)
           }
-          if value.name == "exec", let process = ProcessOutput.decode(value.output) {
-            if !process.stdout.isEmpty { ToolText(title: "Output", text: process.stdout) }
-            if !process.stderr.isEmpty {
-              ToolText(title: "Error output", text: process.stderr, error: true)
-            }
-            Text("Exit code \(process.exitCode)").font(.caption.weight(.medium))
-              .foregroundStyle(process.exitCode == 0 ? Color.secondary : Color.red)
-            if process.truncated {
-              Text("Output truncated.").font(.caption).foregroundStyle(.secondary)
-            }
-          } else {
-            ToolContent(title: "Output", content: value.output)
-          }
+          ToolContent(
+            title: "Output", content: value.output, name: value.name,
+            preview: model.row.presentation == nil ? nil : model.row.text)
         }
       }
     } else {
       ProgressView("Loading details…").font(.caption).foregroundStyle(.secondary)
+    }
+  }
+}
+
+extension MessagePresentation {
+  func activityTitle(toolName: String? = nil) -> String {
+    switch self {
+    case .command(let value): value.command ?? "Command"
+    case .fileChanges(let value):
+      value.changes.isEmpty ? "File changes" : value.changes.map(\.path).joined(separator: ", ")
+    case .tool(let value):
+      [value.namespace, toolName ?? "Tool"].compactMap { $0 }.joined(separator: ".")
+    case .agentCoordination(let value):
+      switch value.action {
+      case .spawn: "Spawn agent"
+      case .sendInput, .sendMessage: "Send agent input"
+      case .followup: "Queue agent input"
+      case .resume: "Resume agent"
+      case .wait: "Wait for agents"
+      case .close: "Close agent"
+      case .interrupt: "Interrupt agent"
+      case .list: "List agents"
+      case .report: "Agent report"
+      case nil: "Agent operation"
+      }
+    case .agentActivity: "Agent activity"
+    case .webSearch(let value):
+      switch value.action {
+      case .openPage: "Open page"
+      case .findInPage: "Search page"
+      default: "Web search"
+      }
+    case .media(let value):
+      switch value.operation {
+      case .generate: "Image generation"
+      case .view: "Image view"
+      case .attachment: "Media attachment"
+      }
+    case .sleep: "Wait"
+    case .plan: "Plan"
+    case .review(let value): "Review \(value.stage.rawValue)"
+    case .hookPrompt: "Historical hook prompt · inert"
+    case .compaction: "Context compaction"
+    case .unknown(let value): "Unknown history item · \(value.kind)"
+    case .unavailable(let value): "Original unavailable · \(value.kind)"
     }
   }
 }
@@ -360,16 +471,40 @@ private struct ToolText: View {
   }
 }
 
-private struct ToolContent: View {
+struct ToolContent: View {
   let title: String
   let content: ToolDetailContent
+  var name: String? = nil
+  var preview: String? = nil
+
+  var showsContent: Bool {
+    guard let preview, !preview.isEmpty, case .text(let value) = content else { return true }
+    return value.truncated || !value.text.utf8.elementsEqual(preview.utf8)
+  }
+
   var body: some View {
-    switch content {
-    case .text(let value):
-      ToolText(title: title, text: value.text)
-      if value.truncated { Text("\(title) truncated.").font(.caption).foregroundStyle(.secondary) }
-    case .unavailable(let value):
-      Text("\(title): \(value.reason.description)").font(.caption).foregroundStyle(.secondary)
+    if showsContent {
+      if name == "exec", let process = ProcessOutput.decode(content) {
+        if !process.stdout.isEmpty { ToolText(title: "Output", text: process.stdout) }
+        if !process.stderr.isEmpty {
+          ToolText(title: "Error output", text: process.stderr, error: true)
+        }
+        Text("Exit code \(process.exitCode)").font(.caption.weight(.medium))
+          .foregroundStyle(process.exitCode == 0 ? Color.secondary : Color.red)
+        if process.truncated {
+          Text("Output truncated.").font(.caption).foregroundStyle(.secondary)
+        }
+      } else {
+        switch content {
+        case .text(let value):
+          ToolText(title: title, text: value.text)
+          if value.truncated {
+            Text("\(title) truncated.").font(.caption).foregroundStyle(.secondary)
+          }
+        case .unavailable(let value):
+          Text("\(title): \(value.reason.description)").font(.caption).foregroundStyle(.secondary)
+        }
+      }
     }
   }
 }
