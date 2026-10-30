@@ -126,6 +126,28 @@ test("closing during a caller-owned embedding await cannot start a late file rea
   } finally { release(); await index.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("a native snapshot read accepts a publisher signal released before its wait", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-search-reader-early-signal-")), path = join(directory, "search.sqlite");
+  const index = new SearchIndex(path), extension = process.env.AGENT_SQLITE_VEC; assert.ok(extension);
+  const gate = new Int32Array(new SharedArrayBuffer(4)); let worker: Worker | undefined;
+  try {
+    await index.upsert("service", "one", records(3), embed);
+    const expected = await index.search("Automobile", embed);
+    Atomics.store(gate, 0, 1);
+    const input: PublishedSearch = { query: "Automobile", vector: new Uint8Array(new Float32Array([1, ...Array<number>(1023).fill(0)]).buffer),
+      space, source_refs: [], limit: 8, mode: "semantic", gaps: [] };
+    const observer = new Worker(new URL("./fixtures/search-snapshot.js", import.meta.url), { workerData: { path, extension, input, gate: gate.buffer } });
+    worker = observer;
+    const result = await new Promise<SearchResult>((resolve, reject) => {
+      observer.on("error", reject);
+      observer.on("message", (value: { type: "snapshot" } | { type: "result"; result: SearchResult }) => {
+        if (value.type === "result") resolve(value.result);
+      });
+    });
+    assert.deepEqual(result, expected);
+  } finally { await worker?.terminate(); await index.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("close immediately retires the writable owner while its read worker terminates", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-search-reader-retire-")), path = join(directory, "search.sqlite");
   let index = new SearchIndex(path);

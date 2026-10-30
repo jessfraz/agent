@@ -17,7 +17,8 @@ let paused = false;
 database.setAuthorizer((action, table) => {
   if (!paused && action === constants.SQLITE_READ && table === "chunk_vectors") {
     paused = true; owner.postMessage({ type: "snapshot" });
-    if (Atomics.wait(gate, 0, 0, 5000) !== "ok") throw new Error("Owned publisher did not release the native read");
+    // A release that arrived before the wait already satisfies the barrier.
+    if (Atomics.wait(gate, 0, 0, 5000) === "timed-out") throw new Error("Owned publisher did not release the native read");
   }
   return constants.SQLITE_OK;
 });
