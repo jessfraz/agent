@@ -10,6 +10,7 @@ import { createModels, fauxAssistantMessage, fauxProvider, fauxThinking, fauxToo
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { HistoryStore, ImportedItemEntry, ImportedThreadEntry, importedText } from "../src/history.js";
+import { HistoryObservation } from "../src/history-revisions.js";
 import { ConversationModels } from "../src/models.js";
 import { TaskStore } from "../src/tasks.js";
 import { createAppTools, Executions } from "../src/tools.js";
@@ -324,7 +325,11 @@ test("verified assets merge across same-version host retries while complete repe
     assert.equal(recovered.added_items, 0); assert.notEqual(recovered.watermark, initial.watermark);
     const complete = { ...incomplete, host_id: "host-three", items: [{ ...original, assets: refs }], complete: true, gaps: [] };
     const finished = await app.imported.import(complete);
-    assert.deepEqual(finished.entry_ids, []); assert.equal(finished.watermark, recovered.watermark);
+    assert.equal(finished.added_items, 0); assert.equal(finished.entry_ids.length, 1);
+    const observation = await conversation.entries({ order: "descending" }, 1, undefined, BACKGROUND_CONTEXT);
+    assert.ok(observation.items[0] && HistoryObservation.is(observation.items[0]));
+    assert.equal(observation.items[0].data.snapshot?.host_id, "host-three");
+    assert.notEqual(finished.watermark, recovered.watermark, "A newly observing host retains causal provenance without repeating the message");
     const repeated = await app.imported.import(complete);
     assert.deepEqual(repeated.entry_ids, []); assert.equal(repeated.watermark, finished.watermark);
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);

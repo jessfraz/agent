@@ -7,7 +7,7 @@ import type { EmbeddingPurpose } from "./generated/EmbeddingPurpose.js";
 import type { EmbeddingSpace } from "./generated/EmbeddingSpace.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 
-export type SearchRecord = { entry_id: string; ordinal: number; text: string; source_refs: string[] };
+export type SearchRecord = { entry_id: string; ordinal: number; text: string; source_refs: string[]; gaps?: string[] };
 export type SearchWatermark = { conversation_id: string; watermark: string };
 export type SearchMatch = { entry_id: string; text: string; source_refs: string[] };
 export type SearchCandidate = { conversation_id: string; score: number; matches: SearchMatch[] };
@@ -17,6 +17,7 @@ type Row = Record<string, SQLOutputValue>;
 type Chunk = SearchRecord & { part: number; hash: string };
 type RankedChunk = { id: number; value: number };
 const CHUNKER = "message-utf8-2048-overlap-256-v4";
+const SOURCE_PROJECTION = "observed-source-revisions-v2";
 const BATCH = 16;
 
 function string(row: Row, key: string): string {
@@ -92,6 +93,9 @@ export class SearchIndex {
       CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(text,content='chunks',content_rowid='id');
       CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN INSERT INTO chunks_fts(rowid,text) VALUES(new.id,new.text); END;
       CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES('delete',old.id,old.text); END;`);
+    if (!this.db.prepare("PRAGMA table_info(conversations)").all().some((row) => string(row, "name") === "gaps")) {
+      this.db.exec("ALTER TABLE conversations ADD COLUMN gaps TEXT NOT NULL DEFAULT '[]'");
+    }
     // The previous staging table was ephemeral and had no conversation owner.
     if (!this.db.prepare("PRAGMA table_info(staging)").all().some((row) => string(row, "name") === "conversation_id")) this.db.exec("DROP TABLE IF EXISTS staging");
     this.db.exec(`CREATE TABLE IF NOT EXISTS staging(conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -106,6 +110,12 @@ export class SearchIndex {
     if (chunker === undefined || string(chunker, "value") !== CHUNKER) {
       this.db.exec("UPDATE conversations SET dirty=1, revision=revision+1");
       this.db.prepare("INSERT OR REPLACE INTO metadata VALUES('chunker',?)").run(CHUNKER);
+    }
+    const projection = this.db.prepare("SELECT value FROM metadata WHERE key='source_projection'").get();
+    if (projection === undefined || string(projection, "value") !== SOURCE_PROJECTION) {
+      // Reproject existing chunks with their cached vectors, preserving the space.
+      this.db.exec("UPDATE conversations SET dirty=1, revision=revision+1");
+      this.db.prepare("INSERT OR REPLACE INTO metadata VALUES('source_projection',?)").run(SOURCE_PROJECTION);
     }
   }
   close(): void { this.db.close(); }
@@ -137,7 +147,7 @@ export class SearchIndex {
     return this.mutate(async () => {
       this.markDirty(conversation_id);
       const revision = number(this.db.prepare("SELECT revision FROM conversations WHERE id=?").get(conversation_id)!, "revision");
-      const run = randomUUID(); let pending: Chunk[] = [];
+      const run = randomUUID(); let pending: Chunk[] = []; const gaps = new Set<string>();
       const stage = async () => {
         if (pending.length === 0) return;
         const batch = pending; pending = [];
@@ -174,7 +184,10 @@ export class SearchIndex {
       };
       // Completed batches survive failure. Only rows observed in this attempt
       // become visible; cached rows removed from the source keep their old tag.
-      for await (const record of records) for (const chunk of chunks(record)) { pending.push(chunk); if (pending.length === BATCH) await stage(); }
+      for await (const record of records) {
+        for (const gap of record.gaps ?? []) gaps.add(gap);
+        for (const chunk of chunks(record)) { pending.push(chunk); if (pending.length === BATCH) await stage(); }
+      }
       await stage();
       this.transaction(() => {
         if (this.space !== undefined) this.db.prepare("DELETE FROM chunk_vectors WHERE rowid IN (SELECT id FROM chunks WHERE conversation_id=?)").run(conversation_id);
@@ -185,7 +198,8 @@ export class SearchIndex {
           SELECT c.id,s.embedding FROM staging s JOIN chunks c ON c.conversation_id=s.conversation_id AND c.entry_id=s.entry_id AND c.part=s.part
           WHERE s.conversation_id=? AND s.run=?`).run(conversation_id, run);
         this.db.prepare(`INSERT INTO source_refs SELECT j.value,c.id FROM chunks c,json_each(c.source_refs) j WHERE c.conversation_id=?`).run(conversation_id);
-        this.db.prepare("UPDATE conversations SET watermark=?,dirty=CASE WHEN revision=? THEN 0 ELSE 1 END WHERE id=?").run(watermark, revision, conversation_id);
+        this.db.prepare("UPDATE conversations SET watermark=?,dirty=CASE WHEN revision=? THEN 0 ELSE 1 END,gaps=? WHERE id=?")
+          .run(watermark, revision, JSON.stringify([...gaps]), conversation_id);
         this.db.prepare("DELETE FROM staging WHERE conversation_id=?").run(conversation_id);
       });
     });
@@ -257,6 +271,12 @@ export class SearchIndex {
         candidate.matches.push({ entry_id, text: string(row, "text"), source_refs: refs(string(row, "source_refs")) });
       }
     }
-    return { candidates: [...candidates.values()].sort((left, right) => right.score - left.score).slice(0, limit), gaps };
+    const selected = [...candidates.values()].sort((left, right) => right.score - left.score).slice(0, limit);
+    if (selected.length > 0) for (const row of this.db.prepare(`SELECT gaps FROM conversations WHERE id IN (${selected.map(() => "?").join(",")})`).all(...selected.map((candidate) => candidate.conversation_id))) {
+      const coverage: unknown = JSON.parse(string(row, "gaps"));
+      if (!Array.isArray(coverage) || !coverage.every((gap): gap is string => typeof gap === "string")) throw new Error("Invalid indexed source coverage");
+      gaps.push(...coverage);
+    }
+    return { candidates: selected, gaps: [...new Set(gaps)] };
   }
 }

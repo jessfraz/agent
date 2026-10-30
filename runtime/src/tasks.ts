@@ -3,7 +3,7 @@ import type { TextContent } from "@earendil-works/pi-ai";
 import { AttachmentStore, validateInput } from "./attachments.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { AssistantEntry, defineDoc, GenerationTask, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID, ToolTask, type Conversation, type ConversationId, type Cursor, type EntryRecord, type Extension, type Harness, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
+import { AssistantEntry, defineDoc, GenerationTask, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID, ToolTask, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
 import type { CoordinatorEnvironment } from "./environment.js";
 import { ConversationModels, DEFAULT_MODEL, ModelError, modelFailureMessage, savedHost, savedModel } from "./models.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
@@ -25,6 +25,7 @@ import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { WorkerRef } from "./generated/WorkerRef.js";
 import { noticeMetadata } from "./transcript.js";
 import { HistoryStore, ImportedItemEntry, importedText } from "./history.js";
+import { REVISION_AMBIGUOUS, REVISION_PENDING, revisionStatus, type RevisionView } from "./history-revisions.js";
 import type { SavedMatch } from "./generated/SavedMatch.js";
 import type { ImportedConversation } from "./generated/ImportedConversation.js";
 import type { SearchRecord, SearchResult } from "./search.js";
@@ -313,13 +314,20 @@ export class TaskStore {
   }
   async readConversation(id: string, maxCharacters = 120_000): Promise<string> {
     const conversation = await this.conversation(id);
+    const maximum = (await conversation.entries({ order: "descending" }, 1, undefined, BACKGROUND_CONTEXT)).items[0]?.id;
     let cursor: Cursor | undefined;
     const chunks: string[] = [];
     let length = 0;
+    const revisions = new Map<string, RevisionView>();
+    const warned = new Set<string>();
     do {
-      const page = await conversation.entries({ order: "descending" }, 100, cursor, BACKGROUND_CONTEXT);
+      const page = await conversation.entries({ order: "descending", ...(maximum === undefined ? {} : { maxEntryId: maximum }) }, 100, cursor, BACKGROUND_CONTEXT);
       for (const entry of page.items) {
-        const content = text(entry);
+        const status = await this.revision(entry, revisions, false, maximum);
+        if (status === "superseded" || status === "outside_snapshot") continue;
+        const warning = status === "ambiguous" ? REVISION_AMBIGUOUS : status === "pending" ? REVISION_PENDING : "";
+        const content = (warning && !warned.has(warning) ? warning + "\n" : "") + text(entry);
+        if (warning) warned.add(warning);
         if (content.length === 0) continue;
         chunks.push(content);
         length += content.length;
@@ -348,9 +356,12 @@ export class TaskStore {
     const conversation = await this.conversation(conversationId);
     const matched = new Set<string>();
     let cursor: Cursor | undefined;
+    const revisions = new Map<string, RevisionView>();
     do {
       const page = await conversation.entries({ order: "descending" }, 100, cursor, BACKGROUND_CONTEXT);
       for (const entry of page.items) {
+        const status = await this.revision(entry, revisions);
+        if (status === "superseded" || status === "outside_snapshot") continue;
         const content = key(text(entry));
         for (const token of tokens) if (content.includes(token)) matched.add(token);
       }
@@ -433,16 +444,32 @@ export class TaskStore {
     const refs = (task?.sources ?? []).map(sourceReference);
     if (imported !== undefined) refs.push(sourceReference({ provider: "codex", account: "local", thread_id: imported.thread.id }));
     let cursor: Cursor | undefined;
+    const revisions = new Map<string, RevisionView>();
     do {
       const page = await conversation.entries({ order: "ascending" }, 100, cursor, BACKGROUND_CONTEXT);
       for (const entry of page.items) {
         if (ImportedItemEntry.is(entry) && entry.data.item.role === "thinking") continue;
+        const status = await this.revision(entry, revisions, true);
+        if (status === "superseded" || status === "outside_snapshot") continue;
         const content = (await this.histories?.indexText(entry)) ?? text(entry, 32_000);
-        if (content.trim().length === 0) continue;
-        yield { entry_id: entry.id.toString(), ordinal: entry.id, text: content, source_refs: refs };
+        const gaps = status === "ambiguous" ? [REVISION_AMBIGUOUS] : status === "pending" ? [REVISION_PENDING] : [];
+        if (content.trim().length === 0 && gaps.length === 0) continue;
+        yield { entry_id: entry.id.toString(), ordinal: entry.id, text: content, source_refs: refs, gaps };
       }
       cursor = page.next;
     } while (cursor !== undefined);
+  }
+  private async revision(entry: EntryRecord, views: Map<string, RevisionView>, prepare = false, maximum?: EntryId): Promise<ReturnType<typeof revisionStatus>> {
+    if (!ImportedItemEntry.is(entry)) return "current";
+    let view = views.get(entry.data.thread_id);
+    if (view === undefined) {
+      const histories = this.histories ?? new HistoryStore(this.session);
+      if (prepare) await histories.prepareRevisions(entry.conversationId.toString());
+      view = await histories.revisionView(entry.data.thread_id);
+      if (maximum !== undefined && view.watermark !== null && view.watermark > maximum) view = { ...view, ready: false };
+      views.set(entry.data.thread_id, view);
+    }
+    return revisionStatus(entry.id, view);
   }
   async findIn(tx: Tx, id: string): Promise<TaskRecord | undefined> {
     const task = (await tx.doc(Tasks)).tasks.find((task) => task.id === id);

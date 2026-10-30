@@ -174,17 +174,20 @@ export class CodexImporter {
     const failed = retries.filter((page) => page.cursor === cursor && page.gaps.some((gap) => !assetGap(gap)));
     gaps = without(gaps, failed.flatMap((page) => page.gaps)); retries = retries.filter((page) => !failed.includes(page));
     const cursors = new Set<string>(); let resets = 0;
+    let capture = await this.history.capture(host, thread, true) ?? null;
     // Record the current observation before an RPC can fail, so a changed or
     // unreliable locator cannot keep advertising yesterday's complete coverage.
     await this.history.import({ host_id: host, thread, items: [], next_cursor: cursor,
-      gaps, complete: false, source_exhausted: false, retry_pages: retries });
+      gaps, complete: false, source_exhausted: false, retry_pages: retries }, capture);
     do {
       const page = await this.read(host, { type: "read", thread_id: thread.id, cursor }, call);
       if (page.type !== "read" || page.thread_id !== thread.id) throw new Error("History host returned another conversation");
       if (page.gaps.some((gap) => gap.code === "changed" && gap.item_id === null) && resets++ === 0) {
-        cursor = null; gaps = []; retries = []; thread = { ...thread, version: page.version || thread.version }; continue;
+        cursor = null; gaps = []; retries = []; thread = { ...thread, version: page.version || thread.version };
+        capture = await this.history.capture(host, thread, true) ?? null; continue;
       }
       if (page.version.length > 0) thread = { ...thread, version: page.version };
+      capture = await this.history.rebindCapture(capture, thread);
       const retained = await this.retain(host, thread, page, progress, call);
       gaps = unique([...gaps, ...retained.gaps]);
       const exhausted = page.source_exhausted === true || page.complete;
@@ -192,7 +195,7 @@ export class CodexImporter {
       const retryGaps = readFailed ? retained.gaps : retained.gaps.filter(assetGap);
       if (retryGaps.length > 0) retries.push({ cursor, gaps: retryGaps });
       const receipt = await this.history.import({ host_id: host, thread, items: retained.items, next_cursor: readFailed ? cursor : page.next_cursor,
-        gaps, complete: exhausted && gaps.length === 0, source_exhausted: exhausted, retry_pages: retries });
+        gaps, complete: exhausted && gaps.length === 0, source_exhausted: exhausted, retry_pages: retries }, capture);
       progress.items_added += receipt.added_items; progress.items_unchanged += receipt.existing_items;
       if (readFailed) break;
       cursor = page.next_cursor;
@@ -202,6 +205,7 @@ export class CodexImporter {
   }
   private async retry(host: string, thread: HistoryThread, saved: HistoryRetryPage[],
     progress: ImportProgress, call: HostCall): Promise<HistoryGap[] | undefined> {
+    let capture = await this.history.capture(host, thread, true) ?? null;
     const retries = structuredClone(saved), cursors = new Set<string>();
     for (let index = 0; index < retries.length;) {
       const pending = retries[index]; if (pending === undefined) break;
@@ -213,6 +217,7 @@ export class CodexImporter {
       const page = await this.read(host, { type: "read", thread_id: thread.id, cursor: pending.cursor }, call);
       if (page.type !== "read" || page.thread_id !== thread.id) throw new Error("History host returned another conversation");
       if ((page.version.length > 0 && page.version !== thread.version) || page.gaps.some((gap) => gap.code === "changed" && gap.item_id === null)) return undefined;
+      capture = await this.history.rebindCapture(capture, thread);
       const retained = await this.retain(host, thread, page, progress, call, targets);
       const seen = new Set(retained.items.map((item) => item.id)), remaining = pending.gaps.filter((gap) => assetGap(gap) && gap.item_id !== null && !seen.has(gap.item_id));
       const replacements: HistoryRetryPage[] = [];
@@ -226,7 +231,7 @@ export class CodexImporter {
       retries.splice(index, 1, ...replacements);
       const gaps = unique(retries.flatMap((page) => page.gaps));
       const receipt = await this.history.import({ host_id: host, thread, items: retained.items, next_cursor: null,
-        gaps, complete: retries.length === 0, source_exhausted: true, retry_pages: retries });
+        gaps, complete: retries.length === 0, source_exhausted: true, retry_pages: retries }, capture);
       progress.items_added += receipt.added_items; progress.items_unchanged += receipt.existing_items;
       // Failed items wait for a later import. Follow only a new continuation
       // needed to locate this page's other affected IDs.

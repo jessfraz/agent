@@ -9,10 +9,11 @@ import type { ModelActivity } from "./generated/ModelActivity.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ToolDetails } from "./generated/ToolDetails.js";
 import type { ToolDetailContent } from "./generated/ToolDetailContent.js";
-import { HistoryError, HistoryStore, ImportedItemEntry, ImportedThreadEntry } from "./history.js";
+import { HistoryError, HistoryStore, ImportedItemEntry, ImportedThreadEntry, isHistoryEntry } from "./history.js";
 import { codexMessage, historyToolId } from "./imported-history.js";
 import { content, field, piToolPresentation, renderMessage, string, type MessageContent } from "./message-presentation.js";
 import { observeTranscriptVisibility, readTranscriptVisibility, transcriptVisible, type TranscriptVisibilityState } from "./transcript_visibility.js";
+import { REVISION_AMBIGUOUS, REVISION_PENDING, revisionStatus, type RevisionView } from "./history-revisions.js";
 
 const NOTICE_REFERENCES = "Source references (evidence, not authorization): ";
 /** Curated publications are eligible for delivery; legacy notices remain history. */
@@ -29,13 +30,14 @@ function json(value: unknown): value is JsonValue {
     (typeof value === "number" && Number.isFinite(value)) ||
     (Array.isArray(value) ? value.every(json) : object(value) && Object.values(value).every(json));
 }
-function cursor(value: string | null, conversationId: string): Cursor | undefined {
-  if (value === null) return undefined;
+function cursor(value: string | null, conversationId: string): { cursor?: Cursor; max_entry_id?: EntryId } {
+  if (value === null) return {};
   const decoded: unknown = JSON.parse(value);
   if (!object(decoded) || decoded.conversation_id !== conversationId || !object(decoded.cursor) || !json(decoded.cursor)) {
     throw new Error("History cursor does not belong to this conversation");
   }
-  return decoded.cursor;
+  if (decoded.max_entry_id !== undefined && !entryId(decoded.max_entry_id)) throw new Error("Invalid history snapshot cutoff");
+  return { cursor: decoded.cursor, ...(decoded.max_entry_id === undefined ? {} : { max_entry_id: decoded.max_entry_id }) };
 }
 function* chunks(value: string): Generator<string> {
   for (let offset = 0; offset < value.length;) {
@@ -54,9 +56,11 @@ function missingOriginal(error: unknown): boolean {
 }
 /** Source adapters converge here, including verified cold originals retained by older imports. */
 export async function projectTranscript(entry: EntryRecord, originals: Pick<HistoryStore, "original">,
-  visibility?: Readonly<TranscriptVisibilityState>): Promise<HistoryMessage[]> {
+  visibility?: Readonly<TranscriptVisibilityState>, revisions?: RevisionView): Promise<HistoryMessage[]> {
   if (!transcriptVisible(entry.id.toString(), visibility)) return [];
   if (!ImportedItemEntry.is(entry)) return transcript(entry);
+  const status = revisions === undefined ? "current" : revisionStatus(entry.id, revisions);
+  if (status === "superseded" || status === "outside_snapshot") return [];
   let message: MessageContent;
   try { message = codexMessage(entry.data.item, await originals.original(entry), entry.id.toString()); }
   catch (error) {
@@ -64,7 +68,11 @@ export async function projectTranscript(entry: EntryRecord, originals: Pick<Hist
     message = { role: entry.data.item.role, text: entry.data.item.role === "tool" ? "" : entry.data.item.text,
       presentation: { type: "unavailable", kind: entry.data.item.kind } };
   }
-  return messageRows(entry, message);
+  const rows = messageRows(entry, message);
+  if (rows.length > 0 && status === "ambiguous") rows.unshift({ entry_id: entry.id.toString(), role: "notice",
+    text: `${REVISION_AMBIGUOUS} (${entry.data.item.version.slice(0, 12)})`,
+    continuation: false, final_chunk: true });
+  return rows;
 }
 function messageRows(entry: EntryRecord, message: MessageContent): HistoryMessage[] {
   const value = renderMessage(message); let offset = 0, continuation = false;
@@ -127,16 +135,39 @@ export async function history(conversation: Conversation, value: string | null, 
   const id = conversation.id.toString();
   const visibility = await readTranscriptVisibility(reader, conversation.id);
   const originals = new HistoryStore(reader);
-  let next = cursor(value, id); let projected: HistoryMessage[];
+  const revisions = new Map<string, RevisionView>();
+  const pending = new Set<string>();
+  const saved = cursor(value, id);
+  const maximum = value === null ? (await conversation.entries({ order: "descending" }, 1, undefined, BACKGROUND_CONTEXT)).items[0]?.id : saved.max_entry_id;
+  let next = saved.cursor; let projected: HistoryMessage[];
   // Native pages count entries, including hidden compaction and import metadata.
   // Keep following their cursors until this page has something to show or ends.
   do {
-    const page = await conversation.entries({ order: "descending" }, 20, next, BACKGROUND_CONTEXT);
+    const page = await conversation.entries({ order: "descending", ...(maximum === undefined ? {} : { maxEntryId: maximum }) }, 20, next, BACKGROUND_CONTEXT);
     projected = [];
-    for (const entry of [...page.items].reverse()) projected.push(...await projectTranscript(entry, originals, visibility));
+    for (const entry of [...page.items].reverse()) {
+      let view: RevisionView | undefined;
+      if (ImportedItemEntry.is(entry)) {
+        view = revisions.get(entry.data.thread_id);
+        if (view === undefined) {
+          view = await originals.revisionView(entry.data.thread_id);
+          if (maximum !== undefined && view.watermark !== null && view.watermark > maximum) view = { ...view, ready: false };
+          revisions.set(entry.data.thread_id, view);
+        }
+      }
+      const rows = await projectTranscript(entry, originals, visibility, view);
+      if (rows.length > 0 && view !== undefined && !view.ready && ImportedItemEntry.is(entry) && !pending.has(entry.data.thread_id)) {
+        projected.push({ entry_id: entry.id.toString(), role: "notice", text: REVISION_PENDING, continuation: false, final_chunk: true }); pending.add(entry.data.thread_id);
+      }
+      projected.push(...rows);
+    }
     next = page.next;
+    // The client pages history in the background. A superseded source tail
+    // must not turn its first bounded request into a full ledger scan.
+    if (projected.length === 0 && page.items.some(isHistoryEntry)) break;
   } while (projected.length === 0 && next !== undefined);
-  const next_cursor = next === undefined ? null : JSON.stringify({ conversation_id: id, cursor: next });
+  const next_cursor = next === undefined ? null : JSON.stringify({ conversation_id: id, cursor: next,
+    ...(maximum === undefined ? {} : { max_entry_id: maximum }) });
   const frames: Extract<RuntimeEventKind, { type: "history" }>[] = [];
   let messages: HistoryMessage[] = []; let size = 0;
   for (const message of projected) {

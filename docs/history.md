@@ -107,6 +107,13 @@ establish that two items are the same; genuine content edits remain distinct.
 An unavailable full payload remains incomplete; its excerpt is not a substitute
 for the original.
 
+Original revisions stay immutable. Normal history and search share a projection
+selected by native timestamps and causally ordered reliable snapshots on the
+same host, not page arrival order. Equal timestamps across hosts or unverified
+observations keep conflicting versions visibly ambiguous. Page receipts
+advance only the items actually observed. Background indexing migrates older
+ledgers using cached vectors; opening history never waits for that scan.
+
 ## Native Pi storage, inert history
 
 Create ownerless Pi conversations and append application `data` entries through
