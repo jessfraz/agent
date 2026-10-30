@@ -1013,6 +1013,26 @@ export class TaskStore {
         task = await this.get(input.task_id);
         actor = this.actor(task, input.agent_id);
       }
+      const uncertain = actor.worker.state === "resume_uncertain" ? actor.worker : undefined;
+      if (uncertain !== undefined && call !== undefined && uncertain.allocation_id === input.allocation_id &&
+          uncertain.binding.host_id === input.binding.host_id && uncertain.binding.session_id === input.binding.session_id &&
+          !sameBinding(uncertain.binding, input.binding) &&
+          (await this.inspect(uncertain.binding, call))?.state === "missing_terminal") {
+        const replacement = await this.inspect(input.binding, call);
+        if (replacement?.state === "present" && replacement.running) {
+          // A lost creation reply must not strand the worker that actually
+          // started. Prove the old pane is gone and this exact replacement is
+          // running before moving the retained allocation to its new binding.
+          task = await this.allocation(input.task_id, "reconcile", (saved) => {
+            const current = this.actor(saved, input.agent_id);
+            this.requireResume(current.worker, uncertain);
+            current.worker = { ...uncertain, state: "bound", binding: { ...input.binding } };
+            return { result: { type: "presence", presence: replacement },
+              reason: "The running replacement confirmed its original allocation and session after the resume reply was lost" };
+          }, input.agent_id);
+          actor = this.actor(task, input.agent_id);
+        }
+      }
       if (actor.worker.state !== "bound" || actor.worker.allocation_id !== input.allocation_id ||
           !sameBinding(actor.worker.binding, input.binding)) {
         throw new TaskError("Worker binding is not confirmed for this task");
