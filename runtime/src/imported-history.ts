@@ -6,6 +6,7 @@ import type { AgentState } from "./generated/AgentState.js";
 import type { AgentActivityState } from "./generated/AgentActivityState.js";
 import type { FileOperation } from "./generated/FileOperation.js";
 import type { WebSearchAction } from "./generated/WebSearchAction.js";
+import type { ToolDetailContent } from "./generated/ToolDetailContent.js";
 import { bounded, content, field, label, list, milliseconds, object, string, type MessageContent } from "./message-presentation.js";
 
 function exitCode(value: unknown): number | null { return typeof value === "number" && Number.isInteger(value) && value >= -2_147_483_648 && value <= 2_147_483_647 ? value : null; }
@@ -30,6 +31,36 @@ function webAction(value: unknown): WebSearchAction | null {
 
 /** Immutable evidence versions own distinct rows; their original native IDs remain untouched. */
 export function historyToolId(entryId: string): string { return "history:" + entryId; }
+
+/** Structured MCP output is evidence alongside its prose, never executable input. */
+export function codexToolOutput(item: HistoryItem, data: unknown): Extract<ToolDetailContent, { type: "text" }> {
+  const plain = content(field(data, "output")) || content(field(data, "result")) ||
+    content(field(data, "contentItems")) || content(field(field(data, "error"), "message"));
+  const output: Extract<ToolDetailContent, { type: "text" }> = { type: "text", text: plain, truncated: plain.length > 32_768 };
+  if (item.kind !== "mcpToolCall") return output;
+  const structured = field(field(data, "result"), "structuredContent");
+  if (structured === undefined || structured === null) return output;
+  const serialized = JSON.stringify(structured, null, 2);
+  if (serialized === undefined) return output;
+  // Keep both parts visible even when a large prose block consumes its budget.
+  const structuredLimit = plain.length === 0 ? 32_768 : 16_384;
+  const combined = [plain.length === 0 ? "" : bounded(plain, 16_384),
+    "Structured result:\n" + bounded(serialized, structuredLimit)].filter((part) => part.length > 0).join("\n\n");
+  return { type: "text", text: bounded(combined),
+    truncated: plain.length > 16_384 || serialized.length > structuredLimit || combined.length > 32_768 };
+}
+
+function userReferences(data: unknown): string | undefined {
+  const parts = list(field(data, "content"));
+  if (!parts.some((part) => field(part, "type") === "skill" || field(part, "type") === "mention")) return undefined;
+  return bounded(parts.map((part) => {
+    const type = field(part, "type");
+    if (type !== "skill" && type !== "mention") return content([part]);
+    const name = label(field(part, "name"), type), path = label(field(part, "path"));
+    return `Historical ${type === "skill" ? "skill reference" : "mention"}: ${name}${path.length === 0 ? "" : ` (${path})`}`;
+  }).filter((part) => part.length > 0).join("\n"));
+}
+
 /** Codex is a source adapter into the same messages and renderer used by live Pi. */
 export function codexMessage(item: HistoryItem, data: unknown, entryId: string): MessageContent {
   const tool = (name: string, presentation: MessagePresentation, text = "", explicitStatus = status(field(data, "status"))): MessageContent =>
@@ -77,12 +108,12 @@ export function codexMessage(item: HistoryItem, data: unknown, entryId: string):
 /** Display bodies are separate from the stable legacy formatter and indexed native excerpts. */
 export function codexDisplayMessage(item: HistoryItem, data: unknown, entryId: string): MessageContent {
   const message = codexMessage(item, data, entryId);
+  if (item.kind === "userMessage") return { ...message, text: userReferences(data) ?? message.text };
   switch (message.presentation?.type) {
     case "command": return { ...message, text: content(field(data, "aggregatedOutput")) };
     case "file_changes": return { ...message, text: bounded([...list(field(data, "changes")).slice(0, 16)
       .flatMap((change) => { const diff = string(field(change, "diff")); return diff === null ? [] : [bounded(diff)]; }), message.text].filter((part) => part.length > 0).join("\n")) };
-    case "tool": return { ...message, text: content(field(data, "output")) || content(field(data, "result")) ||
-      content(field(data, "contentItems")) || content(field(field(data, "error"), "message")) };
+    case "tool": return { ...message, text: codexToolOutput(item, data).text };
     default: return message;
   }
 }

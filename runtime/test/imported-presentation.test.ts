@@ -172,3 +172,102 @@ test("distinct retained tool versions keep separate canonical identities and ins
     assert.equal(app.faux.state.callCount, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
+
+test("MCP structured results survive native import, bounded display, lazy inspection and reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-mcp-structured-")); let app = await fixture(directory);
+  const originals = [
+    item("mcpToolCall", { server: "fixture", tool: "inspect", arguments: { scope: "synthetic" }, status: "completed",
+      result: { content: [], structuredContent: { verified_count: 7 } } }),
+    item("mcpToolCall", { server: "fixture", tool: "inspect", arguments: {}, status: "completed",
+      result: { content: [{ type: "text", text: "Human-readable result" }], structuredContent: { state: "verified" } } }),
+    item("mcpToolCall", { server: "fixture", tool: "inspect", arguments: {}, status: "completed",
+      result: { content: [{ type: "text", text: "Large readable result " + "x".repeat(40_000) }], structuredContent: { evidence: "🦀".repeat(40_000) } } }),
+    item("mcpToolCall", { server: "fixture", tool: "inspect", arguments: {}, status: "completed",
+      result: { content: [{ type: "text", text: "x".repeat(20_000) }], structuredContent: { count: 1 } } }),
+  ].map((value, order) => ({ ...value, id: value.id + "-" + order, order }));
+  try {
+    const saved = await app.store.import(batch(originals)), id = saved.conversation.conversation_id;
+    const conversation = await app.store.conversation(id); assert.ok(conversation);
+    const retained = (await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items;
+    const entries = retained.filter(ImportedItemEntry.is);
+    assert.equal(entries.length, originals.length);
+    const indexBefore = await Promise.all(entries.map((entry) => app.store.indexText(entry)));
+    const messages = await read(app, id);
+    for (const [index, entry] of entries.entries()) {
+      const rows = messages.filter((message) => message.entry_id === entry.id.toString());
+      const display = rows.map((row) => row.text).join("");
+      assert.match(display, /Structured result:/);
+      assert.equal(rows[0]?.presentation?.type, "tool"); assert.equal(rows[0]?.tool?.status, "finished");
+      if (index === 0) assert.match(display, /"verified_count": 7/);
+      if (index === 1) { assert.match(display, /Human-readable result/); assert.match(display, /"state": "verified"/); }
+      if (index === 2) {
+        assert.match(display, /Large readable result/); assert.match(display, /"evidence": "🦀/);
+        assert.ok(display.length <= 33_000, "Structured output must remain a bounded preview");
+        assert.equal(Buffer.from(display, "utf8").toString("utf8"), display);
+      }
+      assert.ok(rows[0]?.tool);
+      const details = await toolDetails(conversation, entry.id.toString(), rows[0].tool.call_id, app.session);
+      assert.equal(details.type, "available");
+      if (details.type === "available") {
+        assert.equal(details.output.type, "text");
+        if (details.output.type === "text") {
+          assert.match(details.output.text, /Structured result:/);
+          assert.match(details.output.text, index === 0 ? /"verified_count": 7/ : index === 1 ? /"state": "verified"/ : index === 2 ? /"evidence": "🦀/ : /"count": 1/);
+          assert.ok(Buffer.byteLength(details.output.text, "utf8") <= 32_768);
+          assert.equal(Buffer.from(details.output.text, "utf8").toString("utf8"), details.output.text);
+          assert.equal(details.output.truncated, index >= 2);
+        }
+      }
+      assert.deepEqual(await app.store.original(entry), originals[index]?.data);
+    }
+    assert.deepEqual(await Promise.all(entries.map((entry) => app.store.indexText(entry))), indexBefore,
+      "Presentation and lazy inspection must not rewrite canonical search text");
+    assert.deepEqual((await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items, retained);
+    assert.deepEqual((await conversation.context(BACKGROUND_CONTEXT)).messages, []);
+    assert.equal(app.faux.state.callCount, 0);
+    await app.session.close(BACKGROUND_CONTEXT); app = await fixture(directory);
+    assert.deepEqual(await read(app, id), messages);
+    const reopened = await app.store.conversation(id); assert.ok(reopened);
+    for (const [index, entry] of entries.entries()) {
+      const row = messages.find((message) => message.entry_id === entry.id.toString()); assert.ok(row?.tool);
+      const details = await toolDetails(reopened, entry.id.toString(), row.tool.call_id, app.session);
+      assert.equal(details.type, "available");
+      if (details.type === "available" && details.output.type === "text") {
+        assert.match(details.output.text, /Structured result:/);
+        assert.equal(details.output.truncated, index >= 2);
+      }
+    }
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("skill and mention user inputs remain inert references in native history without changing indexed originals", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-user-references-")); let app = await fixture(directory);
+  const originals = [
+    item("userMessage", { content: [{ type: "skill", name: "example-skill", path: "/example/SKILL.md" }] }, "user"),
+    item("userMessage", { content: [{ type: "mention", name: "Example app", path: "app://example" }] }, "user"),
+    item("userMessage", { content: [{ type: "text", text: "Inspect the saved evidence." },
+      { type: "skill", name: "example-skill", path: "/example/SKILL.md" }, { type: "mention", name: "Example app", path: "app://example" }] }, "user"),
+  ].map((value, order) => ({ ...value, id: value.id + "-" + order, order }));
+  try {
+    const saved = await app.store.import(batch(originals)), id = saved.conversation.conversation_id;
+    const conversation = await app.store.conversation(id); assert.ok(conversation);
+    const retained = (await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items;
+    const entries = retained.filter(ImportedItemEntry.is);
+    const indexed = await Promise.all(entries.map((entry) => app.store.indexText(entry)));
+    const messages = await read(app, id);
+    assert.equal(messages.length, 3);
+    assert.match(messages[0]?.text ?? "", /Historical skill reference: example-skill.*\/example\/SKILL\.md/);
+    assert.match(messages[1]?.text ?? "", /Historical mention: Example app.*app:\/\/example/);
+    assert.match(messages[2]?.text ?? "", /^Inspect the saved evidence\./);
+    assert.match(messages[2]?.text ?? "", /Historical skill reference:/); assert.match(messages[2]?.text ?? "", /Historical mention:/);
+    for (const message of messages) { assert.equal(message.role, "user"); assert.doesNotMatch(message.text, /Historical media attachment/); }
+    assert.deepEqual(await Promise.all(entries.map((entry) => app.store.indexText(entry))), indexed);
+    for (const [index, entry] of entries.entries()) assert.deepEqual(await app.store.original(entry), originals[index]?.data);
+    assert.deepEqual((await conversation.context(BACKGROUND_CONTEXT)).messages, []);
+    assert.equal(app.faux.state.callCount, 0);
+    await app.session.close(BACKGROUND_CONTEXT); app = await fixture(directory);
+    assert.deepEqual(await read(app, id), messages);
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});

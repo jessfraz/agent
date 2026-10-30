@@ -12,8 +12,8 @@ import type { ToolDetails } from "./generated/ToolDetails.js";
 import type { ToolDetailContent } from "./generated/ToolDetailContent.js";
 import type { MessagePresentation } from "./generated/MessagePresentation.js";
 import { HistoryError, HistoryStore, ImportedItemEntry, ImportedThreadEntry, isHistoryEntry } from "./history.js";
-import { codexDisplayMessage, codexMessage, historyToolId } from "./imported-history.js";
-import { content, field, piToolPresentation, piToolResult, string, type MessageContent } from "./message-presentation.js";
+import { codexDisplayMessage, codexMessage, codexToolOutput, historyToolId } from "./imported-history.js";
+import { field, piToolPresentation, piToolResult, string, type MessageContent } from "./message-presentation.js";
 import { observeTranscriptVisibility, readTranscriptVisibility, transcriptVisible, type TranscriptVisibilityState } from "./transcript_visibility.js";
 import { REVISION_AMBIGUOUS, REVISION_PENDING, revisionStatus, type RevisionView } from "./history-revisions.js";
 
@@ -222,11 +222,15 @@ export async function toolDetails(conversation: Conversation, value: string, cal
     if (canonical.tool === undefined) return { type: "unavailable", call_id: callId };
     const input = field(original, "command") ?? field(original, "arguments") ?? field(original, "changes") ?? field(original, "prompt");
     const agents = field(original, "agentsStates");
-    const output = string(field(original, "aggregatedOutput")) ?? (content(field(original, "output")) || content(field(original, "result")) ||
-      content(field(original, "contentItems")) || (string(field(field(original, "error"), "message")) ?? (agents === undefined ? null : JSON.stringify(agents, null, 2))));
+    const aggregated = string(field(original, "aggregatedOutput")), projected = codexToolOutput(selected.data.item, original);
+    const output = aggregated ?? (projected.text ||
+      (string(field(field(original, "error"), "message")) ?? (agents === undefined ? null : JSON.stringify(agents, null, 2))));
+    const inspected: ToolDetailContent = output === null || output === undefined ? { type: "unavailable", reason: "not_recorded" } : detailText(output);
+    // Inspection's byte limit cannot erase an earlier per-part display cutoff.
+    if (aggregated === null && projected.text.length > 0 && projected.truncated && inspected.type === "text") inspected.truncated = true;
     return { type: "available", call_id: callId, name: canonical.tool.name, status: canonical.tool.status,
       input: input === undefined ? { type: "unavailable", reason: "not_recorded" } : detailText(typeof input === "string" ? input : JSON.stringify(input, null, 2)),
-      output: output === null || output === undefined ? { type: "unavailable", reason: "not_recorded" } : detailText(output) };
+      output: inspected };
   }
   let { call, result } = toolParts(selected, callId);
   if (call === undefined && result === undefined) return { type: "unavailable", call_id: callId };

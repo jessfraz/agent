@@ -34,8 +34,8 @@ use crate::{
 const PAGE_BYTES: usize = 500 * 1024;
 const ITEM_BYTES: usize = 128 * 1024;
 const NATIVE_BYTES: usize = 64 * 1024 * 1024;
-// Retained-kind changes revisit source checkpoints without changing item identity.
-const RETENTION_REVISION: u32 = 1;
+// Reader-semantic changes revisit source checkpoints without changing item identity.
+const RETENTION_REVISION: u32 = 2;
 // Leave room for base64 expansion and metadata within PAGE_BYTES.
 const ASSET_BYTES: usize = 320 * 1024;
 const SOURCES: &[&str] = &[
@@ -408,6 +408,17 @@ impl CodexHistory {
         let mut gaps = Vec::new();
         let mut assets = Vec::new();
         for candidate in media(&data) {
+            let candidate = match candidate {
+                MediaReference::Location(path) => path,
+                MediaReference::RemoteFileId => {
+                    gaps.push(gap(
+                        HistoryGapCode::Unavailable,
+                        Some(header.id.clone()),
+                        "A remote media file ID has no retained bytes",
+                    ));
+                    continue;
+                }
+            };
             let expected_digest = data
                 .get("inputImages")
                 .and_then(Value::as_array)
@@ -1045,7 +1056,11 @@ fn item_text(value: &Value) -> String {
     }
     text.join("\n")
 }
-fn media(value: &Value) -> Vec<String> {
+enum MediaReference {
+    Location(String),
+    RemoteFileId,
+}
+fn media(value: &Value) -> Vec<MediaReference> {
     let mut paths = Vec::new();
     let kind = value
         .get("type")
@@ -1054,29 +1069,31 @@ fn media(value: &Value) -> Vec<String> {
     if kind == "imageView"
         && let Some(path) = value.get("path").and_then(Value::as_str)
     {
-        paths.push(path.into());
+        paths.push(MediaReference::Location(path.into()));
     }
     if kind == "imageGeneration" {
         if let Some(path) = value.get("savedPath").and_then(Value::as_str) {
-            paths.push(path.into());
+            paths.push(MediaReference::Location(path.into()));
         }
         if let Some(data) = value
             .get("result")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
         {
-            paths.push(format!("data:image/png;base64,{data}"));
+            paths.push(MediaReference::Location(format!(
+                "data:image/png;base64,{data}"
+            )));
         }
         if let Some(images) = value.get("inputImages").and_then(Value::as_array) {
             for image in images {
                 if let Some(path) = image.get("path").and_then(Value::as_str) {
-                    paths.push(path.into());
+                    paths.push(MediaReference::Location(path.into()));
                 }
             }
         }
     }
-    if value.get("fileId").is_some() {
-        paths.push("unavailable-native-file-id".into());
+    if value.get("fileId").and_then(Value::as_str).is_some() {
+        paths.push(MediaReference::RemoteFileId);
     }
     for key in ["content", "contentItems"] {
         if let Some(values) = value.get(key).and_then(Value::as_array) {
@@ -1093,9 +1110,9 @@ fn media(value: &Value) -> Vec<String> {
                     _ => None,
                 };
                 if let Some(path) = field.and_then(|key| value.get(key)).and_then(Value::as_str) {
-                    paths.push(path.into());
-                } else if value.get("fileId").is_some() {
-                    paths.push("unavailable-native-file-id".into());
+                    paths.push(MediaReference::Location(path.into()));
+                } else if value.get("fileId").and_then(Value::as_str).is_some() {
+                    paths.push(MediaReference::RemoteFileId);
                 }
             }
         }
@@ -1112,7 +1129,7 @@ fn media(value: &Value) -> Vec<String> {
     }
     paths
 }
-fn media_blocks(blocks: &[Value], paths: &mut Vec<String>) {
+fn media_blocks(blocks: &[Value], paths: &mut Vec<MediaReference>) {
     for block in blocks {
         let kind = block
             .get("type")
@@ -1124,7 +1141,9 @@ fn media_blocks(blocks: &[Value], paths: &mut Vec<String>) {
                     block.get("data").and_then(Value::as_str),
                     block.get("mimeType").and_then(Value::as_str),
                 ) {
-                    paths.push(format!("data:{mime};base64,{data}"));
+                    paths.push(MediaReference::Location(format!(
+                        "data:{mime};base64,{data}"
+                    )));
                 }
             }
             "input_image" | "input_audio" => {
@@ -1133,12 +1152,16 @@ fn media_blocks(blocks: &[Value], paths: &mut Vec<String>) {
                     .or_else(|| block.get("audio_url"))
                     .and_then(Value::as_str)
                 {
-                    paths.push(path.into());
+                    paths.push(MediaReference::Location(path.into()));
+                } else if kind == "input_image"
+                    && block.get("file_id").and_then(Value::as_str).is_some()
+                {
+                    paths.push(MediaReference::RemoteFileId);
                 }
             }
             "resource_link" => {
                 if let Some(path) = block.get("uri").and_then(Value::as_str) {
-                    paths.push(path.into());
+                    paths.push(MediaReference::Location(path.into()));
                 }
             }
             "resource" => {
@@ -1148,7 +1171,9 @@ fn media_blocks(blocks: &[Value], paths: &mut Vec<String>) {
                         resource.get("mimeType").and_then(Value::as_str),
                     )
                 {
-                    paths.push(format!("data:{mime};base64,{data}"));
+                    paths.push(MediaReference::Location(format!(
+                        "data:{mime};base64,{data}"
+                    )));
                 }
             }
             _ => {}
@@ -2584,6 +2609,7 @@ try{
             previous: crate::history::HistoryThread,
             current: crate::history::HistoryThread,
             items: Vec<crate::history::HistoryItem>,
+            gaps: Vec<crate::history::HistoryGap>,
             directory: PathBuf,
         }
         #[derive(Deserialize)]
@@ -2599,9 +2625,10 @@ try{
         let mut native: NativeThread = serde_json::from_str(THREAD).unwrap();
         native.path = Some(locator);
         let fingerprint = crate::history::codex::locator_fingerprint(native.path.as_ref().unwrap());
-        // Exact pre-revision fingerprint format, retained by completed imports.
+        // Exact reader-revision-one fingerprint, retained by completed imports.
         let previous_version = digest(
             &serde_json::to_vec(&(
+                1_u32,
                 &native.id,
                 native.name.as_deref().unwrap(),
                 &native.cwd,
@@ -2621,11 +2648,13 @@ try{
         };
         let source = history(directory.path(), "unused-native-reader".into());
         let mut items = Vec::new();
+        let mut unavailable = Vec::new();
         for (order, raw) in [
             r#"{"id":"user","type":"userMessage","content":[{"type":"text","text":"Retain the original request"}]}"#,
             r#"{"id":"hook","type":"hookPrompt","fragments":[{"text":"Inert historical hook"}]}"#,
             r#"{"id":"compaction","type":"contextCompaction"}"#,
             r#"{"id":"answer","type":"agentMessage","text":"Retain the original answer","phase":"final_answer"}"#,
+            r#"{"id":"remote-image","type":"functionCallOutput","name":"inspect","output":[{"type":"input_image","file_id":"file-example"}]}"#,
         ]
         .into_iter()
         .enumerate()
@@ -2643,9 +2672,10 @@ try{
                 )
                 .await
                 .unwrap();
-            assert!(gaps.is_empty());
+            unavailable.extend(gaps);
             items.push(item.unwrap());
         }
+        assert_eq!(unavailable.len(), 1);
         let runtime = std::env::var_os("AGENT_RUNTIME_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -2698,25 +2728,27 @@ const call=async command=>{
  if(request.type==='list')return {type:'history',response:{type:'list',threads:request.archived?[]:[evidence.current],next_cursor:null}};
  assert.equal(request.type,'read');assert.equal(request.cursor,null,'A retention revision must reread the whole native source');reads++;
  return {type:'history',response:{type:'read',thread_id:evidence.current.id,version:evidence.current.version,items:evidence.items,
-  next_cursor:null,gaps:[],complete:true,source_exhausted:true}};
+  next_cursor:null,gaps:evidence.gaps,complete:false,source_exhausted:true}};
 };
 const run=()=>app.importer.run([host],[host.host_id],[],call,()=>{},()=>app.retrieval.sync(embed,true));
 try{
- const oldItems=evidence.items.filter(item=>item.kind==='userMessage'||item.kind==='agentMessage');
- const seeded=await app.store.import({host_id:host.host_id,thread:evidence.previous,items:oldItems,next_cursor:null,gaps:[],complete:true,source_exhausted:true,retry_pages:[]});
+ const seeded=await app.store.import({host_id:host.host_id,thread:evidence.previous,items:evidence.items,next_cursor:null,gaps:[],complete:true,source_exhausted:true,retry_pages:[]});
  await app.retrieval.sync(embed,true);
  const initialEmbedded=[...embedded],conversation=await app.store.conversation(seeded.conversation.conversation_id);assert.ok(conversation);
  const original=(await conversation.entries({order:'ascending'},100,undefined,BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is);
- const progress=await run();assert.equal(progress.phase,'complete');assert.equal(reads,1,'Completed old retention checkpoints must rescan');
- assert.equal(progress.items_added,2);assert.equal(progress.items_unchanged,2);
+ const progress=await run();assert.equal(reads,1,'Completed reader-revision-one checkpoints must rescan');assert.equal(progress.phase,'partial');
+ assert.equal(progress.items_added,0);assert.equal(progress.items_unchanged,5);
  const retained=(await conversation.entries({order:'ascending'},100,undefined,BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is);
- assert.equal(retained.length,4);for(const entry of original)assert.deepEqual(retained.find(value=>value.id===entry.id),entry);
+ assert.equal(retained.length,5);for(const entry of original)assert.deepEqual(retained.find(value=>value.id===entry.id),entry);
  for(const text of initialEmbedded)assert.equal(embedded.filter(value=>value===text).length,1,'Existing vectors must be reused');
- assert.equal((await app.store.checkpoint(evidence.current.id,host.host_id)).version,evidence.current.version);
+ const checkpoint=await app.store.checkpoint(evidence.current.id,host.host_id);
+ assert.equal(checkpoint.version,evidence.current.version);assert.notEqual(checkpoint.version,evidence.previous.version);
+ assert.equal(checkpoint.complete,false);assert.deepEqual(checkpoint.gaps,evidence.gaps);
  assert.deepEqual((await conversation.context(BACKGROUND_CONTEXT)).messages,[]);assert.equal(app.faux.state.callCount,0);
  const watermark=(await conversation.entries({order:'descending'},1,undefined,BACKGROUND_CONTEXT)).items[0].id,embeddedCount=embedded.length;
  app.retrieval.close();await app.session.close(BACKGROUND_CONTEXT);app=await open();
- const repeated=await run();assert.equal(repeated.threads_unchanged,1);assert.equal(reads,1);assert.equal(embedded.length,embeddedCount);
+ const repeated=await run();assert.equal(repeated.phase,'partial');assert.equal(reads,2);assert.equal(repeated.items_added,0);
+ assert.equal(repeated.items_unchanged,1,'Only the affected image is retried after the one-time reader backfill');assert.equal(embedded.length,embeddedCount);
  const reopened=await app.store.conversation(seeded.conversation.conversation_id);assert.ok(reopened);
  assert.equal((await reopened.entries({order:'descending'},1,undefined,BACKGROUND_CONTEXT)).items[0].id,watermark);
  assert.equal(app.faux.state.callCount,0);assert.equal((await app.session.inspect(BACKGROUND_CONTEXT)).tasks.length,0);
@@ -2734,6 +2766,7 @@ try{
                     previous,
                     current,
                     items,
+                    gaps: unavailable,
                     directory: directory.path().into(),
                 })
                 .unwrap(),
@@ -2754,7 +2787,242 @@ try{
                 receipt.retained,
                 receipt.repeated_embeddings
             ),
-            (1, 2, 4, 0)
+            (2, 0, 5, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn native_remote_image_ids_remain_gaps_without_retained_bytes_across_reopen() {
+        use tokio::io::AsyncWriteExt;
+
+        // Codex 0.165's FunctionCallOutputContentItem accepts an image_url,
+        // a remote file_id, or both. A file ID never grants local file access.
+        #[derive(serde::Serialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Output {
+            InputText {
+                text: &'static str,
+            },
+            InputImage {
+                #[serde(skip_serializing_if = "Option::is_none")]
+                image_url: Option<String>,
+                file_id: String,
+            },
+        }
+        #[derive(serde::Serialize)]
+        struct NativeOutput {
+            id: &'static str,
+            #[serde(rename = "type")]
+            kind: &'static str,
+            name: &'static str,
+            output: Vec<Output>,
+        }
+        #[derive(serde::Serialize)]
+        struct Evidence<'a> {
+            response: &'a HistoryResponse,
+            originals: &'a [Value],
+            asset_root: PathBuf,
+            database: PathBuf,
+        }
+        #[derive(Deserialize)]
+        struct Receipt {
+            retained: usize,
+            gaps: usize,
+            executions: usize,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let image_bytes = STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jW5sAAAAASUVORK5CYII=")
+            .unwrap();
+        let local_file = directory.path().join("a-file-id-is-not-a-local-path.png");
+        std::fs::write(&local_file, &image_bytes).unwrap();
+        let originals: Vec<Value> = [
+            ("remote-id", "file-example".to_owned(), None),
+            (
+                "remote-path",
+                local_file.to_string_lossy().into_owned(),
+                None,
+            ),
+            (
+                "retained-image",
+                "file-retained".to_owned(),
+                Some(format!(
+                    "data:image/png;base64,{}",
+                    STANDARD.encode(&image_bytes)
+                )),
+            ),
+        ]
+        .into_iter()
+        .map(|(id, file_id, image_url)| {
+            serde_json::to_value(NativeOutput {
+                id,
+                kind: "functionCallOutput",
+                name: "inspect",
+                output: vec![
+                    Output::InputText {
+                        text: "Retained tool text",
+                    },
+                    Output::InputImage { image_url, file_id },
+                ],
+            })
+            .unwrap()
+        })
+        .collect();
+        let source = fixture(directory.path(), &provider_fixture(originals.clone()));
+        let response = source
+            .request(HistoryRequest::Read {
+                thread_id: "thread-a".into(),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let HistoryResponse::Read {
+            items,
+            gaps,
+            complete,
+            source_exhausted,
+            next_cursor,
+            ..
+        } = &response
+        else {
+            panic!("Expected native history")
+        };
+        assert!(
+            !complete,
+            "Remote-only native images must prevent a falsely complete import"
+        );
+        assert!(*source_exhausted);
+        assert!(next_cursor.is_none());
+        assert_eq!(items.len(), 3);
+        assert_eq!(gaps.len(), 2);
+        for (item, original) in items.iter().zip(&originals) {
+            assert_eq!(&item.data, original);
+        }
+        for id in ["remote-id", "remote-path"] {
+            assert!(gaps.iter().any(|gap| gap.item_id.as_deref() == Some(id)
+                && matches!(gap.code, HistoryGapCode::Unavailable)));
+        }
+        assert!(items[0].assets.is_empty());
+        assert!(items[1].assets.is_empty());
+        let retained = &items[2].assets;
+        assert_eq!(
+            retained.len(),
+            1,
+            "Retained bytes cover this image's remote identity"
+        );
+        let HistoryResponse::Asset { data_base64, .. } = source
+            .request(HistoryRequest::Asset {
+                thread_id: "thread-a".into(),
+                path: retained[0].path.clone(),
+                offset: 0,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("Expected retained image bytes")
+        };
+        assert_eq!(STANDARD.decode(data_base64).unwrap(), image_bytes);
+        assert!(
+            source
+                .asset(
+                    "thread-a".into(),
+                    local_file.to_string_lossy().into_owned(),
+                    0
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&local_file).unwrap(), image_bytes);
+        let repeated = source
+            .request(HistoryRequest::Read {
+                thread_id: "thread-a".into(),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&response).unwrap(),
+            serde_json::to_vec(&repeated).unwrap()
+        );
+
+        let runtime = std::env::var_os("AGENT_RUNTIME_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/dist/src/bridge.js")
+            });
+        let runtime_root = runtime
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let mut child = tokio::process::Command::new("node")
+            .args(["--no-warnings", "--input-type=module", "--eval", r#"
+import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
+import {BACKGROUND_CONTEXT} from '@earendil-works/chord/context';
+import {openNodeSqliteDatabase} from '@earendil-works/chord/sqlite/node';
+import {createModels} from '@earendil-works/pi-ai';
+import {createRegistry,Harness} from '@earendil-works/pi-durable';
+import {SqliteStorage} from '@earendil-works/pi-durable/storage/sqlite';
+const runtime=pathToFileURL(process.argv[1]);
+const {HistoryStore,ImportedItemEntry}=await import(new URL('./history.js',runtime));
+let raw='';for await(const part of process.stdin)raw+=part;
+const input=JSON.parse(raw),response=input.response;
+const batch={host_id:'fixture-host',thread:{id:response.thread_id,title:'Remote image evidence',cwd:'/example',created_at:1,updated_at:2,
+ forked_from_id:null,parent_thread_id:null,version:response.version,version_reliable:true,archived:true},items:response.items,
+ next_cursor:response.next_cursor,gaps:response.gaps,complete:response.complete,source_exhausted:response.source_exhausted};
+async function open(){const session=await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(input.database)),
+ {models:createModels(),registry:createRegistry(),identity:{attribution:null}},BACKGROUND_CONTEXT);return{session,store:new HistoryStore(session,input.asset_root)};}
+let app=await open();
+try{
+ const first=await app.store.import(batch);assert.equal(first.added_items,3);assert.equal(first.conversation.complete,false);assert.equal(first.conversation.gaps.length,2);
+ const id=first.conversation.conversation_id,conversation=await app.store.conversation(id);assert.ok(conversation);
+ const entries=(await conversation.entries({order:'ascending'},100,undefined,BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is);
+ assert.equal(entries.length,3);assert.deepEqual(await Promise.all(entries.map(entry=>app.store.original(entry))),input.originals);
+ assert.deepEqual((await conversation.context(BACKGROUND_CONTEXT)).messages,[]);
+ assert.equal((await app.session.inspect(BACKGROUND_CONTEXT)).tasks.length,0);
+ await app.session.close(BACKGROUND_CONTEXT);app=await open();
+ const repeated=await app.store.import(batch);assert.equal(repeated.added_items,0);assert.equal(repeated.existing_items,3);
+ assert.deepEqual(repeated.entry_ids,[]);assert.equal(repeated.watermark,first.watermark);assert.equal(repeated.conversation.complete,false);
+ assert.deepEqual(repeated.conversation.gaps,first.conversation.gaps);
+ const reopened=await app.store.conversation(id);assert.ok(reopened);
+ assert.deepEqual((await reopened.entries({order:'ascending'},100,undefined,BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is),entries);
+ const executions=(await app.session.inspect(BACKGROUND_CONTEXT)).tasks.length;assert.equal(executions,0);
+ process.stdout.write(JSON.stringify({retained:entries.length,gaps:repeated.conversation.gaps.length,executions})+'\n');
+}finally{await app.session.close(BACKGROUND_CONTEXT);}
+"#])
+            .arg(&runtime).current_dir(runtime_root).stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                &serde_json::to_vec(&Evidence {
+                    response: &response,
+                    originals: &originals,
+                    asset_root: source.cache.clone(),
+                    database: directory.path().join("retained.sqlite"),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: Receipt = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            (receipt.retained, receipt.gaps, receipt.executions),
+            (3, 2, 0)
         );
     }
 
@@ -2762,9 +3030,20 @@ try{
     async fn missing_native_media_remains_a_gap_while_future_items_retain_their_payload() {
         let directory = tempfile::tempdir().unwrap();
         let source = history(directory.path(), "unavailable-codex-fixture".into());
-        for raw in [
-            r#"{"id":"image-a","type":"userMessage","content":[{"type":"image","fileId":"native-file"}]}"#,
-            r#"{"id":"future-a","type":"futureNativeItem"}"#,
+        for (raw, expected_gaps) in [
+            (
+                r#"{"id":"image-a","type":"userMessage","content":[{"type":"image","fileId":"native-file"}]}"#,
+                1,
+            ),
+            (r#"{"id":"future-a","type":"futureNativeItem"}"#, 0),
+            (
+                r#"{"id":"empty-image","type":"imageGeneration","status":"failed","fileId":null,"result":""}"#,
+                0,
+            ),
+            (
+                r#"{"id":"text-a","type":"userMessage","content":[{"type":"text","text":"Ordinary text","fileId":null}]}"#,
+                0,
+            ),
         ] {
             let entry = NativeEntry {
                 turn_id: "turn-a".into(),
@@ -2774,7 +3053,8 @@ try{
             };
             let (retained, gaps) = source.normalize("thread-a", &entry, 0).await.unwrap();
             let retained = retained.unwrap();
-            assert_eq!(gaps.len(), usize::from(retained.kind == "userMessage"));
+            assert_eq!(retained.data, entry.item);
+            assert_eq!(gaps.len(), expected_gaps);
         }
     }
 
