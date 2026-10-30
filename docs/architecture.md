@@ -346,7 +346,9 @@ Mutations are not replay-safe. Missing receipts remain uncertain until a live
 status check, followed by page or provider inspection. Interruption fences new
 operations while an issued effect reaches its bounded result. Successful turns
 release disposable tabs automatically; an explicit retain action preserves a
-needed draft or result. Connection loss leaves uncertain tabs intact. Native
+needed draft or result. Explicit release can close that connection's owned tabs
+while an earlier effect remains uncertain; its provider outcome still needs
+verification. Connection loss leaves uncertain tabs intact. Native
 absence of a connection cannot establish whether an external action completed.
 
 Source refreshes, resource collection and scheduled jobs use the same native Pi
