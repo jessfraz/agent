@@ -17,7 +17,7 @@ test("timer and manual runs reuse one attached job conversation with each admitt
   const app = await openScheduled(directory, "original", clock), controller = new AbortController();
   let worker: Promise<unknown> | undefined, release = () => {};
   const scheduler = new BackgroundScheduler(app.session, app.registry, app.tasks, {
-    plan: async (cadence, after, now) => planned(cadence, after, now), refreshSources: async () => {}, collectResources: async () => {},
+    plan: async (cadence, after, now) => planned(cadence, after, now), refreshSources: async () => {}, triageSources: async () => {}, collectResources: async () => {},
     runJob: (occurrence, signal, actor) => runScheduled(occurrence, signal, app, actor),
   });
   try {

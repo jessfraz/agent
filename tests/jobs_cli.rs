@@ -628,8 +628,8 @@ fn real_cli_reconciles_files_preserves_builtins_and_reopens_durable_deadlines() 
     let baseline = fixture.status();
     assert_eq!(baseline.jobs, 0);
     assert_eq!(
-        baseline.triggers, 2,
-        "Sources and resources use native built-in triggers even with external sources disabled"
+        baseline.triggers, 3,
+        "Source polling, judgment and resources retain native triggers even with external sources disabled"
     );
 
     let file = fixture.jobs.join("review.toml");
@@ -705,7 +705,7 @@ fn real_cli_reconciles_files_preserves_builtins_and_reopens_durable_deadlines() 
     assert_eq!(
         fixture.status().triggers,
         baseline.triggers + 1,
-        "Invalid files at startup must preserve the applied job and both built-ins"
+        "Invalid files at startup must preserve the applied job and all built-ins"
     );
     fs::remove_file(&duplicate).unwrap();
     assert_eq!(fixture.sync().unchanged, 1);
@@ -747,7 +747,7 @@ fn real_cli_reconciles_files_preserves_builtins_and_reopens_durable_deadlines() 
     assert_eq!(empty.jobs, 0);
     assert_eq!(
         empty.triggers, baseline.triggers,
-        "Removing jobs must preserve both built-in triggers"
+        "Removing jobs must preserve all built-in triggers"
     );
     assert!(empty.errors.is_empty(), "{:?}", empty.errors);
     assert!(

@@ -159,6 +159,10 @@ async function openApplication(): Promise<Application> {
         for (const read of result.response.reads) await sources.admit(read.batch, read.expected_checkpoint);
         cursor = result.response.cursor;
       } while (cursor !== null);
+    },
+    async triageSources() {
+      if (!backgroundSources) return;
+      const settings = (await environment.environment()).settings;
       if (backgroundOwner !== undefined) await triageSources(await app(), backgroundOwner, { type: "triage_sources", instructions: "", model: settings.model, cwd: "/", hosts: [] });
     },
     async collectResources() {

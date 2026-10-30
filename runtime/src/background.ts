@@ -36,6 +36,7 @@ export const JobRunReceiptEntry = defineEntry<JobRunReceipt>("agent.job_run");
 export type BackgroundCallbacks = {
   plan(cadence: BackgroundCadence, after: number | null, now: number, signal: AbortSignal): Promise<OccurrencePlan>;
   refreshSources(signal: AbortSignal): Promise<void>;
+  triageSources(signal: AbortSignal): Promise<void>;
   collectResources(signal: AbortSignal): Promise<void>;
   jobActor?(job: ScheduledJob): Promise<string | undefined>;
   runJob(occurrence: ScheduledOccurrence, signal: AbortSignal, actorId: string): Promise<void>;
@@ -125,6 +126,7 @@ export class BackgroundScheduler {
           try {
             switch (input.work.type) {
               case "sources": await callbacks.refreshSources(runtime.signal); break;
+              case "source_triage": await callbacks.triageSources(runtime.signal); break;
               case "resources": await callbacks.collectResources(runtime.signal); break;
               case "job":
               case "manual_job": {
@@ -157,6 +159,11 @@ export class BackgroundScheduler {
           }
           await runtime.commit(async (tx) => {
             const state = await tx.doc(State), lane = state.lanes.find((item) => item.id === laneId(input.key));
+            // Polling and model judgment have separate durable lanes. Admit
+            // judgment after a poll without holding the next source read open.
+            if (input.work.type === "sources") await this.enqueueIn(tx, state, {
+              key: { type: "builtin", name: "source_triage" }, work: { type: "source_triage" },
+            });
             if (lane?.active === runtime.taskId) {
               lane.active = null;
               const pending = lane.pending.shift();
@@ -287,10 +294,11 @@ export class BackgroundScheduler {
   private async builtins(settings: BackgroundSettings): Promise<void> {
     const old = await this.session.commit(async (tx) => {
       const state = await tx.doc(State), retired: NativeTaskId<null>[] = [];
-      const names: Extract<BackgroundTriggerKey, { type: "builtin" }>["name"][] = ["sources", "resources"];
+      const names: Extract<BackgroundTriggerKey, { type: "builtin" }>["name"][] = ["sources", "source_triage", "resources"];
       for (const name of names) {
-        const seconds = name === "sources" ? settings.poll_interval_seconds : 300;
-        // The service's refresh callback owns --no-sources semantics.
+        const seconds = name === "resources" ? 300 : settings.poll_interval_seconds;
+        // Both source callbacks own --no-sources semantics. The judgment timer
+        // also resumes admitted work and due checks when polling cannot finish.
         const replaced = await this.replaceIn(tx, state, { type: "builtin", name }, JSON.stringify([seconds, settings.sources]),
           { type: "interval", seconds }, null);
         if (replaced !== null) retired.push(replaced);

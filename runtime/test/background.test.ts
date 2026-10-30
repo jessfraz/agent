@@ -7,6 +7,7 @@ import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { SourceJournal } from "../src/sources.js";
 import type { ScheduledOccurrence } from "../src/generated/ScheduledOccurrence.js";
 import { DAY, START, exampleJob, FakeClock, openBackground, planned, pump } from "./fixtures/background-runtime.js";
 
@@ -55,6 +56,75 @@ test("sources, resource collection and jobs share Pi deadlines and coalesce miss
     const status = await app.scheduler.getJob("example-review");
     assert.equal(status.schedules[0]?.last_at, START + 6 * DAY);
     assert.equal(status.schedules[0]?.next_at, START + 7 * DAY);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("held source judgment does not stop native polling or admit concurrent judgments", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-background-source-judgment-")), clock = new FakeClock();
+  const held = gate(); let reads = 0, judgments = 0, active = 0, maximum = 0;
+  const callbacks = {
+    refreshSources: async () => {
+      const previous = (await sources.states()).find((state) => state.source.provider === "mail");
+      reads += 1;
+      await sources.admit({ source: { provider: "mail", account: "example" }, checkpoint: { value: String(reads) },
+        coverage: { status: "complete" }, events: [{ id: String(reads), version: "one",
+          source: { provider: "mail", account: "example", thread_id: String(reads) }, title: "Example update", text: "New source evidence" }] },
+      previous?.checkpoint ?? null);
+    },
+    triageSources: async (signal: AbortSignal) => {
+      judgments += 1; active += 1; maximum = Math.max(maximum, active);
+      try { if (judgments === 1) await untilReleased(held.promise, signal); }
+      finally { active -= 1; }
+    },
+  };
+  const app = await openBackground(directory, clock, callbacks), sources = new SourceJournal(app.session, app.tasks);
+  try {
+    await app.scheduler.start({ poll_interval_seconds: 60, sources: true, jobs: [exampleJob()] });
+    await pump(() => reads === 1);
+    await assert.doesNotReject(pump(() => judgments === 1), "Polling must schedule independent source judgment");
+    for (const expected of [2, 3]) {
+      clock.advance(60_000);
+      await pump(async () => (await sources.events({ provider: "mail" })).length === expected);
+    }
+    assert.equal(judgments, 1, "A held judgment retains its serial lane while polls keep admitting evidence");
+    const receipt = await app.scheduler.runJob({ type: "run_job", job_id: "example-review", schedule_id: null, request_id: "while-judging" });
+    await pump(async () => (await app.receipts())?.jobs.length === 1);
+    assert.equal((await app.receipts())?.jobs[0]?.id, "manual:" + receipt.request_id);
+    await pump(async () => (await app.scheduler.status()).pending === 2);
+    held.release(); await pump(async () => judgments === 2 && (await app.scheduler.status()).pending === 0);
+    assert.equal(maximum, 1);
+    assert.equal((await sources.states()).find((state) => state.source.provider === "mail")?.checkpoint?.value, "3");
+  } finally { held.release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a failed source judgment keeps its native retry identity across reopen while polling advances", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-background-judgment-retry-")), clock = new FakeClock();
+  let judgments = 0;
+  let app = await openBackground(directory, clock, { triageSources: async () => {
+    judgments += 1; throw new Error("Example judgment needs retry");
+  } });
+  try {
+    const settings = { poll_interval_seconds: 60, sources: true, jobs: [] };
+    await app.scheduler.start(settings);
+    await pump(async () => (await app.scheduler.status()).errors.some((error) => error.key.type === "builtin" &&
+      error.key.name === "source_triage" && error.message === "Example judgment needs retry"));
+    const failed = (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.find(({ record, state }) => {
+      const input = record.input;
+      return state.kind === "sleeping" && record.kind === "agent.background" && input !== null && typeof input === "object" &&
+        "type" in input && input.type === "work" && "work" in input && input.work !== null && typeof input.work === "object" &&
+        "type" in input.work && input.work.type === "source_triage";
+    });
+    assert.ok(failed);
+    await pump(async () => (await app.receipts())?.sources === 1);
+    await app.session.close(BACKGROUND_CONTEXT);
+    app = await openBackground(directory, clock, { triageSources: async () => { judgments += 1; } });
+    await app.scheduler.start(settings);
+    assert.equal((await app.session.commit((tx) => tx.task(failed.record.id), BACKGROUND_CONTEXT))?.id, failed.record.id);
+    clock.advance(60_000);
+    await pump(async () => judgments >= 2 && (await app.receipts())?.sources === 2 && (await app.scheduler.status()).pending === 0);
+    const retried = await app.session.commit((tx) => tx.task(failed.record.id), BACKGROUND_CONTEXT);
+    assert.equal(retried?.state.status, "terminal");
+    assert.equal((await app.scheduler.status()).errors.length, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -134,7 +204,7 @@ test("job-only synchronization diffs definitions without altering built-in sourc
     await pump(async () => (await app.receipts())?.sources === 2);
     assert.deepEqual(await app.scheduler.syncJobs([]), { added: 0, updated: 0, removed: 1, unchanged: 0 });
     assert.deepEqual(await app.scheduler.listJobs(), []);
-    assert.equal((await app.scheduler.status()).triggers, 2);
+    assert.equal((await app.scheduler.status()).triggers, 3);
     await assert.rejects(app.scheduler.getJob(job.id), /Unknown scheduled job/);
     await assert.rejects(app.scheduler.syncJobs([job, job]), /Duplicate/);
     clock.advance(60_000);

@@ -1004,6 +1004,7 @@
       "type": "string",
       "enum": [
         "sources",
+        "source_triage",
         "resources"
       ]
     },

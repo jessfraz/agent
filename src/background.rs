@@ -147,6 +147,7 @@ pub enum BackgroundTriggerKey {
 #[serde(rename_all = "snake_case")]
 pub enum BuiltinTrigger {
     Sources,
+    SourceTriage,
     Resources,
 }
 
@@ -154,6 +155,7 @@ pub enum BuiltinTrigger {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackgroundWork {
     Sources,
+    SourceTriage,
     Resources,
     Job {
         occurrence: Box<ScheduledOccurrence>,

@@ -9,7 +9,7 @@ export async function openManual(directory: string, holdWork = false) {
   const app = await openScheduled(directory);
   let calls = 0;
   const scheduler = new BackgroundScheduler(app.session, app.registry, app.tasks, {
-    plan: async (cadence, after, now) => planned(cadence, after, now), refreshSources: async () => {}, collectResources: async () => {},
+    plan: async (cadence, after, now) => planned(cadence, after, now), refreshSources: async () => {}, triageSources: async () => {}, collectResources: async () => {},
     runJob: async (occurrence) => {
       calls += 1;
       if (holdWork) await new Promise<void>(() => {});

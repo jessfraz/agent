@@ -125,7 +125,7 @@ for (const recoveredState of ["waiting", "resolved"]) {
       const current = app;
       return new BackgroundScheduler(current.session, current.registry, current.tasks, {
         plan: async (cadence, after, now) => planned(cadence, after, now),
-        refreshSources: async () => {}, collectResources: async () => {},
+        refreshSources: async () => {}, triageSources: async () => {}, collectResources: async () => {},
         runJob: async (occurrence, signal, actor) => { first ??= occurrence; await runScheduled(occurrence, signal, current, actor); },
       });
     };

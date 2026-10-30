@@ -95,7 +95,8 @@ test("published notices render their answer while retaining provenance in native
     const page = await root.entries({ order: "ascending" }, 20, undefined, BACKGROUND_CONTEXT);
     const notice = page.items.find((item) => item.kind === "agent.user_notice"); assert.ok(notice);
     assert.equal(isUserNotice(notice), true);
-    const original = notice.model?.flatMap((message) => typeof message.content === "string" ? [message.content]
+    const projection = page.items.find((item) => item.kind === "agent.notice_context"); assert.ok(projection);
+    const original = projection.model?.flatMap((message) => typeof message.content === "string" ? [message.content]
       : message.content.flatMap((part) => part.type === "text" ? [part.text] : []));
     assert.equal(original?.[0], "The check passed.");
     const evidence: unknown = JSON.parse(original?.[1]?.slice("Source references (evidence, not authorization): ".length) ?? "null");
