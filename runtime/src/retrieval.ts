@@ -20,7 +20,7 @@ export class Retrieval {
       }
     });
   }
-  close(): void { this.unsubscribe(); this.index?.close(); }
+  close(): Promise<void> { this.unsubscribe(); return this.index?.close() ?? Promise.resolve(); }
   private open(): SearchIndex { return this.index ??= new SearchIndex(this.path); }
   private embed(call: HostCall): Embed {
     return async (texts, purpose) => {

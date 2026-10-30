@@ -832,6 +832,6 @@ try {
 } finally {
   if (application !== undefined) {
     const opened = await application.catch(() => undefined);
-    if (opened !== undefined) { opened.notifications.close(); opened.stopPlacements(); opened.retrieval.close(); await opened.harness.close(BACKGROUND_CONTEXT); }
+    if (opened !== undefined) { opened.notifications.close(); opened.stopPlacements(); await opened.retrieval.close(); await opened.harness.close(BACKGROUND_CONTEXT); }
   }
 }

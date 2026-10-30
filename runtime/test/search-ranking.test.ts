@@ -31,7 +31,7 @@ test("semantic search keeps a strong cross-language match ahead of coincidental 
     assert.deepEqual(result.gaps, []);
     assert.equal(result.candidates[0]?.conversation_id, "clothing");
     assert.equal(result.candidates[0]?.matches[0]?.entry_id, "jacket");
-  } finally { index.close(); }
+  } finally { await index.close(); }
 });
 
 test("keyword intent prioritizes literal errors while exact references and lexical fallback work in both modes", async () => {
@@ -58,7 +58,7 @@ test("keyword intent prioritizes literal errors while exact references and lexic
       assert.equal(fallback.candidates[0]?.conversation_id, "literal");
       assert.deepEqual(fallback.gaps, ["Runner offline"]);
     }
-  } finally { index.close(); }
+  } finally { await index.close(); }
 });
 
 test("candidate evidence retains distinct original entries instead of overlapping chunks from one long log", async () => {
@@ -78,5 +78,5 @@ test("candidate evidence retains distinct original entries instead of overlappin
     const result = await index.search("connector inspection", embed);
     assert.deepEqual(result.gaps, []);
     assert.deepEqual(result.candidates[0]?.matches.map((match) => match.entry_id), ["long-log", "decision", "verification"]);
-  } finally { index.close(); }
+  } finally { await index.close(); }
 });

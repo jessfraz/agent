@@ -42,7 +42,7 @@ test("cached corpus indexing serves queued I/O against the prior publication bef
     assert.equal(served, true, "Cached indexing must yield to ready I/O before finishing the corpus");
     await response;
     assert.deepEqual(index.checkpoint("service"), { watermark: "two", dirty: false });
-  } finally { channel.port1.close(); channel.port2.close(); index.close(); }
+  } finally { channel.port1.close(); channel.port2.close(); await index.close(); }
 });
 
 test("native dense retrieval finds vocabulary mismatches independently and groups several conversations", async () => {
@@ -60,7 +60,7 @@ test("native dense retrieval finds vocabulary mismatches independently and group
     assert.equal(exact.candidates[0]?.conversation_id, "cake");
     await index.delete("automobile");
     assert.equal((await index.search("transport maintenance", embed, [], 3)).candidates.some((item) => item.conversation_id === "automobile"), false);
-  } finally { index.close(); }
+  } finally { await index.close(); }
 });
 
 test("an exact source conversation precedes an unrelated lexical and dense agreement", async () => {
@@ -72,7 +72,7 @@ test("an exact source conversation precedes an unrelated lexical and dense agree
     assert.deepEqual(result.candidates.map((candidate) => candidate.conversation_id), ["exact-history", "distractor"]);
     assert.ok(result.candidates[0]!.score > result.candidates[1]!.score);
     assert.deepEqual(result.candidates[0]?.matches[0]?.source_refs, ["mail:synthetic:exact"]);
-  } finally { index.close(); }
+  } finally { await index.close(); }
 });
 
 test("published text vectors are reused across conversations without merging ownership or surviving every owner", async () => {
@@ -82,7 +82,7 @@ test("published text vectors are reused across conversations without merging own
   const text = "Identical automobile maintenance evidence";
   try {
     await index.upsert("first", "one", records([record("first-entry", text, 0, ["mail:synthetic:first"])]), embedding);
-    index.close(); index = new SearchIndex(path);
+    await index.close(); index = new SearchIndex(path);
     await index.upsert("second", "one", records([record("second-entry", text, 0, ["mail:synthetic:second"])]), embedding);
     assert.equal(documents, 1, "Identical published text must not invoke document embedding again for another conversation");
     const found = await index.search("automobile", embedding);
@@ -98,7 +98,7 @@ test("published text vectors are reused across conversations without merging own
     await index.delete("second"); await index.delete("third");
     await index.upsert("fourth", "one", records([record("fourth-entry", text)]), embedding);
     assert.equal(documents, 2, "Removing every published owner must remove the reusable vector too");
-  } finally { index.close(); await rm(directory, { recursive: true, force: true }); }
+  } finally { await index.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("streamed indexing reuses vectors and preserves the old checkpoint on interruption", async () => {
@@ -117,7 +117,7 @@ test("streamed indexing reuses vectors and preserves the old checkpoint on inter
     await assert.rejects(index.upsert("service", "39", interrupted(), embedding), /Source read interrupted/);
     assert.deepEqual(index.checkpoint("service"), { watermark: "metadata-only-38", dirty: true });
     assert.ok((await index.search("Automobile", embedding)).candidates[0]?.matches.some((item) => item.entry_id !== "new"));
-    index.close(); index = new SearchIndex(path);
+    await index.close(); index = new SearchIndex(path);
     await index.reconcile(inventory([{ conversation_id: "service", watermark: "40" }]), () => records([...data, record("new", "The bicycle is fixed", 38)]), embedding);
     assert.deepEqual(index.checkpoint("service"), { watermark: "40", dirty: false });
     assert.equal(batches.at(-1), 1);
@@ -126,7 +126,7 @@ test("streamed indexing reuses vectors and preserves the old checkpoint on inter
     assert.ok(lexical.candidates.length > 0); assert.deepEqual(lexical.gaps, ["Runner unavailable"]);
     await index.reconcile(inventory([]), () => records([]), embedding);
     assert.equal(index.checkpoint("service"), undefined);
-  } finally { index.close(); await rm(directory, { recursive: true, force: true }); }
+  } finally { await index.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("completed partial embedding batches survive reopen without publishing stale source rows", async () => {
@@ -147,7 +147,7 @@ test("completed partial embedding batches survive reopen without publishing stal
     assert.equal(documents.length, 32);
     assert.deepEqual(index.checkpoint("large"), { watermark: "old", dirty: true });
     assert.deepEqual((await index.search("published", embed)).candidates[0]?.matches.map((match) => match.entry_id), ["old"]);
-    index.close(); index = new SearchIndex(path); fail = false; documents.length = 0;
+    await index.close(); index = new SearchIndex(path); fail = false; documents.length = 0;
     const current = source.filter((row) => row.entry_id !== "e3").map((row) => row.entry_id === "e5"
       ? record(row.entry_id, "Changed cobalt evidence", row.ordinal, ["mail:synthetic:changed"])
       : row.entry_id === "e6" ? record("renamed-six", row.text, row.ordinal, ["mail:synthetic:current-six"]) : row);
@@ -161,7 +161,7 @@ test("completed partial embedding batches survive reopen without publishing stal
         .map((row) => [row.entry_id, row.text, row.source_refs]), current.map((row) => [row.entry_id, row.text, JSON.stringify(row.source_refs)]));
       assert.equal(db.prepare("SELECT count(*) AS count FROM staging").get()?.count, 0);
     } finally { db.close(); }
-  } finally { index.close(); await rm(directory, { recursive: true, force: true }); }
+  } finally { await index.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("partial vector caches are conversation scoped and deleted or rebuilt with their owner", async () => {
@@ -184,14 +184,14 @@ test("partial vector caches are conversation scoped and deleted or rebuilt with 
       assert.equal(db.prepare("SELECT count(*) AS count FROM staging").get()?.count, 0);
       assert.equal(db.prepare("SELECT count(*) AS count FROM conversations").get()?.count, 1);
     } finally { db.close(); }
-  } finally { index.close(); await rm(directory, { recursive: true, force: true }); }
+  } finally { await index.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("legacy ephemeral staging migrates without changing the published projection", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-search-staging-migration-")); const path = join(directory, "search.sqlite");
   let index = new SearchIndex(path);
   try {
-    await index.upsert("retained", "one", records([record("one", "Retained published evidence")]), embed); index.close();
+    await index.upsert("retained", "one", records([record("one", "Retained published evidence")]), embed); await index.close();
     const old = new DatabaseSync(path);
     old.exec(`DROP TABLE staging;
       CREATE TABLE staging(run TEXT NOT NULL, entry_id TEXT NOT NULL, ordinal INTEGER NOT NULL, part INTEGER NOT NULL,
@@ -202,7 +202,7 @@ test("legacy ephemeral staging migrates without changing the published projectio
     assert.deepEqual((await index.search("Retained", embed)).candidates[0]?.matches.map((match) => match.entry_id), ["one"]);
     await index.upsert("retained", "two", records([record("two", "Current published evidence")]), embed);
     assert.deepEqual((await index.search("Current", embed)).candidates[0]?.matches.map((match) => match.entry_id), ["two"]);
-  } finally { index.close(); await rm(directory, { recursive: true, force: true }); }
+  } finally { await index.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("a repeated source entry cannot overwrite another part of the same indexing attempt", async () => {
@@ -214,7 +214,7 @@ test("a repeated source entry cannot overwrite another part of the same indexing
     assert.equal((await index.search("Original", embed)).candidates[0]?.matches[0]?.entry_id, "old");
     await index.upsert("work", "fixed", records([record("duplicate", "Corrected source")]), embed);
     assert.equal((await index.search("Corrected", embed)).candidates[0]?.matches[0]?.text, "Corrected source");
-  } finally { index.close(); }
+  } finally { await index.close(); }
 });
 
 test("the old text generation is refreshed even when native conversation watermarks stay the same", async () => {
@@ -222,7 +222,7 @@ test("the old text generation is refreshed even when native conversation waterma
   let index = new SearchIndex(path);
   try {
     await index.upsert("old-preview", "same-tail", records([record("title", "Legacy oversized preview")]), embed);
-    index.close();
+    await index.close();
     const legacy = new DatabaseSync(path);
     legacy.prepare("UPDATE metadata SET value=? WHERE key='chunker'").run("message-utf8-2048-overlap-256-v1"); legacy.close();
     index = new SearchIndex(path);
@@ -232,7 +232,7 @@ test("the old text generation is refreshed even when native conversation waterma
     assert.deepEqual(index.checkpoint("old-preview"), { watermark: "same-tail", dirty: false });
     const result = await index.search("Concise", embed);
     assert.equal(result.candidates[0]?.matches[0]?.text, "Concise current title");
-  } finally { index.close(); await rm(directory, { recursive: true, force: true }); }
+  } finally { await index.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("a missed notification and a commit during embedding both remain reconcilable", async () => {
@@ -255,7 +255,7 @@ test("a missed notification and a commit during embedding both remain reconcilab
     // No markDirty call: startup inventory must still detect the native tail change.
     await index.reconcile(inventory([{ conversation_id: "work", watermark: "four" }]), () => records([record("four", "A missed commit")]), embedding);
     assert.equal((await index.search("missed", embedding)).candidates[0]?.matches[0]?.entry_id, "four");
-  } finally { release(); index.close(); }
+  } finally { release(); await index.close(); }
 });
 
 test("search does not mix old lexical ranks with rows published during the embedding await", async () => {
@@ -271,7 +271,7 @@ test("search does not mix old lexical ranks with rows published during the embed
     await index.upsert("replacement", "two", records([record("replacement-entry", "A cake recipe")]), embed);
     release();
     assert.deepEqual(await pending, await index.search("needle", embed, ["mail:example:old"]));
-  } finally { release(); index.close(); }
+  } finally { release(); await index.close(); }
 });
 
 test("space changes require an explicit rebuild while lexical evidence remains available", async () => {
@@ -288,7 +288,7 @@ test("space changes require an explicit rebuild while lexical evidence remains a
     await index.rebuild(inventory([{ conversation_id: "first", watermark: "two" }]), () => records([record("two", "New automobile paperwork")]), embedding);
     assert.deepEqual(index.checkpoint("first"), { watermark: "two", dirty: false });
     assert.deepEqual((await index.search("paperwork", embedding)).gaps, []);
-  } finally { index.close(); }
+  } finally { await index.close(); }
 });
 
 test("bounded Unicode chunks retain entry provenance and representative queries use native search indexes", async (t) => {
@@ -359,5 +359,5 @@ test("bounded Unicode chunks retain entry provenance and representative queries 
       assert.ok(typeof count === "number" && count > 1000);
       assert.equal(db.prepare("SELECT count(*) AS count FROM chunk_vectors").get()?.count, count);
     } finally { db.close(); }
-  } finally { index.close(); await rm(directory, { recursive: true, force: true }); }
+  } finally { await index.close(); await rm(directory, { recursive: true, force: true }); }
 });

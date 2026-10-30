@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
+import { Worker } from "node:worker_threads";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { setImmediate } from "node:timers/promises";
 import type { EmbeddingBatch } from "./generated/EmbeddingBatch.js";
@@ -70,13 +71,66 @@ function validate(batch: EmbeddingBatch, count: number): void {
   }
 }
 
+export type PublishedSearch = { query: string; vector: Uint8Array | null; space: EmbeddingSpace | null;
+  source_refs: string[]; limit: number; mode: SearchMode; gaps: string[] };
+export type SearchReadRequest = { id: number; input: PublishedSearch };
+export type SearchReadReply = { id: number; type: "result"; result: SearchResult } | { id: number; type: "failed"; message: string };
+
+/** One owned reader per file index. It never embeds, migrates, or writes. */
+class PublishedReader {
+  private readonly worker: Worker;
+  private readonly pending = new Map<number, { resolve(value: SearchResult): void; reject(error: Error): void }>();
+  private next = 0;
+  private failure: Error | undefined;
+  private closing: Promise<void> | undefined;
+  constructor(path: string, extension: string) {
+    this.worker = new Worker(new URL("./search-worker.js", import.meta.url), { workerData: { path, extension }, name: "published-history" });
+    this.worker.on("message", (reply: SearchReadReply) => {
+      const pending = this.pending.get(reply.id);
+      if (pending === undefined) return;
+      this.pending.delete(reply.id);
+      if (this.pending.size === 0) this.worker.unref();
+      if (reply.type === "result") pending.resolve(reply.result); else pending.reject(new Error(reply.message));
+    });
+    this.worker.on("error", (error: Error) => this.fail(error));
+    this.worker.on("messageerror", (error: Error) => this.fail(error));
+    this.worker.on("exit", (code) => { if (this.closing === undefined) this.fail(new Error(`Published history reader stopped (exit ${code})`)); });
+    this.worker.unref();
+  }
+  private fail(error: Error): void {
+    this.failure ??= error;
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear(); this.worker.unref();
+  }
+  read(input: PublishedSearch): Promise<SearchResult> {
+    if (this.closing !== undefined) return Promise.reject(new Error("Search index is closed"));
+    if (this.failure !== undefined) return Promise.reject(this.failure);
+    const id = this.next++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject }); this.worker.ref();
+      try { this.worker.postMessage({ id, input } satisfies SearchReadRequest); }
+      catch (error) { this.fail(error instanceof Error ? error : new Error("Published history request could not be sent")); }
+    });
+  }
+  close(): Promise<void> {
+    if (this.closing !== undefined) return this.closing;
+    this.fail(new Error("Search index is closed"));
+    return this.closing = this.worker.terminate().then(() => {});
+  }
+}
+
 /** Disposable SQLite projections. Pi commits and their source entries remain authoritative. */
 export class SearchIndex {
   private readonly db: DatabaseSync;
   private space: EmbeddingSpace | undefined;
   private mutations = Promise.resolve();
+  private readonly source: { path: string; extension: string } | undefined;
+  private reads: PublishedReader | undefined;
+  private closed = false;
+  private closing: Promise<void> | undefined;
   constructor(path: string, extension = process.env.AGENT_SQLITE_VEC) {
     if (extension === undefined || extension.length === 0) throw new Error("sqlite-vec is unavailable; use the Nix installation");
+    this.source = path === ":memory:" || path === "" ? undefined : { path: resolve(path), extension };
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path, { allowExtension: true });
     if (path !== ":memory:") chmodSync(path, 0o600);
@@ -119,7 +173,13 @@ export class SearchIndex {
       this.db.prepare("INSERT OR REPLACE INTO metadata VALUES('source_projection',?)").run(SOURCE_PROJECTION);
     }
   }
-  close(): void { this.db.close(); }
+  close(): Promise<void> {
+    if (this.closing !== undefined) return this.closing;
+    this.closed = true;
+    const stopping = this.reads?.close() ?? Promise.resolve();
+    // Retire writes immediately, even while the owned reader is terminating.
+    this.db.close(); return this.closing = stopping;
+  }
   private transaction(action: () => void): void {
     this.db.exec("BEGIN IMMEDIATE");
     try { action(); this.db.exec("COMMIT"); } catch (error) { this.db.exec("ROLLBACK"); throw error; }
@@ -230,26 +290,59 @@ export class SearchIndex {
   }
   async search(query: string, embed: Embed | undefined, source_refs: string[] = [], limit = 8, mode: SearchMode = "semantic"): Promise<SearchResult> {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new Error("Search limit must be 1 to 50");
+    if (this.closed) throw new Error("Search index is closed");
+    let vector: Uint8Array | null = null, selected: EmbeddingSpace | null = null;
+    const gaps: string[] = [];
+    if (query.trim().length > 0 && embed !== undefined) {
+      try {
+        // Query embedding retains its caller's host ownership and cancellation.
+        const batch = await embed([query], "query"); validate(batch, 1);
+        if (this.closed) throw new Error("Search index is closed");
+        this.setSpace(batch.space); selected = batch.space;
+        vector = new Uint8Array(new Float32Array(batch.vectors[0]!).buffer);
+      } catch (error) {
+        if (this.closed) throw new Error("Search index is closed");
+        gaps.push(error instanceof Error ? error.message : "Semantic retrieval is unavailable");
+      }
+    }
+    if (this.closed) throw new Error("Search index is closed");
+    const input: PublishedSearch = { query, vector, space: selected, source_refs, limit, mode, gaps };
+    if (this.source === undefined) return readPublished(this.db, input);
+    this.reads ??= new PublishedReader(this.source.path, this.source.extension);
+    return this.reads.read(input);
+  }
+}
+
+/** Shared by private in-memory indexes and the file-backed read-only worker. */
+export function readPublished(db: DatabaseSync, input: PublishedSearch): SearchResult {
+  const { query, source_refs, limit, mode } = input;
+  db.exec("BEGIN");
+  try {
     let dense: RankedChunk[] = []; let lexical: RankedChunk[] = [];
     const gaps: string[] = []; const take = Math.min(200, limit * 10);
     const exactIds = new Set<number>();
-    const dirty = this.db.prepare("SELECT count(*) AS count FROM conversations WHERE dirty<>0").get();
+    const dirty = db.prepare("SELECT count(*) AS count FROM conversations WHERE dirty<>0").get();
     if (dirty !== undefined && number(dirty, "count") > 0) gaps.push(`${number(dirty, "count")} conversations await indexing`);
+    gaps.push(...input.gaps);
     try {
-      if (query.trim().length > 0 && embed !== undefined) {
-        const batch = await embed([query], "query"); validate(batch, 1); this.setSpace(batch.space);
-        dense = this.db.prepare("SELECT rowid AS id,distance AS value FROM chunk_vectors WHERE embedding MATCH ? AND k=? ORDER BY distance")
-          .all(new Uint8Array(new Float32Array(batch.vectors[0]!).buffer), take).map((row) => ({ id: number(row, "id"), value: number(row, "value") }));
+      if (input.vector !== null) {
+        const saved = db.prepare("SELECT value FROM metadata WHERE key='space'").get();
+        if (saved === undefined || JSON.stringify(space(JSON.parse(string(saved, "value")))) !== JSON.stringify(space(input.space))) {
+          throw new Error("Embedding space changed; rebuild the search index");
+        }
+        dense = db.prepare("SELECT rowid AS id,distance AS value FROM chunk_vectors WHERE embedding MATCH ? AND k=? ORDER BY distance")
+          .all(input.vector, take).map((row) => ({ id: number(row, "id"), value: number(row, "value") }));
       }
     } catch (error) { gaps.push(error instanceof Error ? error.message : "Semantic retrieval is unavailable"); }
-    // No awaits between ranked reads and hydration: a publication may replace/reuse chunk rowids.
+    // One snapshot owns ranks, coverage, and rowids through hydration, including
+    // while the writable owner publishes a replacement on another thread.
     const exact = [...new Set([...source_refs, query.trim()])].filter((ref) => ref.length > 0 && ref.length <= 2048).slice(0, 64);
     if (exact.length > 0) {
-      const matches = this.db.prepare(`SELECT DISTINCT chunk_id AS id FROM source_refs WHERE ref IN (${exact.map(() => "?").join(",")}) LIMIT ?`).all(...exact, take).map((row) => number(row, "id"));
+      const matches = db.prepare(`SELECT DISTINCT chunk_id AS id FROM source_refs WHERE ref IN (${exact.map(() => "?").join(",")}) LIMIT ?`).all(...exact, take).map((row) => number(row, "id"));
       for (const id of matches) exactIds.add(id);
     }
     const tokens = query.match(/[\p{L}\p{N}_]+/gu)?.slice(0, 32) ?? [];
-    if (tokens.length > 0) lexical = this.db.prepare("SELECT rowid AS id,rank AS value FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?")
+    if (tokens.length > 0) lexical = db.prepare("SELECT rowid AS id,rank AS value FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?")
       .all(tokens.map((token) => `"${token.replaceAll('"', '""')}"`).join(" OR "), take).map((row) => ({ id: number(row, "id"), value: number(row, "value") }));
     const scores = new Map<number, number>();
     const rank = (ids: number[], tier: 1 | 2 | 3) => ids.forEach((id, index) => scores.set(id, tier + 1 / (60 + index + 1)));
@@ -265,7 +358,7 @@ export class SearchIndex {
     // Exact source identity outranks either search mode.
     rank([...exactIds].sort((left, right) => (scores.get(right) ?? 0) - (scores.get(left) ?? 0) || left - right), 3);
     if (scores.size === 0) return { candidates: [], gaps };
-    const rows = this.db.prepare(`SELECT id,conversation_id,entry_id,text,source_refs FROM chunks WHERE id IN (${[...scores].map(() => "?").join(",")})`).all(...scores.keys());
+    const rows = db.prepare(`SELECT id,conversation_id,entry_id,text,source_refs FROM chunks WHERE id IN (${[...scores].map(() => "?").join(",")})`).all(...scores.keys());
     const candidates = new Map<string, SearchCandidate>();
     for (const row of rows.sort((left, right) => (scores.get(number(right, "id")) ?? 0) - (scores.get(number(left, "id")) ?? 0))) {
       const id = string(row, "conversation_id"); let candidate = candidates.get(id);
@@ -276,11 +369,11 @@ export class SearchIndex {
       }
     }
     const selected = [...candidates.values()].sort((left, right) => right.score - left.score).slice(0, limit);
-    if (selected.length > 0) for (const row of this.db.prepare(`SELECT gaps FROM conversations WHERE id IN (${selected.map(() => "?").join(",")})`).all(...selected.map((candidate) => candidate.conversation_id))) {
+    if (selected.length > 0) for (const row of db.prepare(`SELECT gaps FROM conversations WHERE id IN (${selected.map(() => "?").join(",")})`).all(...selected.map((candidate) => candidate.conversation_id))) {
       const coverage: unknown = JSON.parse(string(row, "gaps"));
       if (!Array.isArray(coverage) || !coverage.every((gap): gap is string => typeof gap === "string")) throw new Error("Invalid indexed source coverage");
       gaps.push(...coverage);
     }
     return { candidates: selected, gaps: [...new Set(gaps)] };
-  }
+  } finally { db.exec("ROLLBACK"); }
 }

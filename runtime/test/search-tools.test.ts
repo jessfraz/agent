@@ -117,7 +117,7 @@ test("main and worker tools find older substantive context beside a newer shallo
     assert.equal((await tasks.list()).length, 1);
     assert.equal((await history.get("older-substantive"))?.adopted_task_id, null);
     assert.equal((await history.get("newer-shallow"))?.adopted_task_id, null);
-  } finally { retrieval.close(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  } finally { await retrieval.close(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("main and worker search retain fresh matching tasks while an import fills the index results", async () => {
@@ -195,7 +195,7 @@ test("main and worker search retain fresh matching tasks while an import fills t
       } finally { unbind(); }
     }
     assert.equal((await tasks.list()).length, 2); assert.equal(importer.isRunning(), true);
-  } finally { release(); await importing; retrieval.close(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  } finally { release(); await importing; await retrieval.close(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 
@@ -226,10 +226,10 @@ test("automatic context reads published keyword matches while a native corpus up
     release(); await syncing;
     const complete = await retrieval.search("Connector", [], 8, call, true);
     assert.equal(complete.candidates.length, 2, "Full semantic search retains newly published corpus results");
-  } finally { release(); await syncing; retrieval.close(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  } finally { release(); await syncing; await retrieval.close(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("semantic reads after reopen bypass an owned full catchup and retain incremental updates", async () => {
+test("semantic reads after reopen bypass an owned full catchup and retain incremental updates", { timeout: 10_000 }, async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "agent-search-owned-catchup-"));
   const open = async () => {
     const models = createModels();
@@ -245,23 +245,22 @@ test("semantic reads after reopen bypass an owned full catchup and retain increm
   let app = await open(), closed = false;
   let release = () => {}, entered = () => {};
   const held = new Promise<void>((resolve) => { release = resolve; }), started = new Promise<void>((resolve) => { entered = resolve; });
+  t.signal.addEventListener("abort", () => release(), { once: true });
   let catchup: Promise<void> | undefined, query: Promise<Awaited<ReturnType<Retrieval["search"]>>> | undefined;
   try {
     const saved = await app.history.import(batch("retained-vehicle", 1, [item("old", "Published automobile specification", 1)]));
     await app.retrieval.sync(embedding);
     await app.history.import(batch("pending-cooking", 2, [item("new", "Unpublished chocolate cake instructions", 1)]));
-    app.retrieval.close(); await app.session.close(BACKGROUND_CONTEXT); closed = true;
+    await app.retrieval.close(); await app.session.close(BACKGROUND_CONTEXT); closed = true;
     app = await open(); closed = false;
     const owned: HostCall = async (command) => {
       if (command.type === "embed" && command.purpose === "document") { entered(); await held; }
       return embedding(command);
     };
     catchup = app.retrieval.sync(owned, true); await started;
-    let returned = false;
     const read: HostCall = async (command) => { assert.ok(command.type === "embed" && command.purpose === "query", "The query must not take over corpus work"); return embedding(command); };
-    query = app.retrieval.search("car wheel repair", [], 8, read, false).then((result) => { returned = true; return result; });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.equal(returned, true, "A semantic query must return the published index while the owned full reconcile is held");
+    query = app.retrieval.search("car wheel repair", [], 8, read, false);
+    // The owner remains held until the independent published read has returned.
     const published = await query;
     assert.equal(published.candidates[0]?.conversation_id, saved.conversation.conversation_id, "Dense retrieval must retain vocabulary-mismatch matches");
     assert.ok(published.gaps.length > 0, "In-flight catchup must remain explicit partial coverage");
@@ -274,7 +273,7 @@ test("semantic reads after reopen bypass an owned full catchup and retain increm
     const current = await app.retrieval.search("car wheel repair", [], 8, embedding, false);
     assert.ok(current.candidates.some((candidate) => candidate.matches.some((match) => match.text === "Current automobile steering context")), "Normal incremental commits must still become searchable");
     await app.history.import(batch("cold-unindexed", 3, [item("cold", "Unindexed sourdough recipe", 1)]));
-    app.retrieval.close(); await app.session.close(BACKGROUND_CONTEXT); closed = true;
+    await app.retrieval.close(); await app.session.close(BACKGROUND_CONTEXT); closed = true;
     app = await open(); closed = false;
     let documentCalls = 0;
     const cold = await app.retrieval.search("car wheel repair", [], 8, async (command) => {
@@ -286,7 +285,7 @@ test("semantic reads after reopen bypass an owned full catchup and retain increm
     assert.ok(cold.gaps.length > 0, "An unreconciled restart cannot claim complete coverage");
   } finally {
     release(); await Promise.allSettled([catchup, query]);
-    if (!closed) { app.retrieval.close(); await app.session.close(BACKGROUND_CONTEXT); }
+    if (!closed) { await app.retrieval.close(); await app.session.close(BACKGROUND_CONTEXT); }
     await rm(directory, { recursive: true, force: true });
   }
 });
