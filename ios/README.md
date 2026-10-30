@@ -123,6 +123,8 @@ pass `--attachments-path /absolute/existing/directory` to `swift test`.
 `bash ios/scripts/check.sh` runs strict Swift lint, macOS tests, the unsigned
 app build, package tests on iOS and app-hosted rendering tests. It requires an
 installed compatible iOS runtime and cleans up only its own simulator.
+CI runs the `host` and `simulator` phases in parallel; both must pass. The
+default local command runs both phases, or pass either name to check it alone.
 The `Agent` scheme's hosted tests also check that accessibility text sizes
 expand the message layout. History preparation benchmarks exercise the real
 `Transcript` and rich-text parser with invented content. The timing tests run

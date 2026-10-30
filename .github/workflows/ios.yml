@@ -14,19 +14,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  native:
-    name: Native client
+  checks:
+    name: Native checks (${{ matrix.phase }})
     runs-on: macos-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        phase: [host, simulator]
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Check Swift and iOS
-        run: bash ios/scripts/check.sh
+        run: bash ios/scripts/check.sh "${{ matrix.phase }}"
       - name: Retain native test results
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: ios-validation-${{ github.run_attempt }}
-          path: target/ios-validation/run.*/ios-*
+          name: ios-validation-${{ matrix.phase }}-${{ github.run_attempt }}
+          path: |
+            target/ios-validation/run.*/ios-*
+            target/ios-validation/run.*/macos-rendered/
           if-no-files-found: warn
           retention-days: 7
+
+  native:
+    name: Native client
+    runs-on: ubuntu-latest
+    needs: checks
+    if: always()
+    steps:
+      - name: Require every native phase
+        env:
+          RESULT: ${{ needs.checks.result }}
+        run: test "$RESULT" = success

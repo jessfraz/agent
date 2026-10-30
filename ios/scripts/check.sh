@@ -1,29 +1,45 @@
 #!/bin/bash
 set -euo pipefail
 
+phase=${1:-all}
+if (( $# > 1 )); then
+  printf 'Usage: %s [all|host|simulator]\n' "$0" >&2
+  exit 64
+fi
+case "$phase" in
+  all|host|simulator) ;;
+  *) printf 'Usage: %s [all|host|simulator]\n' "$0" >&2; exit 64 ;;
+esac
+
 native_dir=$(cd "$(dirname "$0")/.." && pwd)
 repo_root=$(cd "$native_dir/.." && pwd)
 mkdir -p "$repo_root/target/ios-validation"
 run_dir=$(mktemp -d "$repo_root/target/ios-validation/run.XXXXXX")
 printf 'Native validation output: %s\n' "$run_dir"
-plutil -lint "$native_dir/Agent.xcodeproj/project.pbxproj" \
-  "$native_dir/AgentApp/PrivacyInfo.xcprivacy" "$native_dir/TestFlightExport.plist"
-
-# Rust's exporter owns Generated.swift and its formatting.
-xcrun swift-format lint --strict "$native_dir/Package.swift"
-find "$native_dir/AgentApp" "$native_dir/Sources" "$native_dir/Tests" \
-  -name '*.swift' ! -name Generated.swift -print0 \
-  | xargs -0 xcrun swift-format lint --strict
-mkdir "$run_dir/macos-rendered"
-swift test --package-path "$native_dir" --scratch-path "$run_dir/macos" \
-  --attachments-path "$run_dir/macos-rendered"
+printf 'Native validation phase: %s\n' "$phase"
 performance_test=pagedHistoryAndStreamingPreparationRemainBoundedAndKeepCanonicalIdentity
-swift test --configuration release --package-path "$native_dir" \
-  --scratch-path "$run_dir/macos" --filter "$performance_test" \
-  --attachments-path "$run_dir/macos-rendered"
-xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
-  -destination 'generic/platform=iOS Simulator' \
-  -derivedDataPath "$run_dir/app" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO build
+if [[ "$phase" != simulator ]]; then
+  plutil -lint "$native_dir/Agent.xcodeproj/project.pbxproj" \
+    "$native_dir/AgentApp/PrivacyInfo.xcprivacy" "$native_dir/TestFlightExport.plist"
+
+  # Rust's exporter owns Generated.swift and its formatting.
+  xcrun swift-format lint --strict "$native_dir/Package.swift"
+  find "$native_dir/AgentApp" "$native_dir/Sources" "$native_dir/Tests" \
+    -name '*.swift' ! -name Generated.swift -print0 \
+    | xargs -0 xcrun swift-format lint --strict
+  mkdir "$run_dir/macos-rendered"
+  swift test --package-path "$native_dir" --scratch-path "$run_dir/macos" \
+    --attachments-path "$run_dir/macos-rendered"
+  swift test --configuration release --package-path "$native_dir" \
+    --scratch-path "$run_dir/macos" --filter "$performance_test" \
+    --attachments-path "$run_dir/macos-rendered"
+  xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
+    -destination 'generic/platform=iOS Simulator' \
+    -derivedDataPath "$run_dir/app" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO build
+fi
+if [[ "$phase" == host ]]; then
+  exit 0
+fi
 
 xcrun simctl list runtimes --json > "$run_dir/runtimes.json"
 xcrun simctl list devicetypes --json > "$run_dir/device-types.json"
