@@ -16,7 +16,7 @@ concurrency:
 jobs:
   check:
     name: Check (${{ matrix.os }})
-    timeout-minutes: 25
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -36,20 +36,22 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'runtime/package-lock.json') }}-
       - name: Validate workflows
-        run: nix develop --command actionlint
+        run: nix develop .#ci --command actionlint
       - name: Prepare runtime
-        run: nix develop --command make runtime
+        run: nix develop .#ci --command make runtime
       - name: Install pinned test browser
-        run: nix develop --command node runtime/node_modules/playwright-core/cli.js install --no-shell chromium
+        run: nix develop .#ci --command node runtime/node_modules/playwright-core/cli.js install --no-shell chromium
       - name: Prepare verified browser extension fixture
-        run: nix develop --command node runtime/dist/test/fixtures/prepare-browser.js "$RUNNER_TEMP"
+        run: nix develop .#ci --command node runtime/dist/test/fixtures/prepare-browser.js "$RUNNER_TEMP"
       - name: Check Rust and runtime
-        run: nix develop --command make check
+        run: nix develop .#ci --command make check
       - name: Check generated bindings
         run: git diff --exit-code
       - name: Evaluate flake
         run: nix flake check --no-build --all-systems
       - name: Build packaged CLI
         run: nix build
+      - name: Check native embeddings
+        run: nix develop --command cargo test --locked --lib embeddings::llama::tests::native_runner_is_private_warm_and_returns_retrieval_vectors -- --ignored --exact
       - name: Smoke test package
         run: ./result/bin/agent --version

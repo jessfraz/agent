@@ -3,7 +3,11 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/3ec636362e1816bc2f0888fa0fa2c69f1bc9e504";
 
-  outputs = {self, nixpkgs, ...}: let
+  outputs = {
+    self,
+    nixpkgs,
+    ...
+  }: let
     systems = ["aarch64-darwin" "x86_64-linux" "aarch64-linux"];
     eachSystem = nixpkgs.lib.genAttrs systems;
   in {
@@ -24,8 +28,10 @@
         src = pkgs.lib.fileset.toSource {
           root = ./runtime;
           fileset = pkgs.lib.fileset.unions [
-            ./runtime/src ./runtime/package.json
-            ./runtime/package-lock.json ./runtime/tsconfig.json
+            ./runtime/src
+            ./runtime/package.json
+            ./runtime/package-lock.json
+            ./runtime/tsconfig.json
           ];
         };
         nodejs = pkgs.nodejs_26;
@@ -89,13 +95,17 @@
     });
     devShells = eachSystem (system: let
       pkgs = import nixpkgs {inherit system;};
-    in {
-      default = pkgs.mkShell {
+      tools = {
         packages = with pkgs; [cargo rustc rustfmt clippy nodejs_26 pkg-config git lsof actionlint unzip];
-        AGENT_LLAMA_SERVER = "${self.packages.${system}.embeddingRuntime}/bin/llama-server";
-        AGENT_EMBEDDING_MODEL = self.packages.${system}.embeddingModel;
         AGENT_SQLITE_VEC = "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
       };
+    in {
+      default = pkgs.mkShell (tools
+        // {
+          AGENT_LLAMA_SERVER = "${self.packages.${system}.embeddingRuntime}/bin/llama-server";
+          AGENT_EMBEDDING_MODEL = self.packages.${system}.embeddingModel;
+        });
+      ci = pkgs.mkShell tools;
     });
   };
 }

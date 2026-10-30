@@ -88,6 +88,19 @@ cleanup() {
       status=1
     fi
   fi
+  if (( status != 0 )); then
+    local suite bundle
+    for suite in core performance rendering; do
+      bundle="$run_dir/ios-$suite-tests.xcresult"
+      if [[ -d "$bundle" ]]; then
+        printf 'iOS Simulator %s result:\n' "$suite" >&2
+        if ! xcrun xcresulttool get test-results summary --path "$bundle" --compact \
+          | tee "$run_dir/ios-$suite-summary.json"; then
+          printf 'Could not summarize %s\n' "$bundle" >&2
+        fi
+      fi
+    done
+  fi
   exit "$status"
 }
 trap cleanup EXIT
