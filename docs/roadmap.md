@@ -62,8 +62,9 @@ recovery; [history](history.md) describes import and retrieval.
 
 - [ ] ChatGPT conversation import from a verified export, with resumable,
   idempotent ingestion and attachment coverage.
-- [ ] Representative query plans and benchmarks for native state, full-text
-  search, vector search and hydration. Measure before changing index technology.
+- [x] Representative SQL plans and paired CI benchmarks for history loading,
+  dense/FTS retrieval, hydration and cached indexing. See
+  [performance checks](performance.md).
 - [ ] Private retrieval evals: paraphrases, exact references, similar threads,
   rich older context versus sparse recent context, and incomplete coverage.
   Track recall, wrong-thread selection and latency.
