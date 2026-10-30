@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -9,6 +9,7 @@ import { createInterface } from "node:readline";
 import { setTimeout } from "node:timers/promises";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { chromium, type Browser } from "playwright-core";
 import type { BrowserAction } from "../src/generated/BrowserAction.js";
 import type { BrowserReply } from "../src/generated/BrowserReply.js";
@@ -67,11 +68,25 @@ class NativeHelper {
   }
 }
 
-test("native CDP keeps normal Playwright control with a foreign extension frame and closes only owned tabs",
+test("native CDP keeps full Playwright control and exact ownership despite a stalled existing renderer",
   { skip, timeout: 45_000 }, async t => {
   assert.ok(chrome, "AGENT_TEST_CHROME must select an explicit disposable test binary");
   const directory = await mkdtemp(join(tmpdir(), "agent-native-cdp-"));
-  t.after(() => rm(directory, { recursive: true, force: true }));
+  const profile = join(directory, "profile");
+  let stopChrome: (() => Promise<void>) | undefined;
+  let stopServer: (() => Promise<void>) | undefined;
+  t.after(async () => {
+    const failures: unknown[] = [];
+    try { await stopChrome?.(); } catch (error) { failures.push(error); }
+    try { await stopServer?.(); } catch (error) { failures.push(error); }
+    // Retain the disposable profile and ownership diagnostics if reaping failed.
+    if (failures.length) throw new AggregateError(failures, `Fixture cleanup incomplete: ${directory}`);
+    await rm(directory, { recursive: true, force: true });
+    t.diagnostic("Disposable profile removed after owned Chrome group cleanup");
+  });
+  const version = await promisify(execFile)(chrome, ["--version", `--user-data-dir=${profile}`,
+    "--use-mock-keychain", "--password-store=basic"], { timeout: 5_000 });
+  assert.match(version.stdout, /^Google Chrome for Testing /, "Only disposable Chrome for Testing may run this fixture");
   const extension = join(directory, "inline-menu"); await mkdir(extension);
   await writeFile(join(extension, "manifest.json"), JSON.stringify({ manifest_version: 3,
     name: "Invented inline menu", version: "1.0",
@@ -120,28 +135,55 @@ document.addEventListener('focusin', event => {
       });
     } else response.end("<!doctype html><h1>Unrelated page</h1>");
   });
+  stopServer = () => {
+    server.closeAllConnections();
+    return new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  };
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
   const address = server.address(); assert.ok(address !== null && typeof address !== "string");
   const origin = `http://127.0.0.1:${address.port}`;
-  const profile = join(directory, "profile");
   const args = [`--user-data-dir=${profile}`, "--remote-debugging-port=0", "--headless=new",
     `--load-extension=${extension}`, `--disable-extensions-except=${extension}`, "--use-mock-keychain",
     "--password-store=basic", "--disable-background-networking", "--no-first-run", "--no-default-browser-check", "about:blank"];
   if (process.platform === "linux" || process.getuid?.() === 0) args.unshift("--no-sandbox");
-  const processChrome = spawn(chrome, args, { stdio: "ignore" });
+  const processChrome = spawn(chrome, args, { stdio: "ignore", detached: true });
+  processChrome.once("error", () => {});
   const exited = new Promise<void>(resolve => processChrome.once("close", () => resolve()));
   let observer: Browser | undefined;
+  let recovering: Browser | undefined;
   const hosts: NativeHelper[] = [];
-  t.after(async () => {
-    for (const host of hosts) await host.close();
-    await observer?.close();
-    if (processChrome.exitCode === null && processChrome.signalCode === null) {
-      processChrome.kill("SIGTERM");
-      const stopped = await Promise.race([exited.then(() => true), setTimeout(5000, false)]);
-      if (!stopped) { processChrome.kill("SIGKILL"); await exited; }
+  const nativeTargets = new Set<string>();
+  const group = processChrome.pid;
+  assert.ok(group !== undefined && group > 0, "The fixture must own an explicit detached Chrome group");
+  const groupAlive = () => {
+    try { process.kill(-group, 0); return true; }
+    catch (error) { if (object(error) && error.code === "ESRCH") return false; throw error; }
+  };
+  const signalGroup = (signal: NodeJS.Signals) => {
+    try { process.kill(-group, signal); }
+    catch (error) { if (!object(error) || error.code !== "ESRCH") throw error; }
+  };
+  stopChrome = async () => {
+    const failures: unknown[] = [];
+    for (const host of hosts) {
+      try { await host.close(); } catch (error) { failures.push(error); }
     }
-  });
+    // The browser's main process may already be gone while its renderer group
+    // remains. Reap the group allocated by this spawn, never a discovered port.
+    signalGroup("SIGTERM");
+    let deadline = Date.now() + 3_000;
+    while (groupAlive() && Date.now() < deadline) await setTimeout(25);
+    if (groupAlive()) signalGroup("SIGKILL");
+    deadline = Date.now() + 3_000;
+    while (groupAlive() && Date.now() < deadline) await setTimeout(25);
+    const empty = !groupAlive();
+    t.diagnostic(JSON.stringify({ fixturePid: group, fixtureGroup: group, nativeTargets: [...nativeTargets], groupEmpty: empty }));
+    assert.ok(empty, "Every process in the explicitly owned Chrome group must exit before profile removal");
+    await exited;
+    try { await observer?.close(); } catch (error) { failures.push(error); }
+    try { await recovering?.close(); } catch (error) { failures.push(error); }
+    if (failures.length) throw new AggregateError(failures, "Owned browser helper cleanup failed");
+  };
   let port = 0;
   for (let attempt = 0; attempt < 200; attempt++) {
     assert.equal(processChrome.exitCode, null, "Disposable Chrome must remain running");
@@ -155,7 +197,40 @@ document.addEventListener('focusin', event => {
   assert.notEqual(port, 0, "Disposable Chrome must publish its native endpoint");
   observer = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { noDefaults: true, timeout: 10_000 });
   const context = observer.contexts()[0]; assert.ok(context);
+  const browserSession = await observer.newBrowserCDPSession();
+  browserSession.on("Target.targetCreated", ({ targetInfo }: { targetInfo: { targetId: string } }) => {
+    nativeTargets.add(targetInfo.targetId);
+  });
+  await browserSession.send("Target.setDiscoverTargets", { discover: true });
+  const currentTargets = async () => {
+    const targets = await browserSession.send("Target.getTargets");
+    for (const target of targets.targetInfos) nativeTargets.add(target.targetId);
+    return new Set(targets.targetInfos.map(target => target.targetId));
+  };
+  await currentTargets();
   const sentinel = await context.newPage(); await sentinel.goto(`${origin}/seed`);
+  const sentinelSession = await context.newCDPSession(sentinel);
+  const sentinelId = (await sentinelSession.send("Target.getTargetInfo")).targetInfo.targetId;
+  nativeTargets.add(sentinelId); await sentinelSession.detach();
+  // A separate site gives the stalled user tab its own renderer. Existing
+  // renderer initialization must not gate the new task's unrelated web page.
+  const stalled = await context.newPage();
+  await stalled.goto(`http://localhost:${address.port}/stalled`);
+  const stalledSession = await context.newCDPSession(stalled);
+  const stalledId = (await stalledSession.send("Target.getTargetInfo")).targetInfo.targetId;
+  nativeTargets.add(stalledId);
+  void stalledSession.send("Runtime.evaluate", { expression: "while(true){}" }).catch(() => {});
+  const frameTree = stalledSession.send("Page.getFrameTree");
+  const frameTreeState = await Promise.race([
+    frameTree.then(() => "resolved", () => "rejected"), setTimeout(250, "pending"),
+  ]);
+  assert.equal(frameTreeState, "pending", "The pre-existing renderer must actually stall Page.getFrameTree");
+  await assert.rejects(
+    chromium.connectOverCDP(`http://127.0.0.1:${port}`, { noDefaults: false, timeout: 500 }),
+    error => error instanceof Error && error.name === "TimeoutError",
+    "The normal initialization barrier must remain in effect without noDefaults",
+  );
+  await currentTargets();
   const initialPages = context.pages().length;
   // Separate helpers reconnect to the same browser without extension pairing.
   for (let helper = 0; helper < 2; helper++) {
@@ -165,6 +240,7 @@ document.addEventListener('focusin', event => {
     const execute = async (action: BrowserAction) => (await host.execute({ owner_id, session_id, operation_id: randomUUID(), action })).response;
     const opened = await execute({ type: "open", url: `${origin}/login` });
     assert.ok(opened.type === "ready", JSON.stringify(opened));
+    await currentTargets();
     assert.equal(opened.tabs.length, 1); const tab = opened.tabs[0]; assert.ok(tab);
     const status = await execute({ type: "status" });
     assert.ok(status.type === "ready", JSON.stringify(status));
@@ -211,7 +287,27 @@ document.addEventListener('focusin', event => {
     assert.equal(released.type, "closed", JSON.stringify(released));
     assert.equal(context.pages().length, initialPages, "Release must close every exact owned page");
     assert.equal(sentinel.isClosed(), false);
+    assert.equal(stalled.isClosed(), false);
+    const remainingTargets = await currentTargets();
+    assert.ok(remainingTargets.has(sentinelId), "Release must preserve the exact pre-existing sentinel target");
+    assert.ok(remainingTargets.has(stalledId), "Release must preserve the exact pre-existing stalled target");
     assert.equal(processChrome.exitCode, null, "Disconnect must preserve the user's Chrome process");
     assert.equal(processChrome.signalCode, null);
   }
+  // A connection established while the user page is stalled must retain full
+  // binding support when that same renderer recovers later.
+  recovering = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { noDefaults: true, timeout: 5_000 });
+  const recoveringContext = recovering.contexts()[0]; assert.ok(recoveringContext);
+  const recoveredPage = recoveringContext.waitForEvent("page", {
+    predicate: page => page.url() === `http://localhost:${address.port}/stalled`, timeout: 5_000,
+  });
+  await stalledSession.send("Runtime.terminateExecution");
+  await frameTree;
+  const recovered = await recoveredPage;
+  const recoveredSession = await recoveringContext.newCDPSession(recovered);
+  assert.equal((await recoveredSession.send("Target.getTargetInfo")).targetInfo.targetId, stalledId);
+  await recoveredSession.detach();
+  await recovered.exposeBinding("fixtureRecovered", (_source, value: unknown) => value);
+  assert.equal(await recovered.evaluate("window.fixtureRecovered('Recovered binding')"), "Recovered binding");
+  await stalledSession.detach();
 });

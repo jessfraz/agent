@@ -29,6 +29,7 @@
           root = ./runtime;
           fileset = pkgs.lib.fileset.unions [
             ./runtime/src
+            ./runtime/scripts
             ./runtime/package.json
             ./runtime/package-lock.json
             ./runtime/tsconfig.json

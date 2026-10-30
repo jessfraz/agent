@@ -183,6 +183,8 @@ Migrating a disposable profile is not proof of personal account continuity.
 
 The extension connects to installed Chrome and the selected existing profile.
 Chrome for Testing is a disposable test fixture, never a production fallback.
+Disposable macOS tests use `--use-mock-keychain` and `--password-store=basic`
+to avoid accessing Keychain. These flags do not belong on the user's Chrome.
 Extension mode needs no native debugging port. Its connector can start
 installed Chrome with that same profile when it is closed.
 
