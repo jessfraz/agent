@@ -34,6 +34,10 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] A phone client for the main conversation, using the same submission,
   steering and queueing path as the CLI. The native iPhone app fulfills the
   planned WhatsApp/iMessage client use case.
+- [ ] Enable iPhone alerts for completed main-chat replies and explicit
+  `notify_user` notices, including mid-job requests. The durable delivery path
+  is implemented; Apple provisioning and real-phone delivery remain to verify.
+  See [notification setup](notifications.md).
 - [ ] Direct coordination between task sessions: durable messages with delivery
   receipts, steering or queueing, and references to shared work. Reuse existing
   task inboxes and workers.

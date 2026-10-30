@@ -10,3 +10,6 @@
 {"type":"native","request":{"type":"history","cursor":null}}
 {"type":"native","request":{"type":"tool_details","entry_id":"example","call_id":"example"}}
 {"type":"native","request":{"type":"interrupt"}}
+{"type":"native","request":{"type":"notifications","request":{"type":"status","installation_id":"example"}}}
+{"type":"native","request":{"type":"notifications","request":{"type":"register","installation_id":"example","token":"example"}}}
+{"type":"native","request":{"type":"notifications","request":{"type":"unregister","installation_id":"example"}}}

@@ -142,7 +142,14 @@ async fn serve_with_transport(
     let background = bootstrap
         .as_ref()
         .and_then(|value| value.background.clone());
-    let owner = Runtime::start(script, state)?;
+    let apns = bootstrap
+        .as_ref()
+        .and_then(|value| value.node.as_ref())
+        .and_then(|node| node.launch.config.as_deref())
+        .map(|path| crate::config::load(Some(Path::new(path))))
+        .transpose()?
+        .and_then(|config| config.apns);
+    let owner = Runtime::start_with_notifications(script, state, apns.as_ref())?;
     let broker = match Broker::with_tailscale(bootstrap.as_ref(), state, daemon.clone()) {
         Ok(broker) => Arc::new(broker),
         Err(error) => {

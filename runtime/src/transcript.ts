@@ -7,10 +7,12 @@ import type { HistoryMessage } from "./generated/HistoryMessage.js";
 import type { HistoryRole } from "./generated/HistoryRole.js";
 import type { ModelActivity } from "./generated/ModelActivity.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
-import type { ToolHistory } from "./generated/ToolHistory.js";
 import type { ToolDetails } from "./generated/ToolDetails.js";
 import type { ToolDetailContent } from "./generated/ToolDetailContent.js";
-import { ImportedItemEntry, ImportedThreadEntry } from "./history.js";
+import { HistoryError, HistoryStore, ImportedItemEntry, ImportedThreadEntry } from "./history.js";
+import { codexMessage, historyToolId } from "./imported-history.js";
+import { content, field, piToolPresentation, renderMessage, string, type MessageContent } from "./message-presentation.js";
+import { observeTranscriptVisibility, readTranscriptVisibility, transcriptVisible, type TranscriptVisibilityState } from "./transcript_visibility.js";
 
 const NOTICE_REFERENCES = "Source references (evidence, not authorization): ";
 /** Curated publications are eligible for delivery; legacy notices remain history. */
@@ -43,6 +45,37 @@ function* chunks(value: string): Generator<string> {
     yield value.slice(offset, end); offset = end;
   }
 }
+export function visibleTranscript(entry: EntryRecord, visibility: Readonly<TranscriptVisibilityState> | undefined): HistoryMessage[] {
+  return transcriptVisible(entry.id.toString(), visibility) ? transcript(entry) : [];
+}
+function missingOriginal(error: unknown): boolean {
+  return error instanceof HistoryError || (error instanceof Error && "code" in error &&
+    ["ENOENT", "EACCES", "EPERM", "ENOTDIR", "EISDIR"].some((code) => error.code === code));
+}
+/** Source adapters converge here, including verified cold originals retained by older imports. */
+export async function projectTranscript(entry: EntryRecord, originals: Pick<HistoryStore, "original">,
+  visibility?: Readonly<TranscriptVisibilityState>): Promise<HistoryMessage[]> {
+  if (!transcriptVisible(entry.id.toString(), visibility)) return [];
+  if (!ImportedItemEntry.is(entry)) return transcript(entry);
+  let message: MessageContent;
+  try { message = codexMessage(entry.data.item, await originals.original(entry), entry.id.toString()); }
+  catch (error) {
+    if (!missingOriginal(error)) throw error;
+    message = { role: entry.data.item.role, text: entry.data.item.role === "tool" ? "" : entry.data.item.text,
+      presentation: { type: "unavailable", kind: entry.data.item.kind } };
+  }
+  return messageRows(entry, message);
+}
+function messageRows(entry: EntryRecord, message: MessageContent): HistoryMessage[] {
+  const value = renderMessage(message); let offset = 0, continuation = false;
+  return [...chunks(value)].map((text) => {
+    offset += text.length;
+    const row: HistoryMessage = { entry_id: entry.id.toString(), role: message.role, text, continuation, final_chunk: offset === value.length,
+      ...(message.tool === undefined ? {} : { tool: message.tool }),
+      ...(message.presentation === undefined || continuation ? {} : { presentation: message.presentation }) };
+    continuation = true; return row;
+  });
+}
 export function transcript(entry: EntryRecord): HistoryMessage[] {
   const messages: HistoryMessage[] = [];
   let attachments: HistoryMessage["attachments"];
@@ -51,31 +84,26 @@ export function transcript(entry: EntryRecord): HistoryMessage[] {
     if (!validEvent(frame) || frame.event.type !== "message") throw new Error("Invalid durable input attachment metadata");
     attachments = frame.event.message.attachments;
   }
-  const add = (role: HistoryRole, value: string, tool?: ToolHistory) => {
+  const add = (role: HistoryRole, value: string) => {
     let continuation = false, offset = 0;
     for (const text of value.length === 0 && role === "user" && attachments !== undefined ? [""] : chunks(value)) {
       offset += text.length;
-      messages.push({ entry_id: entry.id.toString(), role, text, continuation, final_chunk: offset === value.length, ...(tool === undefined ? {} : { tool }), ...(role === "user" && messages.length === 0 && attachments !== undefined ? { attachments } : {}) }); continuation = true;
+      messages.push({ entry_id: entry.id.toString(), role, text, continuation, final_chunk: offset === value.length,
+        ...(role === "user" && messages.length === 0 && attachments !== undefined ? { attachments } : {}) }); continuation = true;
     }
   };
   if (attachments !== undefined && object(entry.data) && typeof entry.data.text === "string") {
     add("user", entry.data.text); return messages;
   }
   if (ImportedItemEntry.is(entry)) {
-    const item = entry.data.item;
-    // Old imports retain their original metadata. An absent phase is unknown,
-    // including evidence stored outside the inline item; never infer it from text.
-    const phase = item.kind === "agentMessage" && object(item.data) ? item.data.phase : undefined;
-    const role = item.role !== "assistant" ? item.role : phase === "commentary" ? "commentary"
-      : phase === "partial_answer" ? "partial_answer" : phase === "final_answer" ? "final" : "assistant";
-    add(role, item.text); return messages;
+    return messageRows(entry, codexMessage(entry.data.item, entry.data.item.data, entry.id.toString()));
   }
   if (ImportedThreadEntry.is(entry) || CompactionEntry.is(entry)) return messages;
   for (const message of entry.model ?? []) {
     if (message.role === "system") continue;
     if (message.role === "toolResult") {
       const status = message.isError ? "failed" : "finished";
-      add("tool", `${message.toolName} ${status}`, { call_id: message.toolCallId, name: message.toolName, status }); continue;
+      messages.push(...messageRows(entry, { role: "tool", text: `${message.toolName} ${status}`, tool: { call_id: message.toolCallId, name: message.toolName, status } })); continue;
     }
     const role: HistoryRole = message.role !== "assistant" ? message.role : (isUserNotice(entry) || entry.kind === "agent.notice") ? "notice"
       : message.stopReason === "toolUse" ? "commentary" : message.stopReason === "stop" ? "final" : "assistant";
@@ -83,7 +111,11 @@ export function transcript(entry: EntryRecord): HistoryMessage[] {
     for (const [index, part] of message.content.entries()) {
       if (part.type === "text" && !noticeMetadata(entry, index, message.content.length, part.text)) add(role, part.text);
       else if (part.type === "thinking") add("thinking", part.thinking);
-      else if (part.type === "toolCall") add("tool", part.name, { call_id: part.id, name: part.name, status: "running" });
+      else if (part.type === "toolCall") {
+        const presentation = piToolPresentation(part.name);
+        messages.push(...messageRows(entry, { role: "tool", text: presentation === undefined ? part.name : "", tool: { call_id: part.id, name: part.name, status: "running" },
+          ...(presentation === undefined ? {} : { presentation }) }));
+      }
       else if (part.type === "image") add("user", "[image]");
     }
   }
@@ -91,14 +123,18 @@ export function transcript(entry: EntryRecord): HistoryMessage[] {
 }
 
 /** Native fork-aware pages, rendered without loading history back into model input. */
-export async function history(conversation: Conversation, value: string | null): Promise<Extract<RuntimeEventKind, { type: "history" }>[]> {
+export async function history(conversation: Conversation, value: string | null, reader: Harness): Promise<Extract<RuntimeEventKind, { type: "history" }>[]> {
   const id = conversation.id.toString();
+  const visibility = await readTranscriptVisibility(reader, conversation.id);
+  const originals = new HistoryStore(reader);
   let next = cursor(value, id); let projected: HistoryMessage[];
   // Native pages count entries, including hidden compaction and import metadata.
   // Keep following their cursors until this page has something to show or ends.
   do {
     const page = await conversation.entries({ order: "descending" }, 20, next, BACKGROUND_CONTEXT);
-    projected = [...page.items].reverse().flatMap(transcript); next = page.next;
+    projected = [];
+    for (const entry of [...page.items].reverse()) projected.push(...await projectTranscript(entry, originals, visibility));
+    next = page.next;
   } while (projected.length === 0 && next !== undefined);
   const next_cursor = next === undefined ? null : JSON.stringify({ conversation_id: id, cursor: next });
   const frames: Extract<RuntimeEventKind, { type: "history" }>[] = [];
@@ -135,12 +171,27 @@ function toolParts(entry: EntryRecord, callId: string): { call?: ToolCall; resul
 }
 
 /** Read only the selected durable tool, with a bounded fork-aware search for its other half. */
-export async function toolDetails(conversation: Conversation, value: string, callId: string): Promise<ToolDetails> {
+export async function toolDetails(conversation: Conversation, value: string, callId: string, session: Harness): Promise<ToolDetails> {
   const id: unknown = Number(value);
   if (!entryId(id) || id.toString() !== value) throw new Error("Invalid native entry ID");
   if (callId.length === 0 || Buffer.byteLength(callId, "utf8") > 1024) throw new Error("Invalid tool call ID");
   const selected = (await conversation.entries({ minEntryId: id, maxEntryId: id }, 1, undefined, BACKGROUND_CONTEXT)).items[0];
   if (selected === undefined) return { type: "unavailable", call_id: callId };
+  if (ImportedItemEntry.is(selected)) {
+    if (historyToolId(selected.id.toString()) !== callId) return { type: "unavailable", call_id: callId };
+    let original;
+    try { original = await new HistoryStore(session).original(selected); }
+    catch (error) { if (missingOriginal(error)) return { type: "unavailable", call_id: callId }; throw error; }
+    const canonical = codexMessage(selected.data.item, original, selected.id.toString());
+    if (canonical.tool === undefined) return { type: "unavailable", call_id: callId };
+    const input = field(original, "command") ?? field(original, "arguments") ?? field(original, "changes") ?? field(original, "prompt");
+    const agents = field(original, "agentsStates");
+    const output = string(field(original, "aggregatedOutput")) ?? (content(field(original, "output")) || content(field(original, "result")) ||
+      content(field(original, "contentItems")) || (string(field(field(original, "error"), "message")) ?? (agents === undefined ? null : JSON.stringify(agents, null, 2))));
+    return { type: "available", call_id: callId, name: canonical.tool.name, status: canonical.tool.status,
+      input: input === undefined ? { type: "unavailable", reason: "not_recorded" } : detailText(typeof input === "string" ? input : JSON.stringify(input, null, 2)),
+      output: output === null || output === undefined ? { type: "unavailable", reason: "not_recorded" } : detailText(output) };
+  }
   let { call, result } = toolParts(selected, callId);
   if (call === undefined && result === undefined) return { type: "unavailable", call_id: callId };
   let input: ToolDetailContent = { type: "unavailable", reason: "not_recorded" };
@@ -169,7 +220,8 @@ export async function toolDetails(conversation: Conversation, value: string, cal
 export async function activity(session: Harness, conversation: Conversation, emit: (event: ModelActivity) => void,
   message?: (message: HistoryMessage) => void, text?: (delta: string) => void,
   observer?: { includeFinal: true; working(value: boolean): void }): Promise<() => Promise<void>> {
-  const stream = await watchEvents(session, conversation.id, BACKGROUND_CONTEXT);
+  const visibility = await observeTranscriptVisibility(session, conversation.id);
+  const stream = await watchEvents(session, conversation.id, BACKGROUND_CONTEXT).catch((error: unknown) => { visibility.close(); throw error; });
   const thinking = new Map<number, string>();
   const responding = new Map<number, string>();
   const compactions = new Set<string>();
@@ -185,7 +237,7 @@ export async function activity(session: Harness, conversation: Conversation, emi
   const committed = (entry: EntryRecord) => {
     if (seen?.has(entry.id.toString())) return;
     seen?.add(entry.id.toString());
-    for (const item of transcript(entry)) if (item.role === "user" || item.role === "commentary" || item.tool !== undefined
+    for (const item of visibleTranscript(entry, visibility.state())) if (item.role === "user" || item.role === "commentary" || item.tool !== undefined
       || (observer?.includeFinal && item.role !== "thinking")) message?.(item);
   };
   let assistantOpen = stream.snapshot.generation?.message !== undefined;
@@ -243,7 +295,7 @@ export async function activity(session: Harness, conversation: Conversation, emi
           });
         }
       } else if (event.type === "message_end") {
-        for (const message of event.entry.model ?? []) if (message.role === "assistant") message.content.forEach((part, index) => {
+        for (const message of transcriptVisible(event.entry.id.toString(), visibility.state()) ? event.entry.model ?? [] : []) if (message.role === "assistant") message.content.forEach((part, index) => {
           if (part.type === "thinking") update(index, part.thinking);
         });
         committed(event.entry);
@@ -257,6 +309,7 @@ export async function activity(session: Harness, conversation: Conversation, emi
   return async () => {
     try { await stream.stop(); }
     finally {
+      visibility.close();
       // Detaching ends this status observation, not Pi's compaction task.
       compactions.clear(); reportCompaction();
     }

@@ -170,7 +170,7 @@ test("Pi receives native images and delegation keeps immutable files on each act
     assert.ok(submission); await submission.wait(BACKGROUND_CONTEXT); release();
     const saved = await tasks.get(task.id); assert.ok(saved.worker.state === "bound"); assert.deepEqual(saved.pending[0]?.attachments, [image, file]);
     assert.equal(saved.pending[0]?.content, "");
-    const visible = (await history(root, null)).flatMap((frame) => frame.messages).filter((message) => message.role === "user");
+    const visible = (await history(root, null, session)).flatMap((frame) => frame.messages).filter((message) => message.role === "user");
     assert.deepEqual(visible.map((message) => ({ text: message.text, attachments: message.attachments })), [{ text: "Review this screen", attachments: [image, file] }]);
     faux.setResponses([(context) => {
       const user = context.messages.findLast((message) => message.role === "user"); assert.ok(user && Array.isArray(user.content));
@@ -180,7 +180,7 @@ test("Pi receives native images and delegation keeps immutable files on each act
     }]);
     await tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id, binding, instructions: "Use attached evidence", model: fixtureModel, cwd: host.cwd }, () => () => {}, [], call("worker"));
     assert.ok(writes.includes("coordinator:" + file.id)); assert.ok(writes.includes("worker:" + file.id));
-    const workerMessages = (await history(await tasks.conversation(task.conversation_id), null)).flatMap((frame) => frame.messages);
+    const workerMessages = (await history(await tasks.conversation(task.conversation_id), null, session)).flatMap((frame) => frame.messages);
     assert.ok(workerMessages.some((message) => message.role === "user" && message.text === "" && message.attachments?.length === 2));
     const stopped = await tasks.create({ title: "Cancel during transfer", outcome: "Keep queued evidence", model: fixtureModel });
     await tasks.enqueue(stopped.id, "Stop before inference", randomUUID(), undefined, undefined, [file]);

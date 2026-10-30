@@ -69,6 +69,9 @@ struct ActivityGroup: Identifiable {
   let id: String
   let rows: [RowModel]
 
+  var status: ToolStatus? {
+    rows.compactMap { $0.row.tool?.status }.max { $0.activityPriority < $1.activityPriority }
+  }
   var running: Bool { rows.contains { $0.row.tool?.status == .running } }
   var failed: Bool { rows.contains { $0.row.tool?.status == .failed } }
   var summary: String {
@@ -76,9 +79,15 @@ struct ActivityGroup: Identifiable {
     let thoughts = rows.filter { $0.row.role == .thinking }.count
     let failures = rows.filter { $0.row.tool?.status == .failed }.count
     let active = rows.filter { $0.row.tool?.status == .running }.count
+    let declined = rows.filter { $0.row.tool?.status == .declined }.count
+    let interrupted = rows.filter { $0.row.tool?.status == .interrupted }.count
+    let unknown = rows.filter { $0.row.tool?.status == .unknown }.count
     return [
       failures == 0 ? nil : "\(failures) failed",
       active == 0 ? nil : "\(active) running",
+      declined == 0 ? nil : "\(declined) declined",
+      interrupted == 0 ? nil : "\(interrupted) interrupted",
+      unknown == 0 ? nil : "\(unknown) unknown",
       tools == 0 ? nil : "\(tools) tool \(tools == 1 ? "call" : "calls")",
       thoughts == 0 ? nil : "\(thoughts) \(thoughts == 1 ? "thought" : "thoughts")",
     ].compactMap { $0 }.joined(separator: " · ")
@@ -105,7 +114,7 @@ struct ActivityGroupView: View {
         }
       } label: {
         HStack(spacing: 8) {
-          ActivityStatus(running: group.running, failed: group.failed)
+          ActivityStatus(status: group.status)
           Text(group.summary).lineLimit(2).multilineTextAlignment(.leading)
             .foregroundStyle(group.failed ? .primary : .secondary)
           Image(systemName: expanded ? "chevron.down" : "chevron.right").font(.caption2)
@@ -141,21 +150,43 @@ struct ActivityGroupView: View {
   }
 }
 
+extension ToolStatus {
+  fileprivate var activityPriority: Int {
+    switch self {
+    case .finished: 0
+    case .unknown: 1
+    case .declined: 2
+    case .interrupted: 3
+    case .running: 4
+    case .failed: 5
+    }
+  }
+}
+
 private struct ActivityStatus: View {
-  var running = false
-  var failed = false
+  var status: ToolStatus?
 
   var body: some View {
     Group {
-      if failed {
+      switch status {
+      case .failed:
         Image(systemName: "xmark.circle").foregroundStyle(.red)
-      } else if running {
+      case .running:
         ProgressView().controlSize(.mini)
-      } else {
+      case .finished:
         Image(systemName: "checkmark").foregroundStyle(.secondary)
+      case .declined:
+        Image(systemName: "minus.circle").foregroundStyle(.secondary)
+      case .interrupted:
+        Image(systemName: "pause.circle").foregroundStyle(.secondary)
+      case .unknown:
+        Image(systemName: "questionmark.circle").foregroundStyle(.secondary)
+      case nil:
+        Image(systemName: "text.alignleft").foregroundStyle(.secondary)
       }
     }
-    .font(.caption).frame(width: 18, height: 18).accessibilityHidden(true)
+    .font(.caption).frame(width: 18, height: 18)
+    .accessibilityLabel(status?.rawValue.capitalized ?? "Thinking")
   }
 }
 
@@ -178,7 +209,7 @@ struct ActivityItemView: View {
       } label: {
         HStack(alignment: .center, spacing: 8) {
           if let tool = model.row.tool {
-            ActivityStatus(running: tool.status == .running, failed: tool.status == .failed)
+            ActivityStatus(status: tool.status)
           } else {
             Image(systemName: "text.alignleft").font(.caption).frame(width: 18)
           }

@@ -29,3 +29,4 @@ pub mod tui;
 pub mod usage;
 
 pub mod native;
+pub mod notifications;

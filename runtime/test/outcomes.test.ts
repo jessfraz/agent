@@ -68,7 +68,7 @@ test("bookkeeping finals stay internal until outcome triage selects one useful n
   const live: string[] = [];
   const observe = async () => {
     const root = await app.session.root(BACKGROUND_CONTEXT);
-    stop = watchMainNotices(app.session, root, (event) => {
+    stop = await watchMainNotices(app.session, root, (event) => {
       if (event.type === "message") live.push(event.message.text);
     });
     return root;

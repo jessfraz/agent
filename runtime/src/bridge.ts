@@ -12,7 +12,7 @@ import type { ErrorCode } from "./generated/ErrorCode.js";
 import { CoordinatorEnvironment, EnvironmentError } from "./environment.js";
 import { ConversationModels, ModelError, modelFailureMessage } from "./models.js";
 import { ChatGptAuth } from "./auth.js";
-import { validRequest, validEvent, errorEvent, invalidHostReply, protocolLines } from "./protocol.js";
+import { validRequest, validEvent, validApnsConfig, errorEvent, invalidHostReply, protocolLines } from "./protocol.js";
 import { TaskError, TaskStore, type HostCall } from "./tasks.js";
 import { HistoryStore } from "./history.js";
 import { CodexImporter } from "./importer.js";
@@ -36,6 +36,19 @@ import { reconcileMainInput, watchMainNotices } from "./main_observation.js";
 import { BackgroundScheduler } from "./background.js";
 import { openJobActor, runScheduled } from "./scheduled.js";
 import type { SourcePollCursor } from "./generated/SourcePollCursor.js";
+import { Notifications, NotificationError } from "./notifications.js";
+import type { ApnsConfig } from "./generated/ApnsConfig.js";
+import { annotateTranscript, TranscriptAnnotationError } from "./transcript_visibility.js";
+
+function notificationConfig(): ApnsConfig | undefined {
+  const saved = process.env.AGENT_APNS_CONFIG;
+  if (saved === undefined) return undefined;
+  let value: unknown;
+  try { value = JSON.parse(saved); }
+  catch { throw new Error("The private notification configuration is invalid"); }
+  if (!validApnsConfig(value)) throw new Error("The private notification configuration is invalid");
+  return value;
+}
 
 const VERSION = 1;
 function stateDirectory(): string {
@@ -84,7 +97,7 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
   return hostRequests.call(backgroundOwner, command);
 }
 
-type Application = TriageApplication & { stopPlacements(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore;
+type Application = TriageApplication & { stopPlacements(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore; notifications: Notifications;
   histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler };
 async function openApplication(): Promise<Application> {
   const database = await openNodeSqliteDatabase(join(state, "session.sqlite"));
@@ -93,6 +106,7 @@ async function openApplication(): Promise<Application> {
   const registry = createRegistry();
   const harness = await Harness.open(storage, { models, registry, identity: { attribution: null },
     settings: { steeringMode: "all", followUpMode: "one-at-a-time" } }, BACKGROUND_CONTEXT);
+  const notifications = new Notifications(harness, registry, notificationConfig());
   const tasks = new TaskStore(harness, inference);
   const attachments = new AttachmentStore(state); tasks.useAttachments(attachments);
   const environment = new CoordinatorEnvironment(harness); environment.useLiveGuidance(); tasks.useEnvironment(environment);
@@ -128,7 +142,7 @@ async function openApplication(): Promise<Application> {
       if (conversation.id.toString() === conversationId && !ending.has(id)) emit(id, { type: "input_placed", input_id, entry_id });
     }
   });
-  const core = { stopPlacements, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, attachments, feedback, repairs };
+  const core = { stopPlacements, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, attachments, feedback, repairs, notifications };
   const background = new BackgroundScheduler(harness, registry, tasks, {
     async plan(cadence, after, now) {
       const result = await backgroundCall({ type: "background", request: { type: "plan", cadence, after, now } });
@@ -159,6 +173,7 @@ async function openApplication(): Promise<Application> {
   });
   const jobTools = createJobTools(background, executions); registry.install(jobTools);
   const toolsets = createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools });
+  if (await notifications.start()) harness.resume();
   return { ...core, background, toolsets };
 }
 let application: ReturnType<typeof openApplication> | undefined;
@@ -412,13 +427,30 @@ async function handle(request: RuntimeRequest): Promise<void> {
         break;
       }
       case "import_status": emit(id, { type: "import_progress", progress: await (await app()).importer.status() }); break;
+      case "notifications": emit(id, { type: "notifications", status: await (await app()).notifications.request(command.request) }); break;
+      case "task_input": {
+        const application = await app();
+        const task = await application.tasks.get(command.task_id);
+        await conversationViews.input({ type: "conversation_input", conversation_id: task.conversation_id,
+          input_id: command.input_id, input: command.input, mode: command.mode },
+        (operation) => hostRequests.call(id, operation), (event) => emit(id, event));
+        break;
+      }
+      case "annotate_transcript": {
+        const application = await app();
+        const conversation = await application.tasks.conversation(command.conversation_id);
+        const entries = await annotateTranscript(application.harness, conversation, command.entries);
+        emit(id, { type: "transcript_annotated", conversation_id: command.conversation_id, entries });
+        break;
+      }
       case "search_history": {
         const application = await app();
         const result = await application.tasks.find(command.query, [], command.limit, searchFor(application, id), command.mode);
         emit(id, { type: "saved_matches", ...result }); break;
       }
       case "read_conversation": {
-        for (const frame of await history(await (await app()).tasks.conversation(command.conversation_id), command.cursor)) emit(id, frame);
+        const application = await app();
+        for (const frame of await history(await application.tasks.conversation(command.conversation_id), command.cursor, application.harness)) emit(id, frame);
         break;
       }
       case "list_conversations": {
@@ -473,8 +505,8 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const conversation = task === undefined ? await harness.root(BACKGROUND_CONTEXT)
           : await tasks.conversation(agentId === null ? task.conversation_id
             : task.agents.find((agent) => agent.id === agentId)?.conversation_id ?? "");
-        if (command.type === "read_history") for (const frame of await history(conversation, command.cursor)) emit(id, frame);
-        else emit(id, { type: "tool_details", details: await toolDetails(conversation, command.entry_id, command.call_id) });
+        if (command.type === "read_history") for (const frame of await history(conversation, command.cursor, harness)) emit(id, frame);
+        else emit(id, { type: "tool_details", details: await toolDetails(conversation, command.entry_id, command.call_id, harness) });
         break;
       }
       case "revoke_allocation": {
@@ -530,7 +562,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
           async ready(conversation, title) {
             activeConversations.set(id, conversation);
             await configured(conversation, title);
-            for (const frame of await history(conversation, null)) emit(id, frame);
+            for (const frame of await history(conversation, null, tasks.session)) emit(id, frame);
             stop = await activity(tasks.session, conversation, (activity) => emit(id, { type: "activity", activity }),
               (message) => emit(id, { type: "message", message }));
           },
@@ -570,11 +602,11 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const finished = new Promise<void>((resolve) => { finish = resolve; });
         const observer: MainObserver = { buffer: [], bytes: 0, overflow: false, finish };
         mainObservers.set(id, observer);
-        const stopNotices = watchMainNotices(application.harness, root, (event) => queueMainObserver(id, observer, event));
+        const stopNotices = await watchMainNotices(application.harness, root, (event) => queueMainObserver(id, observer, event));
         try {
           emit(id, { type: "main_ready", conversation_id: root.id.toString(),
             model: await inference.legacy(root, await application.environment.model(null)), cwd: "" });
-          for (const frame of await history(root, null)) emit(id, frame);
+          for (const frame of await history(root, null, application.harness)) emit(id, frame);
           for (const input_id of command.input_ids) {
             for (const event of await reconcileMainInput(root, input_id) ?? []) emit(id, event);
           }
@@ -590,7 +622,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const application = await app();
         const snapshot = async () => {
           const root = await application.harness.root(BACKGROUND_CONTEXT);
-          for (const frame of await history(root, null)) emit(id, frame);
+          for (const frame of await history(root, null, application.harness)) emit(id, frame);
         };
         const [owner, turn] = [...mainTurns].find(([owner]) => !ending.has(owner)) ?? [];
         if (owner === undefined || turn === undefined) { await snapshot(); break; }
@@ -714,7 +746,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
       if (stopping === undefined) emit(id, { type: "interrupted" });
       else await stopping.catch(() => failure(id, "internal", "Interruption could not be confirmed; inspect current work"));
     }
-    else if (error instanceof TaskError || error instanceof ModelError || error instanceof EnvironmentError || error instanceof AttachmentError) failure(id, "invalid_request", error.message);
+    else if (error instanceof TaskError || error instanceof ModelError || error instanceof EnvironmentError || error instanceof AttachmentError || error instanceof NotificationError || error instanceof TranscriptAnnotationError) failure(id, "invalid_request", error.message);
     else emit(id, errorEvent(error));
   } finally {
     ending.add(id);
@@ -800,6 +832,6 @@ try {
 } finally {
   if (application !== undefined) {
     const opened = await application.catch(() => undefined);
-    if (opened !== undefined) { opened.stopPlacements(); opened.retrieval.close(); await opened.harness.close(BACKGROUND_CONTEXT); }
+    if (opened !== undefined) { opened.notifications.close(); opened.stopPlacements(); opened.retrieval.close(); await opened.harness.close(BACKGROUND_CONTEXT); }
   }
 }

@@ -34,6 +34,8 @@ use crate::{
 const PAGE_BYTES: usize = 500 * 1024;
 const ITEM_BYTES: usize = 128 * 1024;
 const NATIVE_BYTES: usize = 64 * 1024 * 1024;
+// Retained-kind changes revisit source checkpoints without changing item identity.
+const RETENTION_REVISION: u32 = 1;
 // Leave room for base64 expansion and metadata within PAGE_BYTES.
 const ASSET_BYTES: usize = 320 * 1024;
 const SOURCES: &[&str] = &[
@@ -374,7 +376,7 @@ impl CodexHistory {
         };
         if matches!(
             header.kind.as_str(),
-            "hookPrompt" | "contextCompaction" | "system" | "developer" | "authentication"
+            "system" | "developer" | "authentication"
         ) {
             return Ok((None, vec![]));
         }
@@ -384,27 +386,9 @@ impl CodexHistory {
                 HistoryRole::Assistant
             }
             "reasoning" => HistoryRole::Thinking,
-            "functionCallOutput"
-            | "commandExecution"
-            | "fileChange"
-            | "mcpToolCall"
-            | "dynamicToolCall"
-            | "collabAgentToolCall"
-            | "subAgentActivity"
-            | "webSearch"
-            | "imageView"
-            | "sleep"
-            | "imageGeneration" => HistoryRole::Tool,
-            _ => {
-                return Ok((
-                    None,
-                    vec![gap(
-                        HistoryGapCode::Unsupported,
-                        Some(header.id),
-                        "Native history item kind is not supported",
-                    )],
-                ));
-            }
+            // Unknown kinds remain inert evidence with an explicit presentation.
+            // Source instructions and authentication above are deliberately excluded.
+            _ => HistoryRole::Tool,
         };
         if header.id.is_empty() || entry.turn_id.is_empty() {
             return Ok((
@@ -838,6 +822,7 @@ impl NativeThread {
             })
             .map(str::to_owned);
         let version = digest(&serde_json::to_vec(&(
+            RETENTION_REVISION,
             &self.id,
             native_title,
             &self.cwd,
@@ -1973,7 +1958,7 @@ try{
             let (replayed, _) = source.normalize("thread-a", &entry, 7).await.unwrap();
             assert_eq!(item.version, replayed.unwrap().version);
         }
-        let excluded = NativeEntry {
+        let inert_hook = NativeEntry {
             turn_id: "turn-a".into(),
             item: serde_json::from_str(
                 r#"{"id":"hook-a","type":"hookPrompt","fragments":[{"text":"Old instructions"}]}"#,
@@ -1982,14 +1967,14 @@ try{
             started_at_ms: None,
             completed_at_ms: None,
         };
-        assert!(
-            source
-                .normalize("thread-a", &excluded, 0)
-                .await
-                .unwrap()
-                .0
-                .is_none()
-        );
+        let retained = source
+            .normalize("thread-a", &inert_hook, 0)
+            .await
+            .unwrap()
+            .0
+            .unwrap();
+        assert!(retained.text.is_empty());
+        assert_eq!(retained.data, inert_hook.item);
     }
 
     #[tokio::test]
@@ -2422,7 +2407,355 @@ try{
     }
 
     #[tokio::test]
-    async fn missing_native_media_and_unknown_items_remain_explicit_gaps() {
+    async fn every_native_item_kind_and_future_payload_is_retained_as_inert_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = history(directory.path(), "unavailable-codex-fixture".into());
+        let cases = [
+            r#"{"id":"user","type":"userMessage","content":[{"type":"text","text":"Original request"}]}"#,
+            r#"{"id":"hook","type":"hookPrompt","fragments":[{"text":"Inert historical hook instructions"}]}"#,
+            r#"{"id":"agent","type":"agentMessage","text":"Original answer","phase":"final_answer"}"#,
+            r#"{"id":"output","type":"functionCallOutput","name":"inspect","output":"Verified"}"#,
+            r#"{"id":"plan","type":"plan","text":"Original plan"}"#,
+            r#"{"id":"reasoning","type":"reasoning","summary":["Exposed summary"],"content":[]}"#,
+            r#"{"id":"command","type":"commandExecution","command":"printf fixture","cwd":"/example","status":"completed","commandActions":[],"exitCode":0}"#,
+            r#"{"id":"files","type":"fileChange","changes":[{"path":"example.rs","kind":{"type":"update"},"diff":"retained diff"}],"status":"completed"}"#,
+            r#"{"id":"mcp","type":"mcpToolCall","server":"fixture","tool":"inspect","arguments":{},"status":"completed","result":{"content":[]}}"#,
+            r#"{"id":"dynamic","type":"dynamicToolCall","tool":"inspect","arguments":{},"status":"completed","success":true}"#,
+            r#"{"id":"collab","type":"collabAgentToolCall","tool":"spawnAgent","status":"completed","senderThreadId":"parent","receiverThreadIds":["child"],"agentsStates":{}}"#,
+            r#"{"id":"activity","type":"subAgentActivity","agentPath":"/root/review","agentThreadId":"child","kind":"completed"}"#,
+            r#"{"id":"search","type":"webSearch","query":"synthetic native schema","action":{"type":"search"}}"#,
+            r#"{"id":"image","type":"imageView","path":""}"#,
+            r#"{"id":"sleep","type":"sleep","durationMs":1000}"#,
+            r#"{"id":"generation","type":"imageGeneration","status":"completed","inputImages":[]}"#,
+            r#"{"id":"entered","type":"enteredReviewMode","review":"Original review"}"#,
+            r#"{"id":"exited","type":"exitedReviewMode","review":"Verified review"}"#,
+            r#"{"id":"compaction","type":"contextCompaction"}"#,
+            r#"{"id":"future","type":"futureNativeItem","future":{"evidence":"Retain unknown fields"}}"#,
+        ];
+        let mut normalized = Vec::new();
+        for (order, raw) in cases.into_iter().enumerate() {
+            let item = serde_json::from_str(raw).unwrap();
+            let entry = NativeEntry {
+                turn_id: "turn-a".into(),
+                item,
+                started_at_ms: Some(1),
+                completed_at_ms: Some(2),
+            };
+            let (retained, _) = source
+                .normalize("thread-a", &entry, order as u64)
+                .await
+                .unwrap();
+            let retained = retained
+                .expect("Known and future native items must retain their original evidence");
+            assert_eq!(retained.data, entry.item);
+            assert_eq!(retained.turn_id, "turn-a");
+            assert_eq!(retained.order, order as u64);
+            normalized.push(retained);
+        }
+        #[derive(serde::Serialize)]
+        struct ProjectionInput<'a> {
+            items: &'a [crate::history::HistoryItem],
+            database: PathBuf,
+        }
+        #[derive(Deserialize)]
+        struct ProjectionReceipt {
+            retained: usize,
+            rendered: usize,
+            executions: usize,
+        }
+        let runtime = std::env::var_os("AGENT_RUNTIME_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/dist/src/bridge.js")
+            });
+        let runtime_root = runtime
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let mut child = tokio::process::Command::new("node")
+            .args(["--no-warnings", "--input-type=module", "--eval", r#"
+import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
+import {BACKGROUND_CONTEXT} from '@earendil-works/chord/context';
+import {openNodeSqliteDatabase} from '@earendil-works/chord/sqlite/node';
+import {createModels} from '@earendil-works/pi-ai';
+import {createRegistry,Harness} from '@earendil-works/pi-durable';
+import {SqliteStorage} from '@earendil-works/pi-durable/storage/sqlite';
+const runtime=pathToFileURL(process.argv[1]);
+const {HistoryStore}=await import(new URL('./history.js',runtime));
+const {history}=await import(new URL('./transcript.js',runtime));
+const {validEvent}=await import(new URL('./protocol.js',runtime));
+let input='';for await(const chunk of process.stdin)input+=chunk;
+const evidence=JSON.parse(input);
+const session=await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(evidence.database)),
+ {models:createModels(),registry:createRegistry(),identity:{attribution:null}},BACKGROUND_CONTEXT);
+try{
+ const store=new HistoryStore(session);
+ const receipt=await store.import({host_id:'fixture-host',thread:{id:'original-thread',title:'Native presentation fixture',cwd:'/example',
+  created_at:1,updated_at:2,forked_from_id:null,parent_thread_id:null,version:'one',version_reliable:true,archived:true},
+  items:evidence.items,next_cursor:null,gaps:[],complete:true});
+ const conversation=await store.conversation(receipt.conversation.conversation_id);assert.ok(conversation);
+ const frames=await history(conversation,null,session);for(const frame of frames)assert.ok(validEvent({version:1,id:1,event:frame}));
+ const messages=frames.flatMap(frame=>frame.messages);assert.equal(messages.length,20);
+ assert.ok(messages.every(message=>message.text.trim().length>0));
+ assert.ok(messages.some(message=>message.presentation?.type==='command'));
+ assert.ok(messages.some(message=>message.presentation?.type==='hook_prompt'));
+ assert.ok(messages.some(message=>message.presentation?.type==='compaction'));
+ assert.ok(messages.some(message=>message.presentation?.type==='unknown'));
+ assert.deepEqual((await conversation.context(BACKGROUND_CONTEXT)).messages,[]);
+ const executions=(await session.inspect(BACKGROUND_CONTEXT)).tasks.length;assert.equal(executions,0);
+ process.stdout.write(JSON.stringify({retained:receipt.added_items,rendered:messages.length,executions})+'\n');
+}finally{await session.close(BACKGROUND_CONTEXT);}
+"#])
+            .arg(&runtime).current_dir(runtime_root).stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        use tokio::io::AsyncWriteExt;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                &serde_json::to_vec(&ProjectionInput {
+                    items: &normalized,
+                    database: directory.path().join("projection.sqlite"),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: ProjectionReceipt = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            (receipt.retained, receipt.rendered, receipt.executions),
+            (20, 20, 0)
+        );
+        for kind in ["system", "developer", "authentication"] {
+            #[derive(serde::Serialize)]
+            struct Sensitive<'a> {
+                id: &'a str,
+                #[serde(rename = "type")]
+                kind: &'a str,
+                text: &'a str,
+            }
+            let entry = NativeEntry {
+                turn_id: "turn-a".into(),
+                item: serde_json::to_value(Sensitive {
+                    id: "sensitive",
+                    kind,
+                    text: "Synthetic private control state",
+                })
+                .unwrap(),
+                started_at_ms: None,
+                completed_at_ms: None,
+            };
+            assert!(
+                source
+                    .normalize("thread-a", &entry, 0)
+                    .await
+                    .unwrap()
+                    .0
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_revision_backfills_completed_sources_without_repeating_messages_or_embeddings()
+     {
+        use tokio::io::AsyncWriteExt;
+
+        #[derive(serde::Serialize)]
+        struct Evidence {
+            previous: crate::history::HistoryThread,
+            current: crate::history::HistoryThread,
+            items: Vec<crate::history::HistoryItem>,
+            directory: PathBuf,
+        }
+        #[derive(Deserialize)]
+        struct Receipt {
+            reads: usize,
+            added: usize,
+            retained: usize,
+            repeated_embeddings: usize,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let locator = directory.path().join("synthetic-rollout.jsonl");
+        std::fs::write(&locator, b"unchanged synthetic source locator").unwrap();
+        let mut native: NativeThread = serde_json::from_str(THREAD).unwrap();
+        native.path = Some(locator);
+        let fingerprint = crate::history::codex::locator_fingerprint(native.path.as_ref().unwrap());
+        // Exact pre-revision fingerprint format, retained by completed imports.
+        let previous_version = digest(
+            &serde_json::to_vec(&(
+                &native.id,
+                native.name.as_deref().unwrap(),
+                &native.cwd,
+                native.updated_at,
+                &native.forked_from_id,
+                &native.parent_thread_id,
+                &native.path,
+                &fingerprint,
+            ))
+            .unwrap(),
+        );
+        let current = native.metadata(false).unwrap();
+        assert!(current.version_reliable);
+        let previous = crate::history::HistoryThread {
+            version: previous_version,
+            ..current.clone()
+        };
+        let source = history(directory.path(), "unused-native-reader".into());
+        let mut items = Vec::new();
+        for (order, raw) in [
+            r#"{"id":"user","type":"userMessage","content":[{"type":"text","text":"Retain the original request"}]}"#,
+            r#"{"id":"hook","type":"hookPrompt","fragments":[{"text":"Inert historical hook"}]}"#,
+            r#"{"id":"compaction","type":"contextCompaction"}"#,
+            r#"{"id":"answer","type":"agentMessage","text":"Retain the original answer","phase":"final_answer"}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (item, gaps) = source
+                .normalize(
+                    &native.id,
+                    &NativeEntry {
+                        turn_id: "turn-a".into(),
+                        item: serde_json::from_str(raw).unwrap(),
+                        started_at_ms: None,
+                        completed_at_ms: None,
+                    },
+                    order as u64,
+                )
+                .await
+                .unwrap();
+            assert!(gaps.is_empty());
+            items.push(item.unwrap());
+        }
+        let runtime = std::env::var_os("AGENT_RUNTIME_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/dist/src/bridge.js")
+            });
+        let runtime_root = runtime
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let mut child = tokio::process::Command::new("node")
+            .args(["--no-warnings", "--input-type=module", "--eval", r#"
+import assert from 'node:assert/strict';
+import {join} from 'node:path';
+import {pathToFileURL} from 'node:url';
+import {BACKGROUND_CONTEXT} from '@earendil-works/chord/context';
+import {openNodeSqliteDatabase} from '@earendil-works/chord/sqlite/node';
+import {createModels,fauxProvider} from '@earendil-works/pi-ai';
+import {createRegistry,Harness} from '@earendil-works/pi-durable';
+import {SqliteStorage} from '@earendil-works/pi-durable/storage/sqlite';
+const runtime=pathToFileURL(process.argv[1]);
+const {HistoryStore,ImportedItemEntry}=await import(new URL('./history.js',runtime));
+const {CodexImporter}=await import(new URL('./importer.js',runtime));
+const {TaskStore}=await import(new URL('./tasks.js',runtime));
+const {ConversationModels}=await import(new URL('./models.js',runtime));
+const {Retrieval}=await import(new URL('./retrieval.js',runtime));
+let serialized='';for await(const chunk of process.stdin)serialized+=chunk;
+const evidence=JSON.parse(serialized), embedded=[];
+const host={host_id:'fixture-host',name:'fixture-host',rex_server:null,agent_program:'agent',home_directory:'/example',coordinator:null,
+ launch:{state_dir:null,runtime:null,config:null,instructions:null,model:null}};
+const embed=async command=>{
+ assert.equal(command.type,'embed');embedded.push(...command.texts);
+ return {type:'embeddings',batch:{space:{id:'synthetic-retention',model_revision:'one',model_digest:'one',dimensions:3,
+  pooling:'last',normalization:'l2',instruction_version:1},vectors:command.texts.map(()=>[1,0,0])}};
+};
+async function open(){
+ const models=createModels(),faux=fauxProvider({provider:'openai',models:[{id:'unused'}]});models.setProvider(faux.provider);
+ const session=await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(evidence.directory,'session.sqlite'))),
+  {models,registry:createRegistry(),identity:{attribution:null}},BACKGROUND_CONTEXT);
+ const store=new HistoryStore(session),tasks=new TaskStore(session,new ConversationModels(models));tasks.useHistory(store);
+ const retrieval=new Retrieval(session,store,tasks,join(evidence.directory,'search.sqlite'));
+ return {session,faux,store,retrieval,importer:new CodexImporter(session,store,join(evidence.directory,'assets'))};
+}
+let app=await open(),reads=0;
+const call=async command=>{
+ assert.equal(command.type,'on_node');assert.equal(command.command.type,'history');
+ const request=command.command.request;
+ if(request.type==='list')return {type:'history',response:{type:'list',threads:request.archived?[]:[evidence.current],next_cursor:null}};
+ assert.equal(request.type,'read');assert.equal(request.cursor,null,'A retention revision must reread the whole native source');reads++;
+ return {type:'history',response:{type:'read',thread_id:evidence.current.id,version:evidence.current.version,items:evidence.items,
+  next_cursor:null,gaps:[],complete:true,source_exhausted:true}};
+};
+const run=()=>app.importer.run([host],[host.host_id],[],call,()=>{},()=>app.retrieval.sync(embed,true));
+try{
+ const oldItems=evidence.items.filter(item=>item.kind==='userMessage'||item.kind==='agentMessage');
+ const seeded=await app.store.import({host_id:host.host_id,thread:evidence.previous,items:oldItems,next_cursor:null,gaps:[],complete:true,source_exhausted:true,retry_pages:[]});
+ await app.retrieval.sync(embed,true);
+ const initialEmbedded=[...embedded],conversation=await app.store.conversation(seeded.conversation.conversation_id);assert.ok(conversation);
+ const original=(await conversation.entries({order:'ascending'},100,undefined,BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is);
+ const progress=await run();assert.equal(progress.phase,'complete');assert.equal(reads,1,'Completed old retention checkpoints must rescan');
+ assert.equal(progress.items_added,2);assert.equal(progress.items_unchanged,2);
+ const retained=(await conversation.entries({order:'ascending'},100,undefined,BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is);
+ assert.equal(retained.length,4);for(const entry of original)assert.deepEqual(retained.find(value=>value.id===entry.id),entry);
+ for(const text of initialEmbedded)assert.equal(embedded.filter(value=>value===text).length,1,'Existing vectors must be reused');
+ assert.equal((await app.store.checkpoint(evidence.current.id,host.host_id)).version,evidence.current.version);
+ assert.deepEqual((await conversation.context(BACKGROUND_CONTEXT)).messages,[]);assert.equal(app.faux.state.callCount,0);
+ const watermark=(await conversation.entries({order:'descending'},1,undefined,BACKGROUND_CONTEXT)).items[0].id,embeddedCount=embedded.length;
+ app.retrieval.close();await app.session.close(BACKGROUND_CONTEXT);app=await open();
+ const repeated=await run();assert.equal(repeated.threads_unchanged,1);assert.equal(reads,1);assert.equal(embedded.length,embeddedCount);
+ const reopened=await app.store.conversation(seeded.conversation.conversation_id);assert.ok(reopened);
+ assert.equal((await reopened.entries({order:'descending'},1,undefined,BACKGROUND_CONTEXT)).items[0].id,watermark);
+ assert.equal(app.faux.state.callCount,0);assert.equal((await app.session.inspect(BACKGROUND_CONTEXT)).tasks.length,0);
+ process.stdout.write(JSON.stringify({reads,added:progress.items_added,retained:retained.length,repeated_embeddings:embedded.length-embeddedCount})+'\n');
+}finally{app.retrieval.close();await app.session.close(BACKGROUND_CONTEXT);}
+"#])
+            .arg(&runtime).current_dir(runtime_root).stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                &serde_json::to_vec(&Evidence {
+                    previous,
+                    current,
+                    items,
+                    directory: directory.path().into(),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let output = child.wait_with_output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: Receipt = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            (
+                receipt.reads,
+                receipt.added,
+                receipt.retained,
+                receipt.repeated_embeddings
+            ),
+            (1, 2, 4, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_native_media_remains_a_gap_while_future_items_retain_their_payload() {
         let directory = tempfile::tempdir().unwrap();
         let source = history(directory.path(), "unavailable-codex-fixture".into());
         for raw in [
@@ -2435,8 +2768,9 @@ try{
                 started_at_ms: None,
                 completed_at_ms: None,
             };
-            let (_, gaps) = source.normalize("thread-a", &entry, 0).await.unwrap();
-            assert_eq!(gaps.len(), 1);
+            let (retained, gaps) = source.normalize("thread-a", &entry, 0).await.unwrap();
+            let retained = retained.unwrap();
+            assert_eq!(gaps.len(), usize::from(retained.kind == "userMessage"));
         }
     }
 
@@ -2490,9 +2824,7 @@ try{
             kind: &'static str,
             text: String,
         }
-        let mut items = vec![
-            serde_json::from_str(r#"{"id":"future-a","type":"unsupportedFutureItem"}"#).unwrap(),
-        ];
+        let mut items = vec![serde_json::from_str(r#"{"type":"itemWithoutIdentity"}"#).unwrap()];
         items.extend((0..60).map(|n| {
             serde_json::to_value(Message {
                 id: format!("message-{n}"),

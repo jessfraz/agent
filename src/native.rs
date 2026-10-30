@@ -39,6 +39,9 @@ pub enum NativeRequest {
         call_id: String,
     },
     Interrupt,
+    Notifications {
+        request: crate::notifications::NotificationRequest,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -135,6 +138,9 @@ pub enum NativeEvent {
     },
     Idle,
     Disconnect,
+    Notifications {
+        status: crate::notifications::NotificationStatus,
+    },
     Done,
 }
 
@@ -184,6 +190,10 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
             }
         }
         NativeRequest::Interrupt => RuntimeCommand::MainInterrupt,
+        NativeRequest::Notifications { request } => {
+            request.validate()?;
+            RuntimeCommand::Notifications { request }
+        }
         NativeRequest::Submit {
             input_id,
             text,
@@ -314,6 +324,9 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
         },
         RuntimeEventKind::Message { message } => NativeEvent::Message {
             message: message.clone(),
+        },
+        RuntimeEventKind::Notifications { status } => NativeEvent::Notifications {
+            status: status.clone(),
         },
         RuntimeEventKind::Answer { entry_id, text, .. } => NativeEvent::Answer {
             entry_id: entry_id.clone(),

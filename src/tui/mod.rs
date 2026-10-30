@@ -595,6 +595,9 @@ impl Message {
                                 ToolStatus::Running => "•",
                                 ToolStatus::Finished => "✓",
                                 ToolStatus::Failed => "✗",
+                                ToolStatus::Declined => "⊘",
+                                ToolStatus::Interrupted => "■",
+                                ToolStatus::Unknown => "?",
                             },
                             markdown::plain(&self.text)
                         ),
@@ -800,7 +803,15 @@ impl State {
             CellOutput::Mutable
         };
         if let Some(tool) = message.tool {
-            self.tool_message(message.entry_id, tool, historical);
+            let specific = message.presentation.as_deref().is_some_and(|presentation| {
+                !matches!(
+                    presentation,
+                    crate::protocol::MessagePresentation::Tool { namespace: None }
+                )
+            });
+            let label =
+                specific.then(|| message.text.lines().next().unwrap_or(&tool.name).to_owned());
+            self.tool_message(message.entry_id, tool, historical, label);
             return;
         }
         let role = Role::from_history(&message.role);
@@ -1045,7 +1056,8 @@ impl State {
     fn tool(&mut self, call_id: String, name: String, status: ToolStatus) {
         if let Some(index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Tool { call_id: id, .. } if id == &call_id)) {
             let message = &mut self.messages[index];
-            if matches!(&message.kind, MessageKind::Tool { status: ToolStatus::Failed, .. })
+            if matches!(&message.kind, MessageKind::Tool { status: ToolStatus::Failed | ToolStatus::Declined | ToolStatus::Interrupted, .. })
+                || (matches!(status, ToolStatus::Unknown) && !matches!(&message.kind, MessageKind::Tool { status: ToolStatus::Unknown, .. }))
                 || (matches!(&message.kind, MessageKind::Tool { status: ToolStatus::Finished, .. }) && matches!(status, ToolStatus::Running | ToolStatus::Finished)) {
                 return;
             }
@@ -1064,13 +1076,22 @@ impl State {
         entry_id: String,
         tool: crate::protocol::ToolHistory,
         historical: bool,
+        label: Option<String>,
     ) {
         let identity = tool.call_id.clone();
         let terminal = tool.status != ToolStatus::Running;
         let index = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Tool { call_id, .. } if call_id == &tool.call_id));
         if let Some(index) = index {
             let call = matches!(tool.status, ToolStatus::Running);
-            self.tool(tool.call_id, tool.name, tool.status);
+            let name = label
+                .clone()
+                .unwrap_or_else(|| self.messages[index].text.clone());
+            self.tool(tool.call_id, name, tool.status);
+            if let Some(label) = label {
+                self.messages[index].text = label;
+                self.messages[index].rendered = None;
+                self.invalidate(index);
+            }
             if historical && call && self.messages[index].id.as_ref() != Some(&entry_id) {
                 let offset = self.history_offset.get_or_insert(0);
                 let mut message = self.messages.remove(index);
@@ -1083,7 +1104,7 @@ impl State {
                 self.messages[index].id = Some(entry_id);
             }
         } else {
-            let mut message = Message::new(Some(entry_id), Role::Tool, tool.name);
+            let mut message = Message::new(Some(entry_id), Role::Tool, label.unwrap_or(tool.name));
             message.output = if historical && self.loading_history.is_some() {
                 CellOutput::Retained
             } else {
@@ -2512,6 +2533,7 @@ mod tests {
         view.event(RuntimeEventKind::History {
             conversation_id: "selected".into(),
             messages: vec![HistoryMessage {
+                presentation: None,
                 entry_id: "saved".into(),
                 role: HistoryRole::Final,
                 text: "Saved reply loaded before attachment".into(),
@@ -2605,6 +2627,7 @@ mod tests {
         reopened.event(RuntimeEventKind::History {
             conversation_id: "main".into(),
             messages: vec![HistoryMessage {
+                presentation: None,
                 entry_id: "table".into(),
                 role: HistoryRole::Final,
                 text: text.into(),
@@ -2677,6 +2700,7 @@ mod tests {
         let frame = |text: &str, continuation| RuntimeEventKind::History {
             conversation_id: "saved".into(),
             messages: vec![HistoryMessage {
+                presentation: None,
                 entry_id: "one".into(),
                 role: HistoryRole::Assistant,
                 text: text.into(),
@@ -2708,6 +2732,7 @@ mod tests {
         assert!(!rendered(&mut history, 80, 20).contains("You · queued"));
         history.event(RuntimeEventKind::Message {
             message: HistoryMessage {
+                presentation: None,
                 entry_id: "next".into(),
                 role: HistoryRole::Assistant,
                 text: "Live ".into(),
@@ -2720,6 +2745,7 @@ mod tests {
         rendered(&mut history, 80, 20);
         history.event(RuntimeEventKind::Message {
             message: HistoryMessage {
+                presentation: None,
                 entry_id: "next".into(),
                 role: HistoryRole::Assistant,
                 text: "continuation".into(),
@@ -3008,6 +3034,7 @@ mod tests {
                 conversation_id: "saved".into(),
                 messages: vec![
                     HistoryMessage {
+                        presentation: None,
                         entry_id: "unrelated".into(),
                         role: HistoryRole::User,
                         text: "Same context".into(),
@@ -3017,6 +3044,7 @@ mod tests {
                         attachments: None,
                     },
                     HistoryMessage {
+                        presentation: None,
                         entry_id: "native".into(),
                         role: HistoryRole::User,
                         text: "Same context".into(),
@@ -3026,6 +3054,7 @@ mod tests {
                         attachments: None,
                     },
                     HistoryMessage {
+                        presentation: None,
                         entry_id: "answer".into(),
                         role: HistoryRole::Final,
                         text: "A saved response".into(),
@@ -3070,6 +3099,7 @@ mod tests {
     fn reconnect_backfill_keeps_a_disjoint_newest_page_after_the_retained_history() {
         let mut view = state();
         let saved = |index| HistoryMessage {
+            presentation: None,
             entry_id: format!("user-{index:02}"),
             role: HistoryRole::User,
             text: format!("Input {index:02}"),
@@ -3530,6 +3560,7 @@ mod tests {
             state.event(RuntimeEventKind::History {
                 conversation_id: "one".into(),
                 messages: vec![HistoryMessage {
+                    presentation: None,
                     entry_id: id.into(),
                     role: HistoryRole::User,
                     text: text.into(),
@@ -3635,6 +3666,7 @@ mod tests {
             page_complete: false,
         };
         let message = |id: &str, role, text: &str, continuation| HistoryMessage {
+            presentation: None,
             entry_id: id.into(),
             role,
             text: text.into(),
@@ -3689,6 +3721,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, (role, text))| HistoryMessage {
+                presentation: None,
                 entry_id: index.to_string(),
                 role,
                 text: text.into(),
@@ -3730,6 +3763,7 @@ mod tests {
         let frame = |id: &str, text: &str| RuntimeEventKind::History {
             conversation_id: "main".into(),
             messages: vec![HistoryMessage {
+                presentation: None,
                 entry_id: id.into(),
                 role: HistoryRole::User,
                 text: text.into(),
@@ -3846,6 +3880,7 @@ mod tests {
         view.event(RuntimeEventKind::History {
             conversation_id: "main".into(),
             messages: vec![HistoryMessage {
+                presentation: None,
                 entry_id: "latest".into(),
                 role: HistoryRole::Assistant,
                 text: (0..40).map(|i| format!("Line {i}\n\n")).collect(),
@@ -3876,6 +3911,7 @@ mod tests {
         view.event(RuntimeEventKind::History {
             conversation_id: "main".into(),
             messages: vec![HistoryMessage {
+                presentation: None,
                 entry_id: "older".into(),
                 role: HistoryRole::Assistant,
                 text: "Older saved answer\n".repeat(30),
@@ -3928,6 +3964,7 @@ mod tests {
         });
         view.event(RuntimeEventKind::Message {
             message: HistoryMessage {
+                presentation: None,
                 entry_id: "native-one".into(),
                 role: HistoryRole::User,
                 text: "Same correction".into(),
@@ -3983,6 +4020,7 @@ mod tests {
         ] {
             view.event(RuntimeEventKind::Message {
                 message: HistoryMessage {
+                    presentation: None,
                     entry_id: "native".into(),
                     role: HistoryRole::User,
                     text,
@@ -4057,6 +4095,7 @@ mod tests {
             conversation_id: "main".into(),
             messages: vec![
                 HistoryMessage {
+                    presentation: None,
                     entry_id: "call-entry".into(),
                     role: HistoryRole::Tool,
                     text: "read_source".into(),
@@ -4070,6 +4109,7 @@ mod tests {
                     }),
                 },
                 HistoryMessage {
+                    presentation: None,
                     entry_id: "user".into(),
                     role: HistoryRole::User,
                     text: "NEW_REQUEST".into(),
@@ -4085,6 +4125,7 @@ mod tests {
         view.event(RuntimeEventKind::Done);
         view.event(RuntimeEventKind::Message {
             message: HistoryMessage {
+                presentation: None,
                 entry_id: "result-entry".into(),
                 role: HistoryRole::Tool,
                 text: "read_source finished".into(),
@@ -4140,6 +4181,7 @@ mod tests {
         let mut view = state();
         let old = vec![
             HistoryMessage {
+                presentation: None,
                 entry_id: "old-user".into(),
                 role: HistoryRole::User,
                 text: "Original question".into(),
@@ -4149,6 +4191,7 @@ mod tests {
                 tool: None,
             },
             HistoryMessage {
+                presentation: None,
                 entry_id: "old-answer".into(),
                 role: HistoryRole::Thinking,
                 text: "First thinking block".into(),
@@ -4158,6 +4201,7 @@ mod tests {
                 tool: None,
             },
             HistoryMessage {
+                presentation: None,
                 entry_id: "old-answer".into(),
                 role: HistoryRole::Thinking,
                 text: "Second thinking block".into(),
@@ -4167,6 +4211,7 @@ mod tests {
                 tool: None,
             },
             HistoryMessage {
+                presentation: None,
                 entry_id: "old-answer".into(),
                 role: HistoryRole::Assistant,
                 text: "Original answer".into(),
@@ -4185,6 +4230,7 @@ mod tests {
         view.event(RuntimeEventKind::Done);
         let mut refreshed = old;
         refreshed.push(HistoryMessage {
+            presentation: None,
             entry_id: "late-answer".into(),
             role: HistoryRole::Assistant,
             text: "Finished while attaching".into(),
@@ -4276,6 +4322,7 @@ mod tests {
         });
         view.event(RuntimeEventKind::Message {
             message: HistoryMessage {
+                presentation: None,
                 entry_id: "chief".into(),
                 role: HistoryRole::User,
                 text: "Review".into(),
@@ -4312,6 +4359,7 @@ mod tests {
         for (text, continuation) in [("Complete ", false), ("local input", true)] {
             chunked.event(RuntimeEventKind::Message {
                 message: HistoryMessage {
+                    presentation: None,
                     entry_id: "local".into(),
                     role: HistoryRole::User,
                     text: text.into(),
@@ -4411,6 +4459,7 @@ mod tests {
         ] {
             view.event(RuntimeEventKind::Message {
                 message: HistoryMessage {
+                    presentation: None,
                     entry_id: "saved-file-input".into(),
                     role: HistoryRole::User,
                     text: text.into(),
@@ -4430,6 +4479,7 @@ mod tests {
         view.event(RuntimeEventKind::History {
             conversation_id: "fixture".into(),
             messages: vec![HistoryMessage {
+                presentation: None,
                 entry_id: "saved-file-input".into(),
                 role: HistoryRole::User,
                 text: "Review this image".into(),
@@ -4449,5 +4499,100 @@ mod tests {
                 .count(),
             1
         );
+    }
+    #[test]
+    fn canonical_command_labels_survive_live_results_and_reopened_history_for_both_adapters() {
+        use crate::protocol::{MessagePresentation, ToolHistory, ToolStatus};
+        for historical in [false, true] {
+            let mut view = state();
+            let command = HistoryMessage {
+                entry_id: "native-call-entry".into(),
+                role: HistoryRole::Tool,
+                text: "$ printf fixture\nrunning · /example".into(),
+                continuation: false,
+                final_chunk: true,
+                tool: Some(ToolHistory {
+                    call_id: "exact-call".into(),
+                    name: "exec".into(),
+                    status: ToolStatus::Running,
+                }),
+                presentation: Some(Box::new(MessagePresentation::Command {
+                    exit_code: None,
+                    duration_ms: None,
+                })),
+                attachments: None,
+            };
+            if historical {
+                view.event(RuntimeEventKind::History {
+                    conversation_id: "saved".into(),
+                    messages: vec![command],
+                    next_cursor: None,
+                    page_complete: true,
+                });
+            } else {
+                view.event(RuntimeEventKind::Message { message: command });
+            }
+            view.event(RuntimeEventKind::Message {
+                message: HistoryMessage {
+                    entry_id: "native-result-entry".into(),
+                    role: HistoryRole::Tool,
+                    text: "exec finished".into(),
+                    continuation: false,
+                    final_chunk: true,
+                    tool: Some(ToolHistory {
+                        call_id: "exact-call".into(),
+                        name: "exec".into(),
+                        status: ToolStatus::Finished,
+                    }),
+                    presentation: None,
+                    attachments: None,
+                },
+            });
+            assert_eq!(view.messages.len(), 1);
+            assert_eq!(view.messages[0].text, "$ printf fixture");
+            assert!(matches!(
+                view.messages[0].kind,
+                MessageKind::Tool {
+                    status: ToolStatus::Finished,
+                    ..
+                }
+            ));
+            view.input(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+            view.input(key(KeyCode::Enter, KeyModifiers::NONE));
+            let screen = rendered(&mut view, 120, 28);
+            assert!(screen.contains("$ printf fixture"), "{screen}");
+        }
+    }
+    #[test]
+    fn explicit_stopped_tool_facts_are_not_replaced_by_generic_finish_activity() {
+        use crate::protocol::{ToolHistory, ToolStatus};
+        for status in [ToolStatus::Declined, ToolStatus::Interrupted] {
+            let mut view = state();
+            view.event(RuntimeEventKind::Message {
+                message: HistoryMessage {
+                    entry_id: "native-event".into(),
+                    role: HistoryRole::Tool,
+                    text: "exec".into(),
+                    continuation: false,
+                    final_chunk: true,
+                    presentation: None,
+                    attachments: None,
+                    tool: Some(ToolHistory {
+                        call_id: "exact-call".into(),
+                        name: "exec".into(),
+                        status,
+                    }),
+                },
+            });
+            view.event(RuntimeEventKind::Activity {
+                activity: crate::protocol::ModelActivity::ToolFinished {
+                    call_id: "exact-call".into(),
+                    name: "exec".into(),
+                },
+            });
+            assert!(
+                matches!(&view.messages[0].kind, MessageKind::Tool { status: saved, .. } if *saved == status)
+            );
+        }
     }
 }

@@ -105,6 +105,14 @@ struct Pending {
 
 impl Runtime {
     pub fn start(script: &Path, state: &Path) -> Result<Self> {
+        Self::start_with_notifications(script, state, None)
+    }
+
+    pub fn start_with_notifications(
+        script: &Path,
+        state: &Path,
+        apns: Option<&crate::notifications::ApnsConfig>,
+    ) -> Result<Self> {
         ensure!(
             script.is_file(),
             "Pi runtime is not built; build the runtime first"
@@ -129,6 +137,13 @@ impl Runtime {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        // This is a local child bootstrap, never a public command or shared
+        // setting. Workers and ad-hoc runtimes must not inherit this capability.
+        command.env_remove("AGENT_APNS_CONFIG");
+        if let Some(config) = apns {
+            config.validate()?;
+            command.env("AGENT_APNS_CONFIG", serde_json::to_string(config)?);
+        }
         // Pi retains this open-file description after exec. Killing its Rust
         // supervisor cannot release ownership while the real writer survives.
         unsafe {

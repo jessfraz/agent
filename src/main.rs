@@ -28,7 +28,8 @@ use agent_cli::{
     protocol::{
         AuthStatus, ConversationChange, ConversationSettings, CoordinatorBootstrap,
         CoordinatorSettings, ImportPhase, InputMode, MainInputContext, RuntimeCommand,
-        RuntimeEventKind, SavedConversation, SearchMode, TaskId, WorkerLaunch, WorkerRef,
+        RuntimeEventKind, SavedConversation, SearchMode, TaskId, TranscriptAnnotation,
+        TranscriptClassification, WorkerLaunch, WorkerRef,
     },
     rex::{BlockId, RexClient, SessionId},
     runtime::{FrameReader, decode_coordinator_event},
@@ -223,6 +224,17 @@ enum TasksAction {
     Read {
         task_id: TaskId,
     },
+    /// Send context directly to an existing task without posting to main chat.
+    Send {
+        task_id: TaskId,
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        input: String,
+        #[arg(long, value_enum, default_value = "steer")]
+        mode: InputMode,
+        /// Reuse this ID when retrying an uncertain delivery.
+        #[arg(long)]
+        input_id: Option<uuid::Uuid>,
+    },
     /// Revoke one interrupted or uncertain allocation by its exact ID.
     Recover {
         task_id: TaskId,
@@ -264,6 +276,14 @@ enum HistoryAction {
         conversation_id: String,
         #[arg(long)]
         host: Option<String>,
+    },
+    /// Classify confirmed internal entries without deleting their originals.
+    Classify {
+        conversation_id: String,
+        #[arg(required = true, num_args = 1..)]
+        entry_ids: Vec<String>,
+        #[arg(long = "as", value_enum)]
+        classification: TranscriptClassification,
     },
 }
 
@@ -665,6 +685,17 @@ async fn main() -> Result<()> {
             TasksAction::List => RuntimeCommand::ListTasks,
             TasksAction::Search { query } => RuntimeCommand::SearchTasks { query },
             TasksAction::Read { task_id } => RuntimeCommand::ReadTask { task_id },
+            TasksAction::Send {
+                task_id,
+                input,
+                mode,
+                input_id,
+            } => RuntimeCommand::TaskInput {
+                task_id,
+                input_id: input_id.unwrap_or_else(uuid::Uuid::new_v4).to_string(),
+                input,
+                mode,
+            },
             TasksAction::Recover {
                 task_id,
                 allocation_id,
@@ -702,6 +733,20 @@ async fn main() -> Result<()> {
             } => RuntimeCommand::OpenConversation {
                 conversation_id,
                 host,
+            },
+            HistoryAction::Classify {
+                conversation_id,
+                entry_ids,
+                classification,
+            } => RuntimeCommand::AnnotateTranscript {
+                conversation_id,
+                entries: entry_ids
+                    .into_iter()
+                    .map(|entry_id| TranscriptAnnotation {
+                        entry_id,
+                        classification,
+                    })
+                    .collect(),
             },
         },
         Action::RunTask {

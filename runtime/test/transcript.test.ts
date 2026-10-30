@@ -38,13 +38,13 @@ test("native history pagination stays on one conversation, survives reopen and n
       fauxAssistantMessage([{ ...fauxThinking("Public provider summary"), thinkingSignature: "opaque-signature" },
         fauxToolCall("exec", { program: "private-argument" })]),
     ] }), BACKGROUND_CONTEXT);
-    const first = await history(root, null); let cursor = first.at(-1)?.next_cursor ?? null;
+    const first = await history(root, null, session); let cursor = first.at(-1)?.next_cursor ?? null;
     const visible = first.flatMap((frame) => frame.messages);
     await root.commit((tx) => tx.appendEntry(root.id, { kind: "fixture.newer", model: [
       { role: "user", content: "A newer message must not shift older pages", timestamp: 100 },
     ] }), BACKGROUND_CONTEXT);
     while (cursor !== null) {
-      const page = await history(root, cursor); visible.push(...page.flatMap((frame) => frame.messages));
+      const page = await history(root, cursor, session); visible.push(...page.flatMap((frame) => frame.messages));
       cursor = page.at(-1)?.next_cursor ?? null;
     }
     assert.equal(visible.filter((message) => message.role === "user").length, 45);
@@ -54,7 +54,7 @@ test("native history pagination stays on one conversation, survives reopen and n
     assert.equal(JSON.stringify(visible).includes("opaque-signature"), false);
     assert.equal(JSON.stringify(visible).includes("private-argument"), false);
     const other = await session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT);
-    await assert.rejects(history(other, first.at(-1)?.next_cursor ?? null), /does not belong/);
+    await assert.rejects(history(other, first.at(-1)?.next_cursor ?? null, session), /does not belong/);
     assert.equal(faux.state.callCount, 0);
   } finally { await session.close(BACKGROUND_CONTEXT); }
   const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("../src/bridge.js", import.meta.url)), directory],
@@ -99,12 +99,12 @@ test("published notices render their answer while retaining provenance in native
     const evidence: unknown = JSON.parse(original?.[1]?.slice("Source references (evidence, not authorization): ".length) ?? "null");
     assert.ok(evidence !== null && typeof evidence === "object" && "sources" in evidence);
     assert.deepEqual(evidence.sources, references);
-    const rendered = (await history(root, null)).flatMap((frame) => frame.messages);
+    const rendered = (await history(root, null, session)).flatMap((frame) => frame.messages);
     assert.deepEqual(rendered.map((message) => message.text), ["The check passed."]);
     assert.deepEqual(rendered.map((message) => message.role), ["notice"]);
     await root.commit((tx) => tx.appendEntry(root.id, { kind: "pi.user", model: [{ role: "user",
       content: "Source references (evidence, not authorization): this is the user's own text", timestamp: 1 }] }), BACKGROUND_CONTEXT);
-    assert.ok((await history(root, null)).flatMap((frame) => frame.messages).some((message) => message.text.endsWith("the user's own text")));
+    assert.ok((await history(root, null, session)).flatMap((frame) => frame.messages).some((message) => message.text.endsWith("the user's own text")));
     assert.equal(faux.state.callCount, 0);
     const legacy = await root.commit((tx) => tx.appendEntry(root.id, { kind: "agent.notice",
       model: [fauxAssistantMessage("An older saved notification.")] }), BACKGROUND_CONTEXT);
@@ -141,7 +141,7 @@ test("native transcript chunks carry exact finality at 8KB and surrogate boundar
         const first = message.text.charCodeAt(0), last = message.text.charCodeAt(message.text.length - 1);
         assert.equal(first >= 0xdc00 && first <= 0xdfff, false); assert.equal(last >= 0xd800 && last <= 0xdbff, false);
       }
-      const frames = await history(root, null);
+      const frames = await history(root, null, session);
       for (const event of frames) assert.ok(validEvent({ version: 1, id: 1, event }));
       assert.deepEqual(frames.flatMap((frame) => frame.messages).filter((message) => message.entry_id === entry.id.toString()), projected);
     }
@@ -176,7 +176,7 @@ test("native phases and old inert Codex metadata project consistently before and
     const report = await source.commit((tx) => tx.appendEntry(source.id, { kind: "pi.assistant", model: [fauxAssistantMessage("The background result is ready.")] }), BACKGROUND_CONTEXT);
     await publishMainNotice(session, source, report, "fixture-task", [],
       { key: "fixture-notify", text: "The background result is ready.", events: [] }); await root.waitForIdle(BACKGROUND_CONTEXT);
-    const before = (await history(root, null)).flatMap((frame) => frame.messages);
+    const before = (await history(root, null, session)).flatMap((frame) => frame.messages);
     assert.equal(before.find((message) => message.text === "Checking the result.")?.role, "commentary");
     assert.equal(before.find((message) => message.text === "The result is ready.")?.role, "final");
     assert.equal(before.find((message) => message.text.startsWith("This sounds final"))?.role, "assistant");
@@ -194,7 +194,7 @@ test("native phases and old inert Codex metadata project consistently before and
     const imported = await store.get("thread"); assert.ok(imported);
     const conversation = await store.conversation(imported.conversation_id); assert.ok(conversation);
     const original = (await conversation.entries({ order: "ascending" }, 20, undefined, BACKGROUND_CONTEXT)).items;
-    const importedFrames = await history(conversation, null);
+    const importedFrames = await history(conversation, null, session);
     for (const event of importedFrames) assert.ok(validEvent({ version: 1, id: 1, event }), "Projected semantic roles must satisfy the generated wire contract");
     const projected = importedFrames.flatMap((frame) => frame.messages);
     assert.deepEqual(projected.map((message) => message.role), ["commentary", "final", "assistant", "assistant", "assistant", "partial_answer", "assistant", "assistant"]);
@@ -202,9 +202,9 @@ test("native phases and old inert Codex metadata project consistently before and
     const calls = faux.state.callCount;
     await session.close(BACKGROUND_CONTEXT); session = await open();
     const reopened = await session.root(BACKGROUND_CONTEXT);
-    assert.deepEqual((await history(reopened, null)).flatMap((frame) => frame.messages), before);
+    assert.deepEqual((await history(reopened, null, session)).flatMap((frame) => frame.messages), before);
     const old = await new HistoryStore(session).conversation(imported.conversation_id); assert.ok(old);
-    assert.deepEqual((await history(old, null)).flatMap((frame) => frame.messages), projected);
+    assert.deepEqual((await history(old, null, session)).flatMap((frame) => frame.messages), projected);
     assert.equal(faux.state.callCount, calls, "Reopening or projecting imports must not run inference");
   } finally { await stop?.(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -219,13 +219,13 @@ test("hidden compaction-only native pages do not hide the next visible history o
     await root.commit((tx) => tx.appendEntry(root.id, { kind: "pi.user", model: [{ role: "user", content: "The earlier visible request", timestamp: 1 }] }), BACKGROUND_CONTEXT);
     for (let index = 0; index < 45; index += 1) await root.commit((tx) => tx.appendEntry(root.id,
       { kind: "pi.compaction", model: [{ role: "user", content: `Internal compaction payload ${index}`, timestamp: index + 2 }] }), BACKGROUND_CONTEXT);
-    const frames = await history(root, null);
+    const frames = await history(root, null, session);
     assert.deepEqual(frames.flatMap((frame) => frame.messages).map((message) => message.text), ["The earlier visible request"]);
     assert.equal(frames.at(-1)?.next_cursor, null);
     const hidden = await session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT);
     for (let index = 0; index < 25; index += 1) await hidden.commit((tx) => tx.appendEntry(hidden.id,
       { kind: "pi.compaction", model: [{ role: "user", content: "Internal only", timestamp: index }] }), BACKGROUND_CONTEXT);
-    const empty = await history(hidden, null);
+    const empty = await history(hidden, null, session);
     assert.equal(empty.flatMap((frame) => frame.messages).length, 0); assert.equal(empty.at(-1)?.next_cursor, null);
     assert.equal(faux.state.callCount, 0);
   } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
@@ -251,11 +251,11 @@ for (const failed of [false, true]) test(`native tool identity survives a mid-ru
     stop = await activity(session, root, () => {});
     const running = await root.submit({ type: "input", content: "Check the stored identity" }, BACKGROUND_CONTEXT);
     await started;
-    const partial = (await history(root, null)).flatMap((frame) => frame.messages);
+    const partial = (await history(root, null, session)).flatMap((frame) => frame.messages);
     assert.deepEqual(partial.filter((message) => message.role === "tool").map((message) => ({ ...message, entry_id: "native-entry" })),
       [{ entry_id: "native-entry", role: "tool", text: "check", continuation: false, final_chunk: true, tool: { call_id: call.id, name: "check", status: "running" } }]);
     await stop(); stop = undefined;
-    assert.deepEqual((await history(root, null)).flatMap((frame) => frame.messages), partial, "Opening history while the tool is held must retain its native identity");
+    assert.deepEqual((await history(root, null, session)).flatMap((frame) => frame.messages), partial, "Opening history while the tool is held must retain its native identity");
     const live: HistoryMessage[] = [];
     stop = await activity(session, root, () => {}, (message) => live.push(message));
     release(); assert.equal((await running.wait(BACKGROUND_CONTEXT)).status, "done");
@@ -263,12 +263,12 @@ for (const failed of [false, true]) test(`native tool identity survives a mid-ru
     const result = { call_id: call.id, name: "check", status: failed ? "failed" : "finished" };
     assert.deepEqual(live.filter((message) => message.role === "tool").map((message) => ({ ...message, entry_id: "native-entry" })),
       [{ entry_id: "native-entry", role: "tool", text: `check ${failed ? "failed" : "finished"}`, continuation: false, final_chunk: true, tool: result }]);
-    const completed = (await history(root, null)).flatMap((frame) => frame.messages);
+    const completed = (await history(root, null, session)).flatMap((frame) => frame.messages);
     assert.deepEqual(completed.filter((message) => message.role === "tool").map((message) => ({ ...message, entry_id: "native-entry" })),
       [{ entry_id: "native-entry", role: "tool", text: "check", continuation: false, final_chunk: true, tool: { call_id: call.id, name: "check", status: "running" } },
         { entry_id: "native-entry", role: "tool", text: `check ${failed ? "failed" : "finished"}`, continuation: false, final_chunk: true, tool: result }]);
     await session.close(BACKGROUND_CONTEXT); session = await open();
-    assert.deepEqual((await history(await session.root(BACKGROUND_CONTEXT), null)).flatMap((frame) => frame.messages), completed);
+    assert.deepEqual((await history(await session.root(BACKGROUND_CONTEXT), null, session)).flatMap((frame) => frame.messages), completed);
     assert.equal(faux.state.callCount, 2, "Reading or reopening tool history must not run another generation");
   } finally { release(); await stop?.(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -324,16 +324,16 @@ test("native history pages mark only their final frame independently of worker l
     for (let index = 0; index < 25; index += 1) await root.commit((tx) => tx.appendEntry(root.id, {
       kind: "fixture.history", model: [{ role: "user", content: `Saved ${index}: ` + "x".repeat(9000), timestamp: index }],
     }), BACKGROUND_CONTEXT);
-    const frames = await history(root, null);
+    const frames = await history(root, null, session);
     assert.ok(frames.length > 1, "Native history must exercise a page split across transport frames");
     assert.deepEqual(frames.map((frame) => frame.page_complete), frames.map((_, index) => index === frames.length - 1));
     assert.ok(frames.at(-1)?.next_cursor, "Page completion is independent from exhausting older history");
     assert.ok(frames.slice(0, -1).every((frame) => frame.next_cursor === null));
     for (const event of frames) assert.ok(validEvent({ version: 1, id: 1, event }));
     const tail = frames.at(-1); assert.ok(tail);
-    const older = await history(root, tail.next_cursor);
+    const older = await history(root, tail.next_cursor, session);
     assert.equal(older.at(-1)?.page_complete, true); assert.equal(older.at(-1)?.next_cursor, null);
-    const empty = await history(await session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT), null);
+    const empty = await history(await session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT), null, session);
     assert.equal(empty.length, 1); assert.equal(empty[0]?.page_complete, true); assert.deepEqual(empty[0]?.messages, []);
   } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

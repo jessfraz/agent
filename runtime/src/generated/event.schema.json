@@ -44,6 +44,30 @@
         "subject"
       ]
     },
+    "AgentAction": {
+      "type": "string",
+      "enum": [
+        "spawn",
+        "send_input",
+        "resume",
+        "wait",
+        "close",
+        "send_message",
+        "followup",
+        "interrupt",
+        "list",
+        "report"
+      ]
+    },
+    "AgentActivityState": {
+      "type": "string",
+      "enum": [
+        "started",
+        "interacted",
+        "interrupted",
+        "completed"
+      ]
+    },
     "AgentNode": {
       "type": "object",
       "properties": {
@@ -101,6 +125,39 @@
         "agent_program",
         "home_directory",
         "launch"
+      ]
+    },
+    "AgentState": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "running",
+        "interrupted",
+        "completed",
+        "failed",
+        "shutdown",
+        "not_found"
+      ]
+    },
+    "AgentStatePresentation": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id"
       ]
     },
     "AllocationDecision": {
@@ -1543,6 +1600,35 @@
         "task_id"
       ]
     },
+    "FileChangePresentation": {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FileOperation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "FileOperation": {
+      "type": "string",
+      "enum": [
+        "add",
+        "delete",
+        "update"
+      ]
+    },
     "HistoryGap": {
       "type": "object",
       "properties": {
@@ -1596,6 +1682,16 @@
         "final_chunk": {
           "type": "boolean",
           "default": false
+        },
+        "presentation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessagePresentation"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "role": {
           "$ref": "#/$defs/HistoryRole"
@@ -2666,6 +2762,313 @@
         "architecture"
       ]
     },
+    "MediaOperation": {
+      "type": "string",
+      "enum": [
+        "view",
+        "generate",
+        "attachment"
+      ]
+    },
+    "MessagePresentation": {
+      "description": "Source-independent display semantics; native originals are retained separately.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "duration_ms": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "exit_code": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32"
+            },
+            "type": {
+              "type": "string",
+              "const": "command"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "changes": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/FileChangePresentation"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "file_changes"
+            }
+          },
+          "required": [
+            "type",
+            "changes"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "namespace": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "tool"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AgentAction"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "agents": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/AgentStatePresentation"
+              }
+            },
+            "receiver_thread_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "sender_thread_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "agent_coordination"
+            }
+          },
+          "required": [
+            "type",
+            "receiver_thread_ids",
+            "agents"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agent_path": {
+              "type": "string"
+            },
+            "agent_thread_id": {
+              "type": "string"
+            },
+            "state": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AgentActivityState"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "agent_activity"
+            }
+          },
+          "required": [
+            "type",
+            "agent_path",
+            "agent_thread_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WebSearchAction"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "query": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "web_search"
+            }
+          },
+          "required": [
+            "type",
+            "query"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "operation": {
+              "$ref": "#/$defs/MediaOperation"
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "media"
+            }
+          },
+          "required": [
+            "type",
+            "operation"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "duration_ms": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "sleep"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "plan"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "stage": {
+              "$ref": "#/$defs/ReviewStage"
+            },
+            "type": {
+              "type": "string",
+              "const": "review"
+            }
+          },
+          "required": [
+            "type",
+            "stage"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "hook_prompt"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "compaction"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "type",
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "type",
+            "kind"
+          ]
+        }
+      ]
+    },
     "ModelActivity": {
       "oneOf": [
         {
@@ -2884,6 +3287,21 @@
         "git_dir",
         "branch",
         "head"
+      ]
+    },
+    "NotificationStatus": {
+      "type": "object",
+      "properties": {
+        "configured": {
+          "type": "boolean"
+        },
+        "registered": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "configured",
+        "registered"
       ]
     },
     "OperatingSystem": {
@@ -3146,6 +3564,13 @@
         }
       ]
     },
+    "ReviewStage": {
+      "type": "string",
+      "enum": [
+        "started",
+        "finished"
+      ]
+    },
     "RuntimeEventKind": {
       "oneOf": [
         {
@@ -3378,6 +3803,45 @@
           },
           "required": [
             "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "$ref": "#/$defs/NotificationStatus"
+            },
+            "type": {
+              "type": "string",
+              "const": "notifications"
+            }
+          },
+          "required": [
+            "type",
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "entries": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TranscriptAnnotation"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "transcript_annotated"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id",
+            "entries"
           ]
         },
         {
@@ -4888,7 +5352,33 @@
       "enum": [
         "running",
         "finished",
-        "failed"
+        "failed",
+        "declined",
+        "interrupted",
+        "unknown"
+      ]
+    },
+    "TranscriptAnnotation": {
+      "type": "object",
+      "properties": {
+        "classification": {
+          "$ref": "#/$defs/TranscriptClassification"
+        },
+        "entry_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_id",
+        "classification"
+      ]
+    },
+    "TranscriptClassification": {
+      "type": "string",
+      "enum": [
+        "visible",
+        "internal_receipt",
+        "maintenance_control"
       ]
     },
     "UsageAvailability": {
@@ -4988,6 +5478,15 @@
       "description": "An absolute instant that has the same exact representation in Rust and JS.",
       "type": "integer",
       "format": "int64"
+    },
+    "WebSearchAction": {
+      "type": "string",
+      "enum": [
+        "search",
+        "open_page",
+        "find_in_page",
+        "other"
+      ]
     },
     "WorkerCapabilities": {
       "type": "object",

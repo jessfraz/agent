@@ -426,6 +426,45 @@ public actor CoordinatorSession {
     } while true
   }
 
+  /// Device controls share trusted transport, never model input or transcript rows.
+  public func notifications(_ request: NotificationRequest) async throws -> NotificationStatus {
+    guard actions.count + previewRequests.count < 32, let address,
+      snapshot.connection == .connected
+    else { throw ConnectionError.closed }
+    let id = UUID()
+    previewRequests.insert(id)
+    defer { previewRequests.remove(id) }
+    let generation = generation
+    let stream = try await connectTransport(address)
+    guard self.generation == generation, !Task.isCancelled else {
+      await stream.close()
+      throw CancellationError()
+    }
+    actionConnections[id] = stream
+    do {
+      try await timedSend(stream, .notifications(.init(request: request)))
+      var status: NotificationStatus?
+      while true {
+        let event = try await timedNext(stream)
+        guard self.generation == generation, !Task.isCancelled else { throw CancellationError() }
+        switch event {
+        case .notifications(let value):
+          guard status == nil else { throw ConnectionError.incompleteFrame }
+          status = value.status
+        case .done:
+          guard let status else { throw ConnectionError.incompleteFrame }
+          await actionConnections.removeValue(forKey: id)?.close()
+          return status
+        case .failure(let value): throw CoordinatorRejection(message: value.message)
+        default: throw ConnectionError.incompleteFrame
+        }
+      }
+    } catch {
+      await actionConnections.removeValue(forKey: id)?.close()
+      throw error
+    }
+  }
+
   /// Tool input and output are loaded only when their durable row is opened.
   public func toolDetails(entryID: String, callID: String) async throws -> ToolDetails {
     guard actions.count + previewRequests.count < 32, let address,
@@ -585,7 +624,7 @@ public actor CoordinatorSession {
     case .idle:
       snapshot.busy = false
       transcript.idle()
-    case .attachment, .toolDetails, .disconnect, .done: break
+    case .attachment, .toolDetails, .notifications, .disconnect, .done: break
     }
   }
   private func schedulePublish() {

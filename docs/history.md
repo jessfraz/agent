@@ -12,15 +12,27 @@ agent history search "fabrication files"
 agent history search "ERR_SURFACE_413" --mode keyword
 agent history read CONVERSATION_ID
 agent history open CONVERSATION_ID
+agent tasks send TASK_ID "Continue with this context" --mode steer
+agent tasks send TASK_ID "Check this afterward" --mode queue --input-id UUID
+agent history classify CONVERSATION_ID ENTRY_ID --as internal-receipt
+agent history classify CONVERSATION_ID ENTRY_ID --as visible
 ```
+
+`tasks send` targets the existing task directly and leaves main chat quiet.
+Steering is the default; queueing waits for the next turn. Retain the input ID
+when retrying an uncertain delivery. `history classify` hides confirmed internal
+receipts or maintenance controls by exact native entry ID; `visible` reverses the
+classification. Originals stay intact. Reloaded views use the classification;
+already printed terminal scrollback cannot be rewritten.
 
 Run import again to catch up. Completed reliable source versions are skipped;
 partial reads resume their committed cursor. Once a transcript scan reaches its
 end, missing attachments retry only their affected source pages. Changed or
 unreliable sources are scanned again; older partial checkpoints reconcile once
 before using targeted retries. Unchanged transcripts still reconcile corrected
-lineage without duplicating messages or regenerating vectors. Retained text is
-indexed alongside source
+lineage without duplicating messages or regenerating vectors. A reader upgrade
+that retains additional event kinds rescans source history once, reusing item
+identities and cached vectors. Retained text is indexed alongside source
 scanning and catches up again afterward, so neither a large vector backlog nor
 attachment retries block the other work. Interrupted or failed final indexing
 resumes from the retained corpus before the next fresh import. Explicit
@@ -117,6 +129,18 @@ assets before committing references; record missing payloads. Historical tool
 calls are evidence, never replayed. Reuse retained assets by verified size and
 digest before requesting source bytes again. Render these data entries alongside
 Pi model messages.
+
+Live Pi messages and imported Codex items use the same Rust-owned message,
+tool-status and presentation types, with generated TypeScript and Swift bindings.
+Source adapters normalize commands, file changes, agent coordination, media and
+other native events before the shared renderer. Existing imports are projected
+from their retained originals, including verified cold payloads, without a source
+reimport or index reset. Unknown kinds retain their original payload; historical
+hooks and compaction are inert markers. Authentication and system/developer
+instructions remain excluded. Missing originals stay visibly unavailable.
+Execution inputs and tool payloads stay in the shared, lazy detail reader.
+Events an older importer discarded need a source backfill; retained tool rows do
+not.
 
 ## One derived search index
 

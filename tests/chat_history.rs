@@ -245,6 +245,7 @@ async fn recovery_connection(
                 drop(known);
                 receipts.push(RuntimeEventKind::Message {
                     message: HistoryMessage {
+                        presentation: None,
                         entry_id: "recovered-answer".into(),
                         role: HistoryRole::Final,
                         text: "Automatic recovery is ready.".into(),
@@ -285,6 +286,7 @@ async fn recovery_connection(
                 .iter()
                 .filter(|input| input.placed)
                 .map(|input| HistoryMessage {
+                    presentation: None,
                     entry_id: format!("native-{}", input.id),
                     role: HistoryRole::User,
                     text: input.text.clone(),
@@ -782,6 +784,7 @@ async fn chief_startup(mode: ChiefStartup) {
                         vec![RuntimeEventKind::History {
                             conversation_id,
                             messages: vec![HistoryMessage {
+                                presentation: None,
                                 attachments: None,
                                 entry_id: "saved-answer".into(),
                                 role: HistoryRole::Final,
@@ -1265,6 +1268,7 @@ async fn exact_resume_renders_history_without_fetching_fuzzy_catalog_pages() {
                         vec![RuntimeEventKind::History {
                             conversation_id,
                             messages: vec![HistoryMessage {
+                                presentation: None,
                                 attachments: None,
                                 entry_id: "saved-answer".into(),
                                 role: HistoryRole::Final,
@@ -1418,6 +1422,7 @@ async fn main_history(older: bool) {
                             conversation_id: "persisted-main".into(),
                             messages: vec![
                                 HistoryMessage {
+                                    presentation: None,
                                     attachments: None,
                                     entry_id: if older { "1" } else { "2" }.into(),
                                     role: HistoryRole::User,
@@ -1432,6 +1437,7 @@ async fn main_history(older: bool) {
                                     tool: None,
                                 },
                                 HistoryMessage {
+                                    presentation: None,
                                     attachments: None,
                                     entry_id: if older { "3" } else { "4" }.into(),
                                     role: HistoryRole::Assistant,

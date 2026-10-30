@@ -194,7 +194,7 @@ test("imported views and settings are inert; actual input uses one normal Rex ac
     await app.views.input(input(saved.conversation_id, "third", "Keep going after detach"), noAllocation, () => {}); await idle(3);
     await app.views.input(input(saved.conversation_id, "third", "Keep going after detach"), noAllocation, () => {});
     assert.equal(app.faux.state.callCount, 3); assert.equal(spawns, 1);
-    const messages = (await history(conversation, null)).flatMap((frame) => frame.messages);
+    const messages = (await history(conversation, null, app.harness)).flatMap((frame) => frame.messages);
     assert.equal(messages.filter((message) => message.role === "user" && message.text === "Keep going after detach").length, 1);
     assert.ok(messages.some((message) => message.text === "Original retained hardware context"));
     const reconciled = observe(app, 2, saved.conversation_id, ["third", "not-sent"]); viewHandles.push(reconciled);
@@ -313,7 +313,7 @@ test("active child steering reuses its actor and closed child or task folders re
     assert.equal(recovered.conversation_id, child.conversation_id);
     await app.tasks.run({ ...command, allocation_id: recovered.worker.allocation_id, binding: nextChild, interactive: false }, () => () => {});
     assert.equal(app.faux.state.callCount, 4);
-    const conversation = await app.tasks.conversation(child.conversation_id), messages = (await history(conversation, null)).flatMap((frame) => frame.messages);
+    const conversation = await app.tasks.conversation(child.conversation_id), messages = (await history(conversation, null, app.harness)).flatMap((frame) => frame.messages);
     assert.equal(messages.filter((message) => message.role === "user").length, 4, "Each actual input must appear exactly once across recovery");
   } finally { app.views.close(); await view?.running; controller.abort(); await running;
     app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }

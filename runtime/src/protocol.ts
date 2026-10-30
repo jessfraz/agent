@@ -5,6 +5,7 @@ import { Ajv2020 } from "ajv/dist/2020.js";
 import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
+import type { ApnsConfig } from "./generated/ApnsConfig.js";
 import { AuthError } from "./auth.js";
 
 const ajv = new Ajv2020({ strict: true });
@@ -41,6 +42,7 @@ async function schema(name: string): Promise<object> {
 
 export const validRequest = ajv.compile<RuntimeRequest>(await schema("request"));
 export const validEvent = ajv.compile<RuntimeEvent>(await schema("event"));
+export const validApnsConfig = ajv.compile<ApnsConfig>(await schema("apns"));
 
 /** JSON frames end at LF, never Unicode line/paragraph separators inside strings. */
 export async function* protocolLines(input: AsyncIterable<Uint8Array>): AsyncGenerator<string> {

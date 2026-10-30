@@ -1889,6 +1889,23 @@
           "required": [
             "type"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "request": {
+              "$ref": "#/$defs/NotificationRequest"
+            },
+            "type": {
+              "type": "string",
+              "const": "notifications"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "request"
+          ]
         }
       ]
     },
@@ -1921,6 +1938,65 @@
         "git_dir",
         "branch",
         "head"
+      ]
+    },
+    "NotificationRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "installation_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "status"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "installation_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "installation_id": {
+              "type": "string"
+            },
+            "token": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "register"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "installation_id",
+            "token"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "installation_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "unregister"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "installation_id"
+          ]
+        }
       ]
     },
     "OccurrencePlan": {
@@ -3241,6 +3317,73 @@
         {
           "type": "object",
           "properties": {
+            "input": {
+              "type": "string"
+            },
+            "input_id": {
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/InputMode"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            },
+            "type": {
+              "type": "string",
+              "const": "task_input"
+            }
+          },
+          "required": [
+            "type",
+            "task_id",
+            "input_id",
+            "input",
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "entries": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TranscriptAnnotation"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "annotate_transcript"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id",
+            "entries"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "request": {
+              "$ref": "#/$defs/NotificationRequest"
+            },
+            "type": {
+              "type": "string",
+              "const": "notifications"
+            }
+          },
+          "required": [
+            "type",
+            "request"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "limit": {
               "type": "integer",
               "format": "uint32",
@@ -3891,6 +4034,29 @@
     },
     "TimezoneId": {
       "type": "string"
+    },
+    "TranscriptAnnotation": {
+      "type": "object",
+      "properties": {
+        "classification": {
+          "$ref": "#/$defs/TranscriptClassification"
+        },
+        "entry_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_id",
+        "classification"
+      ]
+    },
+    "TranscriptClassification": {
+      "type": "string",
+      "enum": [
+        "visible",
+        "internal_receipt",
+        "maintenance_control"
+      ]
     },
     "UsageAvailability": {
       "oneOf": [

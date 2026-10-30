@@ -16,6 +16,12 @@ fn main() -> Result<()> {
     let config = Config::from_env().with_out_dir(&output);
     RuntimeRequest::export_all(&config)?;
     RuntimeEvent::export_all(&config)?;
+    agent_cli::notifications::ApnsConfig::export_all(&config)?;
+    agent_cli::notifications::NotificationTarget::export_all(&config)?;
+    fs::write(
+        output.join("apns.schema.json"),
+        serde_json::to_string_pretty(&schema_for!(agent_cli::notifications::ApnsConfig))?,
+    )?;
     agent_cli::background::BackgroundTaskInput::export_all(&config)?;
     agent_cli::background::BackgroundCheckpoint::export_all(&config)?;
     TaskOutcome::export_all(&config)?;
@@ -51,6 +57,7 @@ fn main() -> Result<()> {
         swift::generate(&[
             serde_json::to_value(schema_for!(agent_cli::native::NativeCommand))?,
             serde_json::to_value(schema_for!(agent_cli::native::NativeEvent))?,
+            serde_json::to_value(schema_for!(agent_cli::notifications::NotificationTarget))?,
         ])? + &format!(
             "public enum AttachmentLimits {{\n    public static let maximumBytes = {}\n    public static let chunkBytes = {}\n    public static let maximumCount = {}\n    public static let maximumNameBytes = {}\n}}\n",
             agent_cli::attachments::MAX_ATTACHMENT_BYTES,

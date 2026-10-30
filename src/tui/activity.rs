@@ -57,6 +57,7 @@ pub(super) fn group(messages: &[Message], start: usize) -> Option<Range<usize>> 
 pub(super) fn summary(messages: &[Message], range: Range<usize>) -> String {
     let mut tools = 0;
     let mut reasoning = 0;
+    let mut events = 0;
     let mut failed = 0;
     let mut running = 0;
     for message in messages.get(range).unwrap_or_default() {
@@ -67,6 +68,7 @@ pub(super) fn summary(messages: &[Message], range: Range<usize>) -> String {
                 running += usize::from(*status == ToolStatus::Running);
             }
             _ if message.role == Role::Thinking => reasoning += 1,
+            _ if message.role == Role::Tool => events += 1,
             _ => {}
         }
     }
@@ -81,6 +83,12 @@ pub(super) fn summary(messages: &[Message], range: Range<usize>) -> String {
         parts.push(format!(
             "{tools} tool {}",
             if tools == 1 { "call" } else { "calls" }
+        ));
+    }
+    if events > 0 {
+        parts.push(format!(
+            "{events} {}",
+            if events == 1 { "event" } else { "events" }
         ));
     }
     if running > 0 {
@@ -567,6 +575,9 @@ fn status_name(status: ToolStatus) -> &'static str {
         ToolStatus::Running => "Running",
         ToolStatus::Finished => "Finished",
         ToolStatus::Failed => "Failed",
+        ToolStatus::Declined => "Declined",
+        ToolStatus::Interrupted => "Interrupted",
+        ToolStatus::Unknown => "Status unavailable",
     }
 }
 fn content_lines(title: &'static str, content: ToolDetailContent, lines: &mut Vec<Line<'static>>) {
@@ -628,6 +639,7 @@ mod tests {
         tool: Option<ToolHistory>,
     ) -> HistoryMessage {
         HistoryMessage {
+            presentation: None,
             entry_id: id.into(),
             role,
             text: text.into(),

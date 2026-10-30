@@ -267,7 +267,8 @@ impl Fixture {
             );
             assert!(
                 Instant::now() < deadline,
-                "Fixture coordinator did not bind"
+                "Fixture coordinator did not bind: {}",
+                fs::read_to_string(&stderr).unwrap_or_default()
             );
             thread::sleep(Duration::from_millis(10));
         }
@@ -337,6 +338,85 @@ fn replay(run: &JobRunReceipt, schedule_id: Option<&str>) -> RuntimeCommand {
         schedule_id: schedule_id.map(|id| ScheduleId::try_from(id.to_owned()).unwrap()),
         request_id: run.request_id.clone(),
     }
+}
+
+#[test]
+fn direct_task_messages_survive_offline_delivery_and_never_post_to_main() {
+    let fixture = Fixture::new();
+    let mut server = fixture.start();
+    fs::write(
+        fixture.jobs.join("review.toml"),
+        definition("Review the saved evidence.", 9),
+    )
+    .unwrap();
+    fixture.sync();
+    let run = fixture.run(&["jobs", "run", JOB_ID]);
+    let input_id = "11111111-1111-4111-8111-111111111111";
+    let message = "Continue with the newly retained evidence.";
+    let task_id = run.task_id.to_string();
+    let args = [
+        "tasks",
+        "send",
+        task_id.as_str(),
+        message,
+        "--mode",
+        "queue",
+        "--input-id",
+        input_id,
+    ];
+    for _ in 0..2 {
+        let output = fixture.cli(&args);
+        assert!(
+            !output.status.success(),
+            "Offline dispatch cannot claim delivery"
+        );
+        let events: Vec<RuntimeEventKind> = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert!(events.iter().any(|event| matches!(event,
+            RuntimeEventKind::InputAccepted { input_id: accepted } if accepted == input_id)));
+        let tasks = fixture.tasks();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, run.task_id);
+        let retained: Vec<_> = tasks[0]
+            .pending
+            .iter()
+            .filter(|input| input.id == input_id)
+            .collect();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].content, message);
+        assert_eq!(retained[0].mode, Some(InputMode::FollowUp));
+    }
+    server.stop();
+    let _reopened = fixture.start();
+    let tasks = fixture.tasks();
+    assert_eq!(
+        tasks[0]
+            .pending
+            .iter()
+            .filter(|input| input.id == input_id)
+            .count(),
+        1
+    );
+    let root = fixture.rpc(RuntimeCommand::ReadConversation {
+        conversation_id: "1".into(),
+        cursor: None,
+    });
+    let mut pages = 0;
+    for event in root {
+        if let RuntimeEventKind::History { messages, .. } = event {
+            pages += 1;
+            assert!(
+                messages.is_empty(),
+                "Maintenance input must not appear in main history"
+            );
+        }
+    }
+    assert!(pages > 0);
+    assert!(!fixture.directory.path().join("external-calls").exists());
 }
 
 #[test]

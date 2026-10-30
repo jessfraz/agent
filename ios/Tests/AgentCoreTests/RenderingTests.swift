@@ -133,7 +133,7 @@
             text: "A **useful** message with `inline code` and a [link](https://example.invalid).",
             tool: nil))
       }
-      for status in [ToolStatus.running, .finished, .failed] {
+      for status in [ToolStatus.running, .finished, .failed, .declined, .interrupted, .unknown] {
         transcript.message(
           .init(
             attachments: nil, continuation: false, entryId: "tool-\(status.rawValue)",
@@ -214,6 +214,31 @@
         #expect(accessible.width >= 390)
         Attachment.record(
           accessible, named: "message-rows-accessibility-\(start / 4 + 1)", as: .png)
+      }
+    }
+
+    @MainActor @Test func nonSuccessToolStatesHaveDistinctNativeIconsAndCollapsedSummaries()
+      async throws
+    {
+      func row(_ status: ToolStatus) throws -> ChatRow {
+        var transcript = Transcript()
+        transcript.message(
+          .init(
+            continuation: false, entryId: "tool-entry", finalChunk: true, role: .tool,
+            text: "Check the requested result",
+            tool: .init(callId: "tool-call", name: "verify_result", status: status)))
+        return try #require(transcript.rows.first)
+      }
+      let finished = try await renderRows([row(.finished)])
+      let finishedPixels = try #require(finished.dataProvider?.data) as Data
+      for status in [ToolStatus.declined, .interrupted, .unknown] {
+        let item = try row(status)
+        let image = try await renderRows([item])
+        let pixels = try #require(image.dataProvider?.data) as Data
+        #expect(finishedPixels != pixels, "\(status.rawValue) must not render as success")
+        let group = ActivityGroup(id: "activity:tool-entry", rows: [RowModel(item)])
+        #expect(group.summary.contains(status.rawValue))
+        Attachment.record(image, named: "tool-state-\(status.rawValue)", as: .png)
       }
     }
 

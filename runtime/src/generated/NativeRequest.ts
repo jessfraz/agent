@@ -2,5 +2,6 @@
 import type { AttachmentRef } from "./AttachmentRef.js";
 import type { AttachmentRequest } from "./AttachmentRequest.js";
 import type { InputMode } from "./InputMode.js";
+import type { NotificationRequest } from "./NotificationRequest.js";
 
-export type NativeRequest = { "type": "attachment", request: AttachmentRequest, } | { "type": "observe", input_ids: Array<string>, } | { "type": "submit", input_id: string, text: string, mode: InputMode, attachments?: Array<AttachmentRef>, } | { "type": "history", cursor: string | null, } | { "type": "tool_details", entry_id: string, call_id: string, } | { "type": "interrupt" };
+export type NativeRequest = { "type": "attachment", request: AttachmentRequest, } | { "type": "observe", input_ids: Array<string>, } | { "type": "submit", input_id: string, text: string, mode: InputMode, attachments?: Array<AttachmentRef>, } | { "type": "history", cursor: string | null, } | { "type": "tool_details", entry_id: string, call_id: string, } | { "type": "interrupt" } | { "type": "notifications", request: NotificationRequest, };

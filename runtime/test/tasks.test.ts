@@ -78,7 +78,7 @@ test("interrupt drains the current native turn before admitting queued steering 
     await app.tasks.input(command, "Correct that direction too", "second-steering"); await interrupt; await idleAgain;
     assert.deepEqual(answers, ["Corrected direction completed", "Second correction completed"]); assert.equal(app.faux.state.callCount, 4);
     assert.deepEqual((await app.tasks.get(task.id)).pending, []);
-    const visible = (await history(conversation, null)).flatMap((frame) => frame.messages);
+    const visible = (await history(conversation, null, app.session)).flatMap((frame) => frame.messages);
     assert.deepEqual(visible.filter((message) => message.role === "user").map((message) => message.text),
       ["Start the old direction", "Use the corrected direction instead", "Start another direction", "Correct that direction too"]);
     assert.equal(visible.some((message) => message.text === "Discarded old direction"), false);
@@ -131,7 +131,7 @@ test("confirmed session loss fences the old actor before reopening the same hist
     await assert.rejects(app.tasks.run(old, () => () => {}), /binding is not confirmed/);
     const result = await app.tasks.run({ ...old, allocation_id: reopened.worker.allocation_id, binding: replacement, interactive: false }, () => () => {});
     assert.equal(result.text, "Continued after the closed tab"); assert.equal(app.faux.state.callCount, 2);
-    const visible = (await history(conversation, null)).flatMap((frame) => frame.messages);
+    const visible = (await history(conversation, null, app.session)).flatMap((frame) => frame.messages);
     assert.equal(visible.some((message) => message.text === "A late stale result"), false);
     assert.equal((await app.tasks.get(task.id)).pending.length, 0);
     let childCreates = 0;
@@ -220,7 +220,7 @@ test("an interactive task serializes local and chief inputs, wakes while idle an
     await assert.rejects(app.tasks.input(command, "Late detached input", "late"), /no longer attached/);
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
     const reopened = await app.tasks.get(task.id); assert.equal(reopened.conversation_id, task.conversation_id);
-    const frames = await history(await app.tasks.conversation(reopened.conversation_id), null);
+    const frames = await history(await app.tasks.conversation(reopened.conversation_id), null, app.session);
     const visible = frames.flatMap((frame) => frame.messages);
     assert.deepEqual(visible.filter((message) => message.role === "user").map((message) => message.text),
       ["Initial chief instruction", "Chief follow-up while the tab is idle", "Reply typed directly in the task tab", "Chief input while the local turn runs"]);
@@ -749,7 +749,7 @@ test("worker host tools execute through the attached client while the main conve
     assert.equal((await main.wait(BACKGROUND_CONTEXT)).status, "done");
     releaseHost({ type: "process", exit_code: 0, stdout: "verified", stderr: "", truncated: false });
     assert.match((await running).text, /follow-up was verified/);
-    const workerHistory = (await history(await app.tasks.conversation(task.conversation_id), null)).flatMap((frame) => frame.messages);
+    const workerHistory = (await history(await app.tasks.conversation(task.conversation_id), null, app.session)).flatMap((frame) => frame.messages);
     assert.deepEqual(workerHistory.filter((message) => message.role === "final").map((message) => message.text),
       ["Worker verified the source.", "The follow-up was verified too."]);
     assert.equal((await app.tasks.get(task.id)).pending.length, 0);

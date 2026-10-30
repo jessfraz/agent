@@ -13,6 +13,7 @@ public struct MainChatView: View {
   private let managesConnection: Bool
   private let detailLoader: ToolDetailsLoader?
   private let initialScrollTarget: String?
+  private let notifications: AppNotifications?
   @State private var settings = false
   @State private var followsLatest = true
   @State private var userScrolling = false
@@ -27,11 +28,12 @@ public struct MainChatView: View {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.colorScheme) private var colorScheme
 
-  public init() {
+  public init(notifications: AppNotifications? = nil) {
     _model = State(initialValue: ChatModel())
     managesConnection = true
     detailLoader = nil
     initialScrollTarget = nil
+    self.notifications = notifications
   }
   // Previews and hosted rendering use the real screen with a seeded model,
   // without taking ownership of a live connection or the user's saved address.
@@ -44,6 +46,7 @@ public struct MainChatView: View {
     managesConnection = false
     detailLoader = details
     self.initialScrollTarget = initialScrollTarget
+    notifications = nil
     _followsLatest = State(initialValue: initialScrollTarget == nil)
   }
   public var body: some View {
@@ -120,7 +123,24 @@ public struct MainChatView: View {
         await model.runUntilCancelled()
       }
       .onChange(of: scenePhase) { _, phase in
+        notifications?.mainVisible = phase == .active && !settings
         if managesConnection { Task { await model.setActive(phase == .active) } }
+      }
+      .onAppear { notifications?.mainVisible = scenePhase == .active && !settings }
+      .onDisappear { notifications?.mainVisible = false }
+      .onChange(of: settings) { _, presented in
+        notifications?.mainVisible = scenePhase == .active && !presented
+      }
+      .onChange(of: model.connection) { _, state in
+        if state == .connected, let registration = notifications?.registration {
+          Task { await model.connectNotifications(registration) }
+        }
+      }
+      .onChange(of: notifications?.openedTarget) { _, target in
+        if target != nil {
+          settings = false
+          followsLatest = true
+        }
       }
     }
   }
@@ -186,6 +206,9 @@ public struct MainChatView: View {
       }
       .onChange(of: model.revision) { _, _ in
         if followsLatest { scroll.scrollTo("latest", anchor: .bottom) }
+      }
+      .onChange(of: notifications?.openedTarget) { _, target in
+        if target != nil { scroll.scrollTo("latest", anchor: .bottom) }
       }
       .overlay(alignment: .bottomTrailing) {
         if !followsLatest && !model.rows.isEmpty {
@@ -337,6 +360,32 @@ public struct MainChatView: View {
           }
         }
         if let error = model.error { Text(error).foregroundStyle(.red) }
+        if let registration = notifications?.registration {
+          Section {
+            Toggle(
+              "Main-chat updates",
+              isOn: Binding(
+                get: { registration.enabled },
+                set: { value in Task { await registration.setEnabled(value) } }
+              )
+            )
+            .disabled(registration.busy || model.connection != .connected)
+            if let error = registration.error {
+              Text(error).font(.footnote).foregroundStyle(.red)
+              if !registration.enabled, registration.registered {
+                Button("Retry removing this device") {
+                  Task { await registration.setEnabled(false) }
+                }.disabled(registration.busy)
+              }
+            } else if !registration.configured {
+              Text("APNs setup is required on the coordinator.").font(.footnote)
+            } else if registration.enabled, !registration.registered {
+              Text("Waiting for this device's Apple registration.").font(.footnote)
+            }
+          } header: {
+            Text("Notifications").foregroundStyle(.primary)
+          }
+        }
         Button("Connect") {
           Task {
             await model.connect(host: host, port: port)

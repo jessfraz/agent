@@ -258,7 +258,7 @@ test("media-only evidence versions alias one immutable message and survive reope
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
     const reopened = await app.imported.import(batch([available])); assert.deepEqual(reopened.entry_ids, []); assert.equal(reopened.watermark, recovered.watermark);
     const saved = await app.imported.conversation(initial.conversation.conversation_id); assert.ok(saved);
-    assert.deepEqual((await history(saved, null)).flatMap((frame) => frame.messages).filter((message) => message.role === "user").map((message) => message.text), [original.text]);
+    assert.deepEqual((await history(saved, null, app.session)).flatMap((frame) => frame.messages).filter((message) => message.role === "user").map((message) => message.text), [original.text]);
     const records = []; for await (const record of app.tasks.records(saved.id.toString())) records.push(record);
     assert.equal(records.filter((record) => record.text === original.text).length, 1); assert.equal(app.faux.state.callCount, 0);
     const edited = { ...available, version: "v3", data: { type: "userMessage", text: original.text + " A distinct raw suffix." } };
@@ -332,7 +332,7 @@ test("verified assets merge across same-version host retries while complete repe
     assert.deepEqual(result.assets, refs);
     const reopened = await app.imported.conversation(initial.conversation.conversation_id); assert.ok(reopened);
     assert.deepEqual((await reopened.entries({ order: "ascending" }, 20, undefined, BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is), [retained]);
-    assert.deepEqual((await history(reopened, null)).flatMap((frame) => frame.messages).filter((message) => message.role === "user").map((message) => message.text), [original.text]);
+    assert.deepEqual((await history(reopened, null, app.session)).flatMap((frame) => frame.messages).filter((message) => message.role === "user").map((message) => message.text), [original.text]);
     const records = []; for await (const record of app.tasks.records(initial.conversation.conversation_id)) records.push(record);
     assert.equal(records.filter((record) => record.text === original.text).length, 1); assert.equal(app.faux.state.callCount, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
@@ -384,7 +384,7 @@ test("adoption reuses the historical Pi conversation and activates only the new 
     const users = context.messages.filter((message) => message.role === "user").flatMap((message) => typeof message.content === "string" ? [message.content]
       : message.content.flatMap((part) => part.type === "text" ? [part.text] : []));
     assert.deepEqual(users, ["Current authorized request"]);
-    const visible = (await history(conversation, null)).flatMap((frame) => frame.messages);
+    const visible = (await history(conversation, null, app.session)).flatMap((frame) => frame.messages);
     assert.ok(visible.some((message) => message.text === old.text)); assert.ok(visible.some((message) => message.text === "Current request completed."));
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

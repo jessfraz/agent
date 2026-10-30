@@ -34,6 +34,8 @@ pub struct ClientConfig {
     pub node_name: Option<String>,
     /// Local Chrome connection settings never travel to another host.
     pub browser: Option<crate::browser::BrowserConfig>,
+    /// APNs credentials are coordinator-local and never announced to workers.
+    pub apns: Option<crate::notifications::ApnsConfig>,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
     #[serde(default = "default_poll_interval")]
@@ -55,6 +57,7 @@ impl Default for ClientConfig {
             trusted_user_ids: Vec::new(),
             node_name: None,
             browser: None,
+            apns: None,
             sources: Vec::new(),
             poll_interval_seconds: default_poll_interval(),
         }
@@ -226,6 +229,17 @@ pub fn load(explicit: Option<&Path>) -> Result<ClientConfig> {
 fn validate(config: &mut ClientConfig) -> Result<()> {
     config.model.validate()?;
     let home = dirs::home_dir();
+    if let Some(apns) = &mut config.apns {
+        ensure!(
+            !config
+                .path
+                .as_ref()
+                .is_some_and(|path| path.starts_with("/nix/store")),
+            "APNs configuration belongs in a private local file, outside the Nix store"
+        );
+        apns.key_file = context_repository_path(&apns.key_file, home.as_deref())?;
+        apns.validate()?;
+    }
     if let Some(browser) = &mut config.browser
         && let Some(path) = &mut browser.user_data_dir
     {
@@ -371,6 +385,38 @@ pub fn program() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use crate::config::{context_repository_path, load, tailnet_address, validate_coordinator};
+
+    #[test]
+    fn apns_is_private_preserved_configuration_not_a_managed_preference() {
+        use crate::notifications::{ApnsConfig, ApnsEnvironment};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let key_file = directory.path().join("AuthKey.p8");
+        let mut config = crate::config::ClientConfig {
+            apns: Some(ApnsConfig {
+                team_id: "TEAM000001".into(),
+                key_id: "KEY0000001".into(),
+                topic: "dev.example.Agent".into(),
+                key_file: key_file.clone(),
+                environment: ApnsEnvironment::Production,
+            }),
+            ..Default::default()
+        };
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let settings = directory.path().join("managed.toml");
+        std::fs::write(&settings, "poll_interval_seconds = 120\n").unwrap();
+        assert!(crate::config::apply(&path, &settings).unwrap().changed);
+        let saved = load(Some(&path)).unwrap();
+        assert_eq!(saved.apns.unwrap().key_file, key_file);
+        #[derive(serde::Serialize)]
+        struct Attempt<'a> {
+            apns: &'a Option<ApnsConfig>,
+        }
+        let managed = toml::to_string(&Attempt { apns: &config.apns }).unwrap();
+        assert!(toml::from_str::<crate::config::ManagedSettings>(&managed).is_err());
+        config.path = Some("/nix/store/example/config.toml".into());
+        assert!(crate::config::validate(&mut config).is_err());
+    }
 
     #[test]
     fn initialization_publishes_real_private_settings_and_never_overwrites() {

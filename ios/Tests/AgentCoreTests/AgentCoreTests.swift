@@ -213,6 +213,13 @@ actor FixtureCoordinator {
   private let closedToolContinuation: AsyncStream<Void>.Continuation
   private var toolRequests: [NativeRequestToolDetails] = []
   private var toolReply: [NativeEvent] = []
+  private var notificationRequests: [NotificationRequest] = []
+  private var notificationsRegistered = false
+  private var notificationsHeld = false
+  private var dropNotificationRemoval = false
+  private var notificationRelease: CheckedContinuation<Void, Never>?
+  private let notificationObserved = AsyncStream<Void>.makeStream()
+  nonisolated var observedNotifications: AsyncStream<Void> { notificationObserved.stream }
   private var delaySnapshot = false
   private var release: CheckedContinuation<Void, Never>?
   init() {
@@ -225,6 +232,14 @@ actor FixtureCoordinator {
   }
   func replyToToolLookups(with events: [NativeEvent]) { toolReply = events }
   func toolLookups() -> [NativeRequestToolDetails] { toolRequests }
+  func notificationControls() -> [NotificationRequest] { notificationRequests }
+  func dropNextNotificationRemoval() { dropNotificationRemoval = true }
+  func holdNotificationRegistration() { notificationsHeld = true }
+  func releaseNotificationRegistration() {
+    notificationsHeld = false
+    notificationRelease?.resume()
+    notificationRelease = nil
+  }
   func holdSnapshot() { delaySnapshot = true }
   func releaseSnapshot() {
     delaySnapshot = false
@@ -270,6 +285,26 @@ actor FixtureCoordinator {
       bytes.removeSubrange(...end)
       guard case .native(let value) = command else { return }
       switch value.request {
+      case .notifications(let request):
+        notificationRequests.append(request.request)
+        notificationObserved.continuation.yield(())
+        if case .unregister = request.request, dropNotificationRemoval {
+          dropNotificationRemoval = false
+          socket.cancel()
+          return
+        }
+        switch request.request {
+        case .register:
+          if notificationsHeld { await withCheckedContinuation { notificationRelease = $0 } }
+          notificationsRegistered = true
+        case .unregister: notificationsRegistered = false
+        case .status: break
+        }
+        try await emit(
+          .notifications(
+            .init(status: .init(configured: true, registered: notificationsRegistered))), on: socket
+        )
+        try await emit(.done, on: socket)
       case .toolDetails(let request):
         toolRequests.append(request)
         var reply = Data()

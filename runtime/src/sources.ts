@@ -288,7 +288,7 @@ export class SourceJournal {
     } finally { release?.(); this.triaging = false; }
   }
   async notify(conversationId: string, callId: string, keys: readonly string[], taskId: string | null,
-    text: string, emit: (task: string | null, text: string) => void): Promise<void> {
+    text: string, emit?: (task: string | null, text: string) => void): Promise<void> {
     const records = await this.events({ keys, limit: 100 });
     if (new Set(keys).size !== records.length) throw new TaskError("Notification refers to unknown source events");
     if (taskId !== null) await this.tasks.get(taskId);
@@ -296,7 +296,7 @@ export class SourceJournal {
     const origin = await this.tasks.origin(conversation, callId);
     await publishMainNotice(this.session, conversation, origin, taskId, records.map((record) => record.event.source),
       { key: callId, text, events: records.map((record) => record.event) });
-    emit(taskId, text);
+    emit?.(taskId, text);
   }
 }
 
@@ -317,7 +317,21 @@ export function createSourceTools(journal: SourceJournal, executions: Executions
       account: Type.Optional(Type.String()), thread_id: Type.Optional(Type.String()), query: Type.Optional(Type.String()),
       pending: Type.Optional(Type.Boolean()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })) }),
     async execute(args) { return output(await journal.events(args)); } });
-  const main = defineExtension({ name: "source-tools", tools: [read,
+  const notifyUser = defineTool({ name: "notify_user", replay: "safe",
+    description: "Publish a brief useful update or necessary user question to the main chat while work continues. Stay quiet for routine progress or receipts; do not request approval again for already authorized work.",
+    parameters: Type.Object({ text: Type.String({ minLength: 1, maxLength: 4000 }) }, { additionalProperties: false }),
+    async execute(args, api) {
+      const id = api.conversationId.toString(), execution = executions.get(id);
+      const task = id === ROOT_CONVERSATION_ID.toString() || execution.role === "triage"
+        ? undefined : (await journal.tasks.owner(id)).task;
+      const text = args.text.trim();
+      if (text.length === 0) throw new TaskError("A user update needs actionable text");
+      // The native tool call owns publication and its stable replay identity.
+      // Canonical main observers deliver it; no second callback is emitted.
+      await journal.notify(id, api.callId, [], task?.id ?? null, text);
+      return output("Published to the main chat.");
+    } });
+  const main = defineExtension({ name: "source-tools", tools: [read, notifyUser,
     defineTool({ name: "link_source_events", description: "Account for source events by linking them to an existing durable task.",
       parameters: Type.Object({ keys: Type.Array(Type.String(), { minItems: 1 }), task_id: Type.String() }),
       async execute(args, api) {
@@ -339,5 +353,5 @@ export function createSourceTools(journal: SourceJournal, executions: Executions
         return output("Published to the main chat.");
       } }),
   ] });
-  return { main, worker: defineExtension({ name: "worker-source-tools", tools: [read] }) };
+  return { main, worker: defineExtension({ name: "worker-source-tools", tools: [read, notifyUser] }) };
 }

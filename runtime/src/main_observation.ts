@@ -1,7 +1,8 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Conversation, Session } from "@earendil-works/pi-durable";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
-import { isUserNotice, transcript } from "./transcript.js";
+import { isUserNotice, visibleTranscript } from "./transcript.js";
+import { observeTranscriptVisibility } from "./transcript_visibility.js";
 
 /** Admission retries and reconnect must agree about terminal Pi submissions. */
 export async function reconcileMainInput(root: Conversation, input_id: string): Promise<RuntimeEventKind[] | undefined> {
@@ -17,12 +18,10 @@ export async function reconcileMainInput(root: Conversation, input_id: string): 
  * Observe the durable entry, not its anonymous execution-local notification.
  * This never claims execution or forwards effects, tool arguments or references.
  */
-export function watchMainNotices(session: Session, root: Conversation, emit: (event: RuntimeEventKind) => void): () => void {
-  return session.subscribeCommits((publication) => {
-    for (const change of publication.changes) {
-      if (change.type !== "entry" || change.value.conversationId !== root.id ||
-          (!isUserNotice(change.value) && change.value.kind !== "agent.notice")) continue;
-      for (const message of transcript(change.value)) if (message.role === "notice") emit({ type: "message", message });
-    }
+export async function watchMainNotices(session: Session, root: Conversation, emit: (event: RuntimeEventKind) => void): Promise<() => void> {
+  const observation = await observeTranscriptVisibility(session, root.id, (entry, visibility) => {
+    if (!isUserNotice(entry) && entry.kind !== "agent.notice") return;
+    for (const message of visibleTranscript(entry, visibility)) if (message.role === "notice") emit({ type: "message", message });
   });
+  return observation.close;
 }

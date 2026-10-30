@@ -115,6 +115,10 @@ final class ChatModel {
     guard let session, let address else { return }
     if active { await session.connect(address) } else { await session.disconnect() }
   }
+  func connectNotifications(_ registration: NotificationRegistration) async {
+    guard let session else { return }
+    await registration.connect { request in try await session.notifications(request) }
+  }
   var canSend: Bool {
     !admitting && !preparingAttachments && connection == .connected
       && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)

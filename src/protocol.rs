@@ -412,6 +412,19 @@ pub enum RuntimeCommand {
         embedding_host: Option<String>,
     },
     ImportStatus,
+    TaskInput {
+        task_id: TaskId,
+        input_id: String,
+        input: String,
+        mode: InputMode,
+    },
+    AnnotateTranscript {
+        conversation_id: String,
+        entries: Vec<TranscriptAnnotation>,
+    },
+    Notifications {
+        request: crate::notifications::NotificationRequest,
+    },
     SearchHistory {
         query: String,
         limit: u32,
@@ -978,6 +991,13 @@ pub enum RuntimeEventKind {
         next_cursor: Option<String>,
     },
     Configured,
+    Notifications {
+        status: crate::notifications::NotificationStatus,
+    },
+    TranscriptAnnotated {
+        conversation_id: String,
+        entries: Vec<TranscriptAnnotation>,
+    },
     NodeRegistered {
         host_id: String,
     },
@@ -1105,6 +1125,9 @@ pub struct HistoryMessage {
     pub final_chunk: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
+    pub presentation: Option<Box<MessagePresentation>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub tool: Option<ToolHistory>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -1124,6 +1147,142 @@ pub enum ToolStatus {
     Running,
     Finished,
     Failed,
+    Declined,
+    Interrupted,
+    Unknown,
+}
+
+/// Source-independent display semantics; native originals are retained separately.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessagePresentation {
+    Command {
+        exit_code: Option<i32>,
+        #[ts(type = "number | null")]
+        duration_ms: Option<u64>,
+    },
+    FileChanges {
+        changes: Vec<FileChangePresentation>,
+    },
+    Tool {
+        namespace: Option<String>,
+    },
+    AgentCoordination {
+        action: Option<AgentAction>,
+        sender_thread_id: Option<String>,
+        receiver_thread_ids: Vec<String>,
+        agents: Vec<AgentStatePresentation>,
+    },
+    AgentActivity {
+        agent_path: String,
+        agent_thread_id: String,
+        state: Option<AgentActivityState>,
+    },
+    WebSearch {
+        query: String,
+        action: Option<WebSearchAction>,
+    },
+    Media {
+        operation: MediaOperation,
+        status: Option<String>,
+        path: Option<String>,
+    },
+    Sleep {
+        #[ts(type = "number | null")]
+        duration_ms: Option<u64>,
+    },
+    Plan,
+    Review {
+        stage: ReviewStage,
+    },
+    HookPrompt,
+    Compaction,
+    Unknown {
+        kind: String,
+    },
+    Unavailable {
+        kind: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct FileChangePresentation {
+    pub path: String,
+    pub operation: Option<FileOperation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOperation {
+    Add,
+    Delete,
+    Update,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAction {
+    Spawn,
+    SendInput,
+    Resume,
+    Wait,
+    Close,
+    SendMessage,
+    Followup,
+    Interrupt,
+    List,
+    Report,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActivityState {
+    Started,
+    Interacted,
+    Interrupted,
+    Completed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentState {
+    Pending,
+    Running,
+    Interrupted,
+    Completed,
+    Failed,
+    Shutdown,
+    NotFound,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct AgentStatePresentation {
+    pub thread_id: String,
+    pub state: Option<AgentState>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchAction {
+    Search,
+    OpenPage,
+    FindInPage,
+    Other,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaOperation {
+    View,
+    Generate,
+    Attachment,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewStage {
+    Started,
+    Finished,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -1140,10 +1299,29 @@ pub enum HistoryRole {
     Tool,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq, clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptClassification {
+    Visible,
+    InternalReceipt,
+    MaintenanceControl,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct TranscriptAnnotation {
+    pub entry_id: String,
+    pub classification: TranscriptClassification,
+}
+
+#[derive(
+    Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq, clap::ValueEnum,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum InputMode {
     Steer,
+    #[value(name = "queue", aliases = ["follow_up", "follow-up"])]
     FollowUp,
 }
 
@@ -1368,6 +1546,7 @@ mod tests {
         assert!(legacy.tool.is_none());
         assert!(!legacy.final_chunk);
         let message = HistoryMessage {
+            presentation: None,
             attachments: None,
             entry_id: "result".into(),
             role: HistoryRole::Tool,
