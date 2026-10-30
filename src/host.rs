@@ -762,7 +762,9 @@ pub(crate) async fn run_process_until(
         .process_group(0)
         .kill_on_drop(true)
         .spawn()
-        .context("Could not start the command")?;
+        .map_err(|error| {
+            anyhow::anyhow!("Could not start command {program:?} in {cwd:?}: {error}")
+        })?;
     let mut group = ProcessGroup(
         child
             .id()
@@ -1026,6 +1028,69 @@ setInterval(() => {}, 1000);
         assert_eq!(stdout, "$(literal)");
         assert_eq!(stderr, "failure");
         assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn command_start_failure_reports_missing_program_without_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory
+            .path()
+            .join("missing-program")
+            .to_string_lossy()
+            .into_owned();
+        let cwd = directory.path().to_string_lossy().into_owned();
+        let argument = "invented-sensitive-argument";
+        let result = execute(HostCommand::Exec {
+            program: program.clone(),
+            args: vec![argument.into()],
+            cwd: cwd.clone(),
+            timeout_seconds: 2,
+        })
+        .await;
+        let HostResult::Failed { message } = result else {
+            panic!("Expected a command start failure");
+        };
+        assert!(message.contains(&program), "{message}");
+        assert!(message.contains(&cwd), "{message}");
+        assert!(
+            message.contains(&std::io::Error::from_raw_os_error(libc::ENOENT).to_string()),
+            "{message}"
+        );
+        assert!(!message.contains(argument), "{message}");
+    }
+
+    #[tokio::test]
+    async fn command_start_failure_reports_missing_directory_on_cancellable_executor() {
+        let directory = tempfile::tempdir().unwrap();
+        let executor = crate::host::Executor::new(directory.path());
+        let cwd = directory
+            .path()
+            .join("missing-directory")
+            .to_string_lossy()
+            .into_owned();
+        let argument = "invented-sensitive-argument";
+        let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+        let result = executor
+            .execute_cancelled(
+                HostCommand::Exec {
+                    program: "node".into(),
+                    args: vec![argument.into()],
+                    cwd: cwd.clone(),
+                    timeout_seconds: 2,
+                },
+                cancelled,
+            )
+            .await;
+        let HostResult::Failed { message } = result else {
+            panic!("Expected a command start failure");
+        };
+        assert!(message.contains("node"), "{message}");
+        assert!(message.contains(&cwd), "{message}");
+        assert!(
+            message.contains(&std::io::Error::from_raw_os_error(libc::ENOENT).to_string()),
+            "{message}"
+        );
+        assert!(!message.contains(argument), "{message}");
     }
 
     #[tokio::test]
