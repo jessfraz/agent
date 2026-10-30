@@ -182,6 +182,10 @@ work by default; `mode:follow_up` queues a separate turn. The same choice is
 available to parent workers when continuing their child agents.
 Resuming an existing terminal retains its complete binding through failures and
 coordinator restarts. An uncertain resume cannot discard a known folder.
+If the resume reply is lost, the replacement worker can confirm its retained
+allocation only after native inspection proves the old pane is gone and the
+replacement is running on the same host in the same session. Ambiguous
+inspection leaves the input queued.
 Only an exited process needs a replacement terminal in the same session; close
 its old pane after the replacement exists.
 Rex server restart recovery remains an open question below.

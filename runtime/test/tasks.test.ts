@@ -702,6 +702,74 @@ test("an unconfirmed terminal startup keeps its session binding and queued corre
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("a restarted worker confirms its replacement after the resume reply was lost", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-resume-confirmation-")); let app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "Retained scheduled work", outcome: "Finish the original run", model: fixtureModel });
+    const allocated = await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    assert.ok(allocated.worker.state === "bound");
+    const allocationId = allocated.worker.allocation_id;
+    await app.tasks.enqueue(task.id, "Run the retained check", "original-run");
+    await assert.rejects(app.tasks.dispatch(task.id, host, async () => ({ type: "creation_uncertain", session_id: binding.session_id })), /resume needs reconciliation/);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const replacement = { ...binding, window_id: "window:55555555-5555-4555-8555-555555555555", block_id: "block:66666666-6666-4666-8666-666666666666" };
+    const inspections: WorkerRef[] = [];
+    app.faux.setResponses([fauxAssistantMessage("The retained check completed")]);
+    const result = await app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: allocationId,
+      binding: replacement, instructions: "", cwd: host.cwd, model: fixtureModel }, () => () => {}, [], async (command) => {
+      assert.equal(command.type, "on_node");
+      if (command.type !== "on_node" || command.command.type !== "inspect_worker") throw new Error("Only native worker inspection is expected");
+      inspections.push(command.command.binding);
+      return { type: "worker_presence", presence: command.command.binding.block_id === binding.block_id
+        ? { state: "missing_terminal" } : { state: "present", running: true } };
+    });
+    assert.equal(result.text, "The retained check completed");
+    assert.deepEqual(inspections, [binding, replacement]);
+    const completed = await app.tasks.get(task.id);
+    assert.equal(completed.conversation_id, task.conversation_id);
+    assert.ok(completed.worker.state === "bound");
+    assert.equal(completed.worker.allocation_id, allocationId);
+    assert.deepEqual(completed.worker.binding, replacement);
+    assert.deepEqual(completed.pending, []);
+    await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: allocationId,
+      binding, instructions: "", cwd: host.cwd, model: fixtureModel }, () => () => {}), /binding is not confirmed/);
+    assert.equal(app.faux.state.callCount, 1);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("replacement confirmation preserves queued work when ownership or native presence is unproven", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-resume-unproven-")); const app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "Keep uncertain work", outcome: "Retain the original check" });
+    const allocated = await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    assert.ok(allocated.worker.state === "bound");
+    const allocationId = allocated.worker.allocation_id;
+    await app.tasks.enqueue(task.id, "Keep this check", "retained-input");
+    await assert.rejects(app.tasks.dispatch(task.id, host, async () => ({ type: "creation_uncertain", session_id: binding.session_id })), /resume needs reconciliation/);
+    const before = await app.tasks.get(task.id);
+    const replacement = { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" };
+    async function reject(candidate: WorkerRef, allocation: string, originalRunning: boolean, replacementKnown: boolean) {
+      let inspected = 0;
+      await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: allocation,
+        binding: candidate, instructions: "", cwd: host.cwd, model: fixtureModel }, () => { throw new Error("Unproven worker must not attach"); }, [], async (command) => {
+        if (command.type !== "on_node" || command.command.type !== "inspect_worker") throw new Error("Only inspection is expected");
+        inspected += 1;
+        if (command.command.binding.block_id === binding.block_id) return { type: "worker_presence", presence: originalRunning ? { state: "present", running: true } : { state: "missing_terminal" } };
+        return replacementKnown ? { type: "worker_presence", presence: { state: "present", running: true } } : { type: "failed", message: "Native inspection unavailable" };
+      }), /binding is not confirmed/);
+      const retained = await app.tasks.get(task.id);
+      assert.deepEqual(retained.worker, before.worker);
+      assert.deepEqual(retained.pending, before.pending);
+      assert.equal(app.faux.state.callCount, 0);
+      return inspected;
+    }
+    assert.equal(await reject(replacement, allocationId, true, true), 1);
+    assert.equal(await reject(replacement, allocationId, false, false), 2);
+    assert.equal(await reject({ ...replacement, session_id: "session:77777777-7777-4777-8777-777777777777" }, allocationId, false, true), 0);
+    assert.equal(await reject(replacement, "another-allocation", false, true), 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("host replies are correlated to their request and release resources when a request ends", async () => {
   const emitted: { request: number; call: string; command: HostCommand }[] = [];
   const requests = new HostRequests((request, call, command) => emitted.push({ request, call, command }));
