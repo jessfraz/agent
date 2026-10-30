@@ -25,13 +25,13 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Ship hosted web search and page retrieval with source links for supported
   OpenAI models. The existing ChatGPT login has passed an isolated search,
   open-page and find-in-page check. Other providers need their own integration.
-- [ ] Verify unattended Chrome tasks through completed sign-in and real task
-  outcomes in the selected host's existing profile. Native CDP and private
-  1Password CLI reads and independent page initialization are implemented.
-  Packaged runtimes passed fresh password/TOTP sign-in on both macOS hosts.
-  Remaining deployment acceptance includes service restarts, OS reboots,
-  ordinary browser relaunch, no recurring consent, owned tab cleanup and
-  interruption recovery with autofill enabled.
+- [x] Ship Chrome control in the selected host's existing profile with normal
+  Playwright code and private 1Password CLI reads. Both macOS deployments
+  passed fresh password/TOTP sign-in with 1Password enabled, authenticated
+  access, independent connections without browser approval clicks, and owned
+  tab cleanup after the Agent service restarted.
+- [ ] Complete unattended Chrome lifecycle acceptance across OS reboots,
+  ordinary browser relaunch and interruption recovery with autofill enabled.
 - [ ] Deliver browser screenshot attachments.
 - [x] A phone client for the main conversation, using the same submission,
   steering and queueing path as the CLI. The native iPhone app fulfills the
