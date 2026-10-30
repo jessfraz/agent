@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -21,6 +21,51 @@ const skip = chrome === undefined && process.env.CI !== "true";
 function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+async function groupAlive(group: number): Promise<boolean> {
+  try { process.kill(-group, 0); return true; }
+  catch (error) {
+    if (object(error) && error.code === "ESRCH") return false;
+    if (!object(error) || error.code !== "EPERM") throw error;
+    // Darwin's killpg filters zombies and returns EPERM when none remain
+    // signalable. Prove that this exact owned group has no live writers rather
+    // than treating every permission failure as successful cleanup.
+    const { stdout } = await promisify(execFile)("/bin/ps", ["-ax", "-o", "pgid=,stat="]);
+    for (const line of stdout.split("\n").filter(line => line.trim() !== "")) {
+      const fields = line.trim().split(/\s+/);
+      assert.ok(fields.length === 2 && /^\d+$/.test(fields[0]!), "Native group inspection must provide group and state");
+      if (fields[0] === String(group) && !fields[1]!.startsWith("Z")) throw error;
+    }
+    return false;
+  }
+}
+
+test("owned Chrome group cleanup recognizes exited native children before their parent reaps them", { timeout: 10_000 }, async () => {
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore", detached: true });
+  const exited = new Promise<void>((resolve, reject) => { child.once("close", () => resolve()); child.once("error", reject); });
+  const group = child.pid; assert.ok(group !== undefined && group > 0);
+  try {
+    // Synchronous process inspection leaves this owned child unreaped until the
+    // assertion. No sleep or scheduler-dependent SIGCHLD race is needed.
+    const deadline = performance.now() + 3_000;
+    let status = "";
+    while (performance.now() < deadline) {
+      status = execFileSync("/bin/ps", ["-p", String(group), "-o", "stat="], { encoding: "utf8" }).trim();
+      if (status.startsWith("Z")) break;
+    }
+    assert.ok(status.startsWith("Z"), "The exact fixture child must have exited but remain unreaped");
+    if (process.platform === "darwin") {
+      assert.throws(() => process.kill(-group, 0), error => object(error) && error.code === "EPERM",
+        "Darwin's zombie-only process group reports EPERM rather than ESRCH");
+      assert.equal(await groupAlive(group), false, "An exited child cannot retain profile writers");
+    }
+    await exited;
+    assert.equal(await groupAlive(group), false);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await exited;
+  }
+});
 
 function reply(value: unknown): value is BrowserReply {
   if (!object(value) || typeof value.operation_id !== "string" || !object(value.response)) return false;
@@ -155,13 +200,13 @@ document.addEventListener('focusin', event => {
   const nativeTargets = new Set<string>();
   const group = processChrome.pid;
   assert.ok(group !== undefined && group > 0, "The fixture must own an explicit detached Chrome group");
-  const groupAlive = () => {
-    try { process.kill(-group, 0); return true; }
-    catch (error) { if (object(error) && error.code === "ESRCH") return false; throw error; }
-  };
-  const signalGroup = (signal: NodeJS.Signals) => {
+  const signalGroup = async (signal: NodeJS.Signals) => {
     try { process.kill(-group, signal); }
-    catch (error) { if (!object(error) || error.code !== "ESRCH") throw error; }
+    catch (error) {
+      if (object(error) && error.code === "ESRCH") return;
+      if (object(error) && error.code === "EPERM" && !await groupAlive(group)) return;
+      throw error;
+    }
   };
   stopChrome = async () => {
     const failures: unknown[] = [];
@@ -170,13 +215,13 @@ document.addEventListener('focusin', event => {
     }
     // The browser's main process may already be gone while its renderer group
     // remains. Reap the group allocated by this spawn, never a discovered port.
-    signalGroup("SIGTERM");
+    await signalGroup("SIGTERM");
     let deadline = Date.now() + 3_000;
-    while (groupAlive() && Date.now() < deadline) await setTimeout(25);
-    if (groupAlive()) signalGroup("SIGKILL");
+    while (await groupAlive(group) && Date.now() < deadline) await setTimeout(25);
+    if (await groupAlive(group)) await signalGroup("SIGKILL");
     deadline = Date.now() + 3_000;
-    while (groupAlive() && Date.now() < deadline) await setTimeout(25);
-    const empty = !groupAlive();
+    while (await groupAlive(group) && Date.now() < deadline) await setTimeout(25);
+    const empty = !await groupAlive(group);
     t.diagnostic(JSON.stringify({ fixturePid: group, fixtureGroup: group, nativeTargets: [...nativeTargets], groupEmpty: empty }));
     assert.ok(empty, "Every process in the explicitly owned Chrome group must exit before profile removal");
     await exited;
