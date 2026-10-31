@@ -230,8 +230,12 @@ final class AgentUITests: XCTestCase {
       context.interpolationQuality = .none
       context.draw(sample, in: CGRect(x: 0, y: 0, width: side, height: side))
       let values = bytes.bindMemory(to: UInt8.self)
-      let brightness = stride(from: 0, to: values.count, by: 4).map { offset in
-        Double(Int(values[offset]) + Int(values[offset + 1]) + Int(values[offset + 2])) / 765
+      let brightness = stride(from: 0, to: values.count, by: 4).map { offset -> Double in
+        let red = Int(values[offset])
+        let green = Int(values[offset + 1])
+        let blue = Int(values[offset + 2])
+        let total = red + green + blue
+        return Double(total) / 765
       }.sorted()
       return brightness[brightness.count / 2]
     }
