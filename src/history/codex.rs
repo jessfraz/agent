@@ -1457,54 +1457,11 @@ mod tests {
             serde_json::to_vec(native).unwrap(),
         )
         .unwrap();
-        let node = std::process::Command::new("node")
-            .args(["--print", "process.execPath"])
-            .output()
-            .unwrap();
-        assert!(node.status.success());
-        let node = String::from_utf8(node.stdout).unwrap();
-        let program = directory.join("codex-fixture");
-        std::fs::write(&program, format!("#!{}\n{}", node.trim(), r#"
-const fs=require('node:fs'),path=require('node:path'),readline=require('node:readline');
-const dir=path.dirname(process.argv[1]);
-const send=(id,result)=>process.stdout.write(JSON.stringify({id,result})+'\n');
-const fail=(id,code,message)=>process.stdout.write(JSON.stringify({id,error:{code,message}})+'\n');
-readline.createInterface({input:process.stdin}).on('line',line=>{
-  const r=JSON.parse(line),p=r.params||{};
-  const data=JSON.parse(fs.readFileSync(path.join(dir,'native.json')));
-  fs.appendFileSync(path.join(dir,'calls'),JSON.stringify({method:r.method,pid:process.pid,includeTurns:p.includeTurns})+'\n');
-  if(r.method==='initialized') return;
-  process.stdout.write(JSON.stringify({method:'history/fixture',params:{}})+'\n');
-  if(r.method==='initialize') return send(r.id,{codexHome:dir});
-  if(r.method==='thread/list') {
-    if(p.sourceKinds.length!==10||!p.sourceKinds.includes('subAgentThreadSpawn')||p.sortKey!=='created_at'||!Array.isArray(p.modelProviders)||p.modelProviders.length!==0)return fail(r.id,-32602,'incomplete enumeration');
-    const start=data.paginateThreads?Number(p.cursor||0):0;
-    const end=data.paginateThreads?Math.min(start+p.limit,data.threads.length):data.threads.length;
-    const done=()=>send(r.id,{data:data.threads.slice(start,end),nextCursor:end<data.threads.length?String(end):null});
-    if(fs.existsSync(path.join(dir,'block')))setTimeout(done,2000);else done();return;
-  }
-  if(r.method==='thread/read') {
-    const t=data.threads.find(t=>t.id===p.threadId);
-    if(!t)return fail(r.id,-32600,'no rollout found');
-    return send(r.id,{thread:{...t,turns:p.includeTurns?data.turns:[]}});
-  }
-  if(r.method==='thread/turns/list') {
-    if(data.unsupportedTurns)return fail(r.id,-32601,'unsupported');
-    if(p.itemsView!=='full'||p.sortDirection!=='asc')return fail(r.id,-32602,'summary would lose evidence');
-    return send(r.id,{data:data.turns,nextCursor:null});
-  }
-  if(r.method==='thread/items/list') {
-    if(data.failItems)return fail(r.id,-32600,'no rollout found');
-    if(p.sortDirection!=='asc')return fail(r.id,-32602,'unexpected item order');
-    const items=data.turns.flatMap(turn=>turn.items.map(item=>({turnId:turn.id,item})));
-    const start=Number(p.cursor||0),end=Math.min(start+p.limit,items.length);
-    return send(r.id,{data:items.slice(start,end),nextCursor:end<items.length?String(end):null});
-  }
-  return fail(r.id,-32601,'unknown method');
-});
-"#)).unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-        history(directory, program)
+        let program =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-native.cjs");
+        let mut source = history(directory, program);
+        source.codex_home = Some(directory.to_owned());
+        source
     }
 
     fn provider_fixture(items: Vec<Value>) -> Value {
@@ -3416,12 +3373,21 @@ try{
                 .collect(),
         );
         let source = fixture(directory.path(), &native);
-        let HistoryResponse::Read { next_cursor, .. } =
-            source.read("thread-a".into(), None).await.unwrap()
+        let HistoryResponse::Read {
+            next_cursor,
+            items,
+            gaps,
+            complete,
+            ..
+        } = source.read("thread-a".into(), None).await.unwrap()
         else {
             panic!("Expected history")
         };
-        assert!(next_cursor.is_some());
+        assert!(
+            next_cursor.is_some(),
+            "Expected a partial page, got {} items, complete={complete}, gaps={gaps:?}",
+            items.len()
+        );
         let first_cursor = next_cursor.clone();
         native
             .get_mut("turns")
