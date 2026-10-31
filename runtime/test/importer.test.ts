@@ -557,7 +557,7 @@ test("status reports a stopped import after reopening Pi and preserves its resum
     const active = await app.importer.status(); assert.notEqual(active.phase, "partial");
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
     const status = await app.importer.status(); assert.equal(status.phase, "partial");
-    assert.equal(status.gaps[0], "Previous import was interrupted; run agent import codex to resume.");
+    assert.equal(status.gaps[0], "Previous import was interrupted; run beep-boop import codex to resume.");
     assert.deepEqual(await app.importer.status(), status);
     assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.next_cursor, "second-page");
     const resumed = await app.run((_host, request) => {

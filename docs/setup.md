@@ -4,48 +4,58 @@ Install [Rex](https://www.superlogical.com/rex) and Tailscale on each execution
 machine. Connect them to the same authorized tailnet. Provider CLIs keep their
 own accounts and credentials; agent does not duplicate that setup.
 
+## Compatibility
+
+The executable is `beep-boop` . Nix also installs an `agent` alias for existing
+launches. Configuration stays at `~/.config/agent/config.toml` ; state stays in
+the existing OS-specific `agent` directory, including its database and socket.
+`AGENT_*` environment variables, `services.agent` , launchd identity and saved
+worker launch paths remain compatible. The SSH fallback still calls `agent` to
+reach older coordinators; an explicit `coordinator_program` is unchanged. The
+repository rename does not require moving local clones or worktrees.
+
 ## Coordinator
 
 Choose one machine that stays on. It owns conversations, shared settings,
 background intake and the main agent.
 
 ```sh
-nix profile add github:jessfraz/agent
-agent init
-agent serve
+nix profile add github:jessfraz/beep-boop
+beep-boop init
+beep-boop serve
 ```
 
-`agent init` creates `~/.config/agent/config.toml` with private permissions and
-refuses to overwrite an existing file.
+`beep-boop init` creates `~/.config/agent/config.toml` with private permissions
+and refuses to overwrite an existing file.
 
-`agent serve` listens on the native Tailscale interface at port 43187 and a
+`beep-boop serve` listens on the native Tailscale interface at port 43187 and a
 private local Unix socket. Leave it running, then use another terminal:
 
 ```sh
-agent login
-agent status
-agent chat
+beep-boop login
+beep-boop status
+beep-boop chat
 ```
 
 Start the service before login. Otherwise the CLI starts a local-only daemon,
-which owns the same database and prevents a second coordinator from starting.
-A Nix service also satisfies this ordering. `agent login` opens ChatGPT
+which owns the same database and prevents a second coordinator from starting. A
+Nix service also satisfies this ordering. `beep-boop login` opens ChatGPT
 sign-in; complete any identity check in the browser. Credentials are stored
 privately and refreshed by the app. No Codex credential copying is required.
 
-ChatGPT is the default provider. A signed-out chat reports `Not signed in to
-ChatGPT. Run agent login.` Other Pi providers can use their supported
-environment or ambient credentials. Agent does not provide an interactive
-login flow for every provider.
+ChatGPT is the default provider. A signed-out chat reports
+`Not signed in to ChatGPT. Run beep-boop login.` Other Pi providers can use
+their supported environment or ambient credentials. Beep Boop does not provide
+an interactive login flow for every provider.
 
 ## Worker or CLI client
 
 On another execution machine:
 
 ```sh
-nix profile add github:jessfraz/agent
-agent init --coordinator tailscale://100.64.0.10
-agent serve
+nix profile add github:jessfraz/beep-boop
+beep-boop init --coordinator tailscale://100.64.0.10
+beep-boop serve
 ```
 
 Replace the invented address with the coordinator's native Tailscale IPv4
@@ -55,18 +65,18 @@ Rex host labels and endpoints are reused when present in its shared host
 inventory; a machine can also announce its own native Rex metadata. There is
 no second host list to maintain in agent settings.
 
-Use `agent chat` from any directory in another terminal. It always reaches the
-configured coordinator. Caller project information accompanies the request;
-shared context and conversation storage stay on the coordinator. `agent nodes`
-shows registered machines and which are online.
+Use `beep-boop chat` from any directory in another terminal. It always reaches
+the configured coordinator. Caller project information accompanies the request;
+shared context and conversation storage stay on the coordinator.
+`beep-boop nodes` shows registered machines and which are online.
 
-In the TUI, `agent` opens that same saved main conversation and attaches to
-ongoing work. `/exit` or Ctrl+C detaches main chat while the work continues.
-If closing waits on an input receipt, press Ctrl+C again to exit the client.
-Accepted work continues. If delivery was unconfirmed, check saved history
-before sending the message again.
-Reopen it to see live progress, steer or queue more context. Saved messages load
-automatically in the background while the composer remains usable.
+In the TUI, `beep-boop` opens that same saved main conversation and attaches to
+ongoing work. `/exit` or Ctrl+C detaches main chat while the work continues. If
+closing waits on an input receipt, press Ctrl+C again to exit the client.
+Accepted work continues. If delivery was unconfirmed, check saved history before
+sending the message again. Reopen it to see live progress, steer or queue more
+context. Saved messages load automatically in the background while the composer
+remains usable.
 
 Task sessions open directly into an interactive `Chat` tab. Reply there or
 through the main agent; both use the same task conversation. Named child tabs
@@ -91,17 +101,15 @@ The reference implementations are Codex's [message cells](https://github.com/ope
 [tool cells](https://github.com/openai/codex/blob/rust-v0.165.0/codex-rs/tui/src/exec_cell/render.rs)
 and [composer](https://github.com/openai/codex/blob/rust-v0.165.0/codex-rs/tui/src/bottom_pane/chat_composer.rs).
 
-In chat, input sent after Esc waits for its stop receipt; editing and
-other chats stay responsive. If stopping cannot be confirmed, the input stays
-unsent for recovery.
-Pi's compaction shows as **Compacting context**; current instructions reload
-before the next model round.
-Select transcript text with the terminal's normal copy/paste controls;
-the wheel and trackpad use native terminal scrollback. PgUp/PgDn scroll the
-loaded conversation or shortcut help. On a Mac, use Fn+Up/Fn+Down.
-Up/Down recalls sent prompts when the
-editor is empty; slash commands offer completion. Use `agent --no-tui chat`
-for plain output or `agent --json chat` for protocol events.
+In chat, input sent after Esc waits for its stop receipt; editing and other
+chats stay responsive. If stopping cannot be confirmed, the input stays unsent
+for recovery. Pi's compaction shows as **Compacting context**; current
+instructions reload before the next model round. Select transcript text with the
+terminal's normal copy/paste controls; the wheel and trackpad use native
+terminal scrollback. PgUp/PgDn scroll the loaded conversation or shortcut help.
+On a Mac, use Fn+Up/Fn+Down. Up/Down recalls sent prompts when the editor is
+empty; slash commands offer completion. Use `beep-boop --no-tui chat` for plain
+output or `beep-boop --json chat` for protocol events.
 
 Reopen the CLI after updating it to load presentation changes. Detaching an
 older client preserves server-owned work and saved history.
@@ -142,7 +150,7 @@ Chrome tools are an optional fallback when an API or CLI cannot complete the
 task. They use the selected host's running Chrome, on macOS or Linux. Browser
 effects stay on that host even when the coordinator runs elsewhere.
 
-On each host that should provide Chrome, add this section to its private Agent
+On each host that should provide Chrome, add this section to its private Beep Boop
 configuration:
 
 ```toml
@@ -155,16 +163,17 @@ configuration:
 # user_data_dir = "/example/chrome-data"
 ```
 
-Install the official [Playwright extension](https://chromewebstore.google.com/detail/playwright/mmlmfjhmonkocbjadbfplnigmagldckm)
+Install the official [Playwright
+extension](https://chromewebstore.google.com/detail/playwright/mmlmfjhmonkocbjadbfplnigmagldckm)
 in that existing Chrome profile. Its status page displays a profile-specific
-`PLAYWRIGHT_MCP_EXTENSION_TOKEN`. Provide that token to Agent's service through
-its private credential environment, directly or through `credential_command`,
-then restart the service. Keep the token in a secret manager and out of Agent
-configuration, launcher arguments, repository files, and the Nix store.
-Installation and pairing are one-time setup; fresh tasks and service or
-browser restarts reuse the token without another connection approval click.
-Upstream opens a temporary Chrome connector URL containing the token. Agent
-discards its output and closes that connector after pairing.
+`PLAYWRIGHT_MCP_EXTENSION_TOKEN` . Provide that token to Beep Boop's service
+through its private credential environment, directly or through
+`credential_command` , then restart the service. Keep the token in a secret
+manager and out of Beep Boop configuration, launcher arguments, repository files,
+and the Nix store. Installation and pairing are one-time setup; fresh tasks and
+service or browser restarts reuse the token without another connection approval
+click. Upstream opens a temporary Chrome connector URL containing the token.
+Beep Boop discards its output and closes that connector after pairing.
 
 An existing Chrome with native debugging enabled can instead use a loopback
 CDP connection:
@@ -177,7 +186,7 @@ debugging_port = 9222
 This selects the connected browser's current profile. Omit `user_data_dir` and
 `profile_dir_name` in this mode; they cannot pin a profile through CDP. Native
 connections disconnect without quitting Chrome and require no Playwright
-extension token. Agent does not launch Chrome or create a replacement profile
+extension token. Beep Boop does not launch Chrome or create a replacement profile
 when this endpoint is unavailable.
 
 Chrome's `chrome://inspect` connection mode requires approval for each new
@@ -215,7 +224,7 @@ return only the task result. No website-specific Nix entries or browser
 credential mappings are needed. Machine authentication stays with the
 credential provider and does not depend on unlocking the desktop extension.
 
-Ask Agent to use Chrome on a named machine when necessary. `browser_open`
+Ask Beep Boop to use Chrome on a named machine when necessary. `browser_open`
 creates an owned tab. `browser_status` inspects the live connection;
 `browser_run_code` runs an `async (page) => { ... }` function with the normal
 Playwright Page API. Use whichever locators, waits, frames, evaluation, file
@@ -238,7 +247,7 @@ draft or result for the user; `browser_release` closes remaining owned tabs and
 disconnects while Chrome keeps running. Retained results survive disconnect
 and leave the task's tab group.
 
-After interruption or connection loss, Agent retains uncertain operations and
+After interruption or connection loss, Beep Boop retains uncertain operations and
 inspects their outcome before repeating them. A browser or host restart
 invalidates old tab handles; it does not prove a submission failed. Reconnect
 to continue, preserving tabs whose ownership cannot be verified.
@@ -249,7 +258,7 @@ settings, desktop applications and general desktop control use other tools.
 
 Chrome may detach an extension debugger when another extension inserts a
 protected frame, including some password-manager menus. That loses the live
-Page handle even if the native tab stays open. Agent reports the interrupted
+Page handle even if the native tab stays open. Beep Boop reports the interrupted
 operation and unverified cleanup rather than treating the tab as closed or
 replaying its actions. Native CDP avoids this extension debugger restriction.
 Verify completed sign-in and the intended task on each host with 1Password
@@ -264,20 +273,21 @@ for installation, profile selection and token pairing.
 repair worker on the originating machine. A repair started inside Rex uses a
 named terminal in that folder; later reports reuse the repair task. From a raw
 CLI, the first report creates its repair session. Results appear in the saved
-main chat. `agent feedback latest` and `agent feedback show <id>` read captures;
-`agent feedback retry <id>` retries a saved report with its original identity.
-Inside Rex, feedback includes an HTML capture of the originating terminal.
-On iOS, it includes a screenshot of the current app window. Added files follow
-the report to the repair worker. Captures stay in private coordinator storage.
+main chat. `beep-boop feedback latest` and `beep-boop feedback show <id>` read
+captures; `beep-boop feedback retry <id>` retries a saved report with its
+original identity. Inside Rex, feedback includes an HTML capture of the
+originating terminal. On iOS, it includes a screenshot of the current app
+window. Added files follow the report to the repair worker. Captures stay in
+private coordinator storage.
 
 Import existing local Codex conversations after both services are connected:
 
 ```sh
-agent import codex
-agent import status
-agent history search "supplier fabrication question"
-agent history read CONVERSATION_ID
-agent history open CONVERSATION_ID
+beep-boop import codex
+beep-boop import status
+beep-boop history search "supplier fabrication question"
+beep-boop history read CONVERSATION_ID
+beep-boop history open CONVERSATION_ID
 ```
 
 The import creates no Rex sessions. Rerun the same command to resume partial
@@ -285,11 +295,11 @@ reads and catch up changed conversations. `--host NAME` limits an import to a
 registered host. An unavailable source is reported as partial coverage, not
 silently skipped. [History](history.md) describes storage and retrieval.
 
-A CLI-only client uses the same `agent init --coordinator ...` command and
+A CLI-only client uses the same `beep-boop init --coordinator ...` command and
 skips the service. The [native iPhone client](../ios/README.md) connects to the
-same main conversation over Tailscale. Use the coordinator's full MagicDNS
-name and port `43187`; numeric tailnet IPv4 addresses also work. Rex's phone
-CLI remains available for terminal access.
+same main conversation over Tailscale. Use the coordinator's full MagicDNS name
+and port `43187` ; numeric tailnet IPv4 addresses also work. Rex's phone CLI
+remains available for terminal access.
 
 If the coordinator is unavailable, chat reports the failure. If a worker goes
 offline, its tasks remain assigned to it. The MVP does not transfer live work
@@ -331,12 +341,12 @@ files. Sync rejects remote clients so their local paths cannot select a
 different working directory on the coordinator:
 
 ```sh
-agent jobs check --next 5
-agent jobs sync
-agent jobs list
-agent jobs get daily-review
-agent jobs run daily-review
-agent jobs run daily-review --schedule morning
+beep-boop jobs check --next 5
+beep-boop jobs sync
+beep-boop jobs list
+beep-boop jobs get daily-review
+beep-boop jobs run daily-review
+beep-boop jobs run daily-review --schedule morning
 ```
 
 `check` and `sync` also accept repeated `--directory PATH` arguments. Check
@@ -348,13 +358,13 @@ duplicate IDs leave the applied catalog intact. An existing empty directory
 can intentionally remove all jobs. Source timers are outside job sync's scope.
 `/jobs` and `/jobs ID` use the same read requests and presentation as list/get.
 
-`run` queues the applied job now with its saved prompt and model. A job with
-one schedule selects it automatically; a job with several requires
-`--schedule ID`. `/run-job JOB [--schedule ID]` uses the same admission path.
-The response identifies the durable task; admission does not mean completion.
-Manual runs serialize with the job's scheduled runs without changing its next
-occurrence or any source timer. Each explicit request creates a run, including
-when that job already has work queued. Inspect it with `agent tasks read ID`.
+`run` queues the applied job now with its saved prompt and model. A job with one
+schedule selects it automatically; a job with several requires `--schedule ID` .
+`/run-job JOB [--schedule ID]` uses the same admission path. The response
+identifies the durable task; admission does not mean completion. Manual runs
+serialize with the job's scheduled runs without changing its next occurrence or
+any source timer. Each explicit request creates a run, including when that job
+already has work queued. Inspect it with `beep-boop tasks read ID` .
 
 Timer and manual runs share the job's task, Pi conversation and Rex chat.
 An open chat is reused; a closed Rex session can reopen with the saved
@@ -382,7 +392,7 @@ the same strict configuration loader as the CLI and exercised in tests. The
 terminals. Configuration is TOML, not JSON.
 
 Set `context_repositories = ["~/context"]` on the coordinator to make an
-existing private Git repository available to every chat. Agent loads its
+existing private Git repository available to every chat. Beep Boop loads its
 `AGENTS.md` and offers bounded read/search tools for relevant files. It does
 not change the caller's working directory or require clients to copy the repo.
 
@@ -405,17 +415,17 @@ internal task outcomes remain available.
 | `slack` | Configured read-only CLI command |
 | `messages` | Switchboard Messages namespaces, or local macOS `messages` |
 
-Omitting `namespaces` discovers all configured accounts for that provider.
-An explicit selection never falls back to another account. Slack additionally
-needs its account and command prefix. The source command must be available in
-the service's PATH. `agent sources` reports coverage and checkpoints; an access
+Omitting `namespaces` discovers all configured accounts for that provider. An
+explicit selection never falls back to another account. Slack additionally needs
+its account and command prefix. The source command must be available in the
+service's PATH. `beep-boop sources` reports coverage and checkpoints; an access
 failure is not an empty inbox.
 
-Messages reads run headlessly through the local Rex Server, using its macOS
-Full Disk Access grant. Enable access for Rex Server once in System Settings;
-agent binaries do not need their own grant. No sessions or terminals are created
-for polling. The agent's literal `messages doctor`, `messages chats`, and
-`messages read` commands, including their Switchboard equivalents, use the
+Messages reads run headlessly through the local Rex Server, using its macOS Full
+Disk Access grant. Enable access for Rex Server once in System Settings;
+beep-boop binaries do not need their own grant. No sessions or terminals are
+created for polling. The agent's literal `messages doctor` , `messages chats` ,
+and `messages read` commands, including their Switchboard equivalents, use the
 same reader. Their working directory, deadline, diagnostics and output limits
 are preserved. Commands run directly in an unrelated shell still use that
 shell's macOS permission context.
@@ -426,17 +436,18 @@ Existing Rex configuration is preserved; an unchanged module causes no reload.
 Setup can also be run explicitly:
 
 ```sh
-agent rex install
+beep-boop rex install
 ```
 
 If Rex configuration is managed elsewhere, include `require('agent_messages')`
 through that owner. The command reports any setup failure and preserves the
 existing configuration; other sources and chat can continue.
 
-`agent usage` and `/status` read quota through the coordinator's installed Codex
-app-server, after verifying its signed-in account matches the agent's. This
-does not expose a separate quota for agent, and requires Codex independently.
-Reset dates use the client's local timezone and include the time remaining.
+`beep-boop usage` and `/status` read quota through the coordinator's installed
+Codex app-server, after verifying its signed-in account matches the agent's.
+This does not expose a separate quota for agent, and requires Codex
+independently. Reset dates use the client's local timezone and include the time
+remaining.
 
 `/status` also reads Pi Durable's own-conversation usage ledger: model/tool
 tokens, cache reads and writes, reported reasoning tokens, and recent request
@@ -514,9 +525,9 @@ The worker's TOML must set `coordinator`; the coordinator's must omit it.
 Model settings, source configuration, credentials and context stay in private
 runtime files. Restart the service after changing its settings.
 
-For generated preferences, `agent config apply preferences.toml` updates only
-the supplied model, context repositories, sources or polling interval in the
-existing private configuration. Connection and trust settings remain local.
-Invalid preferences leave the file untouched; repeated applications are a
-no-op. This allows Nix to manage shared preferences without publishing machine
+For generated preferences, `beep-boop config apply preferences.toml` updates
+only the supplied model, context repositories, sources or polling interval in
+the existing private configuration. Connection and trust settings remain local.
+Invalid preferences leave the file untouched; repeated applications are a no-op.
+This allows Nix to manage shared preferences without publishing machine
 connection details or credentials.

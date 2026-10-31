@@ -144,9 +144,9 @@ async fn repeated_control_c_detaches_while_admission_is_held_and_retains_its_ori
             }
         }
     });
-    let binary =
-        std::env::var_os("AGENT_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_agent").into());
-    let fixture = std::path::Path::new(env!("CARGO_BIN_EXE_agent"))
+    let binary = std::env::var_os("AGENT_TEST_BINARY")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_beep-boop").into());
+    let fixture = std::path::Path::new(env!("CARGO_BIN_EXE_beep-boop"))
         .parent()
         .unwrap()
         .join("examples/terminal-fixture");
@@ -324,9 +324,9 @@ async fn known_chief_history_renders_while_its_observer_readiness_is_held() {
             }
         }
     });
-    let binary =
-        std::env::var_os("AGENT_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_agent").into());
-    let fixture = std::path::Path::new(env!("CARGO_BIN_EXE_agent"))
+    let binary = std::env::var_os("AGENT_TEST_BINARY")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_beep-boop").into());
+    let fixture = std::path::Path::new(env!("CARGO_BIN_EXE_beep-boop"))
         .parent()
         .unwrap()
         .join("examples/terminal-fixture");
@@ -738,9 +738,9 @@ async fn observer_recovery(case: RecoveryCase) {
             }
         }
     });
-    let binary =
-        std::env::var_os("AGENT_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_agent").into());
-    let fixture = std::path::Path::new(env!("CARGO_BIN_EXE_agent"))
+    let binary = std::env::var_os("AGENT_TEST_BINARY")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_beep-boop").into());
+    let fixture = std::path::Path::new(env!("CARGO_BIN_EXE_beep-boop"))
         .parent()
         .unwrap()
         .join("examples/terminal-fixture");
@@ -771,7 +771,7 @@ async fn observer_recovery(case: RecoveryCase) {
     let mut input = child.stdin.take().unwrap();
     let mut output = child.stdout.take().unwrap();
     let mut bytes = Vec::new();
-    read_terminal_until(&mut output, &mut bytes, "Ask Agent to do anything").await;
+    read_terminal_until(&mut output, &mut bytes, "Ask Beep Boop to do anything").await;
     if matches!(
         case,
         RecoveryCase::WaitingWorker | RecoveryCase::UncertainWorker
@@ -1199,9 +1199,9 @@ async fn chief_startup(mode: ChiefStartup) {
             });
         }
     });
-    let binary =
-        std::env::var_os("AGENT_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_agent").into());
-    let fixture = std::path::Path::new(env!("CARGO_BIN_EXE_agent"))
+    let binary = std::env::var_os("AGENT_TEST_BINARY")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_beep-boop").into());
+    let fixture = std::path::Path::new(env!("CARGO_BIN_EXE_beep-boop"))
         .parent()
         .unwrap()
         .join("examples/terminal-fixture");
@@ -1233,7 +1233,7 @@ async fn chief_startup(mode: ChiefStartup) {
     let mut bytes = Vec::new();
     timeout(Duration::from_secs(1), async {
         let mut chunk = [0; 4096];
-        while !String::from_utf8_lossy(&bytes).contains("Ask Agent to do anything") {
+        while !String::from_utf8_lossy(&bytes).contains("Ask Beep Boop to do anything") {
             let count = output.read(&mut chunk).await.unwrap();
             assert!(count > 0);
             bytes.extend_from_slice(&chunk[..count]);
@@ -1492,8 +1492,8 @@ async fn coordinator_decode_failure_reports_safe_metadata_without_private_values
         bytes.push(b'\n');
         writer.write_all(&bytes).await.unwrap();
     });
-    let binary =
-        std::env::var_os("AGENT_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_agent").into());
+    let binary = std::env::var_os("AGENT_TEST_BINARY")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_beep-boop").into());
     let output = Command::new(binary)
         .arg("--state-dir")
         .arg(directory.path())
@@ -1651,9 +1651,9 @@ async fn exact_resume_renders_history_without_fetching_fuzzy_catalog_pages() {
             });
         }
     });
-    let binary =
-        std::env::var_os("AGENT_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_agent").into());
-    let fixture = std::path::Path::new(env!("CARGO_BIN_EXE_agent"))
+    let binary = std::env::var_os("AGENT_TEST_BINARY")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_beep-boop").into());
+    let fixture = std::path::Path::new(env!("CARGO_BIN_EXE_beep-boop"))
         .parent()
         .unwrap()
         .join("examples/terminal-fixture");
@@ -1833,7 +1833,7 @@ async fn main_history(older: bool) {
     });
     for _ in 0..2 {
         let binary = std::env::var_os("AGENT_TEST_BINARY")
-            .unwrap_or_else(|| env!("CARGO_BIN_EXE_agent").into());
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_beep-boop").into());
         let mut child = Command::new(binary)
             .arg("--state-dir")
             .arg(directory.path())
@@ -1869,11 +1869,11 @@ async fn main_history(older: bool) {
         );
         let visible = String::from_utf8(output.stdout).unwrap();
         assert!(
-            visible.contains("user> Saved question\nagent> Saved answer"),
+            visible.contains("user> Saved question\nBeep Boop> Saved answer"),
             "Bare agent must display the saved main conversation before exit; got {visible:?}"
         );
         assert!(
-            !older || visible.contains("user> Earlier question\nagent> Earlier answer"),
+            !older || visible.contains("user> Earlier question\nBeep Boop> Earlier answer"),
             "{visible}"
         );
     }

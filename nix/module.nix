@@ -6,8 +6,9 @@
 }: let
   cfg = config.services.agent;
 in {
+  # Retain the option namespace and launchd identity for existing installations.
   options.services.agent = {
-    enable = lib.mkEnableOption "the agent service";
+    enable = lib.mkEnableOption "the Beep Boop service";
     role = lib.mkOption {
       type = lib.types.enum ["coordinator" "worker"];
       default = "coordinator";
@@ -16,7 +17,7 @@ in {
     package = lib.mkOption {
       type = lib.types.package;
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-      description = "Agent CLI and its pinned Pi runtime.";
+      description = "Beep Boop CLI and its pinned Pi runtime.";
     };
     configFile = lib.mkOption {
       type = lib.types.str;
@@ -55,7 +56,7 @@ in {
     environment.systemPackages = [cfg.package];
     launchd.user.agents.agent = {
       serviceConfig = {
-        ProgramArguments = ["${cfg.package}/bin/agent" "--config" cfg.configFile]
+        ProgramArguments = ["${cfg.package}/bin/beep-boop" "--config" cfg.configFile]
           ++ lib.optionals (cfg.stateDirectory != null) ["--state-dir" cfg.stateDirectory]
           ++ [(if cfg.role == "coordinator" then "serve" else "maintain")]
           ++ lib.optionals (cfg.role == "coordinator") ["--coordinator-only"]

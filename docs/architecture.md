@@ -44,7 +44,7 @@ live delivery and history replay.
 ```text
   phone CLI in Rex       CLI / Rex terminal on any host
              \                       /
-              +----- agent chat ----+
+              +----- beep-boop chat ----+
                           |
                 coordinator (macOS or Linux)
                 + main conversation
@@ -80,13 +80,13 @@ The supervisor reads Pi events while command writes are pending. One frame owns
 its write offset, and the bounded command queue provides backpressure. Shutdown
 has an independent signal so a saturated pipe cannot prevent cleanup.
 
-Workers connect to the coordinator and announce their actual Rex host ID,
-name, executable and local launch paths. Agent reuses Rex's shared host
-inventory when available; each node can announce its own native Rex metadata
-even when that inventory is empty. User settings contain one coordinator
-address, not a duplicated list of machines. `agent nodes` exposes the registry
-and current connections. Saved metadata survives a restart; online status
-requires a live connection.
+Workers connect to the coordinator and announce their actual Rex host ID, name,
+executable and local launch paths. Beep Boop reuses Rex's shared host inventory when
+available; each node can announce its own native Rex metadata even when that
+inventory is empty. User settings contain one coordinator address, not a
+duplicated list of machines. `beep-boop nodes` exposes the registry and current
+connections. Saved metadata survives a restart; online status requires a live
+connection.
 
 The coordinator runs unqualified main/triage effects locally. Work targeted at
 a registered machine travels down that worker's existing connection and uses
@@ -243,7 +243,7 @@ source journal retains one claimed batch across restart and retry.
 Messages reads use Rex Server's existing macOS permission identity. A short
 action starts a headless Rust helper; subsequent calls collect bounded chunks.
 The helper owns the read deadline and process group cleanup. Rex retains one
-bounded job slot, without creating sessions or terminals. Agent upgrades pass
+bounded job slot, without creating sessions or terminals. Beep Boop upgrades pass
 the current helper path to the same actions and require no new disk-access
 grant.
 
@@ -306,7 +306,7 @@ ready only after submodules initialize.
 Scheduled jobs and source polling run once on the coordinator. Each worker
 requests collection for its own host during maintenance. The main agent's
 `collect_worktrees` tool checks all recorded resource hosts; the CLI's
-`agent resources collect` checks only the invoking host. All use the same
+`beep-boop resources collect` checks only the invoking host. All use the same
 collector and ownership records.
 
 Before collection, all parent/child consumers must be finished. The owning

@@ -1,12 +1,15 @@
 [package]
-name = "agent-cli"
+name = "beep-boop"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-default-run = "agent"
+default-run = "beep-boop"
+
+[lib]
+name = "agent_cli"
 
 [[bin]]
-name = "agent"
+name = "beep-boop"
 path = "src/main.rs"
 
 [[bin]]

@@ -6,7 +6,7 @@ local chunk_size = 64 * 1024
 
 rex.action{
   name = "agent_messages_start",
-  title = "Agent: start a Messages read",
+  title = "Beep Boop: start a Messages read",
   args = { id = "string", program = "string", argv = "array", path = "string", timeout_seconds = "integer" },
   run = function(_, args)
     if job and job.cancelled and not job.handle:running() then job = nil end
@@ -44,7 +44,7 @@ rex.action{
 
 rex.action{
   name = "agent_messages_read",
-  title = "Agent: collect a Messages read",
+  title = "Beep Boop: collect a Messages read",
   args = { id = "string", offset = "integer" },
   run = function(_, args)
     if not job or job.id ~= args.id then return { state = "missing" } end
@@ -75,7 +75,7 @@ rex.action{
 
 rex.action{
   name = "agent_messages_cancel",
-  title = "Agent: stop a Messages read",
+  title = "Beep Boop: stop a Messages read",
   args = { id = "string" },
   run = function(_, args)
     if job and job.id == args.id then

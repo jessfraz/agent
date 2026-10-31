@@ -15,10 +15,10 @@ final class AgentUITests: XCTestCase {
     if smallText {
       app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryXS"]
     }
-    // XCTest removes this monitor at test completion. Handle only Agent's
+    // XCTest removes this monitor at test completion. Handle only Beep Boop's
     // native permission prompt, leaving unexpected system alerts as failures.
-    addUIInterruptionMonitor(withDescription: "Agent notification permission") { alert in
-      guard alert.label == "“Agent” Would Like to Send You Notifications",
+    addUIInterruptionMonitor(withDescription: "Beep Boop notification permission") { alert in
+      guard alert.label == "“Beep Boop” Would Like to Send You Notifications",
         alert.buttons["Allow"].exists
       else { return false }
       let receipt = XCTAttachment(screenshot: alert.screenshot())
@@ -230,8 +230,12 @@ final class AgentUITests: XCTestCase {
       context.interpolationQuality = .none
       context.draw(sample, in: CGRect(x: 0, y: 0, width: side, height: side))
       let values = bytes.bindMemory(to: UInt8.self)
-      let brightness = stride(from: 0, to: values.count, by: 4).map { offset in
-        Double(Int(values[offset]) + Int(values[offset + 1]) + Int(values[offset + 2])) / 765
+      let brightness = stride(from: 0, to: values.count, by: 4).map { offset -> Double in
+        let red = Int(values[offset])
+        let green = Int(values[offset + 1])
+        let blue = Int(values[offset + 2])
+        let total = red + green + blue
+        return Double(total) / 765
       }.sorted()
       return brightness[brightness.count / 2]
     }

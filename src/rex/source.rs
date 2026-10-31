@@ -77,7 +77,9 @@ async fn action<T: Serialize, R: serde::de::DeserializeOwned>(
         ])
         .await
         .map_err(crate::rex::read_failure)
-        .context("Messages Rex actions are unavailable; run agent rex install on this machine")?;
+        .context(
+            "Messages Rex actions are unavailable; run beep-boop rex install on this machine",
+        )?;
     serde_json::from_slice(&bytes).context("Rex returned an invalid Messages read result")
 }
 
@@ -143,7 +145,7 @@ pub(crate) async fn execute(
 async fn execute_request(request: Request) -> Result<HostResult> {
     request.validate()?;
     let program = config::program()?;
-    let program = program.to_str().context("Agent path is not UTF-8")?;
+    let program = program.to_str().context("Beep Boop path is not UTF-8")?;
     let path = std::env::var("PATH").context("Source command PATH is unavailable")?;
     read_with(&RexClient::new(None), program, &path, &request).await
 }

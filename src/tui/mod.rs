@@ -384,8 +384,8 @@ impl Role {
     fn label(self) -> &'static str {
         match self {
             Self::User => "You",
-            Self::Agent => "Agent",
-            Self::PartialAnswer => "Agent · partial",
+            Self::Agent => "Beep Boop",
+            Self::PartialAnswer => "Beep Boop · partial",
             Self::Commentary => "Update",
             Self::Thinking => "Thinking",
             Self::Tool => "Tool",
@@ -1268,7 +1268,7 @@ impl State {
                 self.compacting = false;
                 let recovery = if matches!(&code, ErrorCode::AuthenticationRequired | ErrorCode::AuthenticationFailed) {
                     self.info.model.as_ref().map_or_else(String::new, |model| {
-                        if model.provider == ModelProvider::OpenAiCodex { "\n\nRun `agent login` to reconnect ChatGPT.".into() }
+                        if model.provider == ModelProvider::OpenAiCodex { "\n\nRun `beep-boop login` to reconnect ChatGPT.".into() }
                         else { format!("\n\nCheck the configured authentication for `{}`.", model.provider.as_str()) }
                     })
                 } else { String::new() };
@@ -2247,7 +2247,7 @@ fn editor() -> TextArea<'static> {
     editor.set_wrap_mode(WrapMode::WordOrGlyph);
     editor.set_cursor_line_style(Style::default());
     editor.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
-    editor.set_placeholder_text("Ask Agent to do anything");
+    editor.set_placeholder_text("Ask Beep Boop to do anything");
     editor.set_placeholder_style(Style::default().add_modifier(Modifier::DIM));
     editor
 }
@@ -2699,7 +2699,7 @@ mod tests {
         );
         assert!(view.info.model.is_none());
         assert!(
-            !text.contains("Model:") && !text.contains("agent login"),
+            !text.contains("Model:") && !text.contains("beep-boop login"),
             "{text}"
         );
     }
@@ -3461,7 +3461,7 @@ mod tests {
     #[test]
     fn authentication_failures_offer_the_recovery_for_the_selected_provider() {
         for (provider, recovery) in [
-            (crate::models::ModelProvider::OpenAiCodex, "agent login"),
+            (crate::models::ModelProvider::OpenAiCodex, "beep-boop login"),
             (
                 crate::models::ModelProvider::Anthropic,
                 "Check the configured authentication for anthropic",
@@ -4929,7 +4929,7 @@ mod tests {
         assert_eq!(buffer[(0, u16::try_from(tool).unwrap())].fg, Color::Green);
         let composer = rows
             .iter()
-            .position(|line| line.contains("Ask Agent to do anything"))
+            .position(|line| line.contains("Ask Beep Boop to do anything"))
             .unwrap();
         assert_eq!(buffer[(0, u16::try_from(composer).unwrap())].symbol(), "›");
         assert_eq!(
@@ -4951,7 +4951,7 @@ mod tests {
         assert!(!buffer[(2, 30)].modifier.contains(Modifier::DIM));
         assert!(!rows.iter().any(|line| line.contains("Activity ·")
             || line.trim() == "You"
-            || line.trim() == "Agent"));
+            || line.trim() == "Beep Boop"));
         terminal.draw(|frame| reopened.draw(frame)).unwrap();
         assert_eq!(
             terminal.backend().buffer(),

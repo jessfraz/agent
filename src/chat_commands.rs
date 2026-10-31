@@ -126,7 +126,7 @@ pub enum ChatCommand {
     Status,
     /// Show machines, capacity and observed load.
     Machines,
-    /// List Agent-owned worktrees across registered machines.
+    /// List Beep Boop-owned worktrees across registered machines.
     Worktrees,
     /// Show scheduled jobs, or inspect one job by its stable ID.
     Jobs {

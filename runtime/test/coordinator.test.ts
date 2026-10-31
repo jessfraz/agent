@@ -14,7 +14,7 @@ import type { ModelQueue, ModelStep } from "./fixtures/coordinator-runtime.js";
 
 test("real CLI, coordinator and worker retain main history across an offline laptop and route restored work", { timeout: 60_000 }, async (t) => {
   const directory = await realpath(await mkdtemp("/tmp/agent-e2e-"));
-  const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../target/debug/agent", import.meta.url));
+  const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../target/debug/beep-boop", import.meta.url));
   const terminalFixture = fileURLToPath(new URL("../../../target/debug/examples/terminal-fixture", import.meta.url));
   const runtime = fileURLToPath(new URL("./fixtures/coordinator-runtime.js", import.meta.url));
   const coordinator = "11111111-1111-4111-8111-111111111111", laptop = "22222222-2222-4222-8222-222222222222";
@@ -205,7 +205,7 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     assert.notEqual(repair.id, old.id); assert.equal(repair.worker.binding.host_id, laptop);
     assert.equal(repair.worker.binding.session_id, original.binding.session_id); assert.notEqual(repair.worker.binding.window_id, original.binding.window_id);
     const repairLaunch = sessions(join(homes[1]!, "rex.json")).find((window) => window.block_id === repairBinding.block_id); assert.ok(repairLaunch);
-    assert.equal(repairLaunch.label, "Agent feedback");
+    assert.equal(repairLaunch.label, "Beep Boop feedback");
     await script("fixture-feedback-first", [{ text: "The feedback repair is verified and remains in the existing folder." }]);
     const repairActor = start(1, repairLaunch.command.slice(1), undefined,
       { REX_SESSION: repairLaunch.session_id, REX_BLOCK: repairLaunch.block_id }, true);
@@ -301,7 +301,7 @@ test("real CLI, coordinator and worker retain main history across an offline lap
       await script(input, [held(path), { tool: "delegate_task", args: { task_id: old.id, input: workerInput } }, { text: answer }]);
       await script(workerInput, [{ text: workerAnswer }]);
       const terminal = start(host, [], undefined, {}, false, true);
-      await until(async () => terminal.output().includes("Ask Agent to do anything"), "The native main TUI did not start");
+      await until(async () => terminal.output().includes("Ask Beep Boop to do anything"), "The native main TUI did not start");
       terminal.child.stdin.write(input + "\r");
       await until(async () => stat(path + ".started").then(() => true, () => false), "The real coordinator action did not start");
       terminal.child.stdin.write(key);
@@ -356,7 +356,7 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     const stopPath = join(directory, "explicit-stop"), stopAnswer = "An explicitly stopped action must not finish.";
     await script("fixture-explicit-stop", [held(stopPath), { text: stopAnswer }]);
     const detachedStop = start(0, [], undefined, {}, false, true);
-    await until(async () => detachedStop.output().includes("Ask Agent to do anything"));
+    await until(async () => detachedStop.output().includes("Ask Beep Boop to do anything"));
     detachedStop.child.stdin.write("fixture-explicit-stop\r");
     await until(async () => stat(stopPath + ".started").then(() => true, () => false));
     detachedStop.child.stdin.write("/exit\r"); assert.equal(await detachedStop.exited, 0, detachedStop.errors());
@@ -421,7 +421,7 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     const plainNotice = "A useful plaintext notice appears exactly once.", plainAnswer = "The plaintext chief handled the request.";
     await script("fixture-plain-notice", [{ tool: "notify", args: { keys: [], text: plainNotice } }, { text: plainAnswer }]);
     const plain = start(0, ["--no-tui"], undefined, {}, false, true, process.env.AGENT_TEST_PLAIN_BINARY ?? binary);
-    await until(async () => plain.output().includes("agent> "));
+    await until(async () => plain.output().includes("Beep Boop> "));
     plain.child.stdin.write("fixture-plain-notice\n");
     await until(async () => plain.output().includes(plainAnswer));
     plain.child.stdin.write("/exit\n"); assert.equal(await plain.exited, 0, plain.errors());

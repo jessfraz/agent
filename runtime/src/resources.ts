@@ -156,7 +156,7 @@ export function createResourceTools(resources: ResourceStore, tasks: TaskStore, 
       const visible = owner === undefined ? all : all.filter((resource) => resource.task_id === owner.task.id);
       return { output: [{ type: "text", text: JSON.stringify(visible) }] };
     } });
-  const collect = defineTool({ name: "collect_worktrees", description: "Run the background collector for eligible Agent-owned worktrees on their recorded hosts. Active, dirty, unmerged or uncertain work is retained. Returns inventory and any collection gaps.",
+  const collect = defineTool({ name: "collect_worktrees", description: "Run the background collector for eligible Beep Boop-owned worktrees on their recorded hosts. Active, dirty, unmerged or uncertain work is retained. Returns inventory and any collection gaps.",
     replay: "safe", parameters: Type.Object({}), async execute(_args, api) {
       const execution = executions.get(api.conversationId.toString());
       const hosts = [...new Set((await resources.list()).filter((resource) => resource.state.state !== "removed" && resource.state.state !== "partial").map((resource) => resource.host_id))];

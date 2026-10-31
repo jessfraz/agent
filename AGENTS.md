@@ -1,4 +1,4 @@
-# Working on agent
+# Working on Beep Boop
 
 Keep the application small and use upstream Pi for model and conversation
 machinery. Rust owns application types; generate TypeScript protocol bindings.

@@ -33,7 +33,7 @@ user_data_dir = "/example/chrome-data"
 "#;
 
 fn apply(path: &Path, settings: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_agent"))
+    Command::new(env!("CARGO_BIN_EXE_beep-boop"))
         .arg("--config")
         .arg(path)
         .args(["--json", "config", "apply"])

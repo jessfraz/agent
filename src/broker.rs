@@ -197,7 +197,7 @@ impl Broker {
             return HostResult::Browser {
                 response: crate::browser::BrowserResponse::Failed {
                     session_id: request.session_id,
-                    message: "Update Agent on this host before using its Chrome browser tools."
+                    message: "Update Beep Boop on this host before using its Chrome browser tools."
                         .into(),
                 },
             };

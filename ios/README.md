@@ -1,8 +1,29 @@
-# Native coordinator client
+# Beep Boop for iPhone
 
-A SwiftUI client for the coordinator's main conversation. The coordinator owns
-Pi, history, models, tools and Rex workers. The app connects through the existing
-authenticated NDJSON-over-Tailscale service.
+A native SwiftUI client for the coordinator's main conversation. The coordinator
+owns Pi, history, models, tools and Rex workers. The app connects through the
+existing authenticated NDJSON-over-Tailscale service.
+
+## Naming and identity
+
+Beep Boop is the in-app and iPhone Home Screen name. `App.xcconfig` sets
+`CFBundleDisplayName`, which Apple defines as the user-visible name, separately
+from `CFBundleIdentifier`, which identifies the app and participates in signing
+and preferences. The existing bundle ID, signing settings, defaults and data
+paths stay unchanged. `Agent.xcodeproj`, the `Agent` target and scheme,
+`Agent.app`, and the Swift package/module names remain build internals; the
+commands below intentionally keep those names.
+
+App Store Connect's app name is separate metadata on the existing app record.
+Changing the native display name does not rename that record or verify the name
+shown in TestFlight. Store-name changes require authorized App Store Connect
+access and verification of the existing record, without changing its bundle ID.
+
+Apple references:
+
+- [Home Screen display name](https://developer.apple.com/documentation/bundleresources/information-property-list/cfbundledisplayname)
+- [Bundle identity](https://developer.apple.com/documentation/bundleresources/information-property-list/cfbundleidentifier)
+- [App Store Connect app name and bundle ID](https://developer.apple.com/help/app-store-connect/reference/app-information/app-information/)
 
 ## Build and connect
 
@@ -11,8 +32,8 @@ authenticated NDJSON-over-Tailscale service.
    Existing coordinator setup is described in [setup](../docs/setup.md).
 2. Open `Agent.xcodeproj` in full Xcode with an iOS 18-or-newer SDK. The `Agent`
    scheme uses this directory's local Swift package without dependencies. For a
-   device build, choose a development team and use a bundle ID registered to it.
-   Simulator builds do not require signing.
+   signed device build, select the existing app's authorized development team
+   and retain its registered bundle ID. Simulator builds do not require signing.
 3. Connect Tailscale on the device. The coordinator must authorize its peer
    through the existing same-user, pinned-user or pinned-node policy. A pinned
    human account admits its authorized, untagged devices automatically.
@@ -28,8 +49,8 @@ authenticated NDJSON-over-Tailscale service.
 ## Install on an iPhone
 
 Install Apple's TestFlight app, accept the invitation to the private internal
-group, install Agent, and enable **Automatic Updates**. Connect Tailscale before
-opening Agent. Internal testing requires no public App Store release; builds
+group, install the app, and enable **Automatic Updates**. Connect Tailscale before
+opening Beep Boop. Internal testing requires no public App Store release; builds
 expire after 90 days.
 
 The [Xcode Cloud workflow](ci_scripts/README.md) watches `main`, requires native

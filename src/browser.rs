@@ -186,7 +186,7 @@ impl Process {
         let helper = runtime.with_file_name("browser-host.js");
         ensure!(
             helper.is_file(),
-            "Browser runtime is missing; update Agent on this host"
+            "Browser runtime is missing; update Beep Boop on this host"
         );
         let mut command = if let Some((program, arguments)) = config
             .credential_command
@@ -330,7 +330,7 @@ impl BrowserHost {
             }
             let Some(config) = &self.config else {
                 return Ok(BrowserResponse::Failed { session_id: request.session_id,
-                    message: "Chrome is not configured on this host. Add a [browser] section to its private Agent configuration and configure extension pairing or a native debugging port for its existing Chrome.".into() });
+                    message: "Chrome is not configured on this host. Add a [browser] section to its private Beep Boop configuration and configure extension pairing or a native debugging port for its existing Chrome.".into() });
             };
             let runtime = self
                 .runtime
@@ -340,7 +340,7 @@ impl BrowserHost {
                 Ok(process) => process,
                 Err(_) => return Ok(BrowserResponse::Failed {
                     session_id: request.session_id,
-                    message: "The browser runtime could not start. Build or update Agent on this host before connecting Chrome.".into(),
+                    message: "The browser runtime could not start. Build or update Beep Boop on this host before connecting Chrome.".into(),
                 }),
             };
             sessions.insert(request.owner_id.clone(), Arc::new(Mutex::new(process)));

@@ -99,7 +99,7 @@ impl ResourceRecord {
 /// Shared inventory presentation for CLI, terminal chat and native clients.
 pub fn format_inventory(resources: &[ResourceRecord]) -> String {
     if resources.is_empty() {
-        return "No Agent-owned worktrees.".into();
+        return "No Beep Boop-owned worktrees.".into();
     }
     let mut ordered: Vec<_> = resources.iter().collect();
     ordered.sort_by(|left, right| {

@@ -57,8 +57,8 @@ boundary, without alerting for old history.
 
 Turn alerts off in **Connection → Notifications**. That choice and a denied
 permission remain off across launches, without repeated permission prompts.
-To enable alerts after denying permission, allow Agent notifications in iPhone
-Settings and turn **Main-chat updates** back on in Agent.
+To enable alerts after denying permission, allow Beep Boop notifications in iPhone
+Settings and turn **Main-chat updates** back on in Beep Boop.
 
 Each installation/message pair has one durable delivery identity. APNs
 acceptance is not proof that the phone displayed an alert. A lost provider

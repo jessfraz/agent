@@ -81,7 +81,7 @@ impl Fixture {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agent"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_beep-boop"));
         let runtime = std::env::var_os("AGENT_RUNTIME_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| {

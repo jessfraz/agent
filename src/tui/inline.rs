@@ -276,7 +276,7 @@ impl State {
                     Line::default(),
                     Line::from(vec![
                         Span::raw("  >_ "),
-                        Span::styled("Agent", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::styled("Beep Boop", Style::default().add_modifier(Modifier::BOLD)),
                         Span::styled(
                             format!(
                                 " (v{}) · {}",
@@ -1697,17 +1697,20 @@ mod tests {
         state.working(true);
         terminal.draw(|frame| state.draw(frame)).unwrap();
         let rendered = output(&terminal);
-        let banner = rendered.find("Agent (v0.1.0) · Main agent").unwrap();
+        let banner = rendered.find("Beep Boop (v0.1.0) · Main agent").unwrap();
         let saved = rendered.find("Saved question").unwrap();
         let answer = rendered.find("Saved answer").unwrap();
         let pending = rendered.find("Continue this task").unwrap();
-        let composer = rendered.find("Ask Agent to do anything").unwrap();
+        let composer = rendered.find("Ask Beep Boop to do anything").unwrap();
         assert!(banner < saved, "{rendered}");
         assert!(
             saved < answer && answer < pending && pending < composer,
             "{rendered}"
         );
-        assert_eq!(rendered.matches("Agent (v0.1.0) · Main agent").count(), 1);
+        assert_eq!(
+            rendered.matches("Beep Boop (v0.1.0) · Main agent").count(),
+            1
+        );
         assert_eq!(rendered.matches("Working").count(), 1, "{rendered}");
     }
 
@@ -1743,7 +1746,7 @@ mod tests {
                 .find(|line| !line.trim().is_empty())
                 .unwrap()
                 .trim_start()
-                .starts_with(">_ Agent"),
+                .starts_with(">_ Beep Boop"),
             "{visible}"
         );
         assert!(visible.contains("Saved answer"));
@@ -1755,10 +1758,10 @@ mod tests {
         let rendered = output(&terminal);
         assert!(
             rendered.find("Previous command").unwrap()
-                < rendered.find("Agent (v0.1.0) · Main agent").unwrap()
+                < rendered.find("Beep Boop (v0.1.0) · Main agent").unwrap()
         );
         assert!(
-            rendered.find("Agent (v0.1.0) · Main agent").unwrap()
+            rendered.find("Beep Boop (v0.1.0) · Main agent").unwrap()
                 < rendered.find("Saved answer").unwrap()
         );
     }
@@ -1813,7 +1816,7 @@ mod tests {
         state.flush_output(&mut terminal, false).unwrap();
         let rendered = output(&terminal);
         assert!(
-            rendered.find("Agent (v0.1.0) · Main agent").unwrap()
+            rendered.find("Beep Boop (v0.1.0) · Main agent").unwrap()
                 < rendered.find("Saved question").unwrap()
         );
         assert!(
@@ -1840,7 +1843,7 @@ mod tests {
         assert!(loading.contains("Saved question"));
         state.event(RuntimeEventKind::Done);
         let restored = draw_inline(&mut state, &mut terminal);
-        assert!(restored.contains("Agent (v0.1.0) · Main agent"));
+        assert!(restored.contains("Beep Boop (v0.1.0) · Main agent"));
         assert!(restored.contains("Saved question") && restored.contains("Saved answer"));
         let saved = output(&terminal);
         for _ in 0..3 {

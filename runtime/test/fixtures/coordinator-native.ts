@@ -63,7 +63,7 @@ if (process.env.AGENT_TEST_NATIVE === "ssh") {
   else if (method === "session.create" || method === "session.new_window") {
     const creating = method === "session.create";
     const gate = process.env.AGENT_TEST_FEEDBACK_GATE;
-    if (!creating && input.window_label === "Agent feedback" && gate !== undefined && existsSync(gate)) {
+    if (!creating && input.window_label === "Beep Boop feedback" && gate !== undefined && existsSync(gate)) {
       writeFileSync(gate + ".entered", "waiting");
       while (existsSync(gate)) await setTimeout(10);
     }
