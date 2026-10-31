@@ -137,12 +137,18 @@ private func withLocalPeer(_ body: @Sendable (LineConnection, NWConnection) asyn
   }
   for try await _ in ready.stream { break }
   let port = try #require(listener.port)
-  let client = LineConnection(
-    connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+  let connection = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)
+  let client = LineConnection(connection: connection)
+  defer { connection.cancel() }
   for await server in accepted.stream {
     server.start(queue: .global())
     do {
-      try await body(client, server)
+      try await withTaskCancellationHandler {
+        try await body(client, server)
+      } onCancel: {
+        connection.cancel()
+        server.cancel()
+      }
       await client.close()
       server.cancel()
     } catch {
@@ -174,25 +180,115 @@ private func withLocalPeer(_ body: @Sendable (LineConnection, NWConnection) asyn
   }
 }
 
-@Test(.timeLimit(.minutes(1))) func realNetworkTransportRejectsOversizedAndIncompleteFrames()
-  async throws
-{
+@Test(.timeLimit(.minutes(1)))
+func realNetworkTransportRejectsOversizedFramesAndClosesTheTransport() async throws {
   try await withLocalPeer { client, server in
-    let reading = Task { try await client.next() }
-    try await send(Data(repeating: 65, count: LineConnection.maximumFrameBytes + 1), on: server)
+    // A peer may still be writing when the frame limit is reached. Awaiting
+    // that write before observing rejection can deadlock on TCP backpressure.
+    let writing = Task {
+      try await send(Data(repeating: 65, count: LineConnection.maximumFrameBytes * 2), on: server)
+    }
+    defer { server.cancel() }
     do {
-      _ = try await reading.value
+      _ = try await client.next()
       Issue.record("Oversized frame accepted")
     } catch let error as ConnectionError { #expect(error == .frameTooLarge) }
+    do {
+      try await client.send(.interrupt)
+      Issue.record("A rejected frame left its connection writable")
+    } catch let error as ConnectionError { #expect(error == .closed) }
+    await client.close()
+    server.cancel()
+    // Closing the rejected transport may interrupt the peer's pending write.
+    _ = try? await writing.value
   }
+}
+
+@Test(.timeLimit(.minutes(1)))
+func realNetworkTransportAcceptsAnExactLimitFrameAndTheFollowingFrame() async throws {
   try await withLocalPeer { client, server in
-    try await send(Data("{\"type\":".utf8), on: server)
-    server.send(
-      content: nil, contentContext: .finalMessage, isComplete: true, completion: .idempotent)
+    let encoder = JSONEncoder()
+    let overhead = try encoder.encode(NativeEvent.notice(.init(text: ""))).count
+    let text = String(repeating: "x", count: LineConnection.maximumFrameBytes - overhead)
+    var bytes = try encoder.encode(NativeEvent.notice(.init(text: text)))
+    try #require(bytes.count == LineConnection.maximumFrameBytes)
+    bytes.append(10)
+    bytes.append(try encoder.encode(NativeEvent.idle))
+    bytes.append(10)
+    let frames = bytes
+    let writing = Task { try await send(frames, on: server) }
+    defer { server.cancel() }
+    guard case .notice(let notice) = try await client.next() else {
+      Issue.record("Expected the complete boundary-sized notice")
+      return
+    }
+    #expect(SHA256.hash(data: Data(notice.text.utf8)) == SHA256.hash(data: Data(text.utf8)))
+    #expect(try await client.next() == .idle)
+    try await writing.value
+  }
+}
+
+@Test(.timeLimit(.minutes(1)))
+func realNetworkTransportDrainsBufferedFramesBeforeRejectingIncompleteEOF() async throws {
+  try await withLocalPeer { client, server in
+    let events = [NativeEvent.notice(.init(text: "First 🦀")), .idle]
+    var data = Data()
+    for event in events {
+      data.append(try JSONEncoder().encode(event))
+      data.append(10)
+    }
+    data.append(contentsOf: "{\"type\":".utf8)
+    try await send(data, on: server)
+    try await withCheckedThrowingContinuation {
+      (continuation: CheckedContinuation<Void, any Error>) in
+      server.send(
+        content: nil, contentContext: .finalMessage, isComplete: true,
+        completion: .contentProcessed { error in
+          if let error { continuation.resume(throwing: error) } else { continuation.resume() }
+        })
+    }
+    for event in events { #expect(try await client.next() == event) }
     do {
       _ = try await client.next()
       Issue.record("Incomplete frame accepted")
     } catch let error as ConnectionError { #expect(error == .incompleteFrame) }
+    do {
+      try await client.send(.interrupt)
+      Issue.record("Incomplete EOF left its connection writable")
+    } catch let error as ConnectionError { #expect(error == .closed) }
+  }
+}
+
+@Test(.timeLimit(.minutes(1)))
+func realNetworkTransportClosesEvenWhenTheReaderWasAlreadyCancelled() async throws {
+  try await withLocalPeer { client, _ in
+    let reading = Task {
+      withUnsafeCurrentTask { $0?.cancel() }
+      return try await client.next()
+    }
+    do {
+      _ = try await reading.value
+      Issue.record("An already-cancelled reader returned a message")
+    } catch is CancellationError {}
+    do {
+      try await client.send(.interrupt)
+      Issue.record("Cancelling before receive left its connection writable")
+    } catch let error as ConnectionError { #expect(error == .closed) }
+  }
+}
+
+@Test(.timeLimit(.minutes(1)))
+func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
+  try await withLocalPeer { client, server in
+    try await send(Data("{}\n".utf8), on: server)
+    do {
+      _ = try await client.next()
+      Issue.record("Invalid event accepted")
+    } catch is DecodingError {}
+    do {
+      try await client.send(.interrupt)
+      Issue.record("An invalid event left its connection writable")
+    } catch let error as ConnectionError { #expect(error == .closed) }
   }
 }
 

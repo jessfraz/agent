@@ -106,7 +106,9 @@ public enum ConnectionError: Error, LocalizedError, Sendable {
 actor LineConnection {
   private let connection: NWConnection
   private var buffer = Data()
-  private var ended = false
+  private var scannedBytes = 0
+  private enum ReadState { case open, eof, closed }
+  private var readState = ReadState.open
   static let maximumFrameBytes = 4 * 1024 * 1024
 
   init(address: CoordinatorAddress) async throws {
@@ -160,61 +162,91 @@ actor LineConnection {
     throw ConnectionError.vpnUnavailable
   }
   func close() {
-    ended = true
+    readState = .closed
+    buffer.removeAll()
+    scannedBytes = 0
     connection.cancel()
   }
 
   func send(_ request: NativeRequest) async throws {
+    guard readState == .open else { throw ConnectionError.closed }
     let command = NativeCommand.native(.init(request: request))
     var bytes = try JSONEncoder().encode(command)
     guard bytes.count <= Self.maximumFrameBytes else { throw ConnectionError.frameTooLarge }
     bytes.append(10)
     let connection = connection
-    try await withTaskCancellationHandler {
-      try Task.checkCancellation()
-      try await withCheckedThrowingContinuation {
-        (continuation: CheckedContinuation<Void, any Error>) in
-        connection.send(
-          content: bytes,
-          completion: .contentProcessed { error in
-            if let error { continuation.resume(throwing: error) } else { continuation.resume() }
-          })
-      }
-    } onCancel: {
-      connection.cancel()
-    }
-  }
-
-  func next() async throws -> NativeEvent {
-    while true {
-      try Task.checkCancellation()
-      if let newline = buffer.firstIndex(of: 10) {
-        guard newline <= Self.maximumFrameBytes else { throw ConnectionError.frameTooLarge }
-        let frame = buffer.prefix(upTo: newline)
-        let event = try JSONDecoder().decode(NativeEvent.self, from: frame)
-        buffer.removeSubrange(...newline)
-        return event
-      }
-      guard buffer.count <= Self.maximumFrameBytes else { throw ConnectionError.frameTooLarge }
-      if ended { throw buffer.isEmpty ? ConnectionError.closed : ConnectionError.incompleteFrame }
-      let connection = connection
-      let (data, complete) = try await withTaskCancellationHandler {
+    do {
+      try await withTaskCancellationHandler {
+        try Task.checkCancellation()
         try await withCheckedThrowingContinuation {
-          (continuation: CheckedContinuation<(Data, Bool), any Error>) in
-          connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) {
-            data, _, complete, error in
-            if let error {
-              continuation.resume(throwing: error)
-            } else {
-              continuation.resume(returning: (data ?? Data(), complete))
-            }
-          }
+          (continuation: CheckedContinuation<Void, any Error>) in
+          connection.send(
+            content: bytes,
+            completion: .contentProcessed { error in
+              if let error { continuation.resume(throwing: error) } else { continuation.resume() }
+            })
         }
       } onCancel: {
         connection.cancel()
       }
+    } catch {
+      close()
+      throw error
+    }
+  }
+
+  func next() async throws -> NativeEvent {
+    let connection = connection
+    do {
+      return try await withTaskCancellationHandler {
+        try await receiveFrame()
+      } onCancel: {
+        connection.cancel()
+      }
+    } catch {
+      // A rejected or interrupted read must release the peer's pending write,
+      // even when the owner has not resumed to observe this error yet.
+      close()
+      throw error
+    }
+  }
+
+  private func receiveFrame() async throws -> NativeEvent {
+    while true {
+      try Task.checkCancellation()
+      guard readState != .closed else { throw ConnectionError.closed }
+      // Fragmented frames are scanned once, rather than rescanning every byte
+      // already received while the peer continues writing.
+      let start = buffer.index(buffer.startIndex, offsetBy: scannedBytes)
+      if let newline = buffer[start...].firstIndex(of: 10) {
+        guard newline - buffer.startIndex <= Self.maximumFrameBytes else {
+          throw ConnectionError.frameTooLarge
+        }
+        let frame = buffer.prefix(upTo: newline)
+        let event = try JSONDecoder().decode(NativeEvent.self, from: frame)
+        buffer.removeSubrange(...newline)
+        scannedBytes = 0
+        return event
+      }
+      scannedBytes = buffer.count
+      guard buffer.count <= Self.maximumFrameBytes else { throw ConnectionError.frameTooLarge }
+      if readState == .eof {
+        throw buffer.isEmpty ? ConnectionError.closed : ConnectionError.incompleteFrame
+      }
+      let (data, complete) = try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<(Data, Bool), any Error>) in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) {
+          data, _, complete, error in
+          if let error {
+            continuation.resume(throwing: error)
+          } else {
+            continuation.resume(returning: (data ?? Data(), complete))
+          }
+        }
+      }
+      guard readState != .closed else { throw ConnectionError.closed }
       buffer.append(data)
-      ended = complete
+      if complete { readState = .eof }
     }
   }
 }
