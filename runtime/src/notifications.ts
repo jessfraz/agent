@@ -5,6 +5,7 @@ import { createHash, createPrivateKey, randomUUID, sign, type KeyObject } from "
 import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { connect, type ClientHttp2Session } from "node:http2";
+import { stripVTControlCharacters } from "node:util";
 import type { ApnsConfig } from "./generated/ApnsConfig.js";
 import type { NotificationRequest } from "./generated/NotificationRequest.js";
 import type { NotificationStatus } from "./generated/NotificationStatus.js";
@@ -30,6 +31,27 @@ function eligible(entry: EntryRecord): boolean {
   if (isUserNotice(entry)) return transcript(entry).some((message) => message.role === "notice" && message.text.trim().length > 0);
   return AssistantEntry.is(entry) && (entry.model?.some((message) => message.role === "assistant" && message.stopReason === "stop" &&
     message.content.some((part) => part.type === "text" && part.text.trim().length > 0)) ?? false);
+}
+function nativeEntryId(value: unknown): value is EntryId { return typeof value === "number" && Number.isSafeInteger(value) && value > 0; }
+/** Preview the same visible reply as history, never reasoning, tool details or
+ * notice provenance. A short Unicode prefix leaves ample room in APNs' 4 KiB payload. */
+function preview(entry: EntryRecord): string | undefined {
+  if (!eligible(entry)) return;
+  const text = stripVTControlCharacters(transcript(entry).filter((message) => message.role === "final" || message.role === "notice")
+    .map((message) => message.text).join("\n"))
+    .replace(/^[ \t]{0,3}(?:`{3,}|~{3,}).*$/gm, "")
+    .replace(/^[ \t]{0,3}(?:#{1,6}\s+|>\s*|[-+*]\s+|\d+[.)]\s+)/gm, "")
+    .replace(/!?\[([^\]\n]*)\]\([^\n)]*\)/g, "$1")
+    .replace(/`([^`\n]+)`/g, "$1")
+    .replace(/(?<!\w)(\*{1,3}|_{1,3}|~~)(?=\S)(.*?\S)\1(?!\w)/g, "$2")
+    .replace(/[\p{Cc}\s]+/gu, " ").trim();
+  if (text.length === 0) return;
+  let body = "", length = 0;
+  for (const character of text) {
+    if (length === 320) return body.trimEnd() + "…";
+    body += character; length++;
+  }
+  return body;
 }
 async function privateKey(path: string): Promise<KeyObject> {
   if (!path.startsWith("/") || (await realpath(path)).startsWith("/nix/store/")) throw new NotificationError("APNs needs a private key file outside the Nix store.");
@@ -67,7 +89,7 @@ export class ApnsClient {
     const value = unsigned + "." + sign("sha256", Buffer.from(unsigned), { key: this.key, dsaEncoding: "ieee-p1363" }).toString("base64url");
     this.jwt = { at, value }; return value;
   }
-  async send(delivery: Delivery, token: string, signal: AbortSignal): Promise<Result> {
+  async send(delivery: Delivery, token: string, preview: string, signal: AbortSignal): Promise<Result> {
     const uncertain: Result = { state: "uncertain", status: null, invalid_device: false };
     if (this.closed || signal.aborted) return uncertain;
     try {
@@ -99,7 +121,7 @@ export class ApnsClient {
           finish({ state: status === 429 || (status >= 500 && status <= 599) ? "retrying" : "rejected", status, invalid_device });
         });
         const target: NotificationTarget = { conversation_id: delivery.conversation_id, entry_id: delivery.entry_id };
-        request.end(JSON.stringify({ aps: { alert: { title: "Agent", body: "New reply in Agent" }, sound: "default" }, agent: target }));
+        request.end(JSON.stringify({ aps: { alert: { title: "Agent", body: preview }, sound: "default" }, agent: target }));
       });
     } catch { return uncertain; }
   }
@@ -117,7 +139,7 @@ export class Notifications {
     this.client = config === undefined ? undefined : new ApnsClient(config, origin);
     this.task = defineTask<null, Checkpoint, null>({ name: "agent.notifications", version: 1, initial: () => ({ phase: "deliver", last: null }), phases: {
       deliver: async (task, runtime, context) => {
-        let attempt: { key: string; delivery: Delivery; token: string } | undefined;
+        let attempt: { key: string; delivery: Delivery; token: string; preview: string } | undefined;
         await runtime.commit(async (tx) => {
           const state = await tx.doc(NotificationState);
           // A newer ready delivery can replace a sleeping dispatcher. Its
@@ -139,13 +161,15 @@ export class Notifications {
           const device = state.installations.find((item) => item.id === delivery?.installation_id && item.generation === delivery.generation);
           const visible = delivery !== null && transcriptVisible(delivery.entry_id, await tx.doc(TranscriptVisibility, ROOT_CONVERSATION_ID));
           if ((delivery?.state === "queued" || delivery?.state === "retrying") && visible && device !== undefined && this.configured && !this.closed) {
+            const id: unknown = Number(delivery.entry_id), entry = nativeEntryId(id) ? await tx.entry(id) : undefined;
+            const body = entry?.conversationId === ROOT_CONVERSATION_ID ? preview(entry) : undefined;
             if (delivery.expires_at <= runtime.now()) delivery.state = "expired";
-            else {
+            else if (body !== undefined) {
               if (delivery.retry_at !== null && delivery.retry_at > runtime.now()) return {
                 status: "sleeping", until: Math.min(delivery.retry_at, delivery.expires_at), checkpoint: task.state.checkpoint,
               };
               delivery.state = "attempting"; delivery.attempts += 1;
-              attempt = { key, token: device.token, delivery: { ...delivery } }; return;
+              attempt = { key, token: device.token, delivery: { ...delivery }, preview: body }; return;
             }
           }
           if (delivery?.state === "attempting") delivery.state = "uncertain";
@@ -154,7 +178,7 @@ export class Notifications {
           return { status: "running", checkpoint: { phase: "deliver", last: { key, state: delivery?.state ?? "superseded", attempts: delivery?.attempts ?? 0 } } };
         }, context);
         if (attempt === undefined) return;
-        const current = attempt, result = await this.client?.send(current.delivery, current.token, runtime.signal);
+        const current = attempt, result = await this.client?.send(current.delivery, current.token, current.preview, runtime.signal);
         await runtime.commit(async (tx) => {
           const state = await tx.doc(NotificationState), saved = await tx.doc(NotificationDeliveries, current.key, null);
           if (saved.delivery?.state === "attempting") { saved.delivery.state = result?.state ?? "uncertain"; saved.delivery.status = result?.status ?? null; }

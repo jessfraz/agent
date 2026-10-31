@@ -9,6 +9,9 @@ recovery; [history](history.md) describes import and retrieval.
   verify real searches. Missing files stay explicit gaps.
 - [ ] Verify chat admission, steering, interruption, reopening and scrolling
   against a large live corpus while background work runs.
+- [x] Recover main-chat admission after coordinator restart, preserving steer
+  and queue modes. Independent workers and control requests remain responsive
+  while another worker's host effect is held.
 - [x] Use shared typed cells for live and imported messages, with Codex-style
   terminal formatting and retained command output on reopen.
 - [x] Pin and activate scheduled-chat reuse, recovery and shared worktree
@@ -89,8 +92,8 @@ recovery; [history](history.md) describes import and retrieval.
   take effect only after approval of that diff.
 - [x] Connect Pi's native telemetry to the same diagnostics. Show token use,
   cache hits and estimated cost for every chat, separately from subscription
-  quota; keep estimates distinct from billed amounts. Native tests and review
-  pass; deployment is pending.
+  quota; keep estimates distinct from billed amounts. Native tests, review and
+  live coordinator status readback pass.
 - [ ] Benchmark deferred tool discovery before adopting it for larger toolsets.
 
 ## Recovery
@@ -113,7 +116,7 @@ and deployment are tracked separately above.
 | Durable conversations, submissions and task checkpoints | In use | Native Harness, SQLite storage and checkpointed documents own history and execution. |
 | Steering, follow-ups, abort and compaction | In use | Native input modes, abort and compaction events drive chat. |
 | Durable sleeps and wake notifications | In use | Sources, resources and jobs share Pi's persisted sleeps and scheduler. |
-| Typed telemetry and usage totals | Implemented; deployment pending | Native UsageDoc supplies own-conversation totals and bounded request timings in `/status`; the private native SQLite recorder keeps payload-free diagnostics. Unknown prices remain unavailable; API-equivalent estimates are separate from bills and subscription quota. |
+| Typed telemetry and usage totals | In use | Native UsageDoc supplies own-conversation totals and bounded request timings in `/status`; the private native SQLite recorder keeps payload-free diagnostics. Unknown prices remain unavailable; API-equivalent estimates are separate from bills and subscription quota. |
 | Image preparation workers | In use | Pi's Photon worker prepares attached images for native model input. Agent owns transfer and storage. |
 | Image-aware file readers | Not enabled | Agent owns its host file tools; reuse Pi's image-aware reads when extending them. |
 | Forks, child tasks and task graphs | Partial | Pi executes native model/tool task trees. Agent delegates use separate conversations; forks and graph views are not integrated. Evaluate native ownership while preserving delegates' durable lifetimes and Rex bindings. |

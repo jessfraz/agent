@@ -106,7 +106,9 @@ change the chat's project directory. Node registration refreshes executable
 and configuration paths when a task resumes, while preserving that task's
 model selection and working directory.
 Local clients use a private Unix socket. Remote clients use Tailscale with live
-peer identity checks, or an existing SSH connection. With no trust pins,
+peer identity checks, or an existing SSH connection. Native TCP keepalive wakes
+reconnect after a disappeared peer, including idle worker connections. With no
+trust pins,
 authorized untagged peers of the same user are accepted. `trusted_nodes` pins
 stable node IDs, including tagged servers; `trusted_user_ids` pins human
 accounts for their authorized, untagged devices. Either list disables the

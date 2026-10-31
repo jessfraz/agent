@@ -47,10 +47,12 @@ fn killing_supervisor_preserves_lock_until_pi_child_exits() {
     fs::write(
         &script,
         r#"
-      import { writeFileSync } from 'node:fs';
+      import { renameSync, writeFileSync } from 'node:fs';
       import { join } from 'node:path';
       import { createInterface } from 'node:readline';
-      writeFileSync(join(process.argv[2], 'child-pid'), String(process.pid));
+      const pidPath = join(process.argv[2], 'child-pid');
+      writeFileSync(pidPath + '.tmp', String(process.pid));
+      renameSync(pidPath + '.tmp', pidPath);
       setInterval(() => {}, 1000);
       createInterface({input:process.stdin}).on('line', line => {
         const {id, command}=JSON.parse(line);

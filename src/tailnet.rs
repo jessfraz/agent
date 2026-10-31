@@ -298,8 +298,23 @@ fn listen_on(address: Ipv4Addr, port: u16) -> Result<TcpListener> {
 fn scoped_socket(address: Ipv4Addr) -> Result<TcpSocket> {
     let interface = Interface::for_address(address)?;
     let socket = TcpSocket::new_v4()?;
+    keepalive(&socket)?;
     bind_interface(&socket, &interface)?;
     Ok(socket)
+}
+
+/// Quiet dead peers must wake existing reconnect loops. These are connection
+/// probes, not task deadlines; accepted sockets need their own configuration.
+pub(crate) fn keepalive(socket: &impl std::os::fd::AsFd) -> Result<()> {
+    socket2::SockRef::from(socket)
+        .set_tcp_keepalive(
+            &socket2::TcpKeepalive::new()
+                .with_time(Duration::from_secs(30))
+                .with_interval(Duration::from_secs(10))
+                .with_retries(3),
+        )
+        .context("Could not configure Tailscale connection liveness")?;
+    Ok(())
 }
 
 struct Interface {
@@ -437,6 +452,45 @@ async fn invoke<T: DeserializeOwned>(daemon: &Daemon, args: &[&str]) -> Result<T
 
 #[cfg(test)]
 mod tests {
+    fn assert_keepalive(socket: &impl std::os::fd::AsFd) {
+        let options = socket2::SockRef::from(socket);
+        assert!(options.keepalive().unwrap());
+        assert_eq!(
+            options.tcp_keepalive_time().unwrap(),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            options.tcp_keepalive_interval().unwrap(),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(options.tcp_keepalive_retries().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn connected_and_accepted_sockets_retain_native_keepalive() {
+        use crate::tailnet::keepalive;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listening = tokio::net::TcpSocket::new_v4().unwrap();
+        listening.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = listening.listen(8).unwrap();
+        let client = tokio::net::TcpSocket::new_v4().unwrap();
+        keepalive(&client).unwrap();
+        let mut client = client
+            .connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut accepted, _) = listener.accept().await.unwrap();
+        keepalive(&accepted).unwrap();
+        assert_keepalive(&client);
+        assert_keepalive(&accepted);
+        client.write_all(b"live").await.unwrap();
+        let mut bytes = [0; 4];
+        accepted.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"live");
+        accepted.shutdown().await.unwrap();
+        assert_eq!(client.read(&mut bytes).await.unwrap(), 0);
+    }
+
     #[test]
     fn selected_daemon_is_preserved_by_the_native_status_command() {
         let socket = std::path::Path::new("/example/system-tailscale.sock");
@@ -742,12 +796,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn native_socket_retains_its_interface_scope() {
-        use crate::tailnet::{Interface, listen_on};
+        use crate::tailnet::{Interface, listen_on, scoped_socket};
         use std::os::fd::AsRawFd;
-        use tokio::{
-            io::{AsyncReadExt, AsyncWriteExt},
-            net::TcpStream,
-        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let interface = Interface::for_address(Ipv4Addr::LOCALHOST).unwrap();
         let listener = listen_on(Ipv4Addr::LOCALHOST, 0).unwrap();
         let mut index = 0_u32;
@@ -765,10 +816,14 @@ mod tests {
             0
         );
         assert_eq!(index, interface.index);
-        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+        let client = scoped_socket(Ipv4Addr::LOCALHOST).unwrap();
+        client.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut client = client
+            .connect(listener.local_addr().unwrap())
             .await
             .unwrap();
         let (mut accepted, _) = listener.accept().await.unwrap();
+        assert_keepalive(&client);
         client.write_all(b"scoped").await.unwrap();
         let mut received = [0_u8; 6];
         accepted.read_exact(&mut received).await.unwrap();

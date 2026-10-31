@@ -103,7 +103,7 @@ pub struct NotificationStatus {
     pub registered: bool,
 }
 
-/// Public identity only. Notification payloads never include transcript text.
+/// Routing identity; the bounded reply preview travels in APNs' native alert.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct NotificationTarget {
     pub conversation_id: String,

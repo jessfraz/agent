@@ -19,7 +19,7 @@ import { HistoryStore } from "../src/history.js";
 import { DEFAULT_MODEL } from "../src/models.js";
 import { ApnsClient, notificationDeliveryKey, NotificationDeliveries, Notifications, NotificationState } from "../src/notifications.js";
 import { validEvent } from "../src/protocol.js";
-import { history } from "../src/transcript.js";
+import { history, UserNoticeEntry } from "../src/transcript.js";
 import { annotateTranscript } from "../src/transcript_visibility.js";
 import { FakeClock } from "./fixtures/background-runtime.js";
 
@@ -122,10 +122,10 @@ test("new canonical replies and curated notices reach APNs once per device, with
     assert.ok(verify("sha256", Buffer.from(encoded[0] + "." + encoded[1]), { key: f.keys.publicKey, dsaEncoding: "ieee-p1363" }, Buffer.from(encoded[2]!, "base64url")));
     assert.equal(request.headers["apns-topic"], f.config.topic); assert.equal(request.headers["apns-push-type"], "alert");
     assert.ok(Number(request.headers["apns-expiration"]) > Date.now() / 1000); assert.ok(object(request.body) && object(request.body.agent));
-    assert.deepEqual(request.body.aps, { alert: { title: "Agent", body: "New reply in Agent" }, sound: "default" });
+    assert.deepEqual(request.body.aps, { alert: { title: "Agent", body: request.body.agent.entry_id === reply.id.toString()
+      ? "Private fixture response" : "A useful curated update" }, sound: "default" });
     assert.equal(request.body.agent.conversation_id, ROOT_CONVERSATION_ID.toString());
     assert.ok([reply.id.toString(), notice.id.toString()].includes(String(request.body.agent.entry_id)));
-    assert.equal(JSON.stringify(request.body).includes("Private fixture response"), false, "Lock-screen payload must not disclose reply text");
   }
   assert.equal(new Set(f.requests.map((request) => request.headers.authorization)).size, 1, "Reuse the token rather than rotating it per delivery");
   assert.equal(new Set(f.requests.map((request) => request.headers["apns-id"])).size, 4);
@@ -136,6 +136,32 @@ test("new canonical replies and curated notices reach APNs once per device, with
   await until(app.session, t.signal, async () => (await delivery(app.session, second, sameText))?.state === "accepted");
   assert.equal(f.requests.length, 6, "Distinct replies with identical text remain separate notifications");
   assert.equal((await app.session.snapshot(NotificationState, BACKGROUND_CONTEXT))?.pending.length, 0);
+});
+
+test("APNs previews contain readable bounded reply or explicit notice text, never internal blocks", { timeout: 10_000 }, async (t) => {
+  const f = await fixture(t), app = f.current.value;
+  await app.notifications.request({ type: "register", installation_id: first, token });
+  const text = "## Ready\n\n**Board update:** [review files](https://example.com/review)\n- `R2` is ready.\n\n" + "🦀 ".repeat(2_000);
+  const reply = await app.session.commit((tx) => tx.appendEntry(ROOT_CONVERSATION_ID, { kind: AssistantEntry.kind,
+    model: [{ ...fauxAssistantMessage(text), content: [
+      { type: "thinking", thinking: "INTERNAL_REASONING_STAYS_PRIVATE" }, { type: "text", text },
+    ] }] }), BACKGROUND_CONTEXT);
+  app.session.resume();
+  await until(app.session, t.signal, async () => (await delivery(app.session, first, reply))?.state === "accepted");
+  const request = f.requests[0]; assert.ok(request && object(request.body) && object(request.body.aps) && object(request.body.aps.alert));
+  const body = request.body.aps.alert.body; assert.equal(typeof body, "string"); assert.ok(typeof body === "string");
+  assert.ok(body.startsWith("Ready Board update: review files R2 is ready. 🦀 "), body);
+  assert.ok(body.endsWith("…")); assert.ok(Array.from(body).length <= 321);
+  assert.ok(!body.includes("\ufffd")); assert.equal(body.includes("INTERNAL_REASONING"), false);
+  assert.ok(Buffer.byteLength(JSON.stringify(request.body)) < 4096, "The actual JSON request must fit Apple's alert payload limit");
+  const notice = await app.session.commit((tx) => tx.appendEntry(ROOT_CONVERSATION_ID, { kind: UserNoticeEntry.kind,
+    data: { task_id: null, source_conversation_id: "synthetic-source", source_entry_id: "synthetic-entry", text: "The **drawing** needs your review." },
+    model: [fauxAssistantMessage("INTERNAL_CONTEXT_STAYS_PRIVATE")] }), BACKGROUND_CONTEXT);
+  await until(app.session, t.signal, async () => (await delivery(app.session, first, notice))?.state === "accepted");
+  const sent = f.requests[1]; assert.ok(sent && object(sent.body));
+  assert.deepEqual(sent.body.aps, { alert: { title: "Agent", body: "The drawing needs your review." }, sound: "default" });
+  assert.equal(JSON.stringify(sent.body).includes("INTERNAL_CONTEXT"), false);
+  assert.deepEqual(sent.body.agent, { conversation_id: "1", entry_id: notice.id.toString() });
 });
 
 test("restart preserves an uncertain attempt without resending; a rejected token is retired and explicit registration recovers", { timeout: 10_000 }, async (t) => {

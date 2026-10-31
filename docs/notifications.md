@@ -5,9 +5,11 @@ explicitly published user notice. Tools, progress, receipts, compaction,
 imported conversations and history replay do not trigger alerts. Legacy notices
 stay readable without becoming push notifications.
 
-The payload contains a generic alert and conversation/message IDs, not the
-transcript. Opening it shows the existing main chat. An open main chat
-suppresses foreground banners; the app has no persistent background socket.
+Alerts preview the actual reply or published notice, with basic Markdown
+formatting removed and long text truncated. Reasoning, tool output and internal
+notice references stay out of the preview. Conversation/message IDs open the
+existing main chat. An open main chat suppresses foreground banners; the app
+has no persistent background socket.
 
 ## One-time setup
 

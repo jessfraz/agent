@@ -63,7 +63,8 @@ shows registered machines and which are online.
 In the TUI, `agent` opens that same saved main conversation and attaches to
 ongoing work. `/exit` or Ctrl+C detaches main chat while the work continues.
 If closing waits on an input receipt, press Ctrl+C again to exit the client.
-Unconfirmed input keeps its original identity for recovery.
+Accepted work continues. If delivery was unconfirmed, check saved history
+before sending the message again.
 Reopen it to see live progress, steer or queue more context. Saved messages load
 automatically in the background while the composer remains usable.
 

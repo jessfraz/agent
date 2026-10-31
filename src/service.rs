@@ -289,8 +289,8 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
     Ok(())
 }
 
-async fn authenticated<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: S,
+async fn authenticated(
+    stream: tokio::net::TcpStream,
     runtime: Arc<Runtime>,
     broker: Arc<Broker>,
     peer: std::net::SocketAddr,
@@ -300,6 +300,7 @@ async fn authenticated<S: AsyncRead + AsyncWrite + Unpin>(
         runtime.record_peer_rejected(peer, &error.to_string());
         return Err(error);
     }
+    crate::tailnet::keepalive(&stream)?;
     handle(stream, runtime, broker).await
 }
 
@@ -633,7 +634,7 @@ mod tests {
 
     const FIXTURE: &str = r#"
       import { createInterface } from 'node:readline';
-      import { renameSync, writeFileSync } from 'node:fs';
+      import { existsSync, renameSync, writeFileSync } from 'node:fs';
       import { join } from 'node:path';
       const emit = (id,event) => process.stdout.write(JSON.stringify({version:1,id,event})+'\n');
       const finish = id => { emit(id,{type:'auth_status',status:{state:'signed_out'}}); emit(id,{type:'done'}); };
@@ -646,10 +647,14 @@ mod tests {
         publish('admitted','yes');
         if(command.type==='login') {
           publish('login-id',String(id));
-          setTimeout(() => {
+          const complete = () => {
             emit(id,{type:'notice',task_id:'22222222-2222-4222-8222-222222222222',text:'Synthetic task completed.'});
             publish('completed','yes'); finish(id);
-          },60);
+          };
+          const held = join(process.argv[2],'hold-login');
+          if(existsSync(held)) {
+            const gate = setInterval(() => { if(!existsSync(held)) { clearInterval(gate); complete(); } },5);
+          } else setTimeout(complete,60);
         } else if(typeof command.target==='string') {
           publish('callback.json',JSON.stringify({id,target:command.target}));
         } else if(command.type==='run_task'&&command.interactive) {
@@ -1122,20 +1127,35 @@ mod tests {
     #[tokio::test]
     async fn independent_clients_share_one_writer_and_do_not_block_each_other() {
         let service = Running::start().await;
+        let held = service.directory.path().join("hold-login");
+        fs::write(
+            &held,
+            "Keep Login open until both independent clients finish.",
+        )
+        .unwrap();
         let mut slow = service.client().await;
         write_frame(&mut slow, &RuntimeCommand::Login)
             .await
             .unwrap();
-        let first = service.client().await;
-        let second = service.client().await;
-        timeout(Duration::from_secs(1), async {
+        let completed = timeout(Duration::from_secs(10), async {
+            service.wait_for("login-id").await;
+            let first = service.client().await;
+            let second = service.client().await;
             tokio::join!(status(first), status(second));
+            assert!(
+                !service.directory.path().join("completed").exists(),
+                "Both status requests must finish while Login is still held"
+            );
+            fs::remove_file(&held).unwrap();
+            service.wait_for("completed").await;
         })
-        .await
-        .unwrap();
-        service.wait_for("completed").await;
+        .await;
+        if held.exists() {
+            fs::remove_file(held).unwrap();
+        }
         drop(slow);
         service.stop().await;
+        completed.unwrap();
     }
 
     #[tokio::test]
@@ -1407,6 +1427,7 @@ mod tests {
             .await
             .unwrap();
         let (server, peer) = listener.accept().await.unwrap();
+        let options = socket2::SockRef::from(&server).try_clone().unwrap();
         let allowed_runtime = runtime.clone();
         let allowed = tokio::spawn(async move {
             authenticated(
@@ -1420,6 +1441,17 @@ mod tests {
         });
         status(allowed_client).await;
         allowed.await.unwrap().unwrap();
+        assert!(options.keepalive().unwrap());
+        assert_eq!(
+            options.tcp_keepalive_time().unwrap(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            options.tcp_keepalive_interval().unwrap(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(options.tcp_keepalive_retries().unwrap(), 3);
+        drop(options);
         assert!(directory.path().join("admitted").exists());
         Arc::try_unwrap(runtime)
             .ok()
