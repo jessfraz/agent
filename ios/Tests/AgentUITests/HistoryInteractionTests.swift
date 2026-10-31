@@ -72,7 +72,7 @@ final class HistoryInteractionTests: XCTestCase {
     let transcript = app.scrollViews["transcript"]
     XCTAssertTrue(transcript.waitForExistence(timeout: 5))
     XCTAssertTrue(app.staticTexts[recent.last!.text].waitForExistence(timeout: 5))
-    XCTAssertFalse(app.buttons["latest-messages"].exists)
+    XCTAssertTrue(app.buttons["latest-messages"].waitForNonExistence(timeout: 5))
     let initialRequests = await peer.cursors()
     XCTAssertEqual(initialRequests, [])
     for _ in 0..<8 {

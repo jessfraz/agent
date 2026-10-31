@@ -179,35 +179,62 @@ final class AgentUITests: XCTestCase {
     choice.tap()
   }
 
-  private func assertBackground(_ appearance: Appearance, app: XCUIApplication) {
+  private func assertBackground(
+    _ appearance: Appearance, app: XCUIApplication, file: StaticString = #filePath,
+    line: UInt = #line
+  ) {
+    var lastScreenshot: XCUIScreenshot?
+    var lastBrightness: Double?
     let predicate = NSPredicate { [self] _, _ in
-      guard let brightness = backgroundBrightness(app) else { return false }
+      let screenshot = app.screenshot()
+      lastScreenshot = screenshot
+      lastBrightness = screenshot.image.cgImage.flatMap(backgroundBrightness)
+      guard let brightness = lastBrightness else { return false }
       return appearance == .light ? brightness > 0.8 : brightness < 0.2
     }
     let rendered = XCTNSPredicateExpectation(predicate: predicate, object: nil)
-    XCTAssertEqual(XCTWaiter.wait(for: [rendered], timeout: 3), .completed)
+    let result = XCTWaiter.wait(for: [rendered], timeout: 3)
+    if result != .completed, let lastScreenshot {
+      let receipt = XCTAttachment(screenshot: lastScreenshot)
+      receipt.name = "\(appearance.rawValue.lowercased())-background-failure"
+      receipt.lifetime = .keepAlways
+      add(receipt)
+    }
+    let measured = lastBrightness.map { String(format: "%.3f", $0) } ?? "unavailable"
+    XCTAssertEqual(
+      result, .completed,
+      "Expected \(appearance.rawValue) background; median brightness: \(measured)",
+      file: file, line: line)
   }
 
-  private func backgroundBrightness(_ app: XCUIApplication) -> Double? {
-    let screenshot = app.screenshot().image
-    guard let image = screenshot.cgImage,
+  nonisolated private func backgroundBrightness(_ image: CGImage) -> Double? {
+    guard
       let sample = image.cropping(
         to: CGRect(
-          x: Double(image.width) * 0.12, y: Double(image.height) * 0.4, width: 1, height: 1))
+          x: Double(image.width) * 0.08, y: Double(image.height) * 0.25,
+          width: Double(image.width) * 0.84, height: Double(image.height) * 0.4))
     else { return nil }
-    var pixel: [UInt8] = [0, 0, 0, 0]
-    let measured = pixel.withUnsafeMutableBytes { bytes -> Double? in
+    // Text can cover any particular point. The central region's median keeps
+    // foreground glyphs, icons and separators from deciding its appearance.
+    let side = 32
+    var pixels = [UInt8](repeating: 0, count: side * side * 4)
+    return pixels.withUnsafeMutableBytes { bytes -> Double? in
       guard
         let context = CGContext(
-          data: bytes.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+          data: bytes.baseAddress, width: side, height: side, bitsPerComponent: 8,
+          bytesPerRow: side * 4,
           space: CGColorSpaceCreateDeviceRGB(),
-          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            | CGBitmapInfo.byteOrder32Big.rawValue)
       else { return nil }
-      context.draw(sample, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+      context.interpolationQuality = .none
+      context.draw(sample, in: CGRect(x: 0, y: 0, width: side, height: side))
       let values = bytes.bindMemory(to: UInt8.self)
-      return Double(Int(values[0]) + Int(values[1]) + Int(values[2])) / 765
+      let brightness = stride(from: 0, to: values.count, by: 4).map { offset in
+        Double(Int(values[offset]) + Int(values[offset + 1]) + Int(values[offset + 2])) / 765
+      }.sorted()
+      return brightness[brightness.count / 2]
     }
-    return measured
   }
 
   func testConnectionAndEmptyMainAccessibility() throws {

@@ -17,7 +17,8 @@ public struct MainChatView: View {
   @State private var settings = false
   @State private var followsLatest = true
   @State private var userScrolling = false
-  @State private var viewport = TranscriptViewport()
+  @State private var atTop = false
+  @State private var latestVisible = true
   @State private var presentedLatest = false
   @State private var visibleItem: String?
   @State private var historyRequest: HistoryNavigation?
@@ -201,6 +202,13 @@ public struct MainChatView: View {
               .accessibilityLabel("Agent is working")
           }
           Color.clear.frame(height: 1).id("latest")
+            .onScrollVisibilityChange(threshold: 1) { visible in
+              latestVisible = visible
+              if visible && !model.rows.isEmpty { presentedLatest = true }
+              // Layout and keyboard changes must not stop following a live
+              // conversation. A person's scroll may leave the visible tail.
+              if userScrolling || visible { followsLatest = visible }
+            }
         }
         .scrollTargetLayout()
         .padding().frame(maxWidth: 720).frame(maxWidth: .infinity)
@@ -226,16 +234,15 @@ public struct MainChatView: View {
       }
       .onScrollPhaseChange { _, phase in
         userScrolling = phase == .interacting || phase == .decelerating
-        if userScrolling && viewport.atTop { requestHistory() }
+        if userScrolling {
+          followsLatest = latestVisible
+          if atTop { requestHistory() }
+        }
       }
-      .onScrollGeometryChange(for: TranscriptViewport.self) { geometry in
-        TranscriptViewport(geometry)
+      .onScrollGeometryChange(for: Bool.self) { geometry in
+        geometry.contentOffset.y + geometry.contentInsets.top <= 80
       } action: { _, current in
-        viewport = current
-        if current.atBottom && !model.rows.isEmpty { presentedLatest = true }
-        // New content changes geometry too. Only a person's scroll should
-        // turn off following; initial history must still land at the latest row.
-        if userScrolling || current.atBottom { followsLatest = current.atBottom }
+        atTop = current
       }
       .onChange(of: model.revision) { _, _ in
         if followsLatest { scroll.scrollTo("latest", anchor: .bottom) }
@@ -244,7 +251,7 @@ public struct MainChatView: View {
         if target != nil { scroll.scrollTo("latest", anchor: .bottom) }
       }
       .overlay(alignment: .bottomTrailing) {
-        if (!viewport.atBottom || !model.includesLatest) && !model.rows.isEmpty {
+        if (!latestVisible || !model.includesLatest) && !model.rows.isEmpty {
           Button("Latest", systemImage: "arrow.down") {
             followsLatest = true
             historyRequest = .latest(UUID())
@@ -461,22 +468,6 @@ public struct MainChatView: View {
     return
       (try? CoordinatorAddress(
         host: host.trimmingCharacters(in: .whitespacesAndNewlines), port: port)) != nil
-  }
-}
-
-private struct TranscriptViewport: Equatable {
-  var atTop = false
-  var atBottom = true
-
-  init() {}
-  init(_ geometry: ScrollGeometry) {
-    let offset = geometry.contentOffset.y + geometry.contentInsets.top
-    let extent = max(
-      0,
-      geometry.contentSize.height + geometry.contentInsets.top + geometry.contentInsets.bottom
-        - geometry.containerSize.height)
-    atTop = offset <= 80
-    atBottom = offset >= extent - 60
   }
 }
 
