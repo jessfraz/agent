@@ -33,6 +33,7 @@ public struct MainChatView: View {
   @Environment(\.scenePhase) private var scenePhase
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.displayScale) private var displayScale
 
   public init(notifications: AppNotifications? = nil) {
     _model = State(initialValue: ChatModel())
@@ -160,39 +161,46 @@ public struct MainChatView: View {
     return ScrollViewReader { scroll in
       ScrollView {
         LazyVStack(alignment: .leading, spacing: 18) {
-          if model.canLoadEarlier {
-            Button {
-              requestHistory()
-            } label: {
-              HStack {
-                if model.loadingHistory { ProgressView().controlSize(.small) }
-                Text("Load earlier messages")
+          // Pagination is section structure, not transcript content. Keep
+          // one lazy layout so explicit row targets remain discoverable.
+          Section {
+            if model.rows.isEmpty {
+              Text("No messages yet").font(.callout).foregroundStyle(.primary)
+                .frame(maxWidth: .infinity).padding(.vertical, 32)
+            }
+            ForEach(items) { item in
+              Group {
+                switch item {
+                case .message(let row):
+                  MessageRow(
+                    model: row, retry: { id in Task { await model.retry(id) } },
+                    restore: { id in Task { await model.restore(id) } },
+                    preview: { file in Task { await model.preview(file) } })
+                case .activity(let group):
+                  ActivityGroupView(
+                    group: group, expansion: $activityExpansion, details: loadDetails,
+                    onExpand: { followsLatest = false })
+                }
+              }
+              .id(item.id)
+            }
+          } header: {
+            if model.canLoadEarlier {
+              Button {
+                requestHistory()
+              } label: {
+                HStack {
+                  if model.loadingHistory { ProgressView().controlSize(.small) }
+                  Text("Load earlier messages")
+                }
+              }
+              .disabled(model.loadingHistory).frame(maxWidth: .infinity).padding(.vertical)
+              .id(TranscriptControlAnchor.earlier)
+              .onScrollVisibilityChange(threshold: 0.1) { visible in
+                // Initial/live-tail layout is not an instruction to page backward.
+                if visible && presentedLatest && !followsLatest { requestHistory() }
               }
             }
-            .disabled(model.loadingHistory).frame(maxWidth: .infinity).padding(.vertical)
-            .onScrollVisibilityChange(threshold: 0.1) { visible in
-              if visible && presentedLatest { requestHistory() }
-            }
-          }
-          if model.rows.isEmpty {
-            Text("No messages yet").font(.callout).foregroundStyle(.primary)
-              .frame(maxWidth: .infinity).padding(.vertical, 32)
-          }
-          ForEach(items) { item in
-            Group {
-              switch item {
-              case .message(let row):
-                MessageRow(
-                  model: row, retry: { id in Task { await model.retry(id) } },
-                  restore: { id in Task { await model.restore(id) } },
-                  preview: { file in Task { await model.preview(file) } })
-              case .activity(let group):
-                ActivityGroupView(
-                  group: group, expansion: $activityExpansion, details: loadDetails,
-                  onExpand: { followsLatest = false })
-              }
-            }
-            .id(item.id)
           }
           if model.busy {
             HStack(spacing: 8) {
@@ -201,14 +209,7 @@ public struct MainChatView: View {
             }.frame(maxWidth: .infinity, alignment: .leading)
               .accessibilityLabel("Agent is working")
           }
-          Color.clear.frame(height: 1).id("latest")
-            .onScrollVisibilityChange(threshold: 1) { visible in
-              latestVisible = visible
-              if visible && !model.rows.isEmpty { presentedLatest = true }
-              // Layout and keyboard changes must not stop following a live
-              // conversation. A person's scroll may leave the visible tail.
-              if userScrolling || visible { followsLatest = visible }
-            }
+          Color.clear.frame(height: 1).id(TranscriptControlAnchor.latest)
         }
         .scrollTargetLayout()
         .padding().frame(maxWidth: 720).frame(maxWidth: .infinity)
@@ -217,7 +218,15 @@ public struct MainChatView: View {
       .scrollDismissesKeyboard(.interactively)
       .scrollBounceBehavior(.always, axes: .vertical)
       .defaultScrollAnchor(initialScrollTarget == nil ? .bottom : .top, for: .initialOffset)
-      .scrollPosition(id: $visibleItem, anchor: .top)
+      .scrollPosition(
+        id: Binding(
+          get: { visibleItem },
+          set: { item in
+            // Structural controls have no transcript row ID. Keep the real
+            // reading anchor when a paging control temporarily leads.
+            if let item { visibleItem = item }
+          }), anchor: .top
+      )
       .task {
         if let initialScrollTarget {
           await Task.yield()
@@ -239,16 +248,23 @@ public struct MainChatView: View {
           if atTop { requestHistory() }
         }
       }
-      .onScrollGeometryChange(for: Bool.self) { geometry in
-        geometry.contentOffset.y + geometry.contentInsets.top <= 80
+      .onScrollGeometryChange(for: TranscriptEdges.self) { geometry in
+        TranscriptEdges(
+          top: geometry.contentOffset.y + geometry.contentInsets.top <= 80,
+          latest: geometry.visibleRect.maxY >= geometry.contentSize.height - 1 / displayScale)
       } action: { _, current in
-        atTop = current
+        atTop = current.top
+        latestVisible = current.latest
+        if current.latest && !model.rows.isEmpty { presentedLatest = true }
+        // Layout and keyboard changes must not stop following a live
+        // conversation. A person's scroll may leave the visible tail.
+        if userScrolling || current.latest { followsLatest = current.latest }
       }
       .onChange(of: model.revision) { _, _ in
-        if followsLatest { scroll.scrollTo("latest", anchor: .bottom) }
+        if followsLatest { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }
       }
       .onChange(of: notifications?.openedTarget) { _, target in
-        if target != nil { scroll.scrollTo("latest", anchor: .bottom) }
+        if target != nil { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }
       }
       .overlay(alignment: .bottomTrailing) {
         if (!latestVisible || !model.includesLatest) && !model.rows.isEmpty {
@@ -256,9 +272,9 @@ public struct MainChatView: View {
             followsLatest = true
             historyRequest = .latest(UUID())
             if reduceMotion {
-              scroll.scrollTo("latest", anchor: .bottom)
+              scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
             } else {
-              withAnimation { scroll.scrollTo("latest", anchor: .bottom) }
+              withAnimation { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }
             }
           }
           .accessibilityIdentifier("latest-messages")
@@ -469,6 +485,19 @@ public struct MainChatView: View {
       (try? CoordinatorAddress(
         host: host.trimmingCharacters(in: .whitespacesAndNewlines), port: port)) != nil
   }
+}
+
+// End visibility belongs to the viewport, not to a lazy one-pixel child.
+// Allow one display pixel for native content-size rounding at the end.
+private struct TranscriptEdges: Equatable {
+  let top: Bool
+  let latest: Bool
+}
+
+// Controls remain scroll-addressable without sharing transcript row identity.
+private enum TranscriptControlAnchor: Hashable {
+  case earlier
+  case latest
 }
 
 private enum HistoryNavigation: Hashable {

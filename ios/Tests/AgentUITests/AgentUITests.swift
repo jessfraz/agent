@@ -44,8 +44,21 @@ final class AgentUITests: XCTestCase {
     return app
   }
 
+  private func foregroundScreenshot(_ app: XCUIApplication) -> XCUIScreenshot? {
+    // The application AX root can be frameless after relaunch. Sample its
+    // visible window, never a screen fallback that could capture Springboard.
+    guard app.state == .runningForeground else { return nil }
+    let window = app.windows.firstMatch
+    guard window.exists, !window.frame.isEmpty, window.isHittable else { return nil }
+    return window.screenshot()
+  }
+
   private func capture(_ name: String, app: XCUIApplication) {
-    let image = XCTAttachment(screenshot: app.screenshot())
+    guard let screenshot = foregroundScreenshot(app) else {
+      XCTFail("Cannot capture an application without a visible foreground window")
+      return
+    }
+    let image = XCTAttachment(screenshot: screenshot)
     image.name = name
     image.lifetime = .keepAlways
     add(image)
@@ -170,6 +183,26 @@ final class AgentUITests: XCTestCase {
     assertBackground(.light, app: app)
   }
 
+  func testAppearanceSamplingRequiresTheVisibleForegroundApp() {
+    let previous = XCUIDevice.shared.appearance
+    defer { XCUIDevice.shared.appearance = previous }
+    let app = launch(appearance: .dark)
+    executionTimeAllowance = 120
+    defer { app.terminate() }
+    chooseAppearance("Light", app: app)
+    app.buttons["Done"].tap()
+    assertBackground(.light, app: app)
+
+    app.terminate()
+    XCTAssertEqual(app.state, .notRunning)
+    XCTAssertNil(foregroundScreenshot(app), "Springboard is not the application's appearance")
+    XCTAssertEqual(app.state, .notRunning, "Sampling must not launch the application")
+    app.launch()
+    XCTAssertTrue(app.navigationBars["Connection"].waitForExistence(timeout: 5))
+    app.buttons["Done"].tap()
+    assertBackground(.light, app: app)
+  }
+
   private func chooseAppearance(_ label: String, app: XCUIApplication) {
     let picker = app.descendants(matching: .any).matching(identifier: "appearancePicker").firstMatch
     XCTAssertTrue(picker.waitForExistence(timeout: 3))
@@ -186,7 +219,7 @@ final class AgentUITests: XCTestCase {
     var lastScreenshot: XCUIScreenshot?
     var lastBrightness: Double?
     let predicate = NSPredicate { [self] _, _ in
-      let screenshot = app.screenshot()
+      guard let screenshot = foregroundScreenshot(app) else { return false }
       lastScreenshot = screenshot
       lastBrightness = screenshot.image.cgImage.flatMap(backgroundBrightness)
       guard let brightness = lastBrightness else { return false }

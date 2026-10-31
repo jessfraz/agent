@@ -5,11 +5,14 @@ import XCTest
 
 @MainActor
 final class HistoryInteractionTests: XCTestCase {
-  private func eventually(_ predicate: () async throws -> Bool) async throws {
+  private func eventually(
+    file: StaticString = #filePath, line: UInt = #line,
+    _ predicate: () async throws -> Bool
+  ) async throws {
     let deadline = ContinuousClock.now + .seconds(5)
     while try await !predicate() {
       guard ContinuousClock.now < deadline else {
-        XCTFail("Expected history navigation state did not arrive")
+        XCTFail("Expected history navigation state did not arrive", file: file, line: line)
         return
       }
       try await Task.sleep(for: .milliseconds(20))
@@ -73,6 +76,8 @@ final class HistoryInteractionTests: XCTestCase {
     XCTAssertTrue(transcript.waitForExistence(timeout: 5))
     XCTAssertTrue(app.staticTexts[recent.last!.text].waitForExistence(timeout: 5))
     XCTAssertTrue(app.buttons["latest-messages"].waitForNonExistence(timeout: 5))
+    XCTAssertTrue(
+      app.staticTexts[recent.last!.text].isHittable, "Initial history must show its actual tail")
     let initialRequests = await peer.cursors()
     XCTAssertEqual(initialRequests, [])
     for _ in 0..<8 {
@@ -105,6 +110,23 @@ final class HistoryInteractionTests: XCTestCase {
     receipt.lifetime = .keepAlways
     add(receipt)
 
+    let readingPosition = group.frame
+    let incoming = "A reply streams while the earlier question is being read."
+    try await peer.beginReply(incoming)
+    // The reply is outside the lazy viewport. The visible composer proves
+    // that its stream has arrived without scrolling away from the reader.
+    let working = app.buttons["Stop response"]
+    XCTAssertTrue(working.waitForExistence(timeout: 5))
+    XCTAssertEqual(
+      group.frame.minY, readingPosition.minY, accuracy: 2,
+      "Streaming a reply moved the older reading position")
+    let completed = incoming + " The reply is complete."
+    try await peer.reply(completed, id: "reading-reply")
+    XCTAssertTrue(working.waitForNonExistence(timeout: 5))
+    XCTAssertEqual(
+      group.frame.minY, readingPosition.minY, accuracy: 2,
+      "Completing a reply moved the older reading position")
+
     // A further bounded page evicts the recent tail. At the retained window's
     // physical bottom, Latest must still return to real recent conversation.
     for _ in 0..<5 {
@@ -122,7 +144,12 @@ final class HistoryInteractionTests: XCTestCase {
     app.buttons["latest-messages"].tap()
     try await eventually { (await peer.cursors()).last == "<latest>" }
     XCTAssertTrue(app.staticTexts[latest].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts[completed].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts[concurrent].waitForExistence(timeout: 5))
     XCTAssertTrue(app.buttons["latest-messages"].waitForNonExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts[latest].isHittable)
+    XCTAssertTrue(
+      app.staticTexts[concurrent].isHittable, "Latest must include the newest live reply")
     XCTAssertTrue(app.staticTexts[earlier].waitForNonExistence(timeout: 5))
     let tail = XCTAttachment(screenshot: app.screenshot())
     tail.name = "latest-reloads-current-conversation"
@@ -152,12 +179,15 @@ private actor InteractionPeer {
     self.latest = latest
   }
   func cursors() -> [String] { requests }
-  func reply(_ text: String) async throws {
+  func beginReply(_ text: String) async throws {
+    try await emit(.textDelta(.init(text: text)), to: XCTUnwrap(observer))
+  }
+  func reply(_ text: String, id: String = "concurrent-reply") async throws {
     let message = HistoryMessage(
-      continuation: false, entryId: "concurrent-reply", finalChunk: true,
-      role: .final, text: text)
+      continuation: false, entryId: id, finalChunk: true, role: .final, text: text)
     latest?.messages.append(message)
-    try await emit(.message(.init(message: message)), to: XCTUnwrap(observer))
+    try await emit(.answer(.init(entryId: id, text: text)), to: XCTUnwrap(observer))
+    try await emit(.idle, to: XCTUnwrap(observer))
   }
   func hold(_ cursor: String) { held.insert(cursor) }
   func release(_ cursor: String) {
