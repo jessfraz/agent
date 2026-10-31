@@ -17,8 +17,9 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Verify failed scheduled occurrences settle after recovery on their
   existing tasks, clearing scheduler errors while preserving unresolved work.
 - [x] Verify current source events reach triage beside historical backlogs.
-  Deployed per-account old/new selection completed a live batch while older
-  mail remained pending; restart and retry regression tests pass.
+  Deployed per-account old/new selection and separate polling/triage lanes
+  passed live checks with older mail pending. Interrupted source claims
+  settled; restart and retry regression tests pass.
 - [ ] Verify chat reuse and native worktree inventory display live.
 - [x] Ship private lifecycle logs, `/machines`, local usage-reset times and
   countdowns, and the remaining viewport correction.
