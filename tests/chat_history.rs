@@ -111,7 +111,7 @@ async fn repeated_control_c_detaches_while_admission_is_held_and_retains_its_ori
                                 assert_eq!(conversation_id, summary.conversation_id);
                                 write_events(&mut writer, [RuntimeEventKind::ConversationReady {
                                     conversation: summary, model: ModelSelection::default(), cwd: "/example".into(), working: false,
-                                }]).await;
+                                }]).await.unwrap();
                                 retired_observer_closed(&mut reader).await.unwrap();
                                 return;
                             }
@@ -137,7 +137,7 @@ async fn repeated_control_c_detaches_while_admission_is_held_and_retains_its_ori
                             }
                             other => panic!("Closing cannot interrupt or resubmit coordinator work: {other:?}"),
                         };
-                        write_events(&mut writer, events.into_iter().chain([RuntimeEventKind::Done])).await;
+                        write_events(&mut writer, events.into_iter().chain([RuntimeEventKind::Done])).await.unwrap();
                     });
                 }
                 done = connections.join_next(), if !connections.is_empty() => { done.unwrap().unwrap(); }
@@ -294,7 +294,7 @@ async fn known_chief_history_renders_while_its_observer_readiness_is_held() {
                                 hold.acquire().await.unwrap().forget();
                                 write_events(&mut writer, [RuntimeEventKind::ConversationReady {
                                     conversation: summary, model: ModelSelection::default(), cwd: "/example".into(), working: false,
-                                }]).await;
+                                }]).await.unwrap();
                                 ready.send(()).unwrap();
                                 retired_observer_closed(&mut reader).await.unwrap();
                                 return;
@@ -317,7 +317,7 @@ async fn known_chief_history_renders_while_its_observer_readiness_is_held() {
                             }
                             other => panic!("Opening saved history cannot submit model input or read a catalog: {other:?}"),
                         };
-                        write_events(&mut writer, events.into_iter().chain([RuntimeEventKind::Done])).await;
+                        write_events(&mut writer, events.into_iter().chain([RuntimeEventKind::Done])).await.unwrap();
                     });
                 }
                 done = connections.join_next(), if !connections.is_empty() => { done.unwrap().unwrap(); }
@@ -447,13 +447,13 @@ struct ObservedInput {
 async fn write_events(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     events: impl IntoIterator<Item = RuntimeEventKind>,
-) {
+) -> std::io::Result<()> {
     let mut bytes = Vec::new();
     for event in events {
         serde_json::to_writer(&mut bytes, &event).unwrap();
         bytes.push(b'\n');
     }
-    writer.write_all(&bytes).await.unwrap();
+    writer.write_all(&bytes).await
 }
 
 async fn retired_observer_closed<R: tokio::io::AsyncBufRead + Unpin>(
@@ -529,7 +529,10 @@ async fn recovery_connection(
             input_ids,
         } => {
             if conversation_id == "saved-chief" && summary.conversation_id == "saved-worker" {
-                write_events(
+                // /resume can retire the old view before its first ready
+                // response. Exercise that ordering, not a favorable race.
+                retired_observer_closed(&mut reader).await.unwrap();
+                let late_ready = write_events(
                     &mut writer,
                     [RuntimeEventKind::ConversationReady {
                         conversation: RecoveryCase::AcceptedChief.summary(),
@@ -539,7 +542,15 @@ async fn recovery_connection(
                     }],
                 )
                 .await;
-                retired_observer_closed(&mut reader).await.unwrap();
+                if let Err(error) = late_ready {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        ),
+                        "Retired observer failed for another reason: {error}"
+                    );
+                }
                 return;
             }
             assert_eq!(conversation_id, summary.conversation_id);
@@ -557,7 +568,8 @@ async fn recovery_connection(
                         RuntimeEventKind::Done,
                     ],
                 )
-                .await;
+                .await
+                .unwrap();
                 return;
             }
             if index == 0 && case == RecoveryCase::WaitingWorker {
@@ -576,7 +588,8 @@ async fn recovery_connection(
                     working: index == 0,
                 }],
             )
-            .await;
+            .await
+            .unwrap();
             if index == 0 {
                 disconnect.acquire().await.unwrap().forget();
                 if case == RecoveryCase::UncertainWorker {
@@ -610,7 +623,7 @@ async fn recovery_connection(
                         attachments: None,
                     },
                 });
-                write_events(&mut writer, receipts).await;
+                write_events(&mut writer, receipts).await.unwrap();
                 assert!(reader.next_frame().await.unwrap().is_none());
             }
             return;
@@ -631,7 +644,8 @@ async fn recovery_connection(
                         RuntimeEventKind::Done,
                     ],
                 )
-                .await;
+                .await
+                .unwrap();
                 return;
             }
             assert_eq!(conversation_id, summary.conversation_id);
@@ -702,7 +716,8 @@ async fn recovery_connection(
         &mut writer,
         events.into_iter().chain([RuntimeEventKind::Done]),
     )
-    .await;
+    .await
+    .unwrap();
 }
 
 async fn observer_recovery(case: RecoveryCase) {
