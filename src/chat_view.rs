@@ -35,11 +35,38 @@ impl Target {
 
 pub(crate) struct View {
     pub(crate) token: uuid::Uuid,
-    pub(crate) ready: tokio::sync::watch::Receiver<ObservationState>,
+    pub(crate) ready: tokio::sync::watch::Receiver<Observation>,
     target: Arc<Target>,
     input_ids: watch::Sender<Vec<String>>,
-    pub(crate) retry: mpsc::Sender<()>,
+    pub(crate) retry: mpsc::Sender<AttachmentId>,
     task: JoinHandle<()>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AttachmentId(uuid::Uuid);
+
+#[derive(Clone, Copy)]
+pub(crate) enum Observation {
+    Connecting(AttachmentId),
+    Connected(AttachmentId),
+    Reconnecting(AttachmentId),
+    Disconnected,
+}
+impl Observation {
+    pub(crate) fn attachment(self) -> Option<AttachmentId> {
+        match self {
+            Self::Connecting(id) | Self::Connected(id) | Self::Reconnecting(id) => Some(id),
+            Self::Disconnected => None,
+        }
+    }
+    pub(crate) fn state(self) -> ObservationState {
+        match self {
+            Self::Connecting(_) => ObservationState::Connecting,
+            Self::Connected(_) => ObservationState::Connected,
+            Self::Reconnecting(_) => ObservationState::Reconnecting,
+            Self::Disconnected => ObservationState::Disconnected,
+        }
+    }
 }
 impl Drop for View {
     fn drop(&mut self) {
@@ -67,13 +94,11 @@ impl View {
     }
 }
 
-pub(crate) fn observation(
-    ready: &tokio::sync::watch::Receiver<ObservationState>,
-) -> ObservationState {
+pub(crate) fn observation(ready: &tokio::sync::watch::Receiver<Observation>) -> ObservationState {
     if ready.has_changed().is_err() {
         ObservationState::Disconnected
     } else {
-        *ready.borrow()
+        ready.borrow().state()
     }
 }
 
@@ -284,7 +309,8 @@ pub(crate) async fn open(
     }
     let replay = ui.handle.begin_history_replay()?;
     let (ready, attached) = tokio::sync::oneshot::channel();
-    let (connected, readiness) = tokio::sync::watch::channel(ObservationState::Connecting);
+    let attachment = AttachmentId(uuid::Uuid::new_v4());
+    let (connected, readiness) = tokio::sync::watch::channel(Observation::Connecting(attachment));
     ui.history = Some(crate::chat_history::Job::start(
         client,
         item.conversation_id.clone(),
@@ -309,6 +335,7 @@ pub(crate) async fn open(
     let task = tokio::spawn(async move {
         let mut ready = Some(ready);
         let mut delay = Duration::ZERO;
+        let mut attachment = attachment;
         loop {
             while retries.try_recv().is_ok() {}
             let result: std::result::Result<(), ViewError> = async {
@@ -330,7 +357,14 @@ pub(crate) async fn open(
             loop {
                 let frame = tokio::select! {
                     frame = reader.next_frame() => frame.map_err(ViewError::read)?,
-                    _ = retries.recv() => return Err(ViewError::Coordinator(anyhow::anyhow!("The input connection needs to reattach"))),
+                    Some(failed) = retries.recv() => {
+                        // An old control socket can fail after a replacement
+                        // observer starts. Only retire the attachment it used.
+                        if failed == attachment {
+                            return Err(ViewError::Coordinator(anyhow::anyhow!("The input connection needs to reattach")));
+                        }
+                        continue;
+                    },
                 };
                 let Some(frame) = frame else { return Err(ViewError::Coordinator(anyhow::anyhow!("The conversation observation connection closed"))); };
                 let event = decode_coordinator_event(&frame).map_err(ViewError::Internal)?;
@@ -342,7 +376,7 @@ pub(crate) async fn open(
                 if matches!(event, RuntimeEventKind::ConversationReady { .. }) {
                     if let Some(ready) = ready.take() { let _ = ready.send(()); }
                     delay = Duration::ZERO;
-                    let _ = connected.send(ObservationState::Connected);
+                    let _ = connected.send(Observation::Connected(attachment));
                     let _ = handle.observation(ObservationState::Connected);
                 }
                 if matches!(event, RuntimeEventKind::Done | RuntimeEventKind::Failure { code: ErrorCode::CoordinatorUnavailable | ErrorCode::Internal, .. }) {
@@ -358,7 +392,8 @@ pub(crate) async fn open(
         .await;
             match result {
                 Err(ViewError::Coordinator(_)) => {
-                    let _ = connected.send(ObservationState::Reconnecting);
+                    attachment = AttachmentId(uuid::Uuid::new_v4());
+                    let _ = connected.send(Observation::Reconnecting(attachment));
                     if handle.observation(ObservationState::Reconnecting).is_err() {
                         return;
                     }
@@ -377,7 +412,7 @@ pub(crate) async fn open(
                 }
             }
         }
-        let _ = connected.send(ObservationState::Disconnected);
+        let _ = connected.send(Observation::Disconnected);
         let _ = handle.observation(ObservationState::Disconnected);
         let _ = sender.send((token, RuntimeEventKind::Done));
     });
@@ -399,7 +434,8 @@ pub(crate) async fn control(
     token: uuid::Uuid,
     sender: tokio::sync::mpsc::UnboundedSender<(uuid::Uuid, RuntimeEventKind)>,
     admission: &crate::chat_admission::Admission,
-    ready: &tokio::sync::watch::Receiver<ObservationState>,
+    ready: &tokio::sync::watch::Receiver<Observation>,
+    attachment: AttachmentId,
 ) -> std::result::Result<(), ViewError> {
     let mut wire = connection(
         client.config,
@@ -410,7 +446,7 @@ pub(crate) async fn control(
     )
     .await
     .map_err(ViewError::Coordinator)?;
-    if observation(ready) != ObservationState::Connected {
+    if !matches!(*ready.borrow(), Observation::Connected(current) if current == attachment) {
         return Err(ViewError::Coordinator(anyhow::anyhow!(
             "The conversation view is disconnected; this input remains unsent."
         )));

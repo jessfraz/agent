@@ -481,6 +481,9 @@ Import and revision tests use real Pi storage without an inference provider.
 Synthetic vectors test index mechanics; the native embedding test separately
 checks the packaged model and runner.
 
+Terminal recovery scopes retries to the failed attachment. A delayed input
+failure cannot retire its replacement observer or replay a written input.
+
 Fault-injection tests still use controlled peers and providers for lost replies,
 offline workers and malformed frames. Keep those separate from end-to-end
 proof. Exercise surviving children, repeated inputs and source versions,

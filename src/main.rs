@@ -1567,8 +1567,9 @@ fn selected_input(
     while ui.admissions.try_join_next().is_some() {}
     ui.admissions.spawn(async move {
         loop {
+        let mut attachment = None;
         let result: std::result::Result<(), chat_view::ViewError> = async {
-            if ready.wait_for(|ready| matches!(ready, agent_cli::tui::ObservationState::Connected | agent_cli::tui::ObservationState::Disconnected)).await.is_err()
+            if ready.wait_for(|ready| matches!(ready.state(), agent_cli::tui::ObservationState::Connected | agent_cli::tui::ObservationState::Disconnected)).await.is_err()
                 || chat_view::observation(&ready) != agent_cli::tui::ObservationState::Connected
             {
                 if admission.stage()? == chat_admission::Stage::Canceled {
@@ -1576,6 +1577,8 @@ fn selected_input(
                 }
                 return Err(chat_view::ViewError::Coordinator(anyhow::anyhow!("The conversation view did not attach; this input remains unsent.")));
             }
+            attachment = ready.borrow().attachment();
+            let attached = attachment.context("The conversation view has no active attachment")?;
             if admission.stage()? == chat_admission::Stage::Canceled {
                 return Ok(());
             }
@@ -1634,16 +1637,22 @@ fn selected_input(
                 sender.clone(),
                 &admission,
                 &ready,
+                attached,
             )
             .await
         }
         .await;
         if matches!(result, Err(chat_view::ViewError::Coordinator(_))) && ready.has_changed().is_ok() {
             let _ = ready.borrow_and_update();
-            let _ = retry.try_send(());
+            if let Some(attachment) = attachment {
+                let _ = retry.send(attachment).await;
+            }
             // A claimed write is uncertain. Reattach reconciles its original ID;
             // only inputs that never claimed a write may resume automatically.
             if matches!(admission.stage(), Ok(chat_admission::Stage::Waiting)) {
+                if matches!(*ready.borrow_and_update(), chat_view::Observation::Connected(current) if Some(current) != attachment) {
+                    continue;
+                }
                 if ready.changed().await.is_ok() { continue; }
             } else {
                 if matches!(admission.uncertain(), Ok(true)) {

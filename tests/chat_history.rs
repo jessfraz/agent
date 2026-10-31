@@ -860,9 +860,6 @@ async fn observer_recovery(case: RecoveryCase) {
         .unwrap();
     read_terminal_until(&mut output, &mut bytes, "A retained draft").await;
     disconnect.add_permits(1);
-    if case == RecoveryCase::UncertainWorker {
-        lose_receipt.add_permits(1);
-    }
     read_terminal_until(&mut output, &mut bytes, "Reconnecting").await;
     assert!(!terminal_text(&bytes).contains("Code: internal"));
     assert!(terminal_text(&bytes).contains("A retained draft"));
@@ -882,6 +879,11 @@ async fn observer_recovery(case: RecoveryCase) {
     })
     .await
     .unwrap();
+    if case == RecoveryCase::UncertainWorker {
+        // The old input socket can fail after observer recovery has begun.
+        // Its late failure must not retire the replacement attachment.
+        lose_receipt.add_permits(1);
+    }
     assert_eq!(
         inputs.lock().await.len(),
         usize::from(case != RecoveryCase::WaitingWorker)
