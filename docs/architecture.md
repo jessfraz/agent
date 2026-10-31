@@ -226,6 +226,11 @@ account's selection direction persist across restarts, including accounts that
 receive only one slot per batch. Retries keep their exact claimed batch and
 admitted input.
 
+Polling and judgment have separate serialized lanes in the same Pi scheduler.
+A long model turn cannot delay the next provider poll. Poll completion requests
+judgment; its own durable timer also handles due follow-ups and retries. The
+source journal retains one claimed batch across restart and retry.
+
 Messages reads use Rex Server's existing macOS permission identity. A short
 action starts a headless Rust helper; subsequent calls collect bounded chunks.
 The helper owns the read deadline and process group cleanup. Rex retains one
@@ -258,6 +263,11 @@ Outcome triage uses `notify` for useful or requested updates; bookkeeping and
 tool receipts stay internal. Explicit notifications use `agent.user_notice`
 with a durable publication identity. Legacy `agent.notice` entries remain
 readable but are not eligible for push delivery.
+Display-only writes make new notices visible while main is busy. A separate
+hidden entry adds their model context at Pi's normal boundary, preserving reset
+and compaction ordering. Each projection has a stable request ID; replay fills
+an interrupted projection without duplicating the visible notice. A notice
+queued behind a reset is reported as queued until its display write completes.
 
 Task outcomes are a built-in source, admitted in the same transaction as task
 changes. They retain conversation, entry and tool-call provenance. Unfinished

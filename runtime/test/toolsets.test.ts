@@ -64,7 +64,7 @@ async function open(directory: string, guidanceText = "CURRENT_PROFILE_GUIDANCE"
   const sources = new SourceJournal(session, tasks, executions), resources = new ResourceStore(session, tasks); tasks.guardResources(resources);
   const tools = createAppTools(tasks, executions), sourceTools = createSourceTools(sources, executions);
   const background = new BackgroundScheduler(session, registry, tasks, {
-    async plan() { throw new Error("No timer is started by this fixture"); }, async refreshSources() {}, async collectResources() {},
+    async plan() { throw new Error("No timer is started by this fixture"); }, async refreshSources() {}, async triageSources() {}, async collectResources() {},
     async runJob() { throw new Error("No scheduled execution is requested by this fixture"); },
   });
   const toolsets = createToolsets({ guidance: createGuidance(executions), tools, sourceTools,

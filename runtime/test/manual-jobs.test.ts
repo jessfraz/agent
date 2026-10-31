@@ -68,7 +68,7 @@ test("manual admissions retain every requested run in the existing serial job la
     assert.deepEqual(runs.slice(0, 3).map((run) => run.id), ["manual:first", "manual:second", "manual:third"]);
     assert.ok(runs.every((run) => run.job.revision === "one"));
     assert.equal(runs[3]?.scheduled_at, START + 2 * DAY); assert.equal(maximum, 1);
-    assert.equal((await app.scheduler.status()).triggers, 2, "Job removal leaves both built-in triggers intact");
+    assert.equal((await app.scheduler.status()).triggers, 3, "Job removal leaves all built-in triggers intact");
     releases[3]?.release();
   } finally { for (const release of releases) release.release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -241,7 +241,7 @@ test("a manually admitted task executes its reviewed focus through the actual sc
   const app = await openScheduled(directory), controller = new AbortController();
   let worker: Promise<unknown> | undefined;
   const scheduler = new BackgroundScheduler(app.session, app.registry, app.tasks, {
-    plan: async (cadence, after, now) => planned(cadence, after, now), refreshSources: async () => {}, collectResources: async () => {},
+    plan: async (cadence, after, now) => planned(cadence, after, now), refreshSources: async () => {}, triageSources: async () => {}, collectResources: async () => {},
     runJob: (occurrence, signal, actorId) => runScheduled(occurrence, signal, app, actorId),
   });
   try {

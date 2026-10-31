@@ -67,6 +67,7 @@ export async function openBackground(directory: string, clock: FakeClock, overri
   const scheduler = new BackgroundScheduler(session, registry, tasks, {
     plan: async (cadence, after, now) => planned(cadence, after, now),
     refreshSources: async () => { await session.commit(async (tx) => { (await tx.doc(Receipts)).sources += 1; }, BACKGROUND_CONTEXT); },
+    triageSources: async () => {},
     collectResources: async () => { await session.commit(async (tx) => { (await tx.doc(Receipts)).resources += 1; }, BACKGROUND_CONTEXT); },
     runJob: async (occurrence) => { await session.commit(async (tx) => {
       const receipts = await tx.doc(Receipts);

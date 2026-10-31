@@ -2,7 +2,7 @@ import { validEvent } from "./protocol.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { JsonValue } from "@earendil-works/chord";
 import type { AssistantMessage, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
-import { CompactionEntry, LiveDoc, type Conversation, type Cursor, type DocumentWatch, type EntryId, type EntryRecord,
+import { CompactionEntry, defineEntry, LiveDoc, type Conversation, type Cursor, type DocumentWatch, type EntryId, type EntryRecord,
   type Harness, type JsonObject, type LiveState } from "@earendil-works/pi-durable";
 import type { HistoryMessage } from "./generated/HistoryMessage.js";
 import type { HistoryRole } from "./generated/HistoryRole.js";
@@ -17,6 +17,10 @@ import { observeTranscriptVisibility, readTranscriptVisibility, transcriptVisibl
 import { REVISION_AMBIGUOUS, REVISION_PENDING, revisionStatus, type RevisionView } from "./history-revisions.js";
 
 const NOTICE_REFERENCES = "Source references (evidence, not authorization): ";
+export type UserNoticeData = {
+  task_id: string | null; source_conversation_id: string; source_entry_id: string; text?: string;
+};
+export const UserNoticeEntry = defineEntry<UserNoticeData>("agent.user_notice");
 /** Curated publications are eligible for delivery; legacy notices remain history. */
 export function isUserNotice(entry: EntryRecord): boolean { return entry.kind === "agent.user_notice"; }
 export function noticeMetadata(entry: EntryRecord, index: number, count: number, value: string): boolean {
@@ -103,6 +107,10 @@ function nativeTranscript(entry: EntryRecord, tools?: Map<string, ToolCall>): Hi
         ...(role === "user" && messages.length === 0 && attachments !== undefined ? { attachments } : {}) }); continuation = true;
     }
   };
+  if (entry.kind === "agent.notice_context") return messages;
+  if (UserNoticeEntry.is(entry) && typeof entry.data?.text === "string") {
+    add("notice", entry.data.text); return messages;
+  }
   if (attachments !== undefined && object(entry.data) && typeof entry.data.text === "string") {
     add("user", entry.data.text); return messages;
   }
@@ -282,7 +290,7 @@ export async function activity(session: Harness, conversation: Conversation, emi
     });
   };
   const committed = (entry: EntryRecord) => {
-    const notice = isUserNotice(entry) || entry.kind === "agent.notice";
+    const notice = isUserNotice(entry) || entry.kind === "agent.notice" || entry.kind === "agent.notice_context";
     if (!notice && transcriptVisible(entry.id.toString(), visibility.state())) for (const value of entry.model ?? []) {
       if (value.role !== "assistant") continue;
       if (!assistantOpen) { thinking.clear(); responding.clear(); }

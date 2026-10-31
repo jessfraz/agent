@@ -23,7 +23,7 @@ import type { ScheduledOccurrence } from "./generated/ScheduledOccurrence.js";
 import type { TaskAgentRecord } from "./generated/TaskAgentRecord.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { WorkerRef } from "./generated/WorkerRef.js";
-import { noticeMetadata } from "./transcript.js";
+import { noticeMetadata, UserNoticeEntry, type UserNoticeData } from "./transcript.js";
 import { HistoryStore, ImportedItemEntry, importedText } from "./history.js";
 import { REVISION_AMBIGUOUS, REVISION_PENDING, revisionStatus, type RevisionView } from "./history-revisions.js";
 import type { SavedMatch } from "./generated/SavedMatch.js";
@@ -63,6 +63,7 @@ function conversationIdentity(value: unknown): value is ConversationId {
 }
 
 export class TaskError extends Error {}
+export type NoticePublication = "published" | "queued";
 export type OutcomeSink = {
   recordIn(tx: Tx, outcome: TaskOutcome, settled: boolean, attemptId?: string): Promise<void>;
   deliveredIn(tx: Tx, outcome: TaskOutcome): Promise<void>;
@@ -71,10 +72,23 @@ export type OutcomeSink = {
 /** Only an explicit coordinator notification becomes user-visible context. */
 export async function publishMainNotice(session: Harness, conversation: Conversation, entry: EntryRecord,
   taskId: string | null, sources: readonly SourceRef[],
-  notice: { key: string; text: string; events: readonly SourceEvent[] }): Promise<void> {
+  notice: { key: string; text: string; events: readonly SourceEvent[] }): Promise<NoticePublication> {
   const root = await session.root(BACKGROUND_CONTEXT);
   const requestId = "notice:" + entry.id.toString() + ":" + notice.key;
-  if (await session.commit((tx) => tx.submissionByRequest(root.id, requestId), BACKGROUND_CONTEXT) !== undefined) return;
+  // Legacy model-bearing notices already own their eventual visible entry.
+  // Never create a second display entry while that original write is queued.
+  const legacy = await session.commit(async (tx) => {
+    const prior = await tx.submissionByRequest(root.id, requestId);
+    if (prior === undefined) return undefined;
+    if (prior.entry !== undefined) return (await tx.entry(prior.entry))?.model === undefined ? undefined : prior;
+    const pending = (await tx.doc(InboxDoc, root.id)).items.find((item) => item.id === prior.id);
+    return pending?.mode === "write" && pending.entry.model !== undefined ? prior : undefined;
+  }, BACKGROUND_CONTEXT);
+  if (legacy !== undefined) {
+    if (legacy.status === "done") return "published";
+    if (legacy.status === "queued") return "queued";
+    throw new TaskError("The earlier notification did not publish");
+  }
   const model = entry.model?.flatMap((message) => {
     if (message.role !== "assistant") return [];
     const content: TextContent[] = [{ type: "text", text: notice.text }];
@@ -84,17 +98,29 @@ export async function publishMainNotice(session: Harness, conversation: Conversa
     }) });
     return [{ ...message, content }];
   }) ?? [];
-  if (model.length === 0) return;
-  await root.submit({ type: "write", requestId, entry: {
-    kind: "agent.user_notice", data: { task_id: taskId, source_conversation_id: conversation.id.toString(),
-      source_entry_id: entry.id.toString() }, model,
+  if (model.length === 0) throw new TaskError("The notification has no assistant origin");
+  const data: UserNoticeData = { task_id: taskId, source_conversation_id: conversation.id.toString(),
+    source_entry_id: entry.id.toString(), text: notice.text };
+  // Pi can publish display-only writes while main is busy. Model context stays
+  // in its ordered inbox so compaction and resets retain their native boundary.
+  const display = await root.submit({ type: "write", requestId, entry: {
+    kind: UserNoticeEntry.kind, data,
   } }, BACKGROUND_CONTEXT);
+  await root.submit({ type: "write", requestId: "notice-context:" + JSON.stringify([entry.id.toString(), notice.key]), entry: {
+    kind: "agent.notice_context", model,
+  } }, BACKGROUND_CONTEXT);
+  const status = await display.status(BACKGROUND_CONTEXT);
+  if (status.status === "done") return "published";
+  if (status.status === "queued") return "queued";
+  throw new TaskError("The notification did not publish");
 }
 function key(value: string): string { return value.normalize("NFKC").trim().toLocaleLowerCase(); }
 function related(left: SourceRef, right: SourceRef): boolean {
   return left.provider === right.provider && left.account === right.account && left.thread_id === right.thread_id;
 }
 function text(entry: EntryRecord, toolLimit?: number): string {
+  if (entry.kind === "agent.notice_context") return "";
+  if (UserNoticeEntry.is(entry) && typeof entry.data?.text === "string") return entry.data.text;
   const imported = importedText(entry); if (imported !== undefined) return imported;
   return entry.model?.filter((message) => message.role !== "system").map((message) => {
     const content = typeof message.content === "string" ? message.content : message.content.flatMap((part, index) =>
