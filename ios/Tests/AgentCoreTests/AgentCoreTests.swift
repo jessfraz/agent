@@ -181,6 +181,51 @@ private func withLocalPeer(_ body: @Sendable (LineConnection, NWConnection) asyn
 }
 
 @Test(.timeLimit(.minutes(1)))
+func realNetworkTransportRefusalReleasesThePendingSendForReconnect() async throws {
+  let listener = try NWListener(using: .tcp, on: .any)
+  let listening = AsyncThrowingStream<Void, any Error>.makeStream()
+  listener.stateUpdateHandler = { state in
+    switch state {
+    case .ready: listening.continuation.yield(())
+    case .cancelled: listening.continuation.finish()
+    case .failed(let error): listening.continuation.finish(throwing: error)
+    default: break
+    }
+  }
+  listener.newConnectionHandler = { $0.cancel() }
+  listener.start(queue: .global())
+  defer { listener.cancel() }
+  for try await _ in listening.stream { break }
+  let port = try #require(listener.port)
+  listener.cancel()
+  for try await _ in listening.stream {}
+
+  let socket = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)
+  let client = LineConnection(connection: socket)
+  defer { socket.cancel() }
+  let sending = Task { try await client.send(.observe(.init(inputIds: []))) }
+  do {
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      group.addTask { try await sending.value }
+      group.addTask {
+        try await Task.sleep(for: .seconds(2))
+        throw ConnectionError.timedOut
+      }
+      defer {
+        group.cancelAll()
+        sending.cancel()
+      }
+      try await group.next()
+      Issue.record("A refused connection accepted input")
+    }
+  } catch {
+    #expect(!(error is ConnectionError), "Refusal must release the send before its timeout")
+    #expect(ConnectionError.shouldReconnect(after: error))
+  }
+  await client.close()
+}
+
+@Test(.timeLimit(.minutes(1)))
 func realNetworkTransportRejectsOversizedFramesAndClosesTheTransport() async throws {
   try await withLocalPeer { client, server in
     // A peer may still be writing when the frame limit is reached. Awaiting

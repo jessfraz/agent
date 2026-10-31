@@ -114,9 +114,10 @@ Rust owns the native wire types. The existing bindings exporter generates
 Rust's actual serde implementation. Swift tests consume those fixtures and
 exercise loopback framing, outbox persistence, composer admission and owned
 connection cleanup. From the repository root, `make check` also starts the
-production coordinator and Pi database; on macOS it connects the Swift client
-and reconciles its outbox across reconnects and server restarts. Scripted peers
-remain in separate fault-injection tests.
+production coordinator and Pi database. On macOS the same Swift client stays
+alive across server restarts, preserving its draft and reconciling its outbox
+without duplicate input. Scripted peers remain in separate fault-injection
+tests.
 
 Rendering tests capture the production message rows
 in light, dark and large-text appearance using invented content. Markdown

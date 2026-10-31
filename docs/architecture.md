@@ -474,8 +474,9 @@ part of the MVP.
 ## Validation
 
 CI starts the production coordinator with real Pi SQLite storage and Unix
-sockets on Linux and macOS. macOS also connects the native Swift client to
-that server, checking outbox reconciliation across reconnects and restarts.
+sockets on Linux and macOS. macOS keeps the native Swift client alive across
+server restarts, checking automatic reconnection, its draft and one canonical
+saved input.
 These tests use no replacement coordinator or model provider.
 Import and revision tests use real Pi storage without an inference provider.
 Synthetic vectors test index mechanics; the native embedding test separately

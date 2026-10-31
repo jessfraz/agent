@@ -129,12 +129,23 @@ actor LineConnection {
       .value
     try Task.checkCancellation()
     connection = NWConnection(host: .init(host), port: port, using: parameters)
-    connection.start(queue: .global(qos: .userInitiated))
+    Self.start(connection)
   }
 
   // Tests exercise the real reader/writer over a local Network.framework listener.
   init(connection: NWConnection) {
     self.connection = connection
+    Self.start(connection)
+  }
+
+  private static func start(_ connection: NWConnection) {
+    let observe = connection.stateUpdateHandler
+    connection.stateUpdateHandler = { [weak connection] state in
+      observe?(state)
+      // A refused service does not change the network path. Release this
+      // attempt so the session's retry loop can reconnect after a restart.
+      if case .waiting(.posix(.ECONNREFUSED)) = state { connection?.cancel() }
+    }
     connection.start(queue: .global(qos: .userInitiated))
   }
 

@@ -14,13 +14,15 @@ import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import { protocolLines, validEvent } from "../src/protocol.js";
 
+type Server = { child: ChildProcessWithoutNullStreams; closed: Promise<number | null>; errors(): string };
+
 test("production coordinator reconciles saved input before history across a real socket and restart", { timeout: 180_000 }, async (t) => {
   const directory = await mkdtemp("/tmp/agent-observation-e2e-");
   const state = join(directory, "state"), bin = join(directory, "bin"), socket = join(state, "agent.sock");
   const input = "11111111-1111-4111-8111-111111111111", text = "Keep the original saved request.";
   const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../target/debug/agent", import.meta.url));
   const runtime = fileURLToPath(new URL("../src/bridge.js", import.meta.url));
-  const children: { child: ChildProcessWithoutNullStreams; closed: Promise<number | null>; errors(): string }[] = [];
+  const children: Server[] = [];
   try {
     await mkdir(state, { mode: 0o700 }); await mkdir(bin, { mode: 0o700 });
     // Node is the only installed helper. Missing optional Rex/SSH/provider
@@ -86,37 +88,67 @@ test("production coordinator reconciles saved input before history across a real
         throw new Error("Coordinator closed before completing the observation snapshot");
       } finally { channel.destroy(); }
     }
-    async function nativeClient(): Promise<void> {
+    async function stop(server: Server): Promise<void> {
+      server.child.kill("SIGINT");
+      assert.equal(await server.closed, 0, server.errors());
+      assert.equal(await stat(socket).then(() => true, () => false), false,
+        "Shutdown must release the real coordinator's socket");
+    }
+    async function nativeClient(server: Server): Promise<Server> {
       const project = fileURLToPath(new URL("../../../ios", import.meta.url));
       const scratch = fileURLToPath(new URL("../../../target/native-client-integration", import.meta.url));
+      const restart = join(directory, "native-restart-requested"), reconnecting = join(directory, "native-reconnecting");
+      await rm(restart, { force: true }); await rm(reconnecting, { force: true });
       const child = spawn("/usr/bin/xcrun", ["--sdk", "macosx", "swift", "test", "--package-path", project,
         "--scratch-path", scratch, "--filter", "nativeClientReconcilesAgainstTheProductionCoordinator"], {
         detached: true, stdio: ["ignore", "pipe", "pipe"],
         env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", HOME: directory, TMPDIR: directory,
           AGENT_E2E_SOCKET: socket, AGENT_E2E_DIRECTORY: directory,
-          AGENT_E2E_INPUT: input, AGENT_E2E_ENTRY: entry, AGENT_E2E_TEXT: text },
+          AGENT_E2E_INPUT: input, AGENT_E2E_ENTRY: entry, AGENT_E2E_TEXT: text,
+          AGENT_E2E_RESTART_REQUEST: restart, AGENT_E2E_RECONNECTING: reconnecting },
       });
+      const closed = new Promise<number | null>((resolve, reject) => {
+        child.once("close", resolve); child.once("error", reject);
+      });
+      void closed.catch(() => {});
       const pid = child.pid;
       let output = "";
       child.stdout.setEncoding("utf8").on("data", (value: string) => { output += value; });
       child.stderr.setEncoding("utf8").on("data", (value: string) => { output += value; });
-      const stop = () => {
+      const stopClient = () => {
         if (pid !== undefined && child.exitCode === null && child.signalCode === null) {
           try { process.kill(-pid, "SIGTERM"); } catch (error) {
             if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
           }
         }
       };
-      t.signal.addEventListener("abort", stop, { once: true });
+      const untilSignal = async (path: string) => {
+        while (!await stat(path).then(() => true, () => false)) {
+          assert.equal(child.exitCode, null, output);
+          assert.equal(child.signalCode, null, output);
+          t.signal.throwIfAborted();
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      };
+      t.signal.addEventListener("abort", stopClient, { once: true });
       try {
-        const code = await new Promise<number | null>((resolve, reject) => {
-          child.once("close", resolve); child.once("error", reject);
-        });
-        assert.equal(code, 0, output);
-      } finally { t.signal.removeEventListener("abort", stop); stop(); }
+        await untilSignal(restart);
+        await stop(server);
+        // Keep the same native session and its composer alive while the real
+        // service is absent. Restart only once that client observes the loss.
+        await untilSignal(reconnecting);
+        const restarted = await start();
+        await observe();
+        assert.equal(await closed, 0, output + restarted.errors());
+        return restarted;
+      } finally {
+        t.signal.removeEventListener("abort", stopClient);
+        stopClient();
+        await closed.catch(() => {});
+      }
     }
     for (let run = 0; run < 2; run += 1) {
-      const server = await start();
+      let server = await start();
       for (let reconnect = 0; reconnect < 2; reconnect += 1) {
         const events = await observe();
         const placed = events.findIndex((event) => event.type === "input_placed" && event.input_id === input);
@@ -130,11 +162,8 @@ test("production coordinator reconciles saved input before history across a real
       }
       // macOS CI also runs the actual Swift session, outbox and reducer against
       // this same coordinator. Linux exercises the production wire path above.
-      if (process.platform === "darwin") await nativeClient();
-      server.child.kill("SIGINT");
-      assert.equal(await server.closed, 0, server.errors());
-      assert.equal(await stat(socket).then(() => true, () => false), false,
-        "Shutdown must release the real coordinator's socket");
+      if (process.platform === "darwin") server = await nativeClient(server);
+      await stop(server);
     }
   } finally {
     for (const server of children) {
