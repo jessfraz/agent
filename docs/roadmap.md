@@ -41,7 +41,7 @@ recovery; [history](history.md) describes import and retrieval.
   Playwright code and private 1Password CLI reads. Both macOS deployments
   passed fresh password/TOTP sign-in with 1Password enabled, authenticated
   access, independent connections without browser approval clicks, and owned
-  tab cleanup after the Agent service restarted.
+  tab cleanup after the Beep Boop service restarted.
 - [ ] Complete unattended Chrome lifecycle acceptance across OS reboots,
   ordinary browser relaunch and interruption recovery with autofill enabled.
 - [ ] Deliver browser screenshot attachments.
@@ -112,8 +112,8 @@ recovery; [history](history.md) describes import and retrieval.
 
 ## Reuse upstream
 
-Verified against Pi Durable 1.4.0 and Agent's current source. Source integration
-and deployment are tracked separately above.
+Verified against Pi Durable 1.4.0 and Beep Boop's current source. Source
+integration and deployment are tracked separately above.
 
 | Upstream capability | Status | Application use and remaining work |
 | --- | --- | --- |
@@ -121,9 +121,9 @@ and deployment are tracked separately above.
 | Steering, follow-ups, abort and compaction | In use | Native input modes, abort and compaction events drive chat. |
 | Durable sleeps and wake notifications | In use | Sources, resources and jobs share Pi's persisted sleeps and scheduler. |
 | Typed telemetry and usage totals | In use | Native UsageDoc supplies own-conversation totals and bounded request timings in `/status`; the private native SQLite recorder keeps payload-free diagnostics. Unknown prices remain unavailable; API-equivalent estimates are separate from bills and subscription quota. |
-| Image preparation workers | In use | Pi's Photon worker prepares attached images for native model input. Agent owns transfer and storage. |
-| Image-aware file readers | Not enabled | Agent owns its host file tools; reuse Pi's image-aware reads when extending them. |
-| Forks, child tasks and task graphs | Partial | Pi executes native model/tool task trees. Agent delegates use separate conversations; forks and graph views are not integrated. Evaluate native ownership while preserving delegates' durable lifetimes and Rex bindings. |
+| Image preparation workers | In use | Pi's Photon worker prepares attached images for native model input. Beep Boop owns transfer and storage. |
+| Image-aware file readers | Not enabled | Beep Boop owns its host file tools; reuse Pi's image-aware reads when extending them. |
+| Forks, child tasks and task graphs | Partial | Pi executes native model/tool task trees. Beep Boop delegates use separate conversations; forks and graph views are not integrated. Evaluate native ownership while preserving delegates' durable lifetimes and Rex bindings. |
 | Deferred tool search and code mode | Not enabled | Benchmark upstream extensions against the current role-specific toolsets; adopt when they reduce total tokens or round trips. Tool search is separate from conversation search. |
 
 See [Pi Durable](https://github.com/earendil-works/pi/tree/main/packages/durable)

@@ -534,7 +534,7 @@ impl Source for MessagesSource {
         .await;
         Ok(result.unwrap_or_else(|_| SourceBatch::unavailable(
             self.key(),
-            "Messages reads are unavailable; run agent rex install and check Rex Server's Full Disk Access",
+            "Messages reads are unavailable; run beep-boop rex install and check Rex Server's Full Disk Access",
         )))
     }
 }

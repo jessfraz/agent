@@ -48,7 +48,11 @@ use tokio::{
 };
 
 #[derive(Parser)]
-#[command(name = "agent", version, about = "An agent, regrettably")]
+#[command(
+    name = "beep-boop",
+    version,
+    about = "Beep Boop, an agent, regrettably"
+)]
 struct Arguments {
     #[arg(long, global = true)]
     state_dir: Option<PathBuf>,
@@ -933,7 +937,7 @@ async fn main() -> Result<()> {
                 loop {
                     if !arguments.json && std::io::stdin().is_terminal() {
                         let mut stdout = tokio::io::stdout();
-                        stdout.write_all(b"agent> ").await?;
+                        stdout.write_all(b"Beep Boop> ").await?;
                         stdout.flush().await?;
                     }
                     let Some(line) = input.next_line().await? else {
@@ -1862,7 +1866,7 @@ fn feedback_from_ui(
             }
             Err(error) => {
                 if submitted {
-                    let _=handle.notice(format!("Feedback delivery is unconfirmed: {error}. The original report was retained; check `agent feedback latest` before retrying with `agent feedback retry {input_id}`."));
+                    let _=handle.notice(format!("Feedback delivery is unconfirmed: {error}. The original report was retained; check `beep-boop feedback latest` before retrying with `beep-boop feedback retry {input_id}`."));
                 } else {
                     input.text = if input.text.is_empty() {"/feedback".into()} else {format!("/feedback {}",input.text)};
                     let _=handle.restore_composer(input);
@@ -2443,7 +2447,7 @@ async fn local_command_plain(
             for item in items {
                 println!("{}  {}", item.conversation_id, item.title);
             }
-            println!("Open an interactive agent chat to select a saved conversation.");
+            println!("Open an interactive beep-boop chat to select a saved conversation.");
         }
         return Ok(());
     }
@@ -2539,7 +2543,7 @@ async fn local_command_plain(
             command,
             &settings,
             &TuiInfo {
-                title: "Agent".into(),
+                title: "Beep Boop".into(),
                 model: Some(settings.model.clone()),
                 cwd: cwd.to_string_lossy().into_owned(),
             },
@@ -3311,6 +3315,7 @@ async fn connection(
             "1455:127.0.0.1:1455",
         ]);
     }
+    // Older coordinators still expose agent; the package keeps that alias.
     let remote = format!(
         "{} rpc",
         quoted(config.coordinator_program.as_deref().unwrap_or("agent"))
@@ -3977,8 +3982,10 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
             }
         }
         RuntimeEventKind::AuthStatus { status } => match status {
-            AuthStatus::SignedOut => println!("Not signed in. Run agent login."),
-            AuthStatus::NeedsSignIn { .. } => println!("ChatGPT needs sign-in. Run agent login."),
+            AuthStatus::SignedOut => println!("Not signed in. Run beep-boop login."),
+            AuthStatus::NeedsSignIn { .. } => {
+                println!("ChatGPT needs sign-in. Run beep-boop login.")
+            }
             AuthStatus::Connected { account, .. } => println!(
                 "Using ChatGPT plan{}.",
                 account
@@ -4000,7 +4007,7 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
             for message in messages {
                 let role = match message.role {
                     HistoryRole::User => "user",
-                    HistoryRole::Assistant | HistoryRole::Final => "agent",
+                    HistoryRole::Assistant | HistoryRole::Final => "Beep Boop",
                     HistoryRole::Commentary => "update",
                     HistoryRole::PartialAnswer => "partial answer",
                     HistoryRole::Notice => "notice",
@@ -4023,7 +4030,7 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
                     if matches!(message.role, agent_cli::protocol::HistoryRole::User) {
                         "input"
                     } else {
-                        "agent"
+                        "Beep Boop"
                     },
                     message.text
                 );

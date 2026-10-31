@@ -47,7 +47,7 @@ export class CodexImporter {
     if (progress === null || progress === undefined) return initial();
     if (!this.isRunning() && ["discovering", "importing", "indexing"].includes(progress.phase)) return {
       ...progress, phase: "partial", gap_count: progress.gap_count + 1,
-      gaps: ["Previous import was interrupted; run agent import codex to resume.", ...progress.gaps.slice(0, 49)],
+      gaps: ["Previous import was interrupted; run beep-boop import codex to resume.", ...progress.gaps.slice(0, 49)],
     };
     return progress;
   }

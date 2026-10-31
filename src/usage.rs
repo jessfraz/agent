@@ -644,7 +644,7 @@ async fn query<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             params: InitializeParams {
                 client_info: ClientInfo {
                     name: "agent_usage".to_owned(),
-                    title: "Agent Codex account quota".to_owned(),
+                    title: "Beep Boop Codex account quota".to_owned(),
                     version: env!("CARGO_PKG_VERSION").to_owned(),
                 },
             },

@@ -1,6 +1,11 @@
-# agent
+# Beep Boop
 
 An agent, regrettably.
+
+The CLI is `beep-boop` ; the app is **Beep Boop**. The Nix package retains
+`agent` as a compatibility alias for saved launches and older integrations.
+Existing configuration, state, conversations and service identities keep their
+`agent` paths. No data migration or coordinator behavior change is needed.
 
 A Rust CLI around [Pi Durable](https://github.com/earendil-works/pi), with
 ChatGPT plan sign-in, persistent conversations and workers in
@@ -20,7 +25,7 @@ owns the hosts, sessions and terminals. Reuse them.
 ```text
   phone CLI in Rex       CLI / Rex terminal on any host
              \                       /
-              +----- agent chat ----+
+              +----- beep-boop chat ----+
                           |
                coordinator (macOS or Linux)
                main conversation / Pi Durable / SQLite
@@ -51,7 +56,7 @@ connections share metadata, not duplicate executions. Offline workers retain
 their tasks; automatic transfer to another machine comes later.
 
 Rex task tabs open directly into chat and accept replies after a turn finishes.
-The TUI reopens the saved main conversation with `agent` and reconnects to
+The TUI reopens the saved main conversation with `beep-boop` and reconnects to
 ongoing work. `/exit` or Ctrl+C detaches main chat while that work continues;
 reopen it to follow or steer the same execution. Saved history loads in the
 background. Scroll to read it; `/resume` selects another saved chat in place.
@@ -83,32 +88,32 @@ The main chat gets a brief result or the decision needed to move it forward.
 On the coordinator:
 
 ```sh
-nix profile add github:jessfraz/agent
-agent init
-agent serve
+nix profile add github:jessfraz/beep-boop
+beep-boop init
+beep-boop serve
 ```
 
 On another machine, with its own Rex and Tailscale already installed:
 
 ```sh
-nix profile add github:jessfraz/agent
-agent init --coordinator tailscale://100.64.0.10
-agent serve
+nix profile add github:jessfraz/beep-boop
+beep-boop init --coordinator tailscale://100.64.0.10
+beep-boop serve
 ```
 
 That address is invented. Port 43187 is the default. Leave each service running
 or use the Nix service below. Then, in another terminal, sign in once on the
-coordinator with `agent login`. A CLI-only machine uses the same settings and
-skips `agent serve`. On any connected machine:
+coordinator with `beep-boop login` . A CLI-only machine uses the same settings
+and skips `beep-boop serve` . On any connected machine:
 
 ```sh
-agent chat
-agent nodes
-agent tasks list
-agent sources
-agent usage
-agent import codex
-agent history search "fabrication files"
+beep-boop chat
+beep-boop nodes
+beep-boop tasks list
+beep-boop sources
+beep-boop usage
+beep-boop import codex
+beep-boop history search "fabrication files"
 ```
 
 [Setup](docs/setup.md) covers services, trust and provider CLIs. Commented TOML
@@ -118,13 +123,13 @@ model defaults, background sources and optional context repositories. Context
 is available without changing the directory where chat started. Hosts announce
 their own identity and launch paths, using Rex's host inventory when available.
 
-The agent refreshes `$CODEX_HOME/AGENTS.md` or `~/.codex/AGENTS.md`, shared context
-and project instructions before each model round, including after compaction.
-Pi supplies inference and conversation machinery. ChatGPT is the
+The agent refreshes `$CODEX_HOME/AGENTS.md` or `~/.codex/AGENTS.md` , shared
+context and project instructions before each model round, including after
+compaction. Pi supplies inference and conversation machinery. ChatGPT is the
 default; other providers use Pi's environment or ambient credentials. New tasks
-inherit the coordinator's typed model, reasoning and fast-mode settings;
-resumed tasks retain their saved selection. `agent usage` reads the installed
-Codex account's quota and cannot report a separate allowance for this app.
+inherit the coordinator's typed model, reasoning and fast-mode settings; resumed
+tasks retain their saved selection. `beep-boop usage` reads the installed Codex
+account's quota and cannot report a separate allowance for this app.
 
 Supported OpenAI Responses models get hosted web search, page opening and
 find-in-page tools. Source links stay in saved replies. Other providers need
@@ -138,13 +143,13 @@ Switchboard and `gws`, GitHub through Switchboard and `gh`, a configured Slack
 CLI, and the read-only macOS `messages` CLI. Each can be disabled. Failed reads
 remain visible as coverage gaps. Task outcomes are built in.
 
-Tasks can own multiple worktrees. `agent resources list` shows their inventory;
-`agent resources collect` uses the installed guarded `git cleanup` workflow.
-`/worktrees` shows the same inventory in terminal and native chat clients.
-The main agent can invoke that collector with `collect_worktrees`.
-Only merged, clean, inactive work is eligible. Missing helpers, uncertain
-ownership and partial results stay visible. Services check local resources
-every five minutes.
+Tasks can own multiple worktrees. `beep-boop resources list` shows their
+inventory; `beep-boop resources collect` uses the installed guarded
+`git cleanup` workflow. `/worktrees` shows the same inventory in terminal and
+native chat clients. The main agent can invoke that collector with
+`collect_worktrees` . Only merged, clean, inactive work is eligible. Missing
+helpers, uncertain ownership and partial results stay visible. Services check
+local resources every five minutes.
 
 Codex imports are incremental. Saved conversations remain searchable after
 closing Rex; reopening relevant work reuses the same conversation. Local

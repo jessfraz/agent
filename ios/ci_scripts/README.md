@@ -1,4 +1,4 @@
-# TestFlight delivery from main
+# Beep Boop TestFlight delivery from main
 
 Xcode Cloud owns signing and distribution. Its workflow settings live in
 App Store Connect; this directory supplies the archive's additional test gate.
@@ -37,8 +37,12 @@ native checks; it does not inherit the status of another CI provider's jobs.
 Initialize the first workflow from Xcode's Report navigator → Cloud →
 Get Started, select the existing app and intended developer team, and grant
 the Xcode Cloud GitHub integration access to this repository only. Select the
-existing App Store Connect record. After initialization, edit the settings
-above in Xcode or App Store Connect.
+existing App Store Connect record. The native display name is Beep Boop; the
+project, target, scheme and archive product remain `Agent`. App Store Connect
+maintains its own app name separately from `CFBundleDisplayName`; use the same
+app record and bundle ID for any metadata rename, not a new app identity. See
+[naming and identity](../README.md#naming-and-identity). After initialization,
+edit the settings above in Xcode or App Store Connect.
 
 Choose the private group in the Cloud post-action explicitly. The group's
 automatic distribution setting for Xcode uploads does not apply to Cloud builds.

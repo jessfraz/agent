@@ -18,7 +18,7 @@ test("production coordinator reconciles saved input before history across a real
   const directory = await mkdtemp("/tmp/agent-observation-e2e-");
   const state = join(directory, "state"), bin = join(directory, "bin"), socket = join(state, "agent.sock");
   const input = "11111111-1111-4111-8111-111111111111", text = "Keep the original saved request.";
-  const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../target/debug/agent", import.meta.url));
+  const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../target/debug/beep-boop", import.meta.url));
   const runtime = fileURLToPath(new URL("../src/bridge.js", import.meta.url));
   const children: { child: ChildProcessWithoutNullStreams; closed: Promise<number | null>; errors(): string }[] = [];
   try {

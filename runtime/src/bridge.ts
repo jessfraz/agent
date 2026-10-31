@@ -499,7 +499,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         if (task === undefined && imported !== undefined) task = await tasks.adopt(command.conversation_id, {
           id: randomUUID(), outcome: "Continue this historical conversation", evidence: await tasks.readConversation(command.conversation_id, 24_000), model: await environment.model(null),
         });
-        if (task === undefined) throw new TaskError("This conversation has no task; run agent chat for the main conversation");
+        if (task === undefined) throw new TaskError("This conversation has no task; run beep-boop chat for the main conversation");
         const hosts = await environment.hosts("/", null, []);
         const host = "binding" in task.worker ? await tasks.workerHost(task.id)
           : command.host === null ? await environment.defaultHost(hosts)

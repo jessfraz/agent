@@ -1,5 +1,5 @@
 {
-  description = "A local agent CLI";
+  description = "Beep Boop, a local agent CLI";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/3ec636362e1816bc2f0888fa0fa2c69f1bc9e504";
 
@@ -23,7 +23,7 @@
         hash = "sha256-BlB8e0JohGnE5ymLCh4W3v8GyvKRzwpbJ4wwgknD5Dk=";
       };
       runtime = pkgs.buildNpmPackage {
-        pname = "agent-runtime";
+        pname = "beep-boop-runtime";
         version = "0.1.0";
         src = pkgs.lib.fileset.toSource {
           root = ./runtime;
@@ -44,25 +44,26 @@
         '';
         installPhase = ''
           runHook preInstall
-          mkdir -p "$out/lib/agent-runtime/dist" "$out/lib/agent-runtime/src/generated"
-          cp -r dist/src "$out/lib/agent-runtime/dist/"
-          cp -r node_modules package.json "$out/lib/agent-runtime/"
-          cp src/generated/*.schema.json "$out/lib/agent-runtime/src/generated/"
+          mkdir -p "$out/lib/beep-boop-runtime/dist" "$out/lib/beep-boop-runtime/src/generated"
+          cp -r dist/src "$out/lib/beep-boop-runtime/dist/"
+          cp -r node_modules package.json "$out/lib/beep-boop-runtime/"
+          cp src/generated/*.schema.json "$out/lib/beep-boop-runtime/src/generated/"
+          ln -s beep-boop-runtime "$out/lib/agent-runtime"
           runHook postInstall
         '';
       };
       cli = pkgs.rustPlatform.buildRustPackage {
-        pname = "agent";
+        pname = "beep-boop";
         version = "0.1.0";
         src = pkgs.lib.fileset.toSource {
           root = ./.;
           fileset = pkgs.lib.fileset.unions [./src ./tests ./examples ./Cargo.toml ./Cargo.lock];
         };
         cargoLock.lockFile = ./Cargo.lock;
-        cargoBuildFlags = ["--bin" "agent"];
+        cargoBuildFlags = ["--bin" "beep-boop"];
         nativeBuildInputs = [pkgs.makeWrapper];
         nativeCheckInputs = [pkgs.nodejs_26 pkgs.git pkgs.lsof];
-        AGENT_RUNTIME_PATH = "${runtime}/lib/agent-runtime/dist/src/bridge.js";
+        AGENT_RUNTIME_PATH = "${runtime}/lib/beep-boop-runtime/dist/src/bridge.js";
         AGENT_SQLITE_VEC = "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
         preCheck = ''
           patchShebangs tests/fixtures
@@ -74,13 +75,15 @@
             "''${fixtureProfileFlags[@]}" --example terminal-fixture
         '';
         postInstall = ''
-          wrapProgram "$out/bin/agent" \
-            --set AGENT_RUNTIME_PATH "${runtime}/lib/agent-runtime/dist/src/bridge.js" \
+          wrapProgram "$out/bin/beep-boop" \
+            --set AGENT_RUNTIME_PATH "${runtime}/lib/beep-boop-runtime/dist/src/bridge.js" \
             --set AGENT_LLAMA_SERVER "${embeddingRuntime}/bin/llama-server" \
             --set AGENT_EMBEDDING_MODEL "${embeddingModel}" \
             --set AGENT_SQLITE_VEC "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}" \
             --prefix PATH : "${pkgs.lib.makeBinPath [pkgs.nodejs_26 pkgs.git pkgs.lsof pkgs.openssh]}" \
             --suffix PATH : /run/current-system/sw/bin
+          # Saved worker launches and older service configurations still use agent.
+          ln -s beep-boop "$out/bin/agent"
         '';
       };
     in {
@@ -91,8 +94,8 @@
     apps = eachSystem (system: {
       default = {
         type = "app";
-        program = "${self.packages.${system}.default}/bin/agent";
-        meta.description = "An agent CLI with durable conversations and Rex workers";
+        program = "${self.packages.${system}.default}/bin/beep-boop";
+        meta.description = "Beep Boop, an agent CLI with durable conversations and Rex workers";
       };
     });
     devShells = eachSystem (system: let

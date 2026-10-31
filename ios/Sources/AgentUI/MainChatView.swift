@@ -77,7 +77,7 @@ public struct MainChatView: View {
       }
       .background(.background)
       .safeAreaInset(edge: .bottom, spacing: 0) { composer }
-      .navigationTitle("Agent")
+      .navigationTitle("Beep Boop")
       #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(Color(uiColor: .systemBackground), for: .navigationBar)
@@ -86,7 +86,7 @@ public struct MainChatView: View {
       .toolbar {
         ToolbarItem(placement: .principal) {
           VStack(spacing: 1) {
-            Text("Agent").font(.headline)
+            Text("Beep Boop").font(.headline)
             Text(model.model.split(separator: "/").last.map(String.init) ?? model.model)
               .font(.caption).foregroundStyle(.primary.opacity(0.65)).lineLimit(1)
           }.accessibilityElement(children: .combine)
@@ -199,7 +199,7 @@ public struct MainChatView: View {
               ProgressView().controlSize(.mini)
               Text("Working…").font(.footnote).foregroundStyle(.secondary)
             }.frame(maxWidth: .infinity, alignment: .leading)
-              .accessibilityLabel("Agent is working")
+              .accessibilityLabel("Beep Boop is working")
           }
           Color.clear.frame(height: 1).id("latest")
             .onScrollVisibilityChange(threshold: 1) { visible in
@@ -338,7 +338,7 @@ public struct MainChatView: View {
         .tint(.primary).accessibilityLabel("Add attachments or commands")
         .accessibilityIdentifier("composerMenu")
         TextField(
-          model.mode == .steer ? "Message Agent" : "Queue a follow-up", text: $model.draft,
+          model.mode == .steer ? "Message Beep Boop" : "Queue a follow-up", text: $model.draft,
           axis: .vertical
         )
         .lineLimit(1...6).textFieldStyle(.plain).padding(.vertical, 11).padding(.horizontal, 2)
@@ -573,7 +573,7 @@ struct MessageRow: View {
   private var title: String {
     switch model.row.role {
     case .user: "You"
-    case .assistant, .final: "Agent"
+    case .assistant, .final: "Beep Boop"
     case .commentary: "Update"
     case .partialAnswer: "Partial answer"
     case .notice: "Notice"

@@ -214,7 +214,7 @@ private enum RegistrationError: LocalizedError {
     switch self {
     case .coordinatorSetup:
       "Notifications are not configured on the coordinator. Complete the APNs setup to receive alerts."
-    case .permission: "Allow Agent notifications in iPhone Settings to receive alerts."
+    case .permission: "Allow Beep Boop notifications in iPhone Settings to receive alerts."
     }
   }
 }

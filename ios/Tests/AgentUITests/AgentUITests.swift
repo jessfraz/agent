@@ -15,10 +15,10 @@ final class AgentUITests: XCTestCase {
     if smallText {
       app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryXS"]
     }
-    // XCTest removes this monitor at test completion. Handle only Agent's
+    // XCTest removes this monitor at test completion. Handle only Beep Boop's
     // native permission prompt, leaving unexpected system alerts as failures.
-    addUIInterruptionMonitor(withDescription: "Agent notification permission") { alert in
-      guard alert.label == "“Agent” Would Like to Send You Notifications",
+    addUIInterruptionMonitor(withDescription: "Beep Boop notification permission") { alert in
+      guard alert.label == "“Beep Boop” Would Like to Send You Notifications",
         alert.buttons["Allow"].exists
       else { return false }
       let receipt = XCTAttachment(screenshot: alert.screenshot())

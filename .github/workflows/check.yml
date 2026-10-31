@@ -54,4 +54,6 @@ jobs:
       - name: Check native embeddings
         run: nix develop --command cargo test --locked --lib embeddings::llama::tests::native_runner_is_private_warm_and_returns_retrieval_vectors -- --ignored --exact
       - name: Smoke test package
-        run: ./result/bin/agent --version
+        run: |
+          ./result/bin/beep-boop --version
+          ./result/bin/agent --version

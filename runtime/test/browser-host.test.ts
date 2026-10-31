@@ -487,7 +487,7 @@ try {
       const listed = await promisify(execFile)(process.execPath, [cli, "list", "--all", "--json"], { cwd: directory, env, timeout: 15_000 });
       const inventory: unknown = JSON.parse(listed.stdout);
       assert.ok(object(inventory) && Array.isArray(inventory.servers));
-      const servers = inventory.servers.filter((item: unknown) => object(item) && item.title === `Agent ${sessionId}`);
+      const servers = inventory.servers.filter((item: unknown) => object(item) && item.title === `Beep Boop ${sessionId}`);
       assert.equal(servers.length, 1);
       const server: unknown = servers[0]; assert.ok(object(server) && typeof server.endpoint === "string");
       const { chromium } = await import("playwright-core");

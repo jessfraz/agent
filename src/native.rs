@@ -680,7 +680,7 @@ mod tests {
             crate::native::project(&crate::protocol::RuntimeEventKind::Resources {
                 resources: vec![],
             }),
-            Some(crate::native::NativeEvent::Notice { text }) if text == "No Agent-owned worktrees."
+            Some(crate::native::NativeEvent::Notice { text }) if text == "No Beep Boop-owned worktrees."
         ));
     }
 

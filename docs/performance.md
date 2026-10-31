@@ -33,12 +33,12 @@ fails; a failure JSON records the error.
 Run locally after building both revisions' runtime and CLI:
 
 ```sh
-nix develop --command cargo build --release --bin agent \
+nix develop --command cargo build --release --bin beep-boop \
   --example terminal-fixture --example cli-performance
 nix develop --command target/release/examples/cli-performance \
-  --baseline /path/to/base/target/release/agent \
+  --baseline /path/to/base/target/release/beep-boop \
   --baseline-runtime /path/to/base/runtime/dist/src/bridge.js \
-  --candidate target/release/agent \
+  --candidate target/release/beep-boop \
   --candidate-runtime runtime/dist/src/bridge.js \
   --terminal target/release/examples/terminal-fixture \
   --seed runtime/dist/test/fixtures/performance.js \
