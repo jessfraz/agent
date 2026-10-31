@@ -473,8 +473,14 @@ part of the MVP.
 
 ## Validation
 
-Exercise the real CLI, Pi storage and host boundaries with controlled providers:
-surviving children, repeated inputs and source versions, lost effect replies,
-offline workers returning, interrupted imports and guarded resource cleanup.
+CI starts the production coordinator with real Pi SQLite storage and Unix
+sockets on Linux and macOS. macOS also connects the native Swift client to
+that server, checking outbox reconciliation across reconnects and restarts.
+These tests use no replacement coordinator or model provider.
+
+Fault-injection tests still use controlled peers and providers for lost replies,
+offline workers and malformed frames. Keep those separate from end-to-end
+proof. Exercise surviving children, repeated inputs and source versions,
+interrupted imports and guarded resource cleanup through their real owners.
 Use representative model evaluations separately for judgment and follow-through;
 tests that match prompt wording do not establish those behaviors.

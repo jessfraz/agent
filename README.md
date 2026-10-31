@@ -167,4 +167,6 @@ nix build
 Rust generates TypeScript bindings and JSON schemas. CI runs behavior tests
 and package builds on Linux and macOS without personal accounts. Paired
 [performance checks](docs/performance.md) cover history rendering, search and
-cached indexing.
+cached indexing. Reconnect tests start the real coordinator and Pi database;
+macOS also runs the native Swift client against it. Separate fault-injection
+tests use controlled external peers.

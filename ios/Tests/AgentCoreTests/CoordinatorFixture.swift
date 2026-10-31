@@ -169,14 +169,14 @@ actor FixtureCoordinator {
             finalChunk: true, role: .user,
             text: input.text, tool: nil)
         }
-        try await emit(
-          .history(
-            initialHistory ?? .init(messages: messages, nextCursor: nil, pageComplete: true)),
-          on: socket)
         for input in submissions where request.inputIds.contains(input.inputId) {
           try await emit(
             .placed(.init(entryId: "placed-\(input.inputId)", inputId: input.inputId)), on: socket)
         }
+        try await emit(
+          .history(
+            initialHistory ?? .init(messages: messages, nextCursor: nil, pageComplete: true)),
+          on: socket)
         try await emit(.idle, on: socket)
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
           socket.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, _, _ in

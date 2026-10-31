@@ -293,7 +293,7 @@ private func until(_ session: CoordinatorSession, _ predicate: @Sendable (ChatSn
   throw ConnectionError.closed
 }
 
-@Test(.timeLimit(.minutes(1))) func sessionPersistsUncertainInputAndReconcilesWithoutReplay()
+@Test(.timeLimit(.minutes(1))) func sessionPersistsUncertainInputWithoutReplay()
   async throws
 {
   try await withCoordinator { session, fixture, outbox in
@@ -305,16 +305,7 @@ private func until(_ session: CoordinatorSession, _ predicate: @Sendable (ChatSn
     let id = try #require(uncertain.rows.first(where: { $0.delivery == .uncertain })?.inputID)
     let saved = try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
     #expect(saved.map(\.inputId) == [id])
-    await session.disconnect()
-    await session.connect(address)
-    let reconciled = try await until(session) {
-      $0.connection == .connected
-        && $0.rows.contains { $0.entryID == "placed-\(id)" && $0.delivery == nil }
-    }
-    #expect(reconciled.rows.filter { $0.text == "Keep this original" }.count == 1)
-    #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
-    #expect(await fixture.count() == 1, "Reconnect must not replay an uncertain write")
+    #expect(await fixture.count() == 1, "An uncertain write must not be replayed automatically")
   }
 }
 

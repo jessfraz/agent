@@ -628,10 +628,12 @@ async function handle(request: RuntimeRequest): Promise<void> {
         try {
           emit(id, { type: "main_ready", conversation_id: root.id.toString(),
             model: await inference.legacy(root, await application.environment.model(null)), cwd: "" });
-          for (const frame of await history(root, null, application.harness)) emit(id, frame);
+          // Reconcile optimistic rows before history exposes their saved copies.
+          // Page completion makes native clients ready, so receipts must precede it.
           for (const input_id of command.input_ids) {
             for (const event of await reconcileMainInput(root, input_id) ?? []) emit(id, event);
           }
+          for (const frame of await history(root, null, application.harness)) emit(id, frame);
           if (observer.overflow) { failure(id, "internal", "Observation fell behind during history load. Reconnect to recover saved history."); break; }
           for (const frame of observer.buffer ?? []) emit(id, frame);
           delete observer.buffer;

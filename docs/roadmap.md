@@ -12,6 +12,9 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Recover main-chat admission after coordinator restart, preserving steer
   and queue modes. Independent workers and control requests remain responsive
   while another worker's host effect is held.
+- [x] Test native outbox recovery against the production coordinator and Pi
+  storage across reconnects and server restarts, without fake peers. CI runs
+  the wire test on both platforms and the Swift client on macOS.
 - [x] Use shared typed cells for live and imported messages, with Codex-style
   terminal formatting and retained command output on reopen.
 - [x] Pin and activate scheduled-chat reuse, recovery and shared worktree

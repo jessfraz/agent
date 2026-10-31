@@ -110,6 +110,11 @@ test("native main observation survives idle, correlates notices, streams text an
     assert.ok(events(3).some((event) => event.type === "input_placed" && event.input_id === input));
     send(100, { type: "detach_main" }); await done(100);
     send(101, { type: "observe_main", input_ids: [input] }); await wait(101, (event) => event.type === "worker_idle");
+    const replay = events(101);
+    const placedIndex = replay.findIndex((event) => event.type === "input_placed" && event.input_id === input);
+    const historyIndex = replay.findIndex((event) => event.type === "history");
+    assert.ok(placedIndex >= 0 && historyIndex > placedIndex,
+      "Reconnect must reconcile the durable input before history can display its canonical row");
     const historicalNotice = events(101).flatMap((event) => event.type === "history" ? event.messages : []).find((message) => message.role === "notice");
     const historicalAttachment = events(101).flatMap((event) => event.type === "history" ? event.messages : []).find((message) => message.attachments?.[0]?.id === attachment.id);
     assert.equal(historicalAttachment?.text, "attachment-native"); assert.deepEqual(historicalAttachment?.attachments, [attachment]);
