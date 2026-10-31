@@ -169,7 +169,7 @@ test("main and worker tools find older substantive context beside a newer shallo
         await conversation.configure({ extensions: [role === "main" ? tools.main : tools.worker] }, BACKGROUND_CONTEXT);
         const found = await invoke(session, conversation, { type: "toolCall", id: "original-search-" + role, name: "search_tasks", arguments: { query } });
         assert.ok(found !== null && typeof found === "object" && "matches" in found && Array.isArray(found.matches));
-        assert.ok("gaps" in found); assert.deepEqual(found.gaps, []);
+        assert.ok("gaps" in found); assert.deepEqual(found.gaps, ["History changes await indexing; results use the published index"]);
         assert.ok(found.matches.some((match: unknown) => match !== null && typeof match === "object" && "conversation_id" in match && match.conversation_id === recent.conversation.conversation_id));
         const position = found.matches.findIndex((match: unknown) => match !== null && typeof match === "object" && "conversation_id" in match && match.conversation_id === old.conversation.conversation_id);
         assert.ok(position > 0, "The fixture must inspect a substantive candidate rather than automatically choosing the first");
@@ -327,6 +327,7 @@ test("semantic reads after reopen bypass an owned full catchup and retain increm
     assert.deepEqual(caughtUp.gaps, []);
     const conversation = await app.tasks.conversation(saved.conversation.conversation_id);
     await conversation.submit({ type: "write", entry: { kind: "fixture.current", model: [{ role: "user", content: "Current automobile steering context", timestamp: 3 }] } }, BACKGROUND_CONTEXT);
+    await app.retrieval.sync(embedding);
     const current = await app.retrieval.search("car wheel repair", [], 8, embedding, false);
     assert.ok(current.candidates.some((candidate) => candidate.matches.some((match) => match.text === "Current automobile steering context")), "Normal incremental commits must still become searchable");
     await app.history.import(batch("cold-unindexed", 3, [item("cold", "Unindexed sourdough recipe", 1)]));

@@ -1005,7 +1005,8 @@
       "enum": [
         "sources",
         "source_triage",
-        "resources"
+        "resources",
+        "history"
       ]
     },
     "CleanupPlan": {

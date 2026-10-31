@@ -72,14 +72,11 @@ export class Retrieval {
   }
   async search(query: string, sources: string[], limit: number, call: HostCall, importing = false, mode: SearchMode = "semantic"): Promise<SearchResult> {
     const gaps: string[] = [];
-    // Reads can refresh their own observed commits, but never enqueue behind
-    // an owned corpus catchup or turn a cold process into a full-index owner.
-    if (!importing && this.pendingSyncs === 0 && this.dirty.size > 0) {
-      try { await this.queue(() => this.changed(call)); }
-      catch (error) { gaps.push(error instanceof Error ? error.message : "History indexing is unavailable"); }
-    }
+    // The durable background lane owns indexing and its host effects. A lookup
+    // must not inherit arbitrary document inference or a catch-up queue.
     if (importing) gaps.push("Codex history import and indexing are in progress");
     else if (this.pendingSyncs > 0) gaps.push("History indexing is in progress; results use the published index");
+    else if (this.dirty.size > 0) gaps.push("History changes await indexing; results use the published index");
     else if (!this.ready) gaps.push("History index freshness is unverified; results use the published index");
     try {
       const result = await this.open().search(query, this.embed(call), sources, limit, mode);

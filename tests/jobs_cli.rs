@@ -628,8 +628,8 @@ fn real_cli_reconciles_files_preserves_builtins_and_reopens_durable_deadlines() 
     let baseline = fixture.status();
     assert_eq!(baseline.jobs, 0);
     assert_eq!(
-        baseline.triggers, 3,
-        "Source polling, judgment and resources retain native triggers even with external sources disabled"
+        baseline.triggers, 4,
+        "Source polling, judgment, history and resources retain native triggers even with external sources disabled"
     );
 
     let file = fixture.jobs.join("review.toml");

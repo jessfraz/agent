@@ -97,6 +97,31 @@ test("held source judgment does not stop native polling or admit concurrent judg
   } finally { held.release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("history indexing has its own durable lane with source polling disabled", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-background-history-")), clock = new FakeClock();
+  const held = gate(); let calls = 0;
+  let app = await openBackground(directory, clock, { indexHistory: async (signal) => {
+    calls += 1;
+    if (calls === 1) await untilReleased(held.promise, signal);
+  } });
+  try {
+    const settings = { poll_interval_seconds: 60, sources: false, jobs: [exampleJob()] };
+    await app.scheduler.start(settings); await pump(() => calls === 1);
+    await app.scheduler.runJob({ type: "run_job", job_id: "example-review", schedule_id: null, request_id: "while-indexing" });
+    await pump(async () => (await app.receipts())?.jobs.length === 1);
+    for (let i = 0; i < 2; i++) {
+      clock.advance(60_000);
+      await pump(async () => (await app.scheduler.status()).pending > 0);
+    }
+    assert.equal(calls, 1, "Repeated ticks must not start competing index owners");
+    held.release(); await pump(async () => calls === 2 && (await app.scheduler.status()).pending === 0);
+    await app.session.close(BACKGROUND_CONTEXT);
+    app = await openBackground(directory, clock, { indexHistory: async () => { calls += 1; } });
+    await app.scheduler.start(settings);
+    clock.advance(60_000); await pump(async () => calls === 3 && (await app.scheduler.status()).pending === 0);
+  } finally { held.release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("a failed source judgment keeps its native retry identity across reopen while polling advances", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-background-judgment-retry-")), clock = new FakeClock();
   let judgments = 0;
@@ -204,7 +229,7 @@ test("job-only synchronization diffs definitions without altering built-in sourc
     await pump(async () => (await app.receipts())?.sources === 2);
     assert.deepEqual(await app.scheduler.syncJobs([]), { added: 0, updated: 0, removed: 1, unchanged: 0 });
     assert.deepEqual(await app.scheduler.listJobs(), []);
-    assert.equal((await app.scheduler.status()).triggers, 3);
+    assert.equal((await app.scheduler.status()).triggers, 4);
     await assert.rejects(app.scheduler.getJob(job.id), /Unknown scheduled job/);
     await assert.rejects(app.scheduler.syncJobs([job, job]), /Duplicate/);
     clock.advance(60_000);

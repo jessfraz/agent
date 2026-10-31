@@ -5,8 +5,11 @@ recovery; [history](history.md) describes import and retrieval.
 
 ## Finish the current pass
 
-- [ ] Finish Codex catch-up and vector indexing, reconcile source coverage, and
-  verify real searches. Missing files stay explicit gaps.
+- [x] Finish Codex catch-up and vector indexing, reconcile available text against
+  source checkpoints, and verify real searches. Missing media stays explicit
+  coverage gaps; importing and searching open no Rex sessions.
+- [ ] Finish live search latency validation, including time outside the index
+  query while background work runs.
 - [x] Verify a real incoming supplier version reaches its original imported
   task conversation and completes the existing worker's native submission.
 - [ ] Verify chat admission, steering, interruption, reopening and scrolling
@@ -78,7 +81,7 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Representative SQL plans and paired CI benchmarks for history loading,
   dense/FTS retrieval, hydration and cached indexing. See
   [performance checks](performance.md).
-- [ ] Private retrieval evals: paraphrases, exact references, similar threads,
+- [x] Private retrieval evals: paraphrases, exact references, similar threads,
   rich older context versus sparse recent context, and incomplete coverage.
   Track recall, wrong-thread selection and latency.
 - [ ] End-to-end loop-closing tests and model evals: incoming reply → relevant

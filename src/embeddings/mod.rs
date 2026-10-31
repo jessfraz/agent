@@ -13,7 +13,7 @@ pub const MAX_TEXT_BYTES: usize = 8192;
 pub const MODEL_DIGEST: &str = "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439";
 pub const MODEL_REVISION: &str = "370f27d7550e0def9b39c1f16d3fbaa13aa67728";
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum EmbeddingPurpose {
     Query,

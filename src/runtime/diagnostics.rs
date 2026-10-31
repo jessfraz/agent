@@ -103,12 +103,16 @@ pub(crate) enum Event {
         call_id: Option<String>,
         command: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        embedding: Option<EmbeddingCall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         browser: Option<BrowserCall>,
     },
     HostReply {
         call_id: Option<String>,
         command: Option<String>,
         duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        embedding: Option<EmbeddingCall>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         browser: Option<BrowserReceipt>,
     },
@@ -482,23 +486,44 @@ impl Trace {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct EmbeddingCall {
+    purpose: crate::embeddings::EmbeddingPurpose,
+    texts: usize,
+}
+impl EmbeddingCall {
+    fn from_command(command: &crate::protocol::HostCommand) -> Option<Self> {
+        match command {
+            crate::protocol::HostCommand::Embed { texts, purpose } => Some(Self {
+                purpose: *purpose,
+                texts: texts.len(),
+            }),
+            crate::protocol::HostCommand::OnNode { command, .. } => Self::from_command(command),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) struct HostTiming {
     pub started: Instant,
     pub command: Option<String>,
     browser: Option<BrowserCall>,
+    embedding: Option<EmbeddingCall>,
 }
 impl HostTiming {
-    pub fn new(bytes: &[u8]) -> Self {
+    pub fn new(bytes: &[u8], command: &crate::protocol::HostCommand) -> Self {
         Self {
             started: Instant::now(),
             command: host_kind(bytes),
             browser: BrowserCall::decode(bytes),
+            embedding: EmbeddingCall::from_command(command),
         }
     }
     pub fn received(&self, call_id: &str) -> Event {
         Event::HostCall {
             call_id: token(call_id),
             command: self.command.clone(),
+            embedding: self.embedding.clone(),
             browser: self.browser.clone(),
         }
     }
@@ -507,6 +532,7 @@ impl HostTiming {
             call_id: token(call_id),
             command: self.command.clone(),
             duration_ms: millis(self.started.elapsed()),
+            embedding: self.embedding.clone(),
             browser: self.browser.as_ref().map(|browser| browser.reply(result)),
         }
     }
@@ -1035,6 +1061,55 @@ mod tests {
         os::unix::fs::{PermissionsExt, symlink},
     };
     use tokio::sync::mpsc;
+
+    #[test]
+    fn embedding_receipts_distinguish_indexing_from_queries_without_text() {
+        use crate::embeddings::EmbeddingPurpose;
+        use crate::protocol::{
+            HostCommand, HostResult, PROTOCOL_VERSION, RuntimeEvent, RuntimeEventKind,
+        };
+        use crate::runtime::diagnostics::HostTiming;
+
+        for purpose in [EmbeddingPurpose::Query, EmbeddingPurpose::Document] {
+            let command = HostCommand::OnNode {
+                host_id: "synthetic-worker".into(),
+                command: Box::new(HostCommand::Embed {
+                    texts: vec!["PRIVATE_EMBEDDING_TEXT_SENTINEL".into(); 2],
+                    purpose,
+                }),
+            };
+            let frame = RuntimeEvent {
+                version: PROTOCOL_VERSION,
+                id: 1,
+                event: RuntimeEventKind::HostCall {
+                    call_id: "embedding-call".into(),
+                    command: Box::new(command.clone()),
+                },
+            };
+            let timing = HostTiming::new(&serde_json::to_vec(&frame).unwrap(), &command);
+            let events = [
+                timing.received("embedding-call"),
+                timing.reply(
+                    "embedding-call",
+                    &HostResult::Failed {
+                        message: "PRIVATE_EMBEDDING_ERROR_SENTINEL".into(),
+                    },
+                ),
+            ];
+            for event in events {
+                let encoded = serde_json::to_string(&event).unwrap();
+                assert!(!encoded.contains("PRIVATE_"));
+                let embedding = match event {
+                    Event::HostCall { embedding, .. } | Event::HostReply { embedding, .. } => {
+                        embedding.unwrap()
+                    }
+                    _ => panic!("Expected an embedding lifecycle receipt"),
+                };
+                assert_eq!(embedding.texts, 2);
+                assert_eq!(embedding.purpose, purpose);
+            }
+        }
+    }
 
     fn record(sequence: u32) -> Record {
         Record {

@@ -38,6 +38,7 @@ export type BackgroundCallbacks = {
   refreshSources(signal: AbortSignal): Promise<void>;
   triageSources(signal: AbortSignal): Promise<void>;
   collectResources(signal: AbortSignal): Promise<void>;
+  indexHistory(signal: AbortSignal): Promise<void>;
   jobActor?(job: ScheduledJob): Promise<string | undefined>;
   runJob(occurrence: ScheduledOccurrence, signal: AbortSignal, actorId: string): Promise<void>;
 };
@@ -128,6 +129,7 @@ export class BackgroundScheduler {
               case "sources": await callbacks.refreshSources(runtime.signal); break;
               case "source_triage": await callbacks.triageSources(runtime.signal); break;
               case "resources": await callbacks.collectResources(runtime.signal); break;
+              case "history": await callbacks.indexHistory(runtime.signal); break;
               case "job":
               case "manual_job": {
                 const occurrence = input.work.occurrence;
@@ -294,7 +296,7 @@ export class BackgroundScheduler {
   private async builtins(settings: BackgroundSettings): Promise<void> {
     const old = await this.session.commit(async (tx) => {
       const state = await tx.doc(State), retired: NativeTaskId<null>[] = [];
-      const names: Extract<BackgroundTriggerKey, { type: "builtin" }>["name"][] = ["sources", "source_triage", "resources"];
+      const names: Extract<BackgroundTriggerKey, { type: "builtin" }>["name"][] = ["sources", "source_triage", "resources", "history"];
       for (const name of names) {
         const seconds = name === "resources" ? 300 : settings.poll_interval_seconds;
         // Both source callbacks own --no-sources semantics. The judgment timer

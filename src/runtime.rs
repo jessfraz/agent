@@ -559,8 +559,8 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                     if matches!(frame.event, RuntimeEventKind::Notice { .. }) {
                         let _ = notices.send(RuntimeNotice { request_id: frame.id, event: frame.event.clone() });
                     }
-                    if let RuntimeEventKind::HostCall { call_id, .. } = &frame.event {
-                        let timing = HostTiming::new(&bytes);
+                    if let RuntimeEventKind::HostCall { call_id, command } = &frame.event {
+                        let timing = HostTiming::new(&bytes, command);
                         diagnostics.record(frame.id, &call.trace, timing.received(call_id));
                         ensure!(call.host_calls.insert(call_id.clone(), timing).is_none(), "Pi reused an active host call ID");
                     }

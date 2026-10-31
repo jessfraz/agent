@@ -178,6 +178,10 @@ missed notifications cannot permanently hide a conversation. Internal feed
 judgment transcripts are retained in Pi but are not retrieval candidates.
 Search reads published results while an owned import catches up; it reports
 incomplete coverage rather than waiting for a full corpus rebuild.
+The coordinator's durable history lane catches up after restart and indexes
+new commits on the normal polling cadence, independently of source polling and
+jobs. A search never performs document indexing or waits for that lane; query
+embedding remains part of semantic retrieval.
 Cached batches yield to coordinator I/O. Readers retain the previous complete
 publication until its replacement commits atomically.
 After bootstrap, an owned worker handles every index write, so large vector
@@ -204,6 +208,8 @@ read bounded original excerpts from the strongest candidates.
 Several conversations can inform one task; similarity does not authorize
 merging them or changing state.
 An unavailable embedding runner is a retrieval gap, not "no related work."
+Private runtime receipts distinguish query and document embeddings and record
+batch sizes and duration, without retaining the text or vectors.
 
 Automatic chat context reads published keyword matches and current task
 metadata without waiting for corpus indexing. The agent can use semantic search

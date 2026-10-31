@@ -149,6 +149,7 @@ pub enum BuiltinTrigger {
     Sources,
     SourceTriage,
     Resources,
+    History,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -157,6 +158,7 @@ pub enum BackgroundWork {
     Sources,
     SourceTriage,
     Resources,
+    History,
     Job {
         occurrence: Box<ScheduledOccurrence>,
     },

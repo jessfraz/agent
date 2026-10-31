@@ -180,6 +180,7 @@ async function openApplication(): Promise<Application> {
         await resources.collect(host.host_id, backgroundCall);
       }
     },
+    async indexHistory() { await retrieval.sync(backgroundCall); },
     jobActor: (job) => openJobActor(job, tasks, backgroundCall),
     async runJob(occurrence, signal, actor) { await runScheduled(occurrence, signal, { session: harness, tasks, sources, environment, executions, call: backgroundCall }, actor); },
   });
