@@ -130,6 +130,10 @@ authentication and model defaults, with bounded historical excerpts as evidence.
 Never import authentication state, system/developer prompts or permission
 grants.
 
+Discovery and conversation status reads use `ImportedConversationSummary`: the
+full gap count and up to three short diagnostic examples. Canonical import
+records and receipts retain every diagnostic.
+
 Retain available tool arguments/results, structured payloads and referenced
 assets privately on the coordinator, including large cold payloads. A
 path on an unavailable source machine is insufficient. Materialize and verify

@@ -5,20 +5,23 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
-import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type TranscriptContext } from "@earendil-works/pi-ai";
-import { createRegistry, Harness } from "@earendil-works/pi-durable";
+import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type ToolCall, type TranscriptContext } from "@earendil-works/pi-ai";
+import { AssistantEntry, createRegistry, Harness, ToolResultEntry, ToolTask } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { EmbeddingSpace } from "../src/generated/EmbeddingSpace.js";
 import type { AgentNode } from "../src/generated/AgentNode.js";
 import type { HistoryImportBatch } from "../src/generated/HistoryImportBatch.js";
 import type { HistoryItem } from "../src/generated/HistoryItem.js";
+import type { HistoryGap } from "../src/generated/HistoryGap.js";
+import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
 import { HistoryStore, ImportedItemEntry } from "../src/history.js";
 import { CodexImporter } from "../src/importer.js";
-import { ConversationModels } from "../src/models.js";
+import { ConversationModels, DEFAULT_MODEL } from "../src/models.js";
 import { Retrieval } from "../src/retrieval.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
 import { createAppTools, Executions } from "../src/tools.js";
 import { fixtureModel } from "./model.js";
+import { validEvent } from "../src/protocol.js";
 
 const space: EmbeddingSpace = { id: "synthetic-tool-search", model_revision: "fixture", model_digest: "fixture",
   dimensions: 3, pooling: "last", normalization: "l2", instruction_version: 1 };
@@ -36,6 +39,97 @@ function lastResult(context: TranscriptContext): unknown {
   assert.ok(message?.role === "toolResult");
   return JSON.parse(message.content.filter((part) => part.type === "text").map((part) => part.text).join(""));
 }
+
+test("search and task reads bound imported coverage while Pi retains every canonical diagnostic", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-import-coverage-"));
+  const models = createModels(), registry = createRegistry();
+  const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  const history = new HistoryStore(session), tasks = new TaskStore(session, new ConversationModels(models)); tasks.useHistory(history);
+  const retrieval = new Retrieval(session, history, tasks, join(directory, "search.sqlite"));
+  const executions = new Executions(), tools = createAppTools(tasks, executions); registry.install(tools.main);
+  const call: HostCall = async (command) => {
+    assert.equal(command.type, "embed", "Coverage reads must not start workers or host effects");
+    if (command.type !== "embed") throw new Error("Unexpected host effect");
+    return { type: "embeddings", batch: { space, vectors: command.texts.map(() => [1, 0, 0]) } };
+  };
+  const search = (query: string, refs: string[], limit: number) => retrieval.search(query, refs, limit, call, false);
+  const source = batch("retained-connector", 2, [item("decision", "The connector decision needs its original evidence.", 1)]);
+  source.complete = false;
+  source.gaps = Array.from({ length: 2500 }, (_, index): HistoryGap => ({ code: "missing", item_id: "artifact-" + index,
+    message: index === 0 ? "🦀 A synthetic archived artifact is unavailable. ".repeat(100)
+      : `Synthetic archived artifact ${index} is unavailable. ` + "The original output must be recovered before relying on it. ".repeat(4) }));
+  let closed = false;
+  try {
+    const receipt = await history.import(source);
+    assert.deepEqual(receipt.conversation.gaps, source.gaps);
+    await retrieval.sync(call);
+    const found = await tasks.find("connector", [], 8, search);
+    const frame: RuntimeEvent = { version: 1, id: 1, event: { type: "saved_matches", ...found } };
+    const bytes = Buffer.byteLength(JSON.stringify(frame));
+    assert.ok(bytes < 8000, `Discovery serialized ${bytes} bytes of coverage metadata instead of a bounded summary`);
+    assert.ok(validEvent(frame), "The real producer must retain the Rust-owned wire contract");
+    const chosen = found.matches.find((match) => match.conversation_id === receipt.conversation.conversation_id);
+    assert.ok(chosen?.imported);
+    assert.equal(chosen.imported.gap_count, source.gaps.length);
+    assert.equal(chosen.imported.complete, false);
+    assert.equal(chosen.imported.gaps.length, 3);
+    assert.deepEqual(chosen.imported.gaps.map((gap) => gap.item_id), source.gaps.slice(0, 3).map((gap) => gap.item_id));
+    assert.ok(chosen.imported.gaps.every((gap) => Array.from(gap.message).length <= 320));
+    assert.ok(chosen.imported.gaps[0]?.message.endsWith("…"));
+    const root = await session.root(BACKGROUND_CONTEXT);
+    const unbind = executions.bind(root.id.toString(), { cwd: "/example/project", hosts: [], call, search });
+    try {
+      // Admit real Pi tool tasks without registering an inference provider.
+      await root.configure({ extensions: [tools.main] }, BACKGROUND_CONTEXT);
+      async function invoke(call: ToolCall): Promise<unknown> {
+        const id = await root.commit(async (tx) => {
+          const assistant = await tx.appendEntry(AssistantEntry, root.id, { model: [{ role: "assistant", content: [call],
+            api: "openai-responses", provider: DEFAULT_MODEL.provider, model: DEFAULT_MODEL.model_id, stopReason: "toolUse", timestamp: 1,
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } }] });
+          return tx.createTask(ToolTask, { kind: "model", assistant: assistant.id, callId: call.id }, { ownership: { kind: "conversation" } });
+        }, BACKGROUND_CONTEXT);
+        const outcome = (await session.waitForTask(id, BACKGROUND_CONTEXT)).state.outcome;
+        assert.equal(outcome.status, "completed");
+        if (outcome.status !== "completed" || outcome.result.kind !== "model") throw new Error("Pi did not settle the tool task");
+        const entryId = outcome.result.entryId;
+        const entry = await root.commit((tx) => tx.entry(ToolResultEntry, entryId), BACKGROUND_CONTEXT);
+        const message = entry?.model?.[0]; assert.ok(message?.role === "toolResult");
+        assert.equal(message.isError, false);
+        const result: unknown = JSON.parse(message.content.filter((part) => part.type === "text").map((part) => part.text).join(""));
+        assert.ok(Buffer.byteLength(JSON.stringify(result)) < 8000);
+        return result;
+      }
+      const result = await invoke({ type: "toolCall", id: "coverage-search", name: "search_tasks", arguments: { query: "connector" } });
+      assert.ok(result !== null && typeof result === "object" && "matches" in result && Array.isArray(result.matches));
+      const match: unknown = result.matches.find((value: unknown) => value !== null && typeof value === "object" && "conversation_id" in value && value.conversation_id === chosen.conversation_id);
+      assert.ok(match !== null && typeof match === "object" && "imported" in match);
+      assert.deepEqual(match.imported, chosen.imported);
+      const read = await invoke({ type: "toolCall", id: "coverage-read", name: "read_task",
+        arguments: { conversation_id: chosen.conversation_id, include_history: false } });
+      assert.ok(read !== null && typeof read === "object" && "imported" in read);
+      assert.deepEqual(read.imported, chosen.imported);
+      assert.equal("history" in read, false);
+    } finally { unbind(); }
+    assert.deepEqual(await tasks.saved(chosen.conversation_id), receipt.conversation);
+    const adopted = await tasks.adopt(chosen.conversation_id, { id: "11111111-1111-4111-8111-111111111111",
+      outcome: "Continue the retained decision", evidence: "The original connector decision is retained", model: DEFAULT_MODEL });
+    assert.deepEqual((await history.get(source.thread.id))?.gaps, source.gaps);
+    await retrieval.close(); await session.close(BACKGROUND_CONTEXT); closed = true;
+    const reopened = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+      { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
+    try {
+      const retained = new HistoryStore(reopened), canonical = await retained.get(source.thread.id);
+      assert.deepEqual(canonical?.gaps, source.gaps);
+      assert.equal(canonical?.adopted_task_id, adopted.id);
+      assert.deepEqual((await retained.checkpoint(source.thread.id, source.host_id))?.gaps, source.gaps);
+    } finally { await reopened.close(BACKGROUND_CONTEXT); }
+  } finally {
+    if (!closed) { await retrieval.close(); await session.close(BACKGROUND_CONTEXT); }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("main and worker tools find older substantive context beside a newer shallow candidate and read its selected originals", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-search-tools-"));

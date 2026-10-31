@@ -24,7 +24,7 @@ import type { TaskAgentRecord } from "./generated/TaskAgentRecord.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { WorkerRef } from "./generated/WorkerRef.js";
 import { noticeMetadata, UserNoticeEntry, type UserNoticeData } from "./transcript.js";
-import { HistoryStore, ImportedItemEntry, importedText } from "./history.js";
+import { HistoryStore, ImportedItemEntry, importedSummary, importedText } from "./history.js";
 import { REVISION_AMBIGUOUS, REVISION_PENDING, revisionStatus, type RevisionView } from "./history-revisions.js";
 import type { SavedMatch } from "./generated/SavedMatch.js";
 import type { ImportedConversation } from "./generated/ImportedConversation.js";
@@ -448,7 +448,7 @@ export class TaskStore {
       add({ conversation_id: candidate.conversation_id, title: task?.title ?? imported?.thread.title ?? "Main conversation",
         excerpt: candidate.matches.map((match) => match.text).join("\n").slice(0, 24_000), score: candidate.score,
         entry_ids: [...new Set(candidate.matches.map((match) => match.entry_id))],
-        task_id: task?.id ?? imported?.adopted_task_id ?? null, imported }, rank);
+        task_id: task?.id ?? imported?.adopted_task_id ?? null, imported: imported === null ? null : importedSummary(imported) }, rank);
       // Published chunks can lag a corrected task link. Current routing owns
       // exact-source priority; retained Codex identity remains original evidence.
       const currentRefs = task === undefined ? null : new Set(task.sources.map(sourceReference));

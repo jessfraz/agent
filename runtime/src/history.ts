@@ -13,6 +13,7 @@ import type { HistoryItem } from "./generated/HistoryItem.js";
 import type { HistoryRetryPage } from "./generated/HistoryRetryPage.js";
 import type { HistoryThread } from "./generated/HistoryThread.js";
 import type { ImportedConversation } from "./generated/ImportedConversation.js";
+import type { ImportedConversationSummary } from "./generated/ImportedConversationSummary.js";
 import { HistoryObservation, HistoryRevisions, REVISION_FORMAT, RevisionTracker, type CaptureState, type RevisionView, type SourceCapture, type SourceSnapshot } from "./history-revisions.js";
 
 type InertItem = Omit<HistoryItem, "data"> & { data: JsonValue };
@@ -65,6 +66,14 @@ function gaps(left: readonly HistoryGap[], right: readonly HistoryGap[]): Histor
 function title(text: string): string { return Array.from(text.replace(/\s+/gu, " ").trim()).slice(0, 128).join(""); }
 function detached(record: ImportedConversation): ImportedConversation {
   return { ...record, thread: { ...record.thread, title: title(record.thread.title) }, gaps: record.gaps.map((gap) => ({ ...gap })) };
+}
+export function importedSummary(record: ImportedConversation): ImportedConversationSummary {
+  return { source: record.source, thread: { ...record.thread }, conversation_id: record.conversation_id,
+    adopted_task_id: record.adopted_task_id, complete: record.complete, gap_count: record.gaps.length,
+    gaps: record.gaps.slice(0, 3).map((gap) => {
+      const text = Array.from(gap.message);
+      return { ...gap, message: text.length <= 320 ? gap.message : text.slice(0, 319).join("") + "…" };
+    }) };
 }
 function body(data: JsonValue): string {
   if (typeof data !== "object" || data === null || Array.isArray(data)) return "";

@@ -2575,7 +2575,8 @@
         "gaps"
       ]
     },
-    "ImportedConversation": {
+    "ImportedConversationSummary": {
+      "description": "Coverage metadata for discovery and status reads, never an import record.",
       "type": "object",
       "properties": {
         "adopted_task_id": {
@@ -2594,7 +2595,17 @@
         "conversation_id": {
           "type": "string"
         },
+        "gap_count": {
+          "description": "Total retained diagnostics. Older producers omit this and send all gaps,\nso absence means the supplied array length is the full count.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
         "gaps": {
+          "description": "Bounded diagnostic examples. Full diagnostics remain in the import record.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/HistoryGap"
@@ -4632,7 +4643,7 @@
         "imported": {
           "anyOf": [
             {
-              "$ref": "#/$defs/ImportedConversation"
+              "$ref": "#/$defs/ImportedConversationSummary"
             },
             {
               "type": "null"

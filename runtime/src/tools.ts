@@ -19,6 +19,7 @@ import type { SearchMode } from "./generated/SearchMode.js";
 import type { DelegationDecision } from "./generated/DelegationDecision.js";
 import type { InputMode } from "./generated/InputMode.js";
 import { TaskError, TaskStore, type HostCall, type SearchQuery } from "./tasks.js";
+import { importedSummary } from "./history.js";
 import type { BackgroundScheduler } from "./background.js";
 
 export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; default_host?: WorkerHost | null; call: HostCall; role?: "worker" | "triage";
@@ -305,7 +306,8 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         const includeHistory = args.include_history !== false;
         if (args.conversation_id !== undefined) {
           if (args.agent_id !== undefined) throw new TaskError("A conversation already identifies its exact history");
-          return output({ conversation_id: args.conversation_id, imported: await tasks.saved(args.conversation_id) ?? null,
+          const imported = await tasks.saved(args.conversation_id);
+          return output({ conversation_id: args.conversation_id, imported: imported === undefined ? null : importedSummary(imported),
             history: includeHistory && args.entry_ids === undefined ? await tasks.readConversation(args.conversation_id) : undefined,
             originals: includeHistory && args.entry_ids !== undefined ? await tasks.originals(args.conversation_id, args.entry_ids, args.offset) : undefined });
         }

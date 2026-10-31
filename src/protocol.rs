@@ -1448,6 +1448,24 @@ pub struct ImportedConversation {
     pub gaps: Vec<HistoryGap>,
 }
 
+/// Coverage metadata for discovery and status reads, never an import record.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ImportedConversationSummary {
+    pub source: HistoryProvider,
+    pub thread: HistoryThread,
+    pub conversation_id: String,
+    pub adopted_task_id: Option<TaskId>,
+    pub complete: bool,
+    /// Bounded diagnostic examples. Full diagnostics remain in the import record.
+    #[ts(type = "ReadonlyArray<import(\"./HistoryGap.js\").HistoryGap>")]
+    pub gaps: Vec<HistoryGap>,
+    /// Total retained diagnostics. Older producers omit this and send all gaps,
+    /// so absence means the supplied array length is the full count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub gap_count: Option<u32>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct HistoryImportBatch {
     pub host_id: String,
@@ -1512,7 +1530,7 @@ pub struct SavedMatch {
     pub entry_ids: Vec<String>,
     pub score: f64,
     pub task_id: Option<TaskId>,
-    pub imported: Option<ImportedConversation>,
+    pub imported: Option<ImportedConversationSummary>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -1548,9 +1566,51 @@ pub enum ErrorCode {
 #[cfg(test)]
 mod tests {
     use crate::protocol::{
-        HistoryMessage, HistoryRole, RuntimeCommand, RuntimeEventKind, SearchMode, ToolHistory,
+        HistoryMessage, HistoryProvider, HistoryRole, ImportedConversation,
+        ImportedConversationSummary, RuntimeCommand, RuntimeEventKind, SearchMode, ToolHistory,
         ToolStatus,
     };
+
+    #[test]
+    fn import_coverage_summary_preserves_legacy_fields_and_accepts_absent_counts() {
+        let record = ImportedConversation {
+            source: HistoryProvider::Codex,
+            thread: crate::history::HistoryThread {
+                id: "retained-thread".into(),
+                title: "Retained discussion".into(),
+                cwd: "/example".into(),
+                created_at: 1,
+                updated_at: 2,
+                forked_from_id: None,
+                parent_thread_id: None,
+                version: "one".into(),
+                version_reliable: true,
+                archived: true,
+            },
+            conversation_id: "retained-conversation".into(),
+            adopted_task_id: None,
+            complete: false,
+            gaps: vec![crate::history::HistoryGap {
+                code: crate::history::HistoryGapCode::Missing,
+                item_id: Some("retained-item".into()),
+                message: "Original evidence is unavailable".into(),
+            }],
+        };
+        let mut summary: ImportedConversationSummary =
+            serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(
+            summary.gap_count, None,
+            "Legacy producers sent every gap without a count"
+        );
+        assert_eq!(summary.gaps.len(), record.gaps.len());
+        summary.gap_count = Some(2500);
+        let legacy: ImportedConversation =
+            serde_json::from_slice(&serde_json::to_vec(&summary).unwrap()).unwrap();
+        assert_eq!(legacy.thread.id, record.thread.id);
+        assert_eq!(legacy.conversation_id, record.conversation_id);
+        assert!(!legacy.complete);
+        assert_eq!(legacy.gaps[0].item_id, record.gaps[0].item_id);
+    }
 
     #[test]
     fn import_embedding_host_is_optional_and_round_trips() {
