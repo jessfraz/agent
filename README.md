@@ -72,8 +72,9 @@ Attach files or photos on iOS, or drag file paths into the terminal composer.
 
 `/feedback <description>` starts a background repair on the same machine with
 private diagnostics and any attached files. It includes the current app view
-on iOS or the originating terminal's HTML capture in Rex. Its result returns
-to the main chat.
+on iOS or the originating terminal's capture in Rex. Rex captures keep styled
+HTML when it fits and use bounded text when the rendered export is too large.
+Its result returns to the main chat.
 
 For example, JLCPCB emails about a missing fabrication file. The agent finds
 the existing hardware task, attaches the email and continues its Rex session.
