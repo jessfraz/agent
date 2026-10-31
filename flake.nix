@@ -65,6 +65,7 @@
         AGENT_RUNTIME_PATH = "${runtime}/lib/agent-runtime/dist/src/bridge.js";
         AGENT_SQLITE_VEC = "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
         preCheck = ''
+          patchShebangs tests/fixtures
           fixtureProfileFlags=()
           if [ "$cargoCheckType" != debug ]; then
             fixtureProfileFlags=(--profile "$cargoCheckType")
