@@ -37,17 +37,34 @@ export function mutatePublished(database: DatabaseSync, mutation: SearchMutation
       database.exec("DELETE FROM conversations; DROP TABLE IF EXISTS chunk_vectors; DELETE FROM metadata WHERE key='space'");
     } else {
       const { conversation_id } = mutation;
-      if (mutation.vectors) database.prepare("DELETE FROM chunk_vectors WHERE rowid IN (SELECT id FROM chunks WHERE conversation_id=?)").run(conversation_id);
       if (mutation.type === "delete") {
+        if (mutation.vectors) database.prepare("DELETE FROM chunk_vectors WHERE rowid IN (SELECT id FROM chunks WHERE conversation_id=?)").run(conversation_id);
         database.prepare("DELETE FROM conversations WHERE id=?").run(conversation_id);
       } else {
-        database.prepare("DELETE FROM chunks WHERE conversation_id=?").run(conversation_id);
+        // A generation replaces logical contents, not every physical vector.
+        // Retaining unchanged rowids avoids rewriting large vector blobs when
+        // a long conversation gains a message or only its provenance changes.
+        const obsolete = `SELECT c.id FROM chunks c WHERE c.conversation_id=? AND NOT EXISTS (
+          SELECT 1 FROM staging s WHERE s.conversation_id=c.conversation_id AND s.run=?
+          AND s.entry_id=c.entry_id AND s.part=c.part AND s.hash=c.hash)`;
+        if (mutation.vectors) database.prepare(`DELETE FROM chunk_vectors WHERE rowid IN (${obsolete})`).run(conversation_id, mutation.run);
+        database.prepare(`DELETE FROM chunks WHERE id IN (${obsolete})`).run(conversation_id, mutation.run);
         database.prepare(`INSERT INTO chunks(conversation_id,entry_id,ordinal,part,hash,text,source_refs)
-          SELECT conversation_id,entry_id,ordinal,part,hash,text,source_refs FROM staging WHERE conversation_id=? AND run=? ORDER BY ordinal,part`).run(conversation_id, mutation.run);
+          SELECT s.conversation_id,s.entry_id,s.ordinal,s.part,s.hash,s.text,s.source_refs FROM staging s
+          WHERE s.conversation_id=? AND s.run=? AND NOT EXISTS (SELECT 1 FROM chunks c
+          WHERE c.conversation_id=s.conversation_id AND c.entry_id=s.entry_id AND c.part=s.part)
+          ORDER BY s.ordinal,s.part`).run(conversation_id, mutation.run);
         if (mutation.vectors) database.prepare(`INSERT INTO chunk_vectors(rowid,embedding)
           SELECT c.id,s.embedding FROM staging s JOIN chunks c ON c.conversation_id=s.conversation_id AND c.entry_id=s.entry_id AND c.part=s.part
-          WHERE s.conversation_id=? AND s.run=?`).run(conversation_id, mutation.run);
-        database.prepare(`INSERT INTO source_refs SELECT j.value,c.id FROM chunks c,json_each(c.source_refs) j WHERE c.conversation_id=?`).run(conversation_id);
+          WHERE s.conversation_id=? AND s.run=? AND NOT EXISTS (SELECT 1 FROM chunk_vectors v WHERE v.rowid=c.id)`).run(conversation_id, mutation.run);
+        database.prepare(`DELETE FROM source_refs WHERE chunk_id IN (SELECT c.id FROM chunks c JOIN staging s
+          ON s.conversation_id=c.conversation_id AND s.entry_id=c.entry_id AND s.part=c.part
+          WHERE c.conversation_id=? AND s.run=? AND c.source_refs<>s.source_refs)`).run(conversation_id, mutation.run);
+        database.prepare(`UPDATE chunks SET ordinal=s.ordinal,source_refs=s.source_refs FROM staging s
+          WHERE s.conversation_id=? AND s.run=? AND chunks.conversation_id=s.conversation_id
+          AND chunks.entry_id=s.entry_id AND chunks.part=s.part
+          AND (chunks.ordinal<>s.ordinal OR chunks.source_refs<>s.source_refs)`).run(conversation_id, mutation.run);
+        database.prepare(`INSERT OR IGNORE INTO source_refs SELECT j.value,c.id FROM chunks c,json_each(c.source_refs) j WHERE c.conversation_id=?`).run(conversation_id);
         database.prepare("UPDATE conversations SET watermark=?,dirty=CASE WHEN revision=? THEN 0 ELSE 1 END,gaps=? WHERE id=?")
           .run(mutation.watermark, mutation.revision, JSON.stringify(mutation.gaps), conversation_id);
         database.prepare("DELETE FROM staging WHERE conversation_id=?").run(conversation_id);

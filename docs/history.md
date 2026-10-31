@@ -184,6 +184,11 @@ jobs. A search never performs document indexing or waits for that lane; query
 embedding remains part of semantic retrieval.
 Cached batches yield to coordinator I/O. Readers retain the previous complete
 publication until its replacement commits atomically.
+Publication retains unchanged chunk and vector rowids. Append-only changes and
+provenance corrections reuse those rows; removed or changed text replaces only
+its own chunks. New index files use 64 KiB SQLite pages for vector blob reads.
+Existing files keep their page layout; ordinary SQLite compaction preserves the
+stored vectors and checkpoints without inference.
 After bootstrap, an owned worker handles every index write, so large vector
 transactions and SQLite lock waits cannot block the coordinator's event loop.
 File-backed searches use separate owned read-only lanes for vector scans and

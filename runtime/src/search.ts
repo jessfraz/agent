@@ -145,7 +145,9 @@ export class SearchIndex {
     this.db = new DatabaseSync(path, { allowExtension: true });
     if (path !== ":memory:") chmodSync(path, 0o600);
     this.db.loadExtension(extension); this.db.enableLoadExtension(false);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
+    // Set before WAL/schema creation. Existing files retain their layout.
+    // Vector chunks are large blobs; larger pages avoid excessive small reads.
+    this.db.exec(`PRAGMA page_size=65536; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY, watermark TEXT NOT NULL DEFAULT '', dirty INTEGER NOT NULL DEFAULT 1, revision INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,

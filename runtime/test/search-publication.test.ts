@@ -166,3 +166,108 @@ test("concurrent deletion and invalidation release a contended writer without bl
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("incremental publication retains unchanged rowids, vectors and corrected provenance across reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-publication-incremental-")), path = join(directory, "search.sqlite");
+  let index = new SearchIndex(path);
+  const extension = process.env.AGENT_SQLITE_VEC; assert.ok(extension);
+  const reader = new DatabaseSync(path, { readOnly: true, allowExtension: true });
+  reader.loadExtension(extension); reader.enableLoadExtension(false); reader.exec("PRAGMA query_only=ON");
+  const initial: SearchRecord[] = [
+    { entry_id: "retained", ordinal: 0, text: "Automobile maintenance evidence", source_refs: ["mail:synthetic:original"] },
+    { entry_id: "revised", ordinal: 1, text: "Oscilloscope repair evidence", source_refs: ["mail:synthetic:repair"] },
+    { entry_id: "removed", ordinal: 2, text: "Waveform inspection evidence", source_refs: ["mail:synthetic:waveform"] },
+  ];
+  const appended: SearchRecord = { entry_id: "appended", ordinal: 3, text: "Previously embedded reference evidence",
+    source_refs: ["mail:synthetic:append"] };
+  const embeddingCalls: string[][] = [];
+  const embedding: Embed = async (texts, purpose) => {
+    assert.equal(purpose, "document"); embeddingCalls.push(texts);
+    return { space, vectors: texts.map(() => [1, 0, 0]) };
+  };
+  const cachedOnly: Embed = async () => { throw new Error("Published document embeddings must survive reopen and be reused"); };
+  async function* stream(items: SearchRecord[]): AsyncIterable<SearchRecord> { yield* items; }
+  function published(conversation = "owner") {
+    return reader.prepare(`SELECT c.id,c.entry_id,c.ordinal,c.part,c.source_refs,v.embedding FROM chunks c
+      JOIN chunk_vectors v ON v.rowid=c.id WHERE c.conversation_id=? ORDER BY c.ordinal,c.part`).all(conversation).map((row) => {
+      assert.ok(typeof row.id === "number" && typeof row.entry_id === "string"
+        && typeof row.ordinal === "number" && typeof row.part === "number" && typeof row.source_refs === "string");
+      assert.ok(row.embedding instanceof Uint8Array);
+      return { id: row.id, entry_id: row.entry_id, ordinal: row.ordinal, part: row.part,
+        source_refs: row.source_refs, embedding: Buffer.from(row.embedding) };
+    });
+  }
+  function entry(rows: ReturnType<typeof published>, id: string) {
+    const row = rows.find((row) => row.entry_id === id); assert.ok(row); return row;
+  }
+  async function reopen(watermark: string) {
+    assert.deepEqual(index.checkpoint("owner"), { watermark, dirty: false });
+    await index.close(); index = new SearchIndex(path);
+    assert.deepEqual(index.checkpoint("owner"), { watermark, dirty: false });
+    assert.equal(reader.prepare("SELECT count(*) AS count FROM staging WHERE conversation_id=?").get("owner")?.count, 0);
+  }
+  try {
+    await index.upsert("discard", "one", stream([
+      { entry_id: "gap-0", ordinal: 0, text: "Disposable first evidence", source_refs: [] },
+      { entry_id: "gap-1", ordinal: 1, text: "Disposable second evidence", source_refs: [] },
+    ]), embedding);
+    await index.upsert("owner", "one", stream(initial), embedding);
+    // A later owner prevents SQLite from accidentally reusing the highest
+    // rowids when an old implementation deletes and reinserts this owner.
+    await index.upsert("anchor", "one", stream([{ ...appended, entry_id: "anchor", ordinal: 0,
+      source_refs: ["mail:synthetic:anchor"] }]), embedding);
+    await index.delete("discard");
+    const original = published(), anchor = published("anchor"), callsBeforeAppend = embeddingCalls.length;
+    assert.ok(original.every((row) => row.id > 2));
+
+    await index.upsert("owner", "appended", stream([...initial, appended]), cachedOnly);
+    await reopen("appended");
+    const afterAppend = published();
+    for (const before of original) {
+      const after = entry(afterAppend, before.entry_id);
+      assert.equal(after.id, before.id, "Appending must preserve existing chunk row IDs");
+      assert.deepEqual(after.embedding, before.embedding);
+    }
+    assert.deepEqual(entry(afterAppend, "appended").embedding, entry(anchor, "anchor").embedding);
+    assert.equal(embeddingCalls.length, callsBeforeAppend);
+
+    const corrected: SearchRecord[] = [
+      { ...initial[0]!, ordinal: 7, source_refs: ["mail:synthetic:corrected", "issue:synthetic:42"] },
+      { ...initial[1]!, ordinal: 8, text: "Calibration replacement evidence" },
+      { ...initial[2]!, ordinal: 9 },
+      { ...appended, ordinal: 10 },
+    ];
+    await index.upsert("owner", "corrected", stream(corrected), async (texts, purpose) => {
+      assert.equal(purpose, "document"); assert.deepEqual(texts, ["Calibration replacement evidence"]);
+      return { space, vectors: [[0, 1, 0]] };
+    });
+    await reopen("corrected");
+    const afterCorrection = published();
+    for (const id of ["retained", "removed", "appended"]) {
+      assert.equal(entry(afterCorrection, id).id, entry(afterAppend, id).id);
+      assert.deepEqual(entry(afterCorrection, id).embedding, entry(afterAppend, id).embedding);
+    }
+    const retained = entry(afterCorrection, "retained");
+    assert.equal(retained.ordinal, 7);
+    assert.equal(retained.source_refs, JSON.stringify(["issue:synthetic:42", "mail:synthetic:corrected"]));
+    assert.deepEqual(reader.prepare("SELECT ref FROM source_refs WHERE chunk_id=? ORDER BY ref").all(retained.id)
+      .map((row) => row.ref), ["issue:synthetic:42", "mail:synthetic:corrected"]);
+    assert.equal(reader.prepare("SELECT count(*) AS count FROM source_refs WHERE ref=?").get("mail:synthetic:original")?.count, 0);
+    assert.deepEqual(entry(afterCorrection, "revised").embedding, Buffer.from(new Float32Array([0, 1, 0]).buffer));
+    assert.deepEqual((await index.search("Oscilloscope", undefined, [], 8, "keyword")).candidates, []);
+    assert.equal((await index.search("Calibration", undefined, [], 8, "keyword")).candidates[0]?.matches[0]?.entry_id, "revised");
+
+    await index.upsert("owner", "trimmed", stream(corrected.filter((record) => record.entry_id !== "removed")), cachedOnly);
+    await reopen("trimmed");
+    const afterRemoval = published(), removed = entry(afterCorrection, "removed");
+    assert.deepEqual(afterRemoval, afterCorrection.filter((record) => record.entry_id !== "removed"));
+    assert.equal(reader.prepare("SELECT rowid FROM chunk_vectors WHERE rowid=?").get(removed.id), undefined);
+    assert.equal(reader.prepare("SELECT count(*) AS count FROM source_refs WHERE chunk_id=?").get(removed.id)?.count, 0);
+    assert.deepEqual(reader.prepare("SELECT rowid AS id FROM chunk_vectors ORDER BY rowid").all().map((row) => row.id),
+      reader.prepare("SELECT id FROM chunks ORDER BY id").all().map((row) => row.id));
+    assert.deepEqual(published("anchor"), anchor);
+  } finally {
+    reader.close(); await index.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
