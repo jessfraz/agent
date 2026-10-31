@@ -1530,7 +1530,6 @@ mod tests {
         #[derive(Deserialize)]
         struct Receipt {
             message_entries: usize,
-            model_calls: usize,
             executions: usize,
         }
         let directory = tempfile::tempdir().unwrap();
@@ -1582,7 +1581,7 @@ import {readFile} from 'node:fs/promises';
 import {pathToFileURL} from 'node:url';
 import {BACKGROUND_CONTEXT} from '@earendil-works/chord/context';
 import {openNodeSqliteDatabase} from '@earendil-works/chord/sqlite/node';
-import {createModels,fauxProvider} from '@earendil-works/pi-ai';
+import {createModels} from '@earendil-works/pi-ai';
 import {createRegistry,Harness} from '@earendil-works/pi-durable';
 import {SqliteStorage} from '@earendil-works/pi-durable/storage/sqlite';
 const runtime=pathToFileURL(process.argv[1]);
@@ -1595,10 +1594,10 @@ const thread={id:'thread-a',title:'Inspect synthetic media',cwd:'/example/projec
 const batch=(item)=>({host_id:'source-host',thread,items:[item],next_cursor:null,
   complete:item.version===available.version,gaps:item.version===available.version?[]:input.gaps});
 async function open(){
-  const models=createModels(), faux=fauxProvider({provider:'openai',models:[{id:'unused'}]});models.setProvider(faux.provider);
+  const models=createModels();
   const session=await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(input.database)),
     {models,registry:createRegistry(),identity:{attribution:null}},BACKGROUND_CONTEXT);
-  return {session,faux,store:new HistoryStore(session,input.asset_root)};
+  return {session,store:new HistoryStore(session,input.asset_root)};
 }
 let app=await open();
 try{
@@ -1617,7 +1616,6 @@ try{
   assert.deepEqual(overlaid.data.item.assets,available.assets,'Recovered refs retain their actual incoming evidence version');
   assert.equal(createHash('sha256').update(await readFile(available.assets[0].path)).digest('hex'),available.assets[0].sha256);
   assert.deepEqual(await app.store.original(overlaid),missing.data);
-  assert.equal(app.faux.state.callCount,0);
   assert.equal((await app.session.commit(tx=>tx.scanTasks({},100),BACKGROUND_CONTEXT)).items.length,0);
   await app.session.close(BACKGROUND_CONTEXT);app=await open();
   for(const item of [missing,available]){
@@ -1630,8 +1628,8 @@ try{
   assert.equal(saved.flatMap(transcript).filter(message=>message.text===missing.text).length,1);
   assert.deepEqual((await app.store.entry(reopened.id.toString(),original.id.toString())).data.item.assets,available.assets);
   const executions=(await app.session.commit(tx=>tx.scanTasks({},100),BACKGROUND_CONTEXT)).items.length;
-  assert.equal(executions,0);assert.equal(app.faux.state.callCount,0);
-  process.stdout.write(JSON.stringify({message_entries:1,model_calls:app.faux.state.callCount,executions})+'\n');
+  assert.equal(executions,0);
+  process.stdout.write(JSON.stringify({message_entries:1,executions})+'\n');
 }finally{await app.session.close(BACKGROUND_CONTEXT);}
 "#])
             .arg(&runtime).current_dir(runtime_root).stdin(std::process::Stdio::piped())
@@ -1664,7 +1662,6 @@ try{
         );
         let receipt: Receipt = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(receipt.message_entries, 1);
-        assert_eq!(receipt.model_calls, 0);
         assert_eq!(receipt.executions, 0);
     }
 
@@ -2652,7 +2649,7 @@ import {join} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {BACKGROUND_CONTEXT} from '@earendil-works/chord/context';
 import {openNodeSqliteDatabase} from '@earendil-works/chord/sqlite/node';
-import {createModels,fauxProvider} from '@earendil-works/pi-ai';
+import {createModels} from '@earendil-works/pi-ai';
 import {createRegistry,Harness} from '@earendil-works/pi-durable';
 import {SqliteStorage} from '@earendil-works/pi-durable/storage/sqlite';
 const runtime=pathToFileURL(process.argv[1]);
@@ -2671,12 +2668,12 @@ const embed=async command=>{
   pooling:'last',normalization:'l2',instruction_version:1},vectors:command.texts.map(()=>[1,0,0])}};
 };
 async function open(){
- const models=createModels(),faux=fauxProvider({provider:'openai',models:[{id:'unused'}]});models.setProvider(faux.provider);
+ const models=createModels();
  const session=await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(evidence.directory,'session.sqlite'))),
   {models,registry:createRegistry(),identity:{attribution:null}},BACKGROUND_CONTEXT);
  const store=new HistoryStore(session),tasks=new TaskStore(session,new ConversationModels(models));tasks.useHistory(store);
  const retrieval=new Retrieval(session,store,tasks,join(evidence.directory,'search.sqlite'));
- return {session,faux,store,retrieval,importer:new CodexImporter(session,store,join(evidence.directory,'assets'))};
+ return {session,store,retrieval,importer:new CodexImporter(session,store,join(evidence.directory,'assets'))};
 }
 let app=await open(),reads=0;
 const call=async command=>{
@@ -2701,14 +2698,14 @@ try{
  const checkpoint=await app.store.checkpoint(evidence.current.id,host.host_id);
  assert.equal(checkpoint.version,evidence.current.version);assert.notEqual(checkpoint.version,evidence.previous.version);
  assert.equal(checkpoint.complete,false);assert.deepEqual(checkpoint.gaps,evidence.gaps);
- assert.deepEqual((await conversation.context(BACKGROUND_CONTEXT)).messages,[]);assert.equal(app.faux.state.callCount,0);
+ assert.deepEqual((await conversation.context(BACKGROUND_CONTEXT)).messages,[]);
  const watermark=(await conversation.entries({order:'descending'},1,undefined,BACKGROUND_CONTEXT)).items[0].id,embeddedCount=embedded.length;
  app.retrieval.close();await app.session.close(BACKGROUND_CONTEXT);app=await open();
  const repeated=await run();assert.equal(repeated.phase,'partial');assert.equal(reads,2);assert.equal(repeated.items_added,0);
  assert.equal(repeated.items_unchanged,1,'Only the affected image is retried after the one-time reader backfill');assert.equal(embedded.length,embeddedCount);
  const reopened=await app.store.conversation(seeded.conversation.conversation_id);assert.ok(reopened);
  assert.equal((await reopened.entries({order:'descending'},1,undefined,BACKGROUND_CONTEXT)).items[0].id,watermark);
- assert.equal(app.faux.state.callCount,0);assert.equal((await app.session.inspect(BACKGROUND_CONTEXT)).tasks.length,0);
+ assert.equal((await app.session.inspect(BACKGROUND_CONTEXT)).tasks.length,0);
  process.stdout.write(JSON.stringify({reads,added:progress.items_added,retained:retained.length,repeated_embeddings:embedded.length-embeddedCount})+'\n');
 }finally{app.retrieval.close();await app.session.close(BACKGROUND_CONTEXT);}
 "#])

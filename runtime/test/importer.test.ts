@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
-import { createModels, fauxProvider } from "@earendil-works/pi-ai";
+import { createModels } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { AgentNode } from "../src/generated/AgentNode.js";
@@ -19,13 +19,12 @@ import type { ImportProgress } from "../src/generated/ImportProgress.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import { HistoryStore, ImportedItemEntry } from "../src/history.js";
 import { CodexImporter } from "../src/importer.js";
-import { ConversationModels } from "../src/models.js";
+import { ConversationModels, DEFAULT_MODEL } from "../src/models.js";
 import { Retrieval } from "../src/retrieval.js";
 import { SearchIndex } from "../src/search.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
 import { HostRequests } from "../src/tools.js";
 import { transcript } from "../src/transcript.js";
-import { fixtureModel } from "./model.js";
 
 function node(host_id: string): AgentNode {
   return { host_id, name: host_id, rex_server: null, agent_program: "/example/agent", home_directory: "/example/home", coordinator: null,
@@ -54,14 +53,14 @@ function native(producer: Producer): HostCall {
   };
 }
 async function open(directory: string) {
+  // Import and adoption need storage, not an inference provider.
   const models = createModels();
-  const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 }); models.setProvider(faux.provider);
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const assets = join(directory, "assets"), histories = new HistoryStore(session, assets);
   const importer = new CodexImporter(session, histories, assets);
   let indexes = 0;
-  return { session, histories, importer, assets, models, faux, indexCount: () => indexes,
+  return { session, histories, importer, assets, models, indexCount: () => indexes,
     run: (producer: Producer, nodes = [coordinator]) => importer.run(nodes, nodes.map((node) => node.host_id), [], native(producer), () => {}, async () => { indexes += 1; }) };
 }
 async function originals(app: Awaited<ReturnType<typeof open>>, id: string) {
@@ -94,7 +93,7 @@ test("same-version imports repair native lineage before completed skips and affe
       await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
       const tasks = new TaskStore(app.session, new ConversationModels(app.models)); tasks.useHistory(app.histories);
       const adopted = await tasks.adopt(seeded.conversation_id, { id: randomUUID(), outcome: "Continue the retained discussion",
-        evidence: "Synthetic existing context", model: fixtureModel });
+        evidence: "Synthetic existing context", model: DEFAULT_MODEL });
       const index = new Retrieval(app.session, app.histories, tasks, join(directory, "search.sqlite")); retrieval = index;
       const embedding: HostCall = async (command) => {
         if (command.type !== "embed") throw new Error("A lineage repair must not start model or worker effects");
@@ -121,7 +120,7 @@ test("same-version imports repair native lineage before completed skips and affe
       assert.equal((await tasks.get(adopted.id)).conversation_id, seeded.conversation_id);
       assert.equal(await app.histories.evidence(seeded.conversation_id), "Synthetic existing context");
       if (complete) assert.deepEqual(await app.histories.checkpoint(source.id, coordinator.host_id), checkpoint);
-      assert.equal(app.faux.state.callCount, 0);
+
       retrieval.close(); retrieval = undefined;
       await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
       assert.equal((await app.histories.get(source.id))?.thread.parent_thread_id, "native-parent");
@@ -175,7 +174,6 @@ test("unchanged partial imports retry only affected source pages across reopen a
     const checkpoint = await app.histories.checkpoint(source.id, coordinator.host_id);
     assert.equal(checkpoint?.complete, true); assert.deepEqual(checkpoint.retry_pages, []);
     reads.length = 0; assert.equal((await app.run(producer)).threads_unchanged, 1); assert.deepEqual(reads, []);
-    assert.equal(app.faux.state.callCount, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -260,7 +258,7 @@ async function stoppedDuringIndexing(directory: string, producer: Producer) {
   void pending.catch(() => {});
   await began;
   const progress = await previous.importer.status(); assert.equal(progress.phase, "indexing");
-  assert.equal(previous.faux.state.callCount, 0);
+
   const legacy = defineDoc<{ progress: ImportProgress | null; indexing?: ImportProgress | null }>({
     kind: "agent.import-progress", scope: "session", version: 1, initial: () => ({ progress: null }), checkpointWhen: () => true,
   });
@@ -336,7 +334,7 @@ test("source text and cursors commit while native embedding is held, and joined 
     const published = new SearchIndex(join(directory, "search.sqlite"));
     try { assert.deepEqual(published.checkpoint(saved.conversation.conversation_id), { watermark: tail.id.toString(), dirty: false }); }
     finally { published.close(); }
-    assert.equal((await originals(app, source.id)).entries.length, 4); assert.equal(app.faux.state.callCount, 0);
+    assert.equal((await originals(app, source.id)).entries.length, 4);
   } finally {
     release(); releaseSource(); await Promise.allSettled([pending, joined]); retrieval.close();
     await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
@@ -403,7 +401,6 @@ test("failure drains the owned initial host call before request cleanup and rest
     });
     assert.equal(resumed.phase, "complete"); assert.equal(reads, 1); assert.equal(app.indexCount(), 2);
     assert.deepEqual((await originals(app, source.id)).entries.map((entry) => entry.data.item.id), ["before-stop", "committed-during-index", "after-stop"]);
-    assert.equal(app.faux.state.callCount, 0);
   } finally {
     if (!closed) await previous.session.close(BACKGROUND_CONTEXT);
     release(); releaseSource(); await pending?.catch(() => {}); requests.finish(71); await Promise.allSettled(effects);
@@ -426,7 +423,7 @@ test("prewalk indexing failure stays visible during source reads and final succe
     assert.ok(updates.some((progress) => progress.phase === "importing" && progress.gaps.includes("Initial search indexing: Synthetic initial index failure")));
     assert.equal(indexes, 2); assert.equal(reads, 1); assert.equal(result.phase, "partial"); assert.equal(result.gap_count, 1);
     assert.deepEqual(result.gaps, ["missing-media: A referenced media asset is unavailable"]);
-    assert.equal((await originals(app, source.id)).entries.length, 1); assert.equal(app.faux.state.callCount, 0);
+    assert.equal((await originals(app, source.id)).entries.length, 1);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -459,7 +456,6 @@ test("the orchestrator imports active and archived history from both hosts witho
       assert.deepEqual((await saved.conversation.context(BACKGROUND_CONTEXT)).messages, []);
     }
     assert.equal((await app.session.commit((tx) => tx.scanTasks({}, 100), BACKGROUND_CONTEXT)).items.length, 0);
-    assert.equal(app.faux.state.callCount, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -484,7 +480,6 @@ test("an interrupted native page resumes its durable cursor after reopening Pi",
     assert.equal(resumed.phase, "complete"); assert.equal(resumed.items_added, 1); assert.deepEqual(cursors, ["page-two"]);
     assert.equal((await originals(app, source.id)).entries.length, 2);
     assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.complete, true);
-    assert.equal(app.faux.state.callCount, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -510,7 +505,6 @@ test("inventory failures remain visible after the media gap summary fills", asyn
     assert.equal(result.gaps[0], "coordinator: active inventory: Synthetic inventory failure");
     assert.equal((await app.histories.checkpoint(active.id, coordinator.host_id))?.gaps.length, 55);
     assert.equal((await app.histories.checkpoint(archived.id, coordinator.host_id))?.gaps.length, 3);
-    assert.equal(app.faux.state.callCount, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -534,7 +528,7 @@ test("a concurrent rerun attaches to the existing native walk instead of startin
     const second = app.run(producer); release();
     const results = await Promise.all([first, second]); assert.deepEqual(results[0], results[1]);
     assert.equal(results[0]?.phase, "complete"); assert.equal(inventories, 2); assert.equal(reads, 1); assert.equal(app.indexCount(), 2);
-    assert.equal((await originals(app, source.id)).entries.length, 1); assert.equal(app.faux.state.callCount, 0);
+    assert.equal((await originals(app, source.id)).entries.length, 1);
     assert.equal(app.importer.isRunning(), false);
   } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -606,7 +600,7 @@ test("interrupted indexing resumes retained counts and gaps without rereading so
         const results = await Promise.all([first, second]);
         assert.deepEqual(results, [{ ...progress, phase: "partial" }, { ...progress, phase: "partial" }]);
       } finally { release(); await Promise.allSettled([first, second]); }
-      assert.equal(app.importer.isRunning(), false); assert.equal(app.faux.state.callCount, 0);
+      assert.equal(app.importer.isRunning(), false);
       assert.deepEqual((await originals(app, source.id)).entries.map((entry) => entry.data.item.id), ["retained"]);
       catchup = true;
       const fresh = await app.run(producer);
@@ -632,7 +626,6 @@ test("explicit host selection starts a new native walk instead of claiming an in
     const result = await app.importer.run([coordinator, laptop], [coordinator.host_id, laptop.host_id], [laptop.name], call, () => {}, async () => { indexes += 1; });
     assert.equal(result.phase, "complete"); assert.equal(result.items_added, 0); assert.equal(result.items_unchanged, 1);
     assert.deepEqual(hosts, [laptop.host_id, laptop.host_id, laptop.host_id]); assert.equal(indexes, 2);
-    assert.equal(app.faux.state.callCount, 0);
   } finally { await stopped.settle(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -669,7 +662,6 @@ test("a failed index keeps source progress across reopen and clears resolved ind
     assert.deepEqual((await originals(app, source.id)).entries.map((entry) => entry.data.item.id), ["retained"]);
     const fresh = await app.run(producer);
     assert.equal(fresh.items_added, 0); assert.equal(fresh.items_unchanged, 1); assert.equal(app.indexCount(), 2);
-    assert.equal(app.faux.state.callCount, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -711,7 +703,6 @@ test("deleted advertised media preserves mixed user text and same-version recove
     for await (const record of app.histories.inventory()) if (record.conversation_id === conversationId) afterWatermark = record.watermark;
     assert.ok(beforeWatermark && afterWatermark); assert.notEqual(afterWatermark, beforeWatermark, "Recovered assets must invalidate the existing search watermark");
     assert.equal((await app.histories.checkpoint(source.id, laptop.host_id))?.complete, true);
-    assert.equal(app.faux.state.callCount, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -752,7 +743,7 @@ test("verified coordinator assets survive reopen and avoid repeat host transfers
     known = false;
     assert.equal((await app.run(producer, [node("unknown-digest")])).phase, "complete");
     assert.ok(transfers.length > initialTransfers, "Without an advertised digest the ordinary transfer must still verify the source bytes");
-    assert.equal((await originals(app, source.id)).entries.length, 1); assert.equal(app.faux.state.callCount, 0);
+    assert.equal((await originals(app, source.id)).entries.length, 1);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -799,7 +790,6 @@ test("invalid coordinator asset copies are repaired by verified transfer without
       if (corruption === "symlink") assert.deepEqual(await readFile(outside), bytes, "The symlink target is not owned by the asset cache");
       const saved = await originals(app, source.id); assert.equal(saved.entries.length, 1);
       const entry = saved.entries[0]; assert.ok(entry); assert.deepEqual(await app.histories.original(entry), original);
-      assert.equal(app.faux.state.callCount, 0);
     } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
   });
 });
@@ -840,7 +830,7 @@ test("a failed chunked asset transfer leaves a gap and retries the same item ver
     assert.deepEqual(await app.histories.original(entry), original);
     const before = assetReads; const repeated = await app.run(producer);
     assert.equal(repeated.threads_unchanged, 1); assert.equal(assetReads, before);
-    assert.equal((await originals(app, source.id)).entries.length, 1); assert.equal(app.faux.state.callCount, 0);
+    assert.equal((await originals(app, source.id)).entries.length, 1);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -892,7 +882,7 @@ test("operational asset transfer failures outrank missing media and recover with
     assert.deepEqual(await app.histories.original(saved), original);
     const reads = assetReads, repeated = await app.run(producer);
     assert.equal(repeated.items_added, 0); assert.equal(repeated.threads_unchanged, 1); assert.equal(assetReads, reads);
-    assert.equal((await originals(app, source.id)).entries.length, 2); assert.equal(app.faux.state.callCount, 0);
+    assert.equal((await originals(app, source.id)).entries.length, 2);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -917,6 +907,5 @@ test("changed or unreliable first-read failures replace stale completeness befor
       fail = false; const recovered = await app.run(producer);
       assert.equal(recovered.phase, "complete"); assert.equal(recovered.items_added, 0); assert.equal(recovered.items_unchanged, 1);
     }
-    assert.equal(app.faux.state.callCount, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

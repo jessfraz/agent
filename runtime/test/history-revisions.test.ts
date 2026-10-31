@@ -8,7 +8,7 @@ import { test } from "node:test";
 import type { JsonValue } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
-import { createModels, fauxProvider } from "@earendil-works/pi-ai";
+import { createModels } from "@earendil-works/pi-ai";
 import { createRegistry, defineDocFamily, Harness, type ConversationId, type Cursor, type EntryId, type EntryRecord } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { HistoryItem } from "../src/generated/HistoryItem.js";
@@ -31,7 +31,7 @@ function item(text: string, version: string, id = "source-item", turn = "source-
 }
 const old = item("Obsidianoldonly prior decision", "item-one"), current = item("Zirconianewonly corrected decision", "item-two");
 async function open(directory: string) {
-  const models = createModels(), faux = fauxProvider({ provider: "openai", models: [{ id: "unused" }] }); models.setProvider(faux.provider);
+  const models = createModels();
   const storage = await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite")));
   const session = await Harness.open(storage, { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const store = new HistoryStore(session), tasks = new TaskStore(session, new ConversationModels(models)); tasks.useHistory(store);
@@ -43,7 +43,7 @@ async function open(directory: string) {
       pooling: "last", normalization: "l2", instruction_version: 1 }, vectors: command.texts.map(() => [1, 0, 0]) } };
   };
   const retrieval = new Retrieval(session, store, tasks, join(directory, "search.sqlite"));
-  return { session, storage, store, tasks, retrieval, faux, embedded, embed,
+  return { session, storage, store, tasks, retrieval, embedded, embed,
     async close() { retrieval.close(); await session.close(BACKGROUND_CONTEXT); } };
 }
 type App = Awaited<ReturnType<typeof open>>;
@@ -89,7 +89,7 @@ test("native source timestamps select one revision across stale-host order, rest
       await app.close(); app = await open(directory);
       assert.deepEqual((await rows(app, id)).filter((row) => row.role === "user").map((row) => row.text), [current.text]);
       assert.deepEqual(await originals(app, id), retained);
-      assert.equal(app.faux.state.callCount, 0); assert.equal((await app.session.inspect(BACKGROUND_CONTEXT)).tasks.length, 0);
+      assert.equal((await app.session.inspect(BACKGROUND_CONTEXT)).tasks.length, 0);
     } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
   });
 });
@@ -200,7 +200,6 @@ test("same-host same-second captures replace revisions through the native import
     await run(); assert.equal(reads, 2, "A completed snapshot replay must not become a newer capture");
     assert.deepEqual(await nativeEntries(app, id), before); assert.equal((await originals(app, id)).length, 2);
     assert.deepEqual((await rows(app, id)).filter((row) => row.role === "user").map((row) => row.text), [current.text]);
-    assert.equal(app.faux.state.callCount, 0);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -275,7 +274,6 @@ test("empty targeted retry pages retain their confirmed capture and new cursor a
     await run(); assert.deepEqual(reads, [null, "moved-page"]);
     assert.equal((await originals(app, record.conversation_id)).length, 2);
     assert.deepEqual((await app.store.checkpoint(thread.id, node.host_id))?.retry_pages?.map((page) => page.cursor), [null]);
-    assert.equal(app.faux.state.callCount, 0);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -395,6 +393,5 @@ test("legacy history renders a bounded page, then migrates its published vectors
     await app.close(); app = await open(directory);
     const tail = await rows(app, id); assert.equal(tail.filter((row) => row.text === old.text).length, 0);
     assert.equal(tail.filter((row) => row.text === current.text).length, 1);
-    assert.equal(app.faux.state.callCount, 0);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });

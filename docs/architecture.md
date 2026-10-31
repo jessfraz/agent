@@ -477,6 +477,9 @@ CI starts the production coordinator with real Pi SQLite storage and Unix
 sockets on Linux and macOS. macOS also connects the native Swift client to
 that server, checking outbox reconciliation across reconnects and restarts.
 These tests use no replacement coordinator or model provider.
+Import and revision tests use real Pi storage without an inference provider.
+Synthetic vectors test index mechanics; the native embedding test separately
+checks the packaged model and runner.
 
 Fault-injection tests still use controlled peers and providers for lost replies,
 offline workers and malformed frames. Keep those separate from end-to-end
