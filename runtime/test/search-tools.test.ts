@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
-import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type ToolCall, type TranscriptContext } from "@earendil-works/pi-ai";
-import { AssistantEntry, createRegistry, Harness, ToolResultEntry, ToolTask } from "@earendil-works/pi-durable";
+import { createModels, type ToolCall } from "@earendil-works/pi-ai";
+import { AssistantEntry, createRegistry, Harness, ToolResultEntry, ToolTask, type Conversation } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { EmbeddingSpace } from "../src/generated/EmbeddingSpace.js";
 import type { AgentNode } from "../src/generated/AgentNode.js";
@@ -20,7 +20,6 @@ import { ConversationModels, DEFAULT_MODEL } from "../src/models.js";
 import { Retrieval } from "../src/retrieval.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
 import { createAppTools, Executions } from "../src/tools.js";
-import { fixtureModel } from "./model.js";
 import { validEvent } from "../src/protocol.js";
 
 const space: EmbeddingSpace = { id: "synthetic-tool-search", model_revision: "fixture", model_digest: "fixture",
@@ -34,9 +33,22 @@ function batch(id: string, updated_at: number, items: HistoryItem[]): HistoryImp
     version: "v1", version_reliable: true, archived: true, forked_from_id: null, parent_thread_id: null },
     items, next_cursor: null, gaps: [], complete: true };
 }
-function lastResult(context: TranscriptContext): unknown {
-  const message = context.messages.findLast((message) => message.role === "toolResult");
-  assert.ok(message?.role === "toolResult");
+/** Run registered tools through Pi's durable lifecycle without an inference provider. */
+async function invoke(session: Harness, conversation: Conversation, call: ToolCall): Promise<unknown> {
+  const id = await conversation.commit(async (tx) => {
+    const assistant = await tx.appendEntry(AssistantEntry, conversation.id, { model: [{ role: "assistant", content: [call],
+      api: "openai-responses", provider: DEFAULT_MODEL.provider, model: DEFAULT_MODEL.model_id, stopReason: "toolUse", timestamp: 1,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } }] });
+    return tx.createTask(ToolTask, { kind: "model", assistant: assistant.id, callId: call.id }, { ownership: { kind: "conversation" } });
+  }, BACKGROUND_CONTEXT);
+  const outcome = (await session.waitForTask(id, BACKGROUND_CONTEXT)).state.outcome;
+  assert.equal(outcome.status, "completed");
+  if (outcome.status !== "completed" || outcome.result.kind !== "model") throw new Error("Pi did not settle the tool task");
+  const entryId = outcome.result.entryId;
+  const entry = await conversation.commit((tx) => tx.entry(ToolResultEntry, entryId), BACKGROUND_CONTEXT);
+  const message = entry?.model?.[0]; assert.ok(message?.role === "toolResult");
+  assert.equal(message.isError, false);
   return JSON.parse(message.content.filter((part) => part.type === "text").map((part) => part.text).join(""));
 }
 
@@ -80,34 +92,16 @@ test("search and task reads bound imported coverage while Pi retains every canon
     const root = await session.root(BACKGROUND_CONTEXT);
     const unbind = executions.bind(root.id.toString(), { cwd: "/example/project", hosts: [], call, search });
     try {
-      // Admit real Pi tool tasks without registering an inference provider.
       await root.configure({ extensions: [tools.main] }, BACKGROUND_CONTEXT);
-      async function invoke(call: ToolCall): Promise<unknown> {
-        const id = await root.commit(async (tx) => {
-          const assistant = await tx.appendEntry(AssistantEntry, root.id, { model: [{ role: "assistant", content: [call],
-            api: "openai-responses", provider: DEFAULT_MODEL.provider, model: DEFAULT_MODEL.model_id, stopReason: "toolUse", timestamp: 1,
-            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } }] });
-          return tx.createTask(ToolTask, { kind: "model", assistant: assistant.id, callId: call.id }, { ownership: { kind: "conversation" } });
-        }, BACKGROUND_CONTEXT);
-        const outcome = (await session.waitForTask(id, BACKGROUND_CONTEXT)).state.outcome;
-        assert.equal(outcome.status, "completed");
-        if (outcome.status !== "completed" || outcome.result.kind !== "model") throw new Error("Pi did not settle the tool task");
-        const entryId = outcome.result.entryId;
-        const entry = await root.commit((tx) => tx.entry(ToolResultEntry, entryId), BACKGROUND_CONTEXT);
-        const message = entry?.model?.[0]; assert.ok(message?.role === "toolResult");
-        assert.equal(message.isError, false);
-        const result: unknown = JSON.parse(message.content.filter((part) => part.type === "text").map((part) => part.text).join(""));
-        assert.ok(Buffer.byteLength(JSON.stringify(result)) < 8000);
-        return result;
-      }
-      const result = await invoke({ type: "toolCall", id: "coverage-search", name: "search_tasks", arguments: { query: "connector" } });
+      const result = await invoke(session, root, { type: "toolCall", id: "coverage-search", name: "search_tasks", arguments: { query: "connector" } });
+      assert.ok(Buffer.byteLength(JSON.stringify(result)) < 8000);
       assert.ok(result !== null && typeof result === "object" && "matches" in result && Array.isArray(result.matches));
       const match: unknown = result.matches.find((value: unknown) => value !== null && typeof value === "object" && "conversation_id" in value && value.conversation_id === chosen.conversation_id);
       assert.ok(match !== null && typeof match === "object" && "imported" in match);
       assert.deepEqual(match.imported, chosen.imported);
-      const read = await invoke({ type: "toolCall", id: "coverage-read", name: "read_task",
+      const read = await invoke(session, root, { type: "toolCall", id: "coverage-read", name: "read_task",
         arguments: { conversation_id: chosen.conversation_id, include_history: false } });
+      assert.ok(Buffer.byteLength(JSON.stringify(read)) < 8000);
       assert.ok(read !== null && typeof read === "object" && "imported" in read);
       assert.deepEqual(read.imported, chosen.imported);
       assert.equal("history" in read, false);
@@ -134,7 +128,6 @@ test("search and task reads bound imported coverage while Pi retains every canon
 test("main and worker tools find older substantive context beside a newer shallow candidate and read its selected originals", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-search-tools-"));
   const models = createModels();
-  const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 }); models.setProvider(faux.provider);
   const registry = createRegistry();
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
@@ -164,7 +157,7 @@ test("main and worker tools find older substantive context beside a newer shallo
     const entries = (await original.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is);
     const ids = entries.map((entry) => entry.id.toString());
     const decisionEntry = entries.find((entry) => entry.data.item.id === decision.id); assert.ok(decisionEntry);
-    const worker = await tasks.create({ title: "Retrieval check", outcome: "Inspect retained evidence", model: fixtureModel });
+    const worker = await tasks.create({ title: "Retrieval check", outcome: "Inspect retained evidence", model: DEFAULT_MODEL });
     const root = await session.root(BACKGROUND_CONTEXT);
     await retrieval.sync(call);
     for (const role of ["main", "worker"]) {
@@ -173,38 +166,24 @@ test("main and worker tools find older substantive context beside a newer shallo
         ...(role === "worker" ? { role: "worker" } : {}),
         search: (text, refs, limit, mode) => retrieval.search(text, refs, limit, call, false, mode) });
       try {
-        await tasks.inference.configure(conversation, fixtureModel, { instructions: "Find prior context and inspect its original decisions.", cwd: "/example/project",
-          extensions: [role === "main" ? tools.main : tools.worker] });
-        let failure: unknown;
-        faux.setResponses([
-          fauxAssistantMessage(fauxToolCall("search_tasks", { query }), { stopReason: "toolUse" }),
-          async (context) => {
-            try {
-              const found = lastResult(context); assert.ok(found !== null && typeof found === "object" && "matches" in found && Array.isArray(found.matches));
-              assert.ok("gaps" in found); assert.deepEqual(found.gaps, []);
-              assert.ok(found.matches.some((match: unknown) => match !== null && typeof match === "object" && "conversation_id" in match && match.conversation_id === recent.conversation.conversation_id));
-              const position = found.matches.findIndex((match: unknown) => match !== null && typeof match === "object" && "conversation_id" in match && match.conversation_id === old.conversation.conversation_id);
-              assert.ok(position > 0, "The fixture must inspect a substantive candidate rather than automatically choosing the first");
-              const chosen: unknown = found.matches[position];
-              assert.ok(chosen !== null && typeof chosen === "object" && "entry_ids" in chosen && Array.isArray(chosen.entry_ids));
-              assert.deepEqual(chosen.entry_ids, ids, `${role} must receive distinct original entry IDs despite overlapping log chunks`);
-              return fauxAssistantMessage(fauxToolCall("read_task", { conversation_id: old.conversation.conversation_id, entry_ids: chosen.entry_ids }), { stopReason: "toolUse" });
-            } catch (error) { failure = error; return fauxAssistantMessage("Fixture assertion failed."); }
-          },
-          async (context) => {
-            try {
-              const read = lastResult(context); assert.ok(read !== null && typeof read === "object" && "originals" in read && Array.isArray(read.originals));
-              const evidence: unknown = read.originals.find((value: unknown) => value !== null && typeof value === "object" && "entry_id" in value && value.entry_id === decisionEntry.id.toString());
-              assert.ok(evidence !== null && typeof evidence === "object" && "data" in evidence && typeof evidence.data === "string");
-              assert.deepEqual(JSON.parse(evidence.data), decision.data);
-              inspected.push(role);
-              return fauxAssistantMessage("The retained decision and verification are available.");
-            } catch (error) { failure = error; return fauxAssistantMessage("Fixture assertion failed."); }
-          },
-        ]);
-        const settled = await (await conversation.submit({ type: "input", content: "Inspect the prior decisions." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
-        if (failure !== undefined) throw failure;
-        assert.ok(settled.type === "input" && settled.status === "done");
+        await conversation.configure({ extensions: [role === "main" ? tools.main : tools.worker] }, BACKGROUND_CONTEXT);
+        const found = await invoke(session, conversation, { type: "toolCall", id: "original-search-" + role, name: "search_tasks", arguments: { query } });
+        assert.ok(found !== null && typeof found === "object" && "matches" in found && Array.isArray(found.matches));
+        assert.ok("gaps" in found); assert.deepEqual(found.gaps, []);
+        assert.ok(found.matches.some((match: unknown) => match !== null && typeof match === "object" && "conversation_id" in match && match.conversation_id === recent.conversation.conversation_id));
+        const position = found.matches.findIndex((match: unknown) => match !== null && typeof match === "object" && "conversation_id" in match && match.conversation_id === old.conversation.conversation_id);
+        assert.ok(position > 0, "The fixture must inspect a substantive candidate rather than automatically choosing the first");
+        const chosen: unknown = found.matches[position];
+        assert.ok(chosen !== null && typeof chosen === "object" && "entry_ids" in chosen && Array.isArray(chosen.entry_ids));
+        const selected = chosen.entry_ids.map((id: unknown) => { assert.ok(typeof id === "string"); return id; });
+        assert.deepEqual(selected, ids, `${role} must receive distinct original entry IDs despite overlapping log chunks`);
+        const read = await invoke(session, conversation, { type: "toolCall", id: "original-read-" + role, name: "read_task",
+          arguments: { conversation_id: old.conversation.conversation_id, entry_ids: selected } });
+        assert.ok(read !== null && typeof read === "object" && "originals" in read && Array.isArray(read.originals));
+        const evidence: unknown = read.originals.find((value: unknown) => value !== null && typeof value === "object" && "entry_id" in value && value.entry_id === decisionEntry.id.toString());
+        assert.ok(evidence !== null && typeof evidence === "object" && "data" in evidence && typeof evidence.data === "string");
+        assert.deepEqual(JSON.parse(evidence.data), decision.data);
+        inspected.push(role);
       } finally { unbind(); }
     }
     assert.deepEqual(inspected, ["main", "worker"]);
@@ -217,7 +196,6 @@ test("main and worker tools find older substantive context beside a newer shallo
 test("main and worker search retain fresh matching tasks while an import fills the index results", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-search-live-tasks-"));
   const models = createModels();
-  const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 }); models.setProvider(faux.provider);
   const registry = createRegistry();
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
@@ -244,8 +222,8 @@ test("main and worker search retain fresh matching tasks while an import fills t
     }
     await retrieval.sync(call);
     const old = await retrieval.search(query, [], 8, call, true); assert.equal(old.candidates.length, 8);
-    const fresh = await tasks.create({ title: "Connector decisions", outcome: "Continue the connector decision audit", model: fixtureModel });
-    const unrelated = await tasks.create({ title: "Unrelated transport repair", outcome: "Fix a bicycle tire", model: fixtureModel });
+    const fresh = await tasks.create({ title: "Connector decisions", outcome: "Continue the connector decision audit", model: DEFAULT_MODEL });
+    const unrelated = await tasks.create({ title: "Unrelated transport repair", outcome: "Fix a bicycle tire", model: DEFAULT_MODEL });
     importing = importer.run([node], [node.host_id], [], call, () => {}, async () => { indexed(); await gate; });
     await began; assert.equal(importer.isRunning(), true);
     const root = await session.root(BACKGROUND_CONTEXT);
@@ -255,37 +233,22 @@ test("main and worker search retain fresh matching tasks while an import fills t
         ...(role === "worker" ? { role: "worker" } : {}),
         search: (text, refs, limit, mode) => retrieval.search(text, refs, limit, call, importer.isRunning(), mode) });
       try {
-        await tasks.inference.configure(conversation, fixtureModel, { instructions: "Find related existing work before continuing it.", cwd: "/example/project",
-          extensions: [role === "main" ? tools.main : tools.worker] });
-        let failure: unknown;
-        faux.setResponses([
-          fauxAssistantMessage(fauxToolCall("search_tasks", { query }), { stopReason: "toolUse" }),
-          async (context) => {
-            try {
-              const found = lastResult(context); assert.ok(found !== null && typeof found === "object" && "matches" in found && Array.isArray(found.matches));
-              assert.equal(found.matches.length, 8);
-              assert.ok(found.matches.some((match: unknown) => match !== null && typeof match === "object" && "task_id" in match && match.task_id === fresh.id),
-                `${role}: a full historical index must not hide the fresh matching task`);
-              assert.ok(found.matches.some((match: unknown) => match !== null && typeof match === "object" && "entry_ids" in match && Array.isArray(match.entry_ids) && match.entry_ids.length > 0),
-                "Historical originals must remain available beside live task metadata");
-              assert.ok(found.matches.every((match: unknown) => match !== null && typeof match === "object" && "title" in match && match.title !== "Unrelated transport repair"));
-              assert.ok("gaps" in found); assert.deepEqual(found.gaps, ["Codex history import and indexing are in progress"]);
-            } catch (error) { failure ??= error; }
-            return fauxAssistantMessage(fauxToolCall("search_tasks", { query,
-              sources: [{ provider: "task_outcomes", account: "local", thread_id: unrelated.id }] }), { stopReason: "toolUse" });
-          },
-          async (context) => {
-            try {
-              const found = lastResult(context); assert.ok(found !== null && typeof found === "object" && "matches" in found && Array.isArray(found.matches));
-              const first: unknown = found.matches[0];
-              assert.ok(first !== null && typeof first === "object" && "task_id" in first && first.task_id === unrelated.id,
-                "An explicit task outcome source must outrank incidental text relevance");
-            } catch (error) { failure ??= error; }
-            return fauxAssistantMessage("Related work is available.");
-          },
-        ]);
-        await (await conversation.submit({ type: "input", content: "Continue the connector decisions." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
-        if (failure !== undefined) throw failure;
+        await conversation.configure({ extensions: [role === "main" ? tools.main : tools.worker] }, BACKGROUND_CONTEXT);
+        const found = await invoke(session, conversation, { type: "toolCall", id: "fresh-search-" + role, name: "search_tasks", arguments: { query } });
+        assert.ok(found !== null && typeof found === "object" && "matches" in found && Array.isArray(found.matches));
+        assert.equal(found.matches.length, 8);
+        assert.ok(found.matches.some((match: unknown) => match !== null && typeof match === "object" && "task_id" in match && match.task_id === fresh.id),
+          `${role}: a full historical index must not hide the fresh matching task`);
+        assert.ok(found.matches.some((match: unknown) => match !== null && typeof match === "object" && "entry_ids" in match && Array.isArray(match.entry_ids) && match.entry_ids.length > 0),
+          "Historical originals must remain available beside live task metadata");
+        assert.ok(found.matches.every((match: unknown) => match !== null && typeof match === "object" && "title" in match && match.title !== "Unrelated transport repair"));
+        assert.ok("gaps" in found); assert.deepEqual(found.gaps, ["Codex history import and indexing are in progress"]);
+        const exact = await invoke(session, conversation, { type: "toolCall", id: "exact-search-" + role, name: "search_tasks",
+          arguments: { query, sources: [{ provider: "task_outcomes", account: "local", thread_id: unrelated.id }] } });
+        assert.ok(exact !== null && typeof exact === "object" && "matches" in exact && Array.isArray(exact.matches));
+        const first: unknown = exact.matches[0];
+        assert.ok(first !== null && typeof first === "object" && "task_id" in first && first.task_id === unrelated.id,
+          "An explicit task outcome source must outrank incidental text relevance");
       } finally { unbind(); }
     }
     assert.equal((await tasks.list()).length, 2); assert.equal(importer.isRunning(), true);

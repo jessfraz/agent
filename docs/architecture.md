@@ -478,7 +478,8 @@ sockets on Linux and macOS. macOS keeps the native Swift client alive across
 server restarts, checking automatic reconnection, its draft and one canonical
 saved input.
 These tests use no replacement coordinator or model provider.
-Import and revision tests use real Pi storage without an inference provider.
+Import, revision and search-tool tests use real Pi storage without an inference
+provider. Tool tests admit Pi tasks and inspect their persisted results.
 Synthetic vectors test index mechanics; the native embedding test separately
 checks the packaged model and runner.
 
