@@ -46,7 +46,7 @@ test("task search retains every source across indexing and reopen for a conversa
       const started = performance.now(); await index.upsert(task.conversation_id, watermark, tasks.records(task.conversation_id), embed);
       t.diagnostic(JSON.stringify({ references_per_entry: refs.length, records: records.length, index_ms: performance.now() - started }));
       assert.deepEqual(index.checkpoint(task.conversation_id), { watermark, dirty: false });
-    } finally { index.close(); }
+    } finally { await index.close(); }
     index = new SearchIndex(path);
     try {
       const started = performance.now();
@@ -64,7 +64,7 @@ test("task search retains every source across indexing and reopen for a conversa
       const keyword = await index.search("Automobile", embed, [], 8, "keyword");
       assert.equal(keyword.candidates[0]?.conversation_id, task.conversation_id);
       assert.ok(keyword.candidates[0]?.matches.some((match) => match.text.includes("Automobile")));
-    } finally { index.close(); }
+    } finally { await index.close(); }
     const db = new DatabaseSync(path);
     try {
       const chunks = db.prepare("SELECT count(*) AS count FROM chunks").get()?.count; assert.ok(typeof chunks === "number" && chunks > records.length);

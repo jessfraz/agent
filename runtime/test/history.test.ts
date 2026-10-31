@@ -514,5 +514,5 @@ test("native source-triage and unknown conversations stay out of search while hu
       assert.ok(result.candidates.some((candidate) => candidate.conversation_id === id && candidate.matches.some((match) => match.text.includes(query))));
       assert.equal(result.candidates.some((candidate) => candidate.conversation_id === internal || candidate.conversation_id === unknown.id.toString()), false);
     }
-  } finally { index.close(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  } finally { await index.close(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

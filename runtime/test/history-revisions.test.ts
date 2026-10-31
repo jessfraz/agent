@@ -65,7 +65,7 @@ async function nativeEntries(app: App, id: string) {
 async function originals(app: App, id: string) { return (await nativeEntries(app, id)).filter(ImportedItemEntry.is); }
 async function lexical(directory: string, query: string) {
   const index = new SearchIndex(join(directory, "search.sqlite"));
-  try { return await index.search(query, undefined, [], 4, "keyword"); } finally { index.close(); }
+  try { return await index.search(query, undefined, [], 4, "keyword"); } finally { await index.close(); }
 }
 
 test("native source timestamps select one revision across stale-host order, restart, history and actual search", async (t) => {
@@ -377,7 +377,7 @@ test("legacy history renders a bounded page, then migrates its published vectors
     const embed = async (texts: string[]) => { const response = await app.embed({ type: "embed", texts, purpose: "document" }); assert.ok(response.type === "embeddings"); return response.batch; };
     const reopened = await app.store.conversation(id); assert.ok(reopened);
     const watermark = (await reopened.entries({ order: "descending" }, 1, undefined, BACKGROUND_CONTEXT)).items[0]; assert.ok(watermark);
-    await index.upsert(id, watermark.id.toString(), legacyRecords(), embed); index.close();
+    await index.upsert(id, watermark.id.toString(), legacyRecords(), embed); await index.close();
     const previous = new DatabaseSync(join(directory, "search.sqlite"));
     previous.prepare("DELETE FROM metadata WHERE key=?").run("source_projection");
     previous.exec("ALTER TABLE conversations DROP COLUMN gaps"); previous.close();

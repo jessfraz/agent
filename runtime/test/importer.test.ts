@@ -106,7 +106,7 @@ test("same-version imports repair native lineage before completed skips and affe
       assert.ok(before);
       const retained = await originals(app, source.id), indexed = embeddings;
       const search = new SearchIndex(join(directory, "search.sqlite"));
-      const published = search.checkpoint(seeded.conversation_id); search.close();
+      const published = search.checkpoint(seeded.conversation_id); await search.close();
       corrected = true; reads = 0;
       const result = await app.importer.run([coordinator], [coordinator.host_id], [], native(producer), () => {}, () => index.sync(embedding, true));
       assert.equal(result.items_added, 0); assert.equal(reads, complete ? 0 : 1);
@@ -116,7 +116,7 @@ test("same-version imports repair native lineage before completed skips and affe
       assert.deepEqual((await originals(app, source.id)).all, retained.all);
       assert.equal(embeddings, indexed, "Repairing lineage must leave the native search watermark and embeddings unchanged");
       const afterSearch = new SearchIndex(join(directory, "search.sqlite"));
-      try { assert.deepEqual(afterSearch.checkpoint(seeded.conversation_id), published); } finally { afterSearch.close(); }
+      try { assert.deepEqual(afterSearch.checkpoint(seeded.conversation_id), published); } finally { await afterSearch.close(); }
       assert.equal((await tasks.get(adopted.id)).conversation_id, seeded.conversation_id);
       assert.equal(await app.histories.evidence(seeded.conversation_id), "Synthetic existing context");
       if (complete) assert.deepEqual(await app.histories.checkpoint(source.id, coordinator.host_id), checkpoint);
@@ -125,7 +125,7 @@ test("same-version imports repair native lineage before completed skips and affe
       await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
       assert.equal((await app.histories.get(source.id))?.thread.parent_thread_id, "native-parent");
       assert.equal((await app.histories.get(source.id))?.adopted_task_id, adopted.id);
-    } finally { retrieval?.close(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+    } finally { await retrieval?.close(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
   });
 });
 
@@ -333,7 +333,7 @@ test("source text and cursors commit while native embedding is held, and joined 
     const tail = (await retainedConversation.entries({ order: "descending" }, 1, undefined, BACKGROUND_CONTEXT)).items[0]; assert.ok(tail);
     const published = new SearchIndex(join(directory, "search.sqlite"));
     try { assert.deepEqual(published.checkpoint(saved.conversation.conversation_id), { watermark: tail.id.toString(), dirty: false }); }
-    finally { published.close(); }
+    finally { await published.close(); }
     assert.equal((await originals(app, source.id)).entries.length, 4);
   } finally {
     release(); releaseSource(); await Promise.allSettled([pending, joined]); await retrieval.close();
