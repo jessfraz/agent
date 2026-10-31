@@ -20,13 +20,17 @@ final class RowModel: Identifiable {
 
 @MainActor @Observable
 final class ChatModel {
-  var rows: [RowModel] = []
+  var rows: [RowModel] = [] {
+    didSet { transcriptItems = TranscriptItem.grouped(rows, preserving: transcriptItems) }
+  }
+  private(set) var transcriptItems: [TranscriptItem] = []
   var connection: ConnectionState = .disconnected
   var model = "Main conversation"
   var commands: [SlashCommand] = []
   var busy = false
   var canLoadEarlier = false
   var loadingHistory = false
+  var includesLatest = true
   var error: String?
   var revision = 0
   var draft = ""
@@ -250,7 +254,8 @@ final class ChatModel {
     }
     return try await session.toolDetails(entryID: entryID, callID: tool.callId)
   }
-  func history() async { await session?.loadEarlier() }
+  func history(anchorID: String?) async { await session?.loadEarlier(anchorID: anchorID) }
+  func latestHistory() async { await session?.loadLatest() }
   func interrupt() async { await session?.interrupt() }
   private func apply(_ update: ChatSnapshot) {
     let existing = Dictionary(
@@ -262,7 +267,11 @@ final class ChatModel {
       }
       return RowModel(row)
     }
-    if rows.map(\.id) != next.map(\.id) { rows = next }
+    if rows.map(\.id) != next.map(\.id) {
+      rows = next
+    } else {
+      transcriptItems = TranscriptItem.grouped(rows, preserving: transcriptItems)
+    }
     revision &+= 1
     connection = update.connection
     model = update.model
@@ -270,6 +279,7 @@ final class ChatModel {
     commands = update.commands
     canLoadEarlier = update.olderCursor != nil
     loadingHistory = update.loadingHistory
+    includesLatest = update.includesLatest
     error = update.error
   }
 }

@@ -63,6 +63,7 @@ struct Transcript: Sendable {
     var messages: [HistoryMessage] = []
     var bytes = 0
     var truncated = false
+    var replacedRows: [String: ChatRow]?
   }
   // nil is the observer; action UUIDs own their independent chunk streams.
   private var pages: [UUID?: Page] = [:]
@@ -103,8 +104,19 @@ struct Transcript: Sendable {
     }
   }
   mutating func abandonHistory(_ requestID: UUID) { pages.removeValue(forKey: requestID) }
+  mutating func beginLatestHistory(_ requestID: UUID) {
+    // Keep live output and pending inputs that arrive during a refresh. Only
+    // the previous bounded window is replaced when the complete page arrives.
+    pages[requestID] = Page(
+      replacedRows: Dictionary(
+        uniqueKeysWithValues:
+          rows.filter {
+            $0.delivery == nil && $0.id != responseID && $0.id != thinkingID
+          }.map { ($0.id, $0) }))
+  }
   mutating func history(
-    _ frame: NativeEventHistory, olderPage: Bool = false, requestID: UUID? = nil
+    _ frame: NativeEventHistory, olderPage: Bool = false, requestID: UUID? = nil,
+    preserving anchorID: String? = nil
   ) {
     var page = pages.removeValue(forKey: requestID) ?? Page()
     for message in frame.messages {
@@ -152,19 +164,26 @@ struct Transcript: Sendable {
       return row
     }
     let incomingIDs = Set(incoming.map(\.id))
-    storage.removeAll { loadedIDs.contains($0.entryID ?? "") || incomingIDs.contains($0.id) }
+    storage.removeAll {
+      loadedIDs.contains($0.entryID ?? "") || incomingIDs.contains($0.id)
+        || page.replacedRows?[$0.id] == $0
+    }
     if olderPage {
       storage.insert(contentsOf: incoming, at: 0)
     } else {
       let unsaved = storage.filter { $0.inputID != nil && $0.entryID == nil }
       storage.removeAll { $0.inputID != nil && $0.entryID == nil }
-      storage.append(contentsOf: incoming)
+      if page.replacedRows != nil {
+        storage.insert(contentsOf: incoming, at: 0)
+      } else {
+        storage.append(contentsOf: incoming)
+      }
       storage.append(contentsOf: unsaved)
     }
     for (id, count) in loaded.segmentCounts {
       segmentCounts[id] = max(segmentCounts[id] ?? 0, count)
     }
-    bound(olderPage: olderPage)
+    bound(olderPage: olderPage, preserving: anchorID)
     if page.truncated {
       notice(
         "A large history page reached this device’s display limit. Full content remains on the coordinator."
@@ -308,10 +327,13 @@ struct Transcript: Sendable {
     return String(text.prefix(Self.maximumRowCharacters))
       + "\n\n[Display limit reached. Full content remains on the coordinator.]"
   }
-  private mutating func bound(olderPage: Bool = false) {
+  var lastReceivedRowID: String? { storage.last { $0.delivery == nil }?.id }
+  private mutating func bound(olderPage: Bool = false, preserving anchorID: String? = nil) {
     textBytes = storage.reduce(0) { $0 + $1.text.utf8.count }
     while storage.count > Self.maximumRows || textBytes > Self.maximumTextBytes {
-      let candidates = storage.indices.filter { storage[$0].delivery == nil }
+      let candidates = storage.indices.filter {
+        storage[$0].delivery == nil && storage[$0].id != anchorID
+      }
       guard let index = olderPage ? candidates.last : candidates.first else { break }
       let removed = storage.remove(at: index)
       textBytes -= removed.text.utf8.count

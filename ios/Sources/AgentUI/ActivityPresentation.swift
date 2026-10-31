@@ -42,12 +42,33 @@ enum TranscriptItem: Identifiable {
     }
   }
 
-  static func grouped(_ rows: [RowModel]) -> [TranscriptItem] {
+  var anchorID: String? {
+    switch self {
+    case .message(let row): row.id
+    case .activity(let group): group.rows.first?.id
+    }
+  }
+
+  static func grouped(_ rows: [RowModel], preserving previous: [TranscriptItem] = [])
+    -> [TranscriptItem]
+  {
     var result: [TranscriptItem] = []
     var activity: [RowModel] = []
+    var previousGroups: [String: String] = [:]
+    for case .activity(let group) in previous {
+      for row in group.rows { previousGroups[row.id] = group.id }
+    }
+    var usedGroups: Set<String> = []
     func flush() {
       if let first = activity.first {
-        result.append(.activity(ActivityGroup(id: "activity:\(first.id)", rows: activity)))
+        // Earlier pages can extend a leading group; live output can append to
+        // it. Keep its identity in both directions, including open disclosures.
+        var id =
+          activity.lazy.compactMap { previousGroups[$0.id] }
+          .first { !usedGroups.contains($0) } ?? "activity:\(first.id)"
+        if usedGroups.contains(id) { id = "activity:\(UUID().uuidString)" }
+        usedGroups.insert(id)
+        result.append(.activity(ActivityGroup(id: id, rows: activity)))
       }
       activity = []
     }

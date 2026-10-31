@@ -116,8 +116,10 @@ default same-user rule. The connected /32 and node owner must match native
 WhoIs metadata. See [trust configuration](setup.md#trust).
 
 The SwiftUI iPhone client uses this same coordinator and main conversation.
-It loads recent history first and fetches older pages on demand, retaining at
-most 500 display rows and 4 MiB of text. A full MagicDNS name is resolved and
+It loads recent history first and fetches earlier conversation when scrolling
+to the top, coalescing activity-only pages in bounded batches. The visible
+position stays anchored; Latest restores the recent window. At most 500 display
+rows and 4 MiB of text remain in memory. A full MagicDNS name is resolved and
 validated on each connection. Pending input and immutable attachment copies
 stay in a protected, endpoint-specific outbox until admission is acknowledged.
 

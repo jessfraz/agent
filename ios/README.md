@@ -58,10 +58,14 @@ Mode if requested, then Run.
   bodies. Complete messages use at most four parsing workers, joined before
   publication. Rendering and incoming pages
   are bounded; display truncation does not alter coordinator history.
-- Startup reads a bounded recent page. Older history is cursor-paged through
-  **Load earlier messages**; the phone never downloads the whole conversation
-  before it becomes usable. At most 500 rows and 4 MiB of display text remain
-  in memory. The coordinator retains the full history.
+- Startup reads a bounded recent page. Scrolling to the top loads earlier
+  conversation while preserving the visible position. Tool-only pages are
+  coalesced until dialogue appears, with an eight-page, 500-row, 4 MiB batch
+  limit; **Load earlier messages** remains available. At most 500 rows and
+  4 MiB of display text remain in memory. The coordinator retains full history.
+  **Latest** returns to a fresh recent page, retaining concurrent replies and
+  pending messages. It stays available if paging evicted recent history;
+  otherwise it disappears at the bottom.
 - Consecutive tool calls and thinking share a compact disclosure. Progress
   messages stay visible. Expand activity to read the returned reasoning text
   or inspect a command's arguments, output, errors and status.

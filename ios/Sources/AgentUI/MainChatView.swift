@@ -17,6 +17,10 @@ public struct MainChatView: View {
   @State private var settings = false
   @State private var followsLatest = true
   @State private var userScrolling = false
+  @State private var viewport = TranscriptViewport()
+  @State private var presentedLatest = false
+  @State private var visibleItem: String?
+  @State private var historyRequest: HistoryNavigation?
   @State private var importingFiles = false
   #if os(iOS)
     @State private var selectedPhoto: PhotosPickerItem?
@@ -151,12 +155,13 @@ public struct MainChatView: View {
     .preferredColorScheme(appearance.colorScheme)
   }
   private var transcript: some View {
-    ScrollViewReader { scroll in
+    let items = model.transcriptItems
+    return ScrollViewReader { scroll in
       ScrollView {
         LazyVStack(alignment: .leading, spacing: 18) {
           if model.canLoadEarlier {
             Button {
-              Task { await model.history() }
+              requestHistory()
             } label: {
               HStack {
                 if model.loadingHistory { ProgressView().controlSize(.small) }
@@ -164,23 +169,29 @@ public struct MainChatView: View {
               }
             }
             .disabled(model.loadingHistory).frame(maxWidth: .infinity).padding(.vertical)
+            .onScrollVisibilityChange(threshold: 0.1) { visible in
+              if visible && presentedLatest { requestHistory() }
+            }
           }
           if model.rows.isEmpty {
             Text("No messages yet").font(.callout).foregroundStyle(.primary)
               .frame(maxWidth: .infinity).padding(.vertical, 32)
           }
-          ForEach(TranscriptItem.grouped(model.rows)) { item in
-            switch item {
-            case .message(let row):
-              MessageRow(
-                model: row, retry: { id in Task { await model.retry(id) } },
-                restore: { id in Task { await model.restore(id) } },
-                preview: { file in Task { await model.preview(file) } })
-            case .activity(let group):
-              ActivityGroupView(
-                group: group, expansion: $activityExpansion, details: loadDetails,
-                onExpand: { followsLatest = false })
+          ForEach(items) { item in
+            Group {
+              switch item {
+              case .message(let row):
+                MessageRow(
+                  model: row, retry: { id in Task { await model.retry(id) } },
+                  restore: { id in Task { await model.restore(id) } },
+                  preview: { file in Task { await model.preview(file) } })
+              case .activity(let group):
+                ActivityGroupView(
+                  group: group, expansion: $activityExpansion, details: loadDetails,
+                  onExpand: { followsLatest = false })
+              }
             }
+            .id(item.id)
           }
           if model.busy {
             HStack(spacing: 8) {
@@ -191,27 +202,40 @@ public struct MainChatView: View {
           }
           Color.clear.frame(height: 1).id("latest")
         }
+        .scrollTargetLayout()
         .padding().frame(maxWidth: 720).frame(maxWidth: .infinity)
       }
       .accessibilityIdentifier("transcript")
       .scrollDismissesKeyboard(.interactively)
       .scrollBounceBehavior(.always, axes: .vertical)
       .defaultScrollAnchor(initialScrollTarget == nil ? .bottom : .top, for: .initialOffset)
+      .scrollPosition(id: $visibleItem, anchor: .top)
       .task {
         if let initialScrollTarget {
           await Task.yield()
           scroll.scrollTo(initialScrollTarget, anchor: .top)
         }
       }
+      .task(id: historyRequest) {
+        guard let request = historyRequest else { return }
+        switch request {
+        case .earlier(_, let anchorID): await model.history(anchorID: anchorID)
+        case .latest: await model.latestHistory()
+        }
+        if !Task.isCancelled { historyRequest = nil }
+      }
       .onScrollPhaseChange { _, phase in
         userScrolling = phase == .interacting || phase == .decelerating
+        if userScrolling && viewport.atTop { requestHistory() }
       }
-      .onScrollGeometryChange(for: Bool.self) { geometry in
-        geometry.contentOffset.y + geometry.containerSize.height >= geometry.contentSize.height - 60
-      } action: { _, atBottom in
+      .onScrollGeometryChange(for: TranscriptViewport.self) { geometry in
+        TranscriptViewport(geometry)
+      } action: { _, current in
+        viewport = current
+        if current.atBottom && !model.rows.isEmpty { presentedLatest = true }
         // New content changes geometry too. Only a person's scroll should
         // turn off following; initial history must still land at the latest row.
-        if userScrolling || atBottom { followsLatest = atBottom }
+        if userScrolling || current.atBottom { followsLatest = current.atBottom }
       }
       .onChange(of: model.revision) { _, _ in
         if followsLatest { scroll.scrollTo("latest", anchor: .bottom) }
@@ -220,21 +244,31 @@ public struct MainChatView: View {
         if target != nil { scroll.scrollTo("latest", anchor: .bottom) }
       }
       .overlay(alignment: .bottomTrailing) {
-        if !followsLatest && !model.rows.isEmpty {
+        if (!viewport.atBottom || !model.includesLatest) && !model.rows.isEmpty {
           Button("Latest", systemImage: "arrow.down") {
             followsLatest = true
+            historyRequest = .latest(UUID())
             if reduceMotion {
               scroll.scrollTo("latest", anchor: .bottom)
             } else {
               withAnimation { scroll.scrollTo("latest", anchor: .bottom) }
             }
           }
+          .accessibilityIdentifier("latest-messages")
           .buttonStyle(.borderedProminent).tint(.primary)
           .foregroundStyle(colorScheme == .dark ? Color.black : Color.white)
           .clipShape(Capsule()).padding()
         }
       }
     }
+  }
+  private func requestHistory() {
+    guard historyRequest == nil, !model.loadingHistory, model.canLoadEarlier else { return }
+    followsLatest = false
+    let anchor =
+      model.transcriptItems.first(where: { $0.id == visibleItem })
+      ?? model.transcriptItems.first
+    historyRequest = .earlier(UUID(), anchorID: anchor?.anchorID)
   }
   private func loadDetails(_ row: ChatRow) async throws -> ToolDetails {
     if let detailLoader { return try await detailLoader(row) }
@@ -428,6 +462,27 @@ public struct MainChatView: View {
       (try? CoordinatorAddress(
         host: host.trimmingCharacters(in: .whitespacesAndNewlines), port: port)) != nil
   }
+}
+
+private struct TranscriptViewport: Equatable {
+  var atTop = false
+  var atBottom = true
+
+  init() {}
+  init(_ geometry: ScrollGeometry) {
+    let offset = geometry.contentOffset.y + geometry.contentInsets.top
+    let extent = max(
+      0,
+      geometry.contentSize.height + geometry.contentInsets.top + geometry.contentInsets.bottom
+        - geometry.containerSize.height)
+    atTop = offset <= 80
+    atBottom = offset >= extent - 60
+  }
+}
+
+private enum HistoryNavigation: Hashable {
+  case earlier(UUID, anchorID: String?)
+  case latest(UUID)
 }
 
 struct MessageRow: View {

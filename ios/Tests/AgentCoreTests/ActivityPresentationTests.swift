@@ -105,3 +105,26 @@ func visibleToolLookupsAreSerialAndCancelledQueuedRowsNeverLoad() async throws {
   await #expect(throws: CancellationError.self) { try await second.value }
   #expect(calls == ["first"])
 }
+
+@MainActor @Test func prependingAndAppendingActivityKeepTheVisibleGroupIdentity() throws {
+  func tool(_ id: String) -> RowModel {
+    RowModel(
+      ChatRow(
+        id: id, entryID: id, role: .tool, text: "",
+        tool: .init(callId: id, name: "exec", status: .finished)))
+  }
+  let a = tool("a")
+  let b = tool("b")
+  let c = tool("c")
+  let model = ChatModel()
+  model.rows = [b]
+  let identity = try #require(model.transcriptItems.first?.id)
+  model.rows = [a, b]
+  #expect(model.transcriptItems.first?.id == identity)
+  model.rows = [a, b, c]
+  #expect(model.transcriptItems.first?.id == identity)
+  // Inserting a message can split a group; each disclosure still needs a
+  // distinct identity even if surviving activity has changed order.
+  model.rows = [a, RowModel(ChatRow(id: "message", role: .user, text: "Follow-up")), b, c]
+  #expect(Set(model.transcriptItems.map(\.id)).count == model.transcriptItems.count)
+}

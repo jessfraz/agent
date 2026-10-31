@@ -26,6 +26,7 @@ public struct ChatSnapshot: Sendable {
   public var commands: [SlashCommand] = []
   public var olderCursor: String?
   public var loadingHistory = false
+  public var includesLatest = true
   public var error: String?
 }
 
@@ -46,6 +47,16 @@ public actor CoordinatorSession {
   private var observation: Task<Void, Never>?
   private var connection: LineConnection?
   private var actions: [UUID: Task<Void, Never>] = [:]
+  private enum HistoryWindow {
+    case earlier(cursor: String, anchorID: String?)
+    case latest
+  }
+  private struct HistoryAction {
+    let id: UUID
+    let window: HistoryWindow
+  }
+  private var historyAction: HistoryAction?
+  private var latestRowID: String?
   private var actionConnections: [UUID: LineConnection] = [:]
   private var previewRequests: Set<UUID> = []
   private var pending: [NativeRequestSubmit] = []
@@ -112,6 +123,7 @@ public actor CoordinatorSession {
     flush = nil
     for action in actions.values { action.cancel() }
     actions = [:]
+    historyAction = nil
     let ownedConnections = Array(actionConnections.values) + [connection].compactMap { $0 }
     actionConnections = [:]
     connection = nil
@@ -219,13 +231,105 @@ public actor CoordinatorSession {
     publish()
     return RestoredDraft(text: request.text, mode: request.mode, attachments: files)
   }
-  public func loadEarlier() {
-    guard actions.count < 32, let cursor = snapshot.olderCursor, !snapshot.loadingHistory,
-      snapshot.connection == .connected
+  public func loadEarlier(anchorID: String? = nil) async {
+    guard let cursor = snapshot.olderCursor else { return }
+    await loadHistory(.earlier(cursor: cursor, anchorID: anchorID ?? transcript.rows.first?.id))
+  }
+
+  public func loadLatest() async {
+    if let action = historyAction, let task = actions[action.id] {
+      task.cancel()
+      await actionConnections[action.id]?.close()
+      await task.value
+    }
+    guard !Task.isCancelled else { return }
+    await loadHistory(.latest)
+  }
+
+  private func loadHistory(_ window: HistoryWindow) async {
+    guard actions.count < 32, historyAction == nil, snapshot.connection == .connected, let address
     else { return }
+    let id = UUID()
+    let generation = generation
+    historyAction = HistoryAction(id: id, window: window)
     snapshot.loadingHistory = true
-    perform(.history(.init(cursor: cursor)))
     publish()
+    let task = Task<Void, Never> { [weak self] in
+      await self?.loadHistory(
+        id: id, window: window, address: address, generation: generation)
+    }
+    actions[id] = task
+    await withTaskCancellationHandler {
+      await task.value
+    } onCancel: {
+      task.cancel()
+      Task { await self.cancelHistory(id) }
+    }
+  }
+
+  private func cancelHistory(_ id: UUID) async {
+    guard historyAction?.id == id else { return }
+    await actionConnections[id]?.close()
+  }
+
+  private func loadHistory(
+    id: UUID, window: HistoryWindow, address: CoordinatorAddress,
+    generation: UUID
+  ) async {
+    defer {
+      if historyAction?.id == id {
+        historyAction = nil
+        snapshot.loadingHistory = false
+        publish()
+      }
+      actions.removeValue(forKey: id)
+    }
+    switch window {
+    case .earlier(let cursor, _):
+      await loadEarlier(id: id, address: address, cursor: cursor, generation: generation)
+    case .latest:
+      transcript.beginLatestHistory(id)
+      await exchange(
+        id: id, address: address, request: .history(.init(cursor: nil)),
+        inputID: nil, generation: generation)
+    }
+  }
+
+  private func loadEarlier(id: UUID, address: CoordinatorAddress, cursor: String, generation: UUID)
+    async
+  {
+    let retainedEntries = Set(transcript.rows.compactMap(\.entryID))
+    var cursor = cursor
+    var requested: Set<String> = []
+    var rows = 0
+    var bytes = 0
+    // A raw page can contain only collapsed activity. Fetch a useful piece of
+    // conversation in one owned batch, without sweeping an unbounded history.
+    for _ in 0..<8 {
+      guard self.generation == generation, !Task.isCancelled,
+        snapshot.connection == .connected
+      else { return }
+      guard requested.insert(cursor).inserted else {
+        snapshot.error = "History pagination did not advance. Try loading earlier messages again."
+        return
+      }
+      guard
+        let page = await exchange(
+          id: id, address: address, request: .history(.init(cursor: cursor)), inputID: nil,
+          generation: generation)
+      else { return }
+      rows += page.rows
+      bytes += page.bytes
+      guard let next = page.nextCursor else { return }
+      guard !requested.contains(next) else {
+        snapshot.error = "History pagination did not advance. Try loading earlier messages again."
+        return
+      }
+      let hasDialogue = !page.dialogueEntries.isSubset(of: retainedEntries)
+      guard !hasDialogue, rows < Transcript.maximumRows, bytes < Transcript.maximumTextBytes
+      else { return }
+      cursor = next
+    }
   }
   public func interrupt() {
     if actions.count < 32, snapshot.connection == .connected { perform(.interrupt) }
@@ -299,23 +403,50 @@ public actor CoordinatorSession {
     let id = UUID()
     let generation = generation
     actions[id] = Task { [weak self] in
-      await self?.exchange(
+      _ = await self?.exchange(
         id: id, address: address, request: request, inputID: inputID, generation: generation)
     }
   }
-  private func exchange(
+  private struct HistoryPage {
+    var rows = 0
+    var bytes = 0
+    var dialogueEntries: Set<String> = []
+    var nextCursor: String?
+    var complete = false
+
+    mutating func include(_ frame: NativeEventHistory) {
+      rows += frame.messages.count
+      bytes += frame.messages.reduce(0) { $0 + $1.text.utf8.count }
+      for message in frame.messages
+      where !message.text.isEmpty || message.attachments?.isEmpty == false {
+        switch message.role {
+        case .user, .assistant, .partialAnswer, .final, .commentary, .notice:
+          dialogueEntries.insert(message.entryId)
+        case .thinking, .tool: break
+        }
+      }
+      if frame.pageComplete {
+        nextCursor = frame.nextCursor
+        complete = true
+      }
+    }
+  }
+
+  @discardableResult private func exchange(
     id: UUID, address: CoordinatorAddress, request: NativeRequest, inputID: String?,
     generation: UUID
-  ) async {
+  ) async -> HistoryPage? {
+    var page = HistoryPage()
+    var failed = false
     defer {
-      actions.removeValue(forKey: id)
+      if historyAction?.id != id { actions.removeValue(forKey: id) }
       transcript.abandonHistory(id)
     }
     do {
       let stream = try await connectTransport(address)
       guard self.generation == generation, !Task.isCancelled else {
         await stream.close()
-        return
+        return nil
       }
       actionConnections[id] = stream
       if case .submit(let input) = request {
@@ -335,13 +466,17 @@ public actor CoordinatorSession {
         if case .done = event { break }
         if case .disconnect = event {
           await disconnect()
-          return
+          return nil
         }
         // The observer alone owns live transcript presentation. Action
         // responses carry acknowledgements, controls and history pages.
         switch event {
+        case .history(let frame):
+          page.include(frame)
+          consume(event, historyRequestID: id)
         case .message, .answer, .textDelta, .activity, .ready, .idle: break
         case .failure:
+          failed = true
           consume(event, historyRequestID: id)
           if let inputID, pending.contains(where: { $0.inputId == inputID }) {
             transcript.delivery(inputID, .uncertain)
@@ -354,6 +489,7 @@ public actor CoordinatorSession {
         if case .feedbackReady(let ready) = event, ready.inputId == inputID { break }
       }
     } catch {
+      failed = true
       if self.generation == generation && !Task.isCancelled {
         if let inputID, pending.contains(where: { $0.inputId == inputID }) {
           transcript.delivery(inputID, attemptedInputs.contains(inputID) ? .uncertain : .rejected)
@@ -371,10 +507,8 @@ public actor CoordinatorSession {
       }
     }
     await actionConnections.removeValue(forKey: id)?.close()
-    if self.generation == generation {
-      snapshot.loadingHistory = false
-      publish()
-    }
+    if self.generation == generation { publish() }
+    return page.complete && !failed ? page : nil
   }
   private func transfer(_ request: AttachmentRequest, on stream: LineConnection) async throws
     -> AttachmentResponse
@@ -585,6 +719,7 @@ public actor CoordinatorSession {
     }
   }
   private func consume(_ event: NativeEvent, historyRequestID: UUID? = nil) {
+    let previousTail = transcript.lastReceivedRowID
     switch event {
     case .commands(let value): snapshot.commands = value.commands
     case .ready(let value):
@@ -592,10 +727,29 @@ public actor CoordinatorSession {
       snapshot.model = value.model
       snapshot.busy = true
     case .history(let value):
-      transcript.history(value, olderPage: historyRequestID != nil, requestID: historyRequestID)
+      let earlier: Bool
+      let anchorID: String?
+      if let action = historyAction, action.id == historyRequestID {
+        switch action.window {
+        case .earlier(_, let anchor):
+          earlier = true
+          anchorID = anchor
+        case .latest:
+          earlier = false
+          anchorID = nil
+        }
+      } else {
+        earlier = historyRequestID != nil
+        anchorID = nil
+      }
+      transcript.history(
+        value, olderPage: earlier, requestID: historyRequestID, preserving: anchorID)
       if value.pageComplete {
         snapshot.olderCursor = value.nextCursor
-        snapshot.loadingHistory = false
+        if !earlier {
+          latestRowID = transcript.lastReceivedRowID
+          snapshot.includesLatest = true
+        }
       }
     case .message(let value): transcript.message(value.message)
     case .answer(let value): transcript.answer(value)
@@ -626,6 +780,13 @@ public actor CoordinatorSession {
       transcript.idle()
     case .attachment, .toolDetails, .notifications, .disconnect, .done: break
     }
+    switch event {
+    case .message, .answer, .textDelta, .activity, .notice, .placed:
+      if historyRequestID == nil, transcript.lastReceivedRowID != previousTail {
+        latestRowID = transcript.lastReceivedRowID
+      }
+    default: break
+    }
   }
   private func schedulePublish() {
     guard flush == nil else { return }
@@ -640,6 +801,11 @@ public actor CoordinatorSession {
   }
   private func publish() {
     snapshot.rows = transcript.rows
+    // New replies do not fill a gap left by paging. Only a fresh recent page
+    // can restore the complete latest window.
+    if let latestRowID, !snapshot.rows.contains(where: { $0.id == latestRowID }) {
+      snapshot.includesLatest = false
+    }
     continuation.yield(snapshot)
   }
   @discardableResult private func acknowledge(_ inputID: String) -> Bool {
