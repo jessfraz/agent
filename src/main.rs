@@ -1802,7 +1802,7 @@ fn feedback_from_ui(
             context.queued_inputs = queued_inputs;
             context.client_errors = client_errors;
             // Capture the origin pane before feedback can create a repair worker.
-            // Rex's supported visual format is HTML, not a whole-desktop image.
+            // Preserve styled HTML when it fits, otherwise bounded pane text.
             let capture = if input.attachment_count() < agent_cli::attachments::MAX_ATTACHMENTS {
                 match context.binding.as_ref() {
                     Some(binding) => match capture_feedback_view(&directory, binding).await {
@@ -1890,12 +1890,16 @@ async fn capture_feedback_view(
 ) -> Result<FeedbackViewCapture> {
     use std::io::Write;
     use std::os::unix::fs::DirBuilderExt;
-    let html = RexClient::new(None)
+    let capture = RexClient::new(None)
         .capture_terminal(
             &SessionId::parse(&binding.session_id)?,
             &BlockId::parse(&binding.block_id)?,
         )
         .await?;
+    let (name, content) = match capture {
+        agent_cli::rex::TerminalCapture::Html(content) => ("terminal-view.html", content),
+        agent_cli::rex::TerminalCapture::Text(content) => ("terminal-view.txt", content),
+    };
     let folder = directory
         .join("feedback-views")
         .join(uuid::Uuid::new_v4().to_string());
@@ -1904,14 +1908,14 @@ async fn capture_feedback_view(
         .mode(0o700)
         .create(&folder)?;
     let capture = FeedbackViewCapture {
-        path: folder.join("terminal-view.html"),
+        path: folder.join(name),
     };
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&capture.path)?;
-    file.write_all(html.as_bytes())?;
+    file.write_all(content.as_bytes())?;
     file.sync_all()?;
     Ok(capture)
 }
@@ -4283,6 +4287,131 @@ mod tests {
             matches!(parsed.command, Some(Action::Feedback { command: FeedbackAction::Show { id } }) if id == "example-id")
         );
         assert!(Arguments::try_parse_from(["agent", "feedback", "upload"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn feedback_capture_keeps_bounded_text_when_rendered_export_is_too_large() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "AGENT_TEST_FEEDBACK_CAPTURE_CASE";
+        const TEST: &str =
+            "tests::feedback_capture_keeps_bounded_text_when_rendered_export_is_too_large";
+        const SESSION: &str = "session:11111111-1111-4111-8111-111111111111";
+        const BLOCK: &str = "block:33333333-3333-4333-8333-333333333333";
+        if let Ok(case) = std::env::var(CHILD) {
+            let directory = tempfile::tempdir().unwrap();
+            let binding = agent_cli::protocol::WorkerRef {
+                host_id: "44444444-4444-4444-8444-444444444444".into(),
+                session_id: SESSION.into(),
+                window_id: "window:22222222-2222-4222-8222-222222222222".into(),
+                block_id: BLOCK.into(),
+            };
+            let capture = crate::capture_feedback_view(directory.path(), &binding).await;
+            if matches!(case.as_str(), "html" | "remote_limit" | "local_limit") {
+                let capture = capture.expect("feedback must retain a usable terminal attachment");
+                let (name, expected) = if case == "html" {
+                    ("terminal-view.html", "<pre>Current task view 🦀</pre>\n")
+                } else {
+                    ("terminal-view.txt", "Current task view 🦀\n")
+                };
+                assert_eq!(capture.path.file_name().unwrap(), name);
+                assert_eq!(std::fs::read_to_string(&capture.path).unwrap(), expected);
+                assert_eq!(
+                    std::fs::metadata(&capture.path)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+                let folder = capture.path.parent().unwrap().to_owned();
+                assert_eq!(
+                    std::fs::metadata(&folder).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+                drop(capture);
+                assert!(
+                    !folder.exists(),
+                    "temporary attachment must be removed after use"
+                );
+            } else {
+                assert!(capture.is_err());
+                assert!(!directory.path().join("feedback-views").exists());
+            }
+            return;
+        }
+        for case in [
+            "remote_limit",
+            "html",
+            "local_limit",
+            "missing",
+            "failed",
+            "text_limit",
+            "invalid_text",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let program = directory.path().join("rex");
+            std::fs::write(&program, r#"#!/bin/sh
+set -eu
+[ -z "${REX_SESSION-}" ] && [ -z "${REX_BLOCK-}" ] && [ -z "${REX_CLIENT-}" ]
+[ "$1" = --autostart=false ] && [ "$2" = --timeout ] && [ "$3" = 8s ]
+[ "$4" = capture ] && [ "$5" = --session ] && [ "$6" = session:11111111-1111-4111-8111-111111111111 ]
+[ "$7" = --block ] && [ "$8" = block:33333333-3333-4333-8333-333333333333 ]
+[ "$9" = --format ]
+shift 9
+format=$1
+printf '%s\n' "$format" >> "$AGENT_TEST_FEEDBACK_CAPTURE_CALLS"
+oversize() {
+  block=$(printf '%01024d' 0)
+  i=0
+  while [ "$i" -lt 1024 ]; do printf '%s' "$block"; i=$((i + 1)); done
+  printf x
+}
+if [ "$format" = html ]; then
+  case "$AGENT_TEST_FEEDBACK_CAPTURE_CASE" in
+    html) printf '<pre>Current task view 🦀</pre>\n'; exit 0 ;;
+    missing) printf 'Error: no such session (status=404 code=session_not_found)\n' >&2; exit 1 ;;
+    failed) printf 'Error: deadline exceeded\n' >&2; exit 1 ;;
+    local_limit) oversize; exit 0 ;;
+    *) printf 'Error: control response exceeds 1048576 bytes (status=413 code=too_large)\n' >&2; exit 1 ;;
+  esac
+fi
+[ "$format" = text ]
+case "$AGENT_TEST_FEEDBACK_CAPTURE_CASE" in
+  text_limit) oversize ;;
+  invalid_text) printf '\377' ;;
+  *) printf 'Current task view 🦀\n' ;;
+esac
+"#).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let calls = directory.path().join("calls");
+            let path = std::env::join_paths(std::iter::once(directory.path().to_owned()).chain(
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+            ))
+            .unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, case)
+                .env("AGENT_TEST_FEEDBACK_CAPTURE_CALLS", &calls)
+                .env("PATH", path)
+                .env("REX_SESSION", "unrelated-session")
+                .env("REX_BLOCK", "unrelated-pane")
+                .env("REX_CLIENT", "unrelated-client")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let actual = std::fs::read_to_string(calls).unwrap();
+            let expected = if matches!(case, "html" | "missing" | "failed") {
+                "html\n"
+            } else {
+                "html\ntext\n"
+            };
+            assert_eq!(actual, expected, "{case}");
+        }
     }
 
     fn attachment_feedback_command(id: uuid::Uuid) -> agent_cli::protocol::RuntimeCommand {

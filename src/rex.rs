@@ -25,6 +25,7 @@ pub enum RexError {
     InvalidId,
     Unavailable,
     ReadFailed,
+    OutputTooLarge,
     InvalidResponse,
     BindingMismatch,
     SessionNotFound,
@@ -37,6 +38,7 @@ impl fmt::Display for RexError {
             Self::InvalidId => f.write_str("Invalid Rex resource identifier"),
             Self::Unavailable => f.write_str("Rex CLI is unavailable"),
             Self::ReadFailed => f.write_str("Rex read failed or timed out"),
+            Self::OutputTooLarge => f.write_str("Rex response exceeds the supported size limit"),
             Self::InvalidResponse => f.write_str("Rex returned an unsupported response"),
             Self::BindingMismatch => f.write_str("Rex session does not match its recorded worker binding"),
             Self::SessionNotFound => f.write_str("The recorded Rex session no longer exists"),
@@ -179,6 +181,13 @@ impl SessionView {
 pub struct RexClient {
     server: Option<String>,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TerminalCapture {
+    Html(String),
+    Text(String),
+}
+
 impl RexClient {
     /// The live-session list is not an existence check. Inspect the recorded
     /// session directly, and accept absence only from its native 404 status.
@@ -240,20 +249,38 @@ impl RexClient {
         &self,
         session: &SessionId,
         block: &BlockId,
-    ) -> Result<String, RexError> {
-        let output = self
-            .run(vec![
+    ) -> Result<TerminalCapture, RexError> {
+        let arguments = |format: &str| {
+            vec![
                 "capture".to_owned(),
                 "--session".to_owned(),
                 session.to_string(),
                 "--block".to_owned(),
                 block.to_string(),
                 "--format".to_owned(),
-                "html".to_owned(),
-            ])
-            .await
-            .map_err(read_failure)?;
-        String::from_utf8(output).map_err(|_| RexError::InvalidResponse)
+                format.to_owned(),
+            ]
+        };
+        let decode = |output| {
+            let text = String::from_utf8(output).map_err(|_| RexError::InvalidResponse)?;
+            if text.is_empty() {
+                return Err(RexError::InvalidResponse);
+            }
+            Ok(text)
+        };
+        match self.run(arguments("html")).await {
+            Ok(output) => decode(output).map(TerminalCapture::Html),
+            // Styling can exceed Rex's control-response cap while the same
+            // pane's text still fits. Other failures must not select a pane
+            // implicitly or cause another export attempt.
+            Err(CallFailure::OutputTooLarge) => self
+                .run(arguments("text"))
+                .await
+                .map_err(read_failure)
+                .and_then(decode)
+                .map(TerminalCapture::Text),
+            Err(error) => Err(read_failure(error)),
+        }
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, RexError> {
@@ -529,12 +556,17 @@ impl RexClient {
             )
             .map_err(|_| CallFailure::Failed)?;
             if bytes.len() as u64 > MAX_OUTPUT_BYTES {
-                return Err(CallFailure::Failed);
+                return Err(CallFailure::OutputTooLarge);
             }
             if error.len() as u64 > MAX_ERROR_BYTES {
                 return Err(CallFailure::Failed);
             }
             if !status.success() {
+                if std::str::from_utf8(&error)
+                    .is_ok_and(|error| error.trim_end().ends_with("(status=413 code=too_large)"))
+                {
+                    return Err(CallFailure::OutputTooLarge);
+                }
                 if std::str::from_utf8(&error).is_ok_and(|error| {
                     error
                         .trim_end()
@@ -573,6 +605,7 @@ enum CallFailure {
     Unavailable,
     InvalidInput,
     Failed,
+    OutputTooLarge,
     SessionNotFound,
 }
 fn read_failure(error: CallFailure) -> RexError {
@@ -580,6 +613,7 @@ fn read_failure(error: CallFailure) -> RexError {
         CallFailure::Unavailable => RexError::Unavailable,
         CallFailure::InvalidInput => RexError::InvalidInput,
         CallFailure::Failed => RexError::ReadFailed,
+        CallFailure::OutputTooLarge => RexError::OutputTooLarge,
         CallFailure::SessionNotFound => RexError::SessionNotFound,
     }
 }
@@ -822,7 +856,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(output, "<pre>Current task view 🦀</pre>\n");
+            assert_eq!(
+                output,
+                TerminalCapture::Html("<pre>Current task view 🦀</pre>\n".into())
+            );
             return;
         }
         let directory = tempfile::tempdir().unwrap();
