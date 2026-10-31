@@ -7,6 +7,8 @@ recovery; [history](history.md) describes import and retrieval.
 
 - [ ] Finish Codex catch-up and vector indexing, reconcile source coverage, and
   verify real searches. Missing files stay explicit gaps.
+- [x] Verify a real incoming supplier version reaches its original imported
+  task conversation and completes the existing worker's native submission.
 - [ ] Verify chat admission, steering, interruption, reopening and scrolling
   against a large live corpus while background work runs.
 - [x] Recover main-chat admission after coordinator restart, preserving steer
