@@ -278,6 +278,7 @@ func withCoordinator(
         // Fixture teardown cancels receives on its remaining connections.
       } catch let error as NWError
         where error == .posix(.EPIPE) || error == .posix(.ECONNRESET)
+        || error == .posix(.ENOTCONN)
       {
         // A cancelled history batch closes its socket before the held reply.
       } catch { Issue.record(error) }
