@@ -63,9 +63,13 @@ enum TranscriptItem: Identifiable {
       if let first = activity.first {
         // Earlier pages can extend a leading group; live output can append to
         // it. Keep its identity in both directions, including open disclosures.
-        var id =
-          activity.lazy.compactMap { previousGroups[$0.id] }
-          .first { !usedGroups.contains($0) } ?? "activity:\(first.id)"
+        var id = "activity:\(first.id)"
+        for row in activity {
+          if let previousID = previousGroups[row.id], !usedGroups.contains(previousID) {
+            id = previousID
+            break
+          }
+        }
         if usedGroups.contains(id) { id = "activity:\(UUID().uuidString)" }
         usedGroups.insert(id)
         result.append(.activity(ActivityGroup(id: id, rows: activity)))
