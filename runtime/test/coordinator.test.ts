@@ -12,7 +12,7 @@ import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import { sessions } from "./fixtures/coordinator-native.js";
 import type { ModelQueue, ModelStep } from "./fixtures/coordinator-runtime.js";
 
-test("real CLI, coordinator and worker retain main history across an offline laptop and route restored work", { timeout: 60_000 }, async () => {
+test("real CLI, coordinator and worker retain main history across an offline laptop and route restored work", { timeout: 60_000 }, async (t) => {
   const directory = await realpath(await mkdtemp("/tmp/agent-e2e-"));
   const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../target/debug/agent", import.meta.url));
   const terminalFixture = fileURLToPath(new URL("../../../target/debug/examples/terminal-fixture", import.meta.url));
@@ -246,6 +246,55 @@ test("real CLI, coordinator and worker retain main history across an offline lap
       const frame = (await cli(0, [], "/exit\n")).find((event) => event.type === "history");
       assert.ok(frame?.type === "history"); assert.equal(frame.conversation_id, chiefConversationId); return frame;
     }
+    await t.test("held worker effects do not serialize main admission, another task or peer controls", async () => {
+      const firstPath = join(directory, "parallel-first"), secondPath = join(directory, "parallel-second");
+      const firstInput = "fixture-parallel-first", secondInput = "fixture-parallel-second";
+      const firstAnswer = "The first parallel task finished.", secondAnswer = "The second parallel task finished.";
+      await script(firstInput, [held(firstPath), { text: firstAnswer }]);
+      await script("fixture-parallel-dispatch-first", [{ tool: "delegate_task", args: { task_id: old.id, input: firstInput } },
+        { text: "The first task owns its separate worker." }]);
+      await cli(0, ["chat", "fixture-parallel-dispatch-first"]);
+      await until(async () => stat(firstPath + ".started").then(() => true, () => false));
+      const before = await tasks(), receipts: RuntimeEventKind[] = [];
+      await script(secondInput, [held(secondPath), { text: secondAnswer }]);
+      await script("fixture-parallel-dispatch-second", [delegate(secondInput, coordinator), { text: "The second task owns its separate worker." }]);
+      const input: RuntimeCommand = { type: "conversation_input", conversation_id: chiefConversationId,
+        input_id: "parallel-main-input", input: "fixture-parallel-dispatch-second", mode: "steer" };
+      const admission = exchange(input, (event) => { receipts.push(event); }); void admission.catch(() => {});
+      await until(async () => receipts.some((event) => event.type === "done"),
+        "Main admission and delegation must finish independently of the held worker");
+      const admitted = await admission;
+      assert.ok(receipts.some((event) => event.type === "input_accepted" && event.input_id === input.input_id));
+      assert.equal(await stat(firstPath + ".finished").then(() => true, () => false), false,
+        "The main request must finish delegating while the first worker's host effect remains held");
+      const repeated = await exchange(input);
+      assert.deepEqual(repeated.find((event) => event.type === "input_placed"), admitted.find((event) => event.type === "input_placed"),
+        "Retrying one main input must return its original durable placement");
+      const second = (await tasks()).find((task) => task.title === secondInput); assert.ok(second?.worker.state === "bound");
+      const binding = second.worker.binding;
+      assert.notEqual(binding.session_id, original.binding.session_id);
+      assert.equal(binding.host_id, coordinator);
+      const launch = sessions(join(homes[0]!, "rex.json")).find((window) => window.block_id === binding.block_id); assert.ok(launch);
+      const parallel = start(0, launch.command.slice(1), undefined, { REX_SESSION: launch.session_id, REX_BLOCK: launch.block_id }, true);
+      await until(async () => stat(secondPath + ".started").then(() => true, () => false),
+        "The second task must start its real host effect before the first finishes");
+      const peerInput = "fixture-parallel-peer", peerAnswer = "The other worker remains responsive while both effects wait.";
+      await script(peerInput, [{ text: peerAnswer }]); repairActor.child.stdin.write(peerInput + "\n");
+      await until(async () => events(repairActor.output()).some((event) => event.type === "answer" && event.text === peerAnswer));
+      assert.equal((await tasks()).length, before.length + 1);
+      assert.equal((await tasks()).filter((task) => task.title === secondInput).length, 1);
+      assert.equal((await mainHistory()).messages.filter((message) => message.role === "user" && message.text === input.input).length, 1);
+      for (const path of [firstPath, secondPath]) assert.equal(await stat(path + ".finished").then(() => true, () => false), false,
+        "Read and worker-control requests must complete while both real host effects remain held");
+      await writeFile(secondPath + ".release", "Finish the independent task first.");
+      await until(async () => events(parallel.output()).some((event) => event.type === "answer" && event.text === secondAnswer));
+      assert.equal(await stat(firstPath + ".finished").then(() => true, () => false), false);
+      await writeFile(firstPath + ".release", "Finish the original worker.");
+      await until(async () => events(actor.output()).some((event) => event.type === "answer" && event.text === firstAnswer));
+      for (const path of [firstPath, secondPath]) assert.equal(await readFile(path + ".finished", "utf8"), "once\n");
+      assert.deepEqual((await tasks()).find((task) => task.id === old.id)?.worker, originalAfterFeedback.worker);
+      parallel.child.stdin.end("/exit\n"); assert.equal(await parallel.exited, 0, parallel.errors());
+    });
     for (const [name, key, host] of [["exit", "/exit\r", 1], ["control-c", "\u0003", 0]] satisfies [string, string, number][]) {
       const path = join(directory, "detach-" + name), input = "fixture-detach-" + name, answer = "Detached " + name + " completed.";
       const workerInput = "fixture-worker-detach-" + name, workerAnswer = "Worker continued after " + name + ".";

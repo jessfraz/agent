@@ -178,6 +178,11 @@ Main and resumed views detach from coordinator-owned execution. Direct
 `RunTask` processes still own their host effects; transferring that execution
 to a daemon before their process exits remains recovery work.
 
+Recovery binds the main conversation's execution context before native Pi work
+can depend on it. New input uses Pi's steering or follow-up admission while
+earlier work runs; saving input never waits for that earlier turn to become
+idle. Native request IDs reconcile retries with the same durable submission.
+
 Persist allocation intent before creating a session or terminal. A missing
 creation receipt becomes uncertain and requires reconciliation. History sync
 must never create an execution. Find matching tasks regardless of process state.

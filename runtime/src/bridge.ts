@@ -304,6 +304,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
   const { id } = request;
   let effective = request.command;
   const initial = request.command;
+  const inputMode = initial.type === "main_input" || initial.type === "conversation_input" ? initial.mode : undefined;
   if (initial.type === "chat" || initial.type === "run_task" || initial.type === "attach_main" || initial.type === "attach_conversation") activeCommands.add(id);
   if (initial.type === "chat") mainTurns.set(id, mainTurn());
   if (initial.type === "run_task" && initial.interactive === true) {
@@ -676,8 +677,9 @@ async function handle(request: RuntimeRequest): Promise<void> {
           const default_host = await environment.defaultHost(hosts);
           activeConversations.set(id, root);
           if (interrupted.has(id)) { emit(id, { type: "interrupted" }); return; }
-          await root.waitForIdle(BACKGROUND_CONTEXT);
-          if (interrupted.has(id)) { await interrupts.get(id); return; }
+          // Recovered Pi guidance/tools need this owner before they can run.
+          // New input joins that work through Pi's steer/follow-up admission;
+          // waiting for idle here would make recovery depend on itself.
           const release = executions.bind(root.id.toString(), {
             model: selected, cwd: command.cwd, hosts, default_host, origin_host_id: command.origin_host_id,
             connectedHosts: () => environment.hosts(command.cwd, command.origin_host_id, command.hosts), search: searchFor(application, id),
@@ -703,7 +705,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
             const submission = await application.attachments.admit(command.attachments, () => {
               if (interrupted.has(id)) return undefined;
               submissionAttempted = true;
-              return root.submit({ type: "input", ...prepared,
+              return root.submit({ type: "input", ...prepared, whenBusy: inputMode === "steer" ? "steer" : "followUp",
                 ...(command.input_id === undefined ? {} : { requestId: command.input_id }) }, BACKGROUND_CONTEXT);
             });
             if (submission === undefined) { await interrupts.get(id); return; }
