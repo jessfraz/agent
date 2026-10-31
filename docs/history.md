@@ -176,10 +176,11 @@ Search reads published results while an owned import catches up; it reports
 incomplete coverage rather than waiting for a full corpus rebuild.
 Cached batches yield to coordinator I/O. Readers retain the previous complete
 publication until its replacement commits atomically.
-File-backed searches use an owned read-only worker so vector scans cannot block
-coordinator message admission. Each lookup holds one SQLite snapshot through
-ranking, coverage and hydration. Query embeddings retain their caller's host
-and cancellation; closing the index closes its reader and pending lookups.
+File-backed searches use separate owned read-only lanes for vector scans and
+lookups without a vector. Automatic keyword context cannot queue behind a
+semantic-search backlog. Each lookup holds one SQLite snapshot through ranking,
+coverage and hydration. Query embeddings retain their caller's host and
+cancellation; closing the index closes both readers and pending lookups.
 
 Keep useful user/assistant text and bounded meaningful tool content searchable.
 Respect message boundaries and retain entry/asset provenance for every chunk.

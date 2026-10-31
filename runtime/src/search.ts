@@ -76,7 +76,7 @@ export type PublishedSearch = { query: string; vector: Uint8Array | null; space:
 export type SearchReadRequest = { id: number; input: PublishedSearch };
 export type SearchReadReply = { id: number; type: "result"; result: SearchResult } | { id: number; type: "failed"; message: string };
 
-/** One owned reader per file index. It never embeds, migrates, or writes. */
+/** An owned read lane. It never embeds, migrates, or writes. */
 class PublishedReader {
   private readonly worker: Worker;
   private readonly pending = new Map<number, { resolve(value: SearchResult): void; reject(error: Error): void }>();
@@ -125,7 +125,7 @@ export class SearchIndex {
   private space: EmbeddingSpace | undefined;
   private mutations = Promise.resolve();
   private readonly source: { path: string; extension: string } | undefined;
-  private reads: PublishedReader | undefined;
+  private readonly readers = new Map<SearchMode, PublishedReader>();
   private closed = false;
   private closing: Promise<void> | undefined;
   constructor(path: string, extension = process.env.AGENT_SQLITE_VEC) {
@@ -176,7 +176,7 @@ export class SearchIndex {
   close(): Promise<void> {
     if (this.closing !== undefined) return this.closing;
     this.closed = true;
-    const stopping = this.reads?.close() ?? Promise.resolve();
+    const stopping = Promise.all([...this.readers.values()].map(reader => reader.close())).then(() => {});
     // Retire writes immediately, even while the owned reader is terminating.
     this.db.close(); return this.closing = stopping;
   }
@@ -308,8 +308,15 @@ export class SearchIndex {
     if (this.closed) throw new Error("Search index is closed");
     const input: PublishedSearch = { query, vector, space: selected, source_refs, limit, mode, gaps };
     if (this.source === undefined) return readPublished(this.db, input);
-    this.reads ??= new PublishedReader(this.source.path, this.source.extension);
-    return this.reads.read(input);
+    // Automatic keyword context cannot queue behind whole-corpus vector scans.
+    // Both lanes retain the same ranking, snapshot and publication rules.
+    const lane: SearchMode = vector === null ? "keyword" : "semantic";
+    let reader = this.readers.get(lane);
+    if (reader === undefined) {
+      reader = new PublishedReader(this.source.path, this.source.extension);
+      this.readers.set(lane, reader);
+    }
+    return reader.read(input);
   }
 }
 

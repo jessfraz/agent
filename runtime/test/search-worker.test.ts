@@ -21,6 +21,7 @@ test("warm file-backed dense search services queued coordinator I/O before retur
   try {
     await index.upsert("service", "one", records(4096), embed);
     await index.search("Automobile", embed); // Exercise the existing warm reader, not just worker startup.
+    await index.search("Automobile", undefined, [], 1, "keyword");
     let finished = false;
     const served = new Promise<void>((resolve, reject) => channel.port1.once("message", () => {
       try { assert.equal(finished, false, "A dense read must not hold queued coordinator I/O behind its result"); resolve(); }
@@ -36,10 +37,34 @@ test("warm file-backed dense search services queued coordinator I/O before retur
     }));
     channel.port2.postMessage("coordinator shutdown");
     const first = assert.rejects(index.search("Automobile", embed), /closed/);
-    const second = assert.rejects(index.search("Automobile", embed), /closed/);
+    const second = assert.rejects(index.search("Automobile", undefined, [], 1, "keyword"), /closed/);
     await closed; await Promise.all([first, second]);
     await assert.rejects(index.search("Automobile", embed), /closed/);
   } finally { channel.port1.close(); channel.port2.close(); await index.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("literal chat context does not queue behind a burst of real vector scans", { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-search-reader-lanes-"));
+  const index = new SearchIndex(join(directory, "search.sqlite"));
+  const scans: Promise<SearchResult>[] = [];
+  try {
+    await index.upsert("service", "one", records(8192), embed);
+    await index.search("Automobile", embed);
+    await index.search("Automobile", undefined, [], 1, "keyword");
+    let completed = 0;
+    for (let i = 0; i < 64; i++) scans.push(index.search("transport", embed).then(result => {
+      completed += 1; return result;
+    }));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.ok(completed < scans.length, "The vector burst must still be running");
+    const literal = await index.search("Automobile", undefined, [], 1, "keyword");
+    assert.equal(literal.candidates[0]?.conversation_id, "service");
+    assert.ok(completed < scans.length, "Literal context must finish before the dense backlog drains");
+    for (const result of await Promise.all(scans)) assert.equal(result.candidates[0]?.conversation_id, "service");
+  } finally {
+    await Promise.allSettled(scans);
+    await index.close(); await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("file-backed reader startup errors reject every waiter and a fresh owner can reopen the publication", { timeout: 15_000 }, async () => {
