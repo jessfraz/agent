@@ -121,7 +121,7 @@ test("same-version imports repair native lineage before completed skips and affe
       assert.equal(await app.histories.evidence(seeded.conversation_id), "Synthetic existing context");
       if (complete) assert.deepEqual(await app.histories.checkpoint(source.id, coordinator.host_id), checkpoint);
 
-      retrieval.close(); retrieval = undefined;
+      await retrieval.close(); retrieval = undefined;
       await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
       assert.equal((await app.histories.get(source.id))?.thread.parent_thread_id, "native-parent");
       assert.equal((await app.histories.get(source.id))?.adopted_task_id, adopted.id);
@@ -336,7 +336,7 @@ test("source text and cursors commit while native embedding is held, and joined 
     finally { published.close(); }
     assert.equal((await originals(app, source.id)).entries.length, 4);
   } finally {
-    release(); releaseSource(); await Promise.allSettled([pending, joined]); retrieval.close();
+    release(); releaseSource(); await Promise.allSettled([pending, joined]); await retrieval.close();
     await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
   }
 });

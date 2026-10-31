@@ -482,6 +482,8 @@ Import, revision and search-tool tests use real Pi storage without an inference
 provider. Tool tests admit Pi tasks and inspect their persisted results.
 Synthetic vectors test index mechanics; the native embedding test separately
 checks the packaged model and runner.
+Real SQLite write locks exercise concurrent reads, invalidation and shutdown,
+including reopen with the previous publication and reusable staged vectors.
 
 Terminal recovery scopes retries to the failed attachment. A delayed input
 failure cannot retire its replacement observer or replay a written input.

@@ -180,6 +180,8 @@ Search reads published results while an owned import catches up; it reports
 incomplete coverage rather than waiting for a full corpus rebuild.
 Cached batches yield to coordinator I/O. Readers retain the previous complete
 publication until its replacement commits atomically.
+After bootstrap, an owned worker handles every index write, so large vector
+transactions and SQLite lock waits cannot block the coordinator's event loop.
 File-backed searches use separate owned read-only lanes for vector scans and
 lookups without a vector. Automatic keyword context cannot queue behind a
 semantic-search backlog. Each lookup holds one SQLite snapshot through ranking,

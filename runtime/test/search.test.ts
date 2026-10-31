@@ -248,7 +248,7 @@ test("a missed notification and a commit during embedding both remain reconcilab
     await index.upsert("work", "one", records([record("one", "First note")]), embedding);
     gate = true;
     const indexing = index.upsert("work", "two", records([record("two", "Second note")]), embedding);
-    await began; index.markDirty("work"); release(); await indexing;
+    await began; await index.markDirty("work"); release(); await indexing;
     assert.deepEqual(index.checkpoint("work"), { watermark: "two", dirty: true });
     await index.reconcile(inventory([{ conversation_id: "work", watermark: "three" }]), () => records([record("three", "Latest note")]), embedding);
     assert.deepEqual(index.checkpoint("work"), { watermark: "three", dirty: false });

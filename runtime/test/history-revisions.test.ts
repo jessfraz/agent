@@ -44,7 +44,7 @@ async function open(directory: string) {
   };
   const retrieval = new Retrieval(session, store, tasks, join(directory, "search.sqlite"));
   return { session, storage, store, tasks, retrieval, embedded, embed,
-    async close() { retrieval.close(); await session.close(BACKGROUND_CONTEXT); } };
+    async close() { await retrieval.close(); await session.close(BACKGROUND_CONTEXT); } };
 }
 type App = Awaited<ReturnType<typeof open>>;
 async function save(app: App, items: HistoryItem[], at = 10, version = "thread-one", extra: { host?: string; cursor?: string | null } = {}) {

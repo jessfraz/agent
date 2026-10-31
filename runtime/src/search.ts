@@ -8,6 +8,7 @@ import type { EmbeddingBatch } from "./generated/EmbeddingBatch.js";
 import type { EmbeddingPurpose } from "./generated/EmbeddingPurpose.js";
 import type { EmbeddingSpace } from "./generated/EmbeddingSpace.js";
 import type { SearchMode } from "./generated/SearchMode.js";
+import { mutatePublished, type SearchMutation, type StagedChunk } from "./search-mutations.js";
 
 export type SearchRecord = { entry_id: string; ordinal: number; text: string; source_refs: string[]; gaps?: string[] };
 export type SearchWatermark = { conversation_id: string; watermark: string };
@@ -73,19 +74,23 @@ function validate(batch: EmbeddingBatch, count: number): void {
 
 export type PublishedSearch = { query: string; vector: Uint8Array | null; space: EmbeddingSpace | null;
   source_refs: string[]; limit: number; mode: SearchMode; gaps: string[] };
-export type SearchReadRequest = { id: number; input: PublishedSearch };
-export type SearchReadReply = { id: number; type: "result"; result: SearchResult } | { id: number; type: "failed"; message: string };
+export type SearchWork<Input> = { id: number; input: Input };
+export type SearchReply<Result> = { id: number; type: "result"; result: Result } | { id: number; type: "failed"; message: string };
+export type SearchReadRequest = SearchWork<PublishedSearch>;
+export type SearchReadReply = SearchReply<SearchResult>;
 
-/** An owned read lane. It never embeds, migrates, or writes. */
-class PublishedReader {
+/** The owner rejects pending work before retiring its worker. */
+class IndexWorker<Input, Result> {
   private readonly worker: Worker;
-  private readonly pending = new Map<number, { resolve(value: SearchResult): void; reject(error: Error): void }>();
+  private readonly cancellation = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+  private readonly pending = new Map<number, { resolve(value: Result): void; reject(error: Error): void }>();
   private next = 0;
   private failure: Error | undefined;
   private closing: Promise<void> | undefined;
-  constructor(path: string, extension: string) {
-    this.worker = new Worker(new URL("./search-worker.js", import.meta.url), { workerData: { path, extension }, name: "published-history" });
-    this.worker.on("message", (reply: SearchReadReply) => {
+  constructor(script: string, location: { path: string; extension: string }, private readonly label: string) {
+    // Eval and test-process flags do not apply to these compiled worker files.
+    this.worker = new Worker(new URL(script, import.meta.url), { workerData: { ...location, cancellation: this.cancellation.buffer }, name: label, execArgv: [] });
+    this.worker.on("message", (reply: SearchReply<Result>) => {
       const pending = this.pending.get(reply.id);
       if (pending === undefined) return;
       this.pending.delete(reply.id);
@@ -94,7 +99,7 @@ class PublishedReader {
     });
     this.worker.on("error", (error: Error) => this.fail(error));
     this.worker.on("messageerror", (error: Error) => this.fail(error));
-    this.worker.on("exit", (code) => { if (this.closing === undefined) this.fail(new Error(`Published history reader stopped (exit ${code})`)); });
+    this.worker.on("exit", (code) => { if (this.closing === undefined) this.fail(new Error(`${label} stopped (exit ${code})`)); });
     this.worker.unref();
   }
   private fail(error: Error): void {
@@ -102,18 +107,21 @@ class PublishedReader {
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear(); this.worker.unref();
   }
-  read(input: PublishedSearch): Promise<SearchResult> {
+  request(input: Input): Promise<Result> {
     if (this.closing !== undefined) return Promise.reject(new Error("Search index is closed"));
     if (this.failure !== undefined) return Promise.reject(this.failure);
     const id = this.next++;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject }); this.worker.ref();
-      try { this.worker.postMessage({ id, input } satisfies SearchReadRequest); }
-      catch (error) { this.fail(error instanceof Error ? error : new Error("Published history request could not be sent")); }
+      try { this.worker.postMessage({ id, input } satisfies SearchWork<Input>); }
+      catch (error) { this.fail(error instanceof Error ? error : new Error(`${this.label} request could not be sent`)); }
     });
   }
   close(): Promise<void> {
     if (this.closing !== undefined) return this.closing;
+    // A blocked SQLite call cannot receive a message; cancellation must be
+    // visible before its transaction is allowed to commit.
+    Atomics.store(this.cancellation, 0, 1);
     this.fail(new Error("Search index is closed"));
     return this.closing = this.worker.terminate().then(() => {});
   }
@@ -125,7 +133,9 @@ export class SearchIndex {
   private space: EmbeddingSpace | undefined;
   private mutations = Promise.resolve();
   private readonly source: { path: string; extension: string } | undefined;
-  private readonly readers = new Map<SearchMode, PublishedReader>();
+  private readonly readers = new Map<SearchMode, IndexWorker<PublishedSearch, SearchResult>>();
+  private publisher: IndexWorker<SearchMutation, void> | undefined;
+  private settingSpace: Promise<void> | undefined;
   private closed = false;
   private closing: Promise<void> | undefined;
   constructor(path: string, extension = process.env.AGENT_SQLITE_VEC) {
@@ -172,41 +182,49 @@ export class SearchIndex {
       this.db.exec("UPDATE conversations SET dirty=1, revision=revision+1");
       this.db.prepare("INSERT OR REPLACE INTO metadata VALUES('source_projection',?)").run(SOURCE_PROJECTION);
     }
+    // After bootstrap this connection only reads. Every file-backed write has
+    // one asynchronous owner, including small writes that could wait on its lock.
+    if (this.source !== undefined) this.db.exec("PRAGMA query_only=ON");
   }
   close(): Promise<void> {
     if (this.closing !== undefined) return this.closing;
     this.closed = true;
-    const stopping = Promise.all([...this.readers.values()].map(reader => reader.close())).then(() => {});
-    // Retire writes immediately, even while the owned reader is terminating.
+    const stopping = Promise.all([...this.readers.values(), ...(this.publisher === undefined ? [] : [this.publisher])]
+      .map(worker => worker.close())).then(() => {});
+    // Reject owned work before closing the local snapshot connection.
     this.db.close(); return this.closing = stopping;
-  }
-  private transaction(action: () => void): void {
-    this.db.exec("BEGIN IMMEDIATE");
-    try { action(); this.db.exec("COMMIT"); } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
   private mutate(action: () => Promise<void>): Promise<void> {
     const operation = this.mutations.then(action); this.mutations = operation.catch(() => {}); return operation;
   }
-  markDirty(conversation_id: string): void {
-    this.db.prepare("INSERT INTO conversations(id) VALUES(?) ON CONFLICT(id) DO UPDATE SET dirty=1,revision=revision+1").run(conversation_id);
+  private async publish(mutation: SearchMutation): Promise<void> {
+    if (this.closed) throw new Error("Search index is closed");
+    if (this.source === undefined) mutatePublished(this.db, mutation);
+    else {
+      // Record iteration and embeddings stay with their current owner; only
+      // bounded staged rows and publication identifiers cross to the writer.
+      this.publisher ??= new IndexWorker("./search-publisher.js", this.source, "History publication");
+      await this.publisher.request(mutation);
+    }
+  }
+  markDirty(conversation_id: string): Promise<void> {
+    return this.publish({ type: "dirty", conversation_id });
   }
   checkpoint(conversation_id: string): { watermark: string; dirty: boolean } | undefined {
     const row = this.db.prepare("SELECT watermark,dirty FROM conversations WHERE id=?").get(conversation_id);
     return row === undefined ? undefined : { watermark: string(row, "watermark"), dirty: number(row, "dirty") !== 0 };
   }
-  private setSpace(space: EmbeddingSpace): void {
-    if (this.space !== undefined && JSON.stringify(this.space) !== JSON.stringify(space)) throw new Error("Embedding space changed; rebuild the search index");
+  private async setSpace(space: EmbeddingSpace): Promise<void> {
     if (this.space === undefined) {
-      this.transaction(() => {
-        this.db.exec(`CREATE VIRTUAL TABLE chunk_vectors USING vec0(embedding float[${space.dimensions}] distance_metric=cosine)`);
-        this.db.prepare("INSERT INTO metadata VALUES('space',?)").run(JSON.stringify(space));
-      });
-      this.space = space;
+      const setting = this.settingSpace ??= this.publish({ type: "space", space }).then(() => { this.space = space; });
+      try { await setting; }
+      finally { if (this.settingSpace === setting) this.settingSpace = undefined; }
     }
+    if (this.space === undefined || JSON.stringify(this.space) !== JSON.stringify(space)) throw new Error("Embedding space changed; rebuild the search index");
   }
   upsert(conversation_id: string, watermark: string, records: AsyncIterable<SearchRecord>, embed: Embed): Promise<void> {
     return this.mutate(async () => {
-      this.markDirty(conversation_id);
+      await this.markDirty(conversation_id);
       const revision = number(this.db.prepare("SELECT revision FROM conversations WHERE id=?").get(conversation_id)!, "revision");
       const run = randomUUID(); let pending: Chunk[] = []; const gaps = new Set<string>();
       const stage = async () => {
@@ -229,20 +247,16 @@ export class SearchIndex {
         }
         const missing = [...new Map(batch.filter((chunk) => !cached.has(chunk.hash)).map((chunk) => [chunk.hash, chunk])).values()];
         if (missing.length > 0) {
-          const embedded = await embed(missing.map((chunk) => chunk.text), "document"); validate(embedded, missing.length); this.setSpace(embedded.space);
+          const embedded = await embed(missing.map((chunk) => chunk.text), "document"); validate(embedded, missing.length); await this.setSpace(embedded.space);
           missing.forEach((chunk, index) => cached.set(chunk.hash, new Uint8Array(new Float32Array(embedded.vectors[index]!).buffer)));
         }
-        this.transaction(() => {
-          const insert = this.db.prepare(`INSERT INTO staging(conversation_id,run,entry_id,ordinal,part,hash,text,source_refs,embedding) VALUES(?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(conversation_id,entry_id,part) DO UPDATE SET run=excluded.run,ordinal=excluded.ordinal,hash=excluded.hash,
-              text=excluded.text,source_refs=excluded.source_refs,embedding=excluded.embedding WHERE staging.run<>excluded.run`);
-          for (const chunk of batch) {
-            const written = insert.run(conversation_id, run, chunk.entry_id, chunk.ordinal, chunk.part, chunk.hash, chunk.text,
-              JSON.stringify(chunk.source_refs), cached.get(chunk.hash)!);
-            if (written.changes !== 1) throw new Error("Search source repeated an entry part");
-          }
+        const staged: StagedChunk[] = batch.map((chunk) => {
+          const embedding = cached.get(chunk.hash);
+          if (embedding === undefined) throw new Error("Search batch has no embedding");
+          return { entry_id: chunk.entry_id, ordinal: chunk.ordinal, part: chunk.part, hash: chunk.hash, text: chunk.text, source_refs: chunk.source_refs, embedding };
         });
-        // Cache hits need no external I/O. Keep queued chat requests moving
+        await this.publish({ type: "stage", conversation_id, run, chunks: staged });
+        // Cache hits need no model I/O. Keep queued chat requests moving
         // between durable batches instead of monopolizing the event loop.
         await setImmediate();
       };
@@ -253,26 +267,11 @@ export class SearchIndex {
         for (const chunk of chunks(record)) { pending.push(chunk); if (pending.length === BATCH) await stage(); }
       }
       await stage();
-      this.transaction(() => {
-        if (this.space !== undefined) this.db.prepare("DELETE FROM chunk_vectors WHERE rowid IN (SELECT id FROM chunks WHERE conversation_id=?)").run(conversation_id);
-        this.db.prepare("DELETE FROM chunks WHERE conversation_id=?").run(conversation_id);
-        this.db.prepare(`INSERT INTO chunks(conversation_id,entry_id,ordinal,part,hash,text,source_refs)
-          SELECT conversation_id,entry_id,ordinal,part,hash,text,source_refs FROM staging WHERE conversation_id=? AND run=? ORDER BY ordinal,part`).run(conversation_id, run);
-        if (this.space !== undefined) this.db.prepare(`INSERT INTO chunk_vectors(rowid,embedding)
-          SELECT c.id,s.embedding FROM staging s JOIN chunks c ON c.conversation_id=s.conversation_id AND c.entry_id=s.entry_id AND c.part=s.part
-          WHERE s.conversation_id=? AND s.run=?`).run(conversation_id, run);
-        this.db.prepare(`INSERT INTO source_refs SELECT j.value,c.id FROM chunks c,json_each(c.source_refs) j WHERE c.conversation_id=?`).run(conversation_id);
-        this.db.prepare("UPDATE conversations SET watermark=?,dirty=CASE WHEN revision=? THEN 0 ELSE 1 END,gaps=? WHERE id=?")
-          .run(watermark, revision, JSON.stringify([...gaps]), conversation_id);
-        this.db.prepare("DELETE FROM staging WHERE conversation_id=?").run(conversation_id);
-      });
+      await this.publish({ type: "publish", conversation_id, run, watermark, revision, gaps: [...gaps], vectors: this.space !== undefined });
     });
   }
   delete(conversation_id: string): Promise<void> {
-    return this.mutate(async () => this.transaction(() => {
-      if (this.space !== undefined) this.db.prepare("DELETE FROM chunk_vectors WHERE rowid IN (SELECT id FROM chunks WHERE conversation_id=?)").run(conversation_id);
-      this.db.prepare("DELETE FROM conversations WHERE id=?").run(conversation_id);
-    }));
+    return this.mutate(() => this.publish({ type: "delete", conversation_id, vectors: this.space !== undefined }));
   }
   async reconcile(inventory: AsyncIterable<SearchWatermark>, records: (id: string) => AsyncIterable<SearchRecord>, embed: Embed): Promise<void> {
     const seen = new Set<string>();
@@ -283,9 +282,7 @@ export class SearchIndex {
     for (const row of this.db.prepare("SELECT id FROM conversations").all()) if (!seen.has(string(row, "id"))) await this.delete(string(row, "id"));
   }
   async rebuild(inventory: AsyncIterable<SearchWatermark>, records: (id: string) => AsyncIterable<SearchRecord>, embed: Embed): Promise<void> {
-    await this.mutate(async () => this.transaction(() => {
-      this.db.exec("DELETE FROM conversations; DROP TABLE IF EXISTS chunk_vectors; DELETE FROM metadata WHERE key='space'"); this.space = undefined;
-    }));
+    await this.mutate(async () => { await this.publish({ type: "reset" }); this.space = undefined; });
     await this.reconcile(inventory, records, embed);
   }
   async search(query: string, embed: Embed | undefined, source_refs: string[] = [], limit = 8, mode: SearchMode = "semantic"): Promise<SearchResult> {
@@ -298,7 +295,7 @@ export class SearchIndex {
         // Query embedding retains its caller's host ownership and cancellation.
         const batch = await embed([query], "query"); validate(batch, 1);
         if (this.closed) throw new Error("Search index is closed");
-        this.setSpace(batch.space); selected = batch.space;
+        await this.setSpace(batch.space); selected = batch.space;
         vector = new Uint8Array(new Float32Array(batch.vectors[0]!).buffer);
       } catch (error) {
         if (this.closed) throw new Error("Search index is closed");
@@ -313,10 +310,10 @@ export class SearchIndex {
     const lane: SearchMode = vector === null ? "keyword" : "semantic";
     let reader = this.readers.get(lane);
     if (reader === undefined) {
-      reader = new PublishedReader(this.source.path, this.source.extension);
+      reader = new IndexWorker("./search-worker.js", this.source, "Published history reader");
       this.readers.set(lane, reader);
     }
-    return reader.read(input);
+    return reader.request(input);
   }
 }
 

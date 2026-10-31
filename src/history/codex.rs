@@ -2700,14 +2700,14 @@ try{
  assert.equal(checkpoint.complete,false);assert.deepEqual(checkpoint.gaps,evidence.gaps);
  assert.deepEqual((await conversation.context(BACKGROUND_CONTEXT)).messages,[]);
  const watermark=(await conversation.entries({order:'descending'},1,undefined,BACKGROUND_CONTEXT)).items[0].id,embeddedCount=embedded.length;
- app.retrieval.close();await app.session.close(BACKGROUND_CONTEXT);app=await open();
+ await app.retrieval.close();await app.session.close(BACKGROUND_CONTEXT);app=await open();
  const repeated=await run();assert.equal(repeated.phase,'partial');assert.equal(reads,2);assert.equal(repeated.items_added,0);
  assert.equal(repeated.items_unchanged,1,'Only the affected image is retried after the one-time reader backfill');assert.equal(embedded.length,embeddedCount);
  const reopened=await app.store.conversation(seeded.conversation.conversation_id);assert.ok(reopened);
  assert.equal((await reopened.entries({order:'descending'},1,undefined,BACKGROUND_CONTEXT)).items[0].id,watermark);
  assert.equal((await app.session.inspect(BACKGROUND_CONTEXT)).tasks.length,0);
  process.stdout.write(JSON.stringify({reads,added:progress.items_added,retained:retained.length,repeated_embeddings:embedded.length-embeddedCount})+'\n');
-}finally{app.retrieval.close();await app.session.close(BACKGROUND_CONTEXT);}
+}finally{await app.retrieval.close();await app.session.close(BACKGROUND_CONTEXT);}
 "#])
             .arg(&runtime).current_dir(runtime_root).stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
