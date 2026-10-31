@@ -180,27 +180,49 @@ private func withLocalPeer(_ body: @Sendable (LineConnection, NWConnection) asyn
   }
 }
 
-@Test(.timeLimit(.minutes(1)))
-func realNetworkTransportRefusalReleasesThePendingSendForReconnect() async throws {
-  let listener = try NWListener(using: .tcp, on: .any)
-  let listening = AsyncThrowingStream<Void, any Error>.makeStream()
-  listener.stateUpdateHandler = { state in
+enum UnavailablePeer: CaseIterable, Sendable { case refusedTCP, missingUnixSocket }
+
+@Test(.timeLimit(.minutes(1)), arguments: UnavailablePeer.allCases)
+func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: UnavailablePeer)
+  async throws
+{
+  let directory = URL(filePath: "/tmp").appending(path: "agent-unavailable-\(UUID().uuidString)")
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let socket: NWConnection
+  switch peer {
+  case .refusedTCP:
+    let listener = try NWListener(using: .tcp, on: .any)
+    let listening = AsyncThrowingStream<Void, any Error>.makeStream()
+    listener.stateUpdateHandler = { state in
+      switch state {
+      case .ready: listening.continuation.yield(())
+      case .cancelled: listening.continuation.finish()
+      case .failed(let error): listening.continuation.finish(throwing: error)
+      default: break
+      }
+    }
+    listener.newConnectionHandler = { $0.cancel() }
+    listener.start(queue: .global())
+    defer { listener.cancel() }
+    for try await _ in listening.stream { break }
+    let port = try #require(listener.port)
+    listener.cancel()
+    for try await _ in listening.stream {}
+    socket = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)
+  case .missingUnixSocket:
+    socket = NWConnection(
+      to: .unix(path: directory.appending(path: "missing.sock").path), using: .tcp)
+  }
+  let failures = AsyncStream<NWError>.makeStream()
+  socket.stateUpdateHandler = { state in
     switch state {
-    case .ready: listening.continuation.yield(())
-    case .cancelled: listening.continuation.finish()
-    case .failed(let error): listening.continuation.finish(throwing: error)
+    case .waiting(let error), .failed(let error): failures.continuation.yield(error)
+    case .cancelled: failures.continuation.finish()
     default: break
     }
   }
-  listener.newConnectionHandler = { $0.cancel() }
-  listener.start(queue: .global())
-  defer { listener.cancel() }
-  for try await _ in listening.stream { break }
-  let port = try #require(listener.port)
-  listener.cancel()
-  for try await _ in listening.stream {}
-
-  let socket = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)
+  defer { failures.continuation.finish() }
   let client = LineConnection(connection: socket)
   defer { socket.cancel() }
   let sending = Task { try await client.send(.observe(.init(inputIds: []))) }
@@ -220,6 +242,8 @@ func realNetworkTransportRefusalReleasesThePendingSendForReconnect() async throw
     }
   } catch {
     #expect(!(error is ConnectionError), "Refusal must release the send before its timeout")
+    let original = await failures.stream.first(where: { _ in true })
+    #expect(error as? NWError == original, "The owner must classify the original network failure")
     #expect(ConnectionError.shouldReconnect(after: error))
   }
   await client.close()

@@ -5,6 +5,15 @@ import Testing
 @testable import AgentCore
 @testable import AgentUI
 
+private actor NativeConnectionTrace {
+  private var states: [String] = []
+  func record(_ state: String) {
+    states.append(state)
+    if states.count > 12 { states.removeFirst() }
+  }
+  var description: String { states.joined(separator: ", ") }
+}
+
 // The runtime integration runner starts the production coordinator before
 // selecting this test. Ordinary Swift unit runs have no server to connect to.
 @Test(
@@ -24,10 +33,16 @@ func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
   let outbox = directory.appending(path: "native-pending.json")
   let input = NativeRequestSubmit(inputId: inputID, mode: .steer, text: text)
   try JSONEncoder().encode([input]).write(to: outbox, options: .atomic)
+  let trace = NativeConnectionTrace()
   let session = CoordinatorSession(
     outboxURL: outbox,
     connectTransport: { _ in
-      LineConnection(connection: NWConnection(to: .unix(path: socket), using: .tcp))
+      let connection = NWConnection(to: .unix(path: socket), using: .tcp)
+      connection.stateUpdateHandler = { state in
+        let text = String(describing: state)
+        Task { await trace.record(text) }
+      }
+      return LineConnection(connection: connection)
     })
   let model = ChatModel()
   func verifySavedInput(_ rows: [ChatRow]) throws {
@@ -41,10 +56,13 @@ func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
   func waitFor(_ description: String, _ predicate: () -> Bool) async throws {
     let deadline = ContinuousClock.now + .seconds(20)
     while !predicate() {
-      try #require(
-        ContinuousClock.now < deadline,
-        "Native client did not reach \(description): \(model.connection.label), \(model.error ?? "no error")"
-      )
+      if ContinuousClock.now >= deadline {
+        let states = await trace.description
+        try #require(
+          ContinuousClock.now < deadline,
+          "Native client did not reach \(description): \(model.connection.label), \(model.error ?? "no error"); transport: \(states)"
+        )
+      }
       try await Task.sleep(for: .milliseconds(10))
     }
   }

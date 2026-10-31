@@ -107,8 +107,18 @@ actor LineConnection {
   private let connection: NWConnection
   private var buffer = Data()
   private var scannedBytes = 0
-  private enum ReadState { case open, eof, closed }
+  private enum ReadState: Equatable {
+    case open, eof, closed
+    case failed(NWError)
+  }
   private var readState = ReadState.open
+  private var terminalError: (any Error)? {
+    switch readState {
+    case .failed(let error): error
+    case .closed: ConnectionError.closed
+    case .open, .eof: nil
+    }
+  }
   static let maximumFrameBytes = 4 * 1024 * 1024
 
   init(address: CoordinatorAddress) async throws {
@@ -129,24 +139,30 @@ actor LineConnection {
       .value
     try Task.checkCancellation()
     connection = NWConnection(host: .init(host), port: port, using: parameters)
-    Self.start(connection)
+    Self.start(connection, owner: self)
   }
 
   // Tests exercise the real reader/writer over a local Network.framework listener.
   init(connection: NWConnection) {
     self.connection = connection
-    Self.start(connection)
+    Self.start(connection, owner: self)
   }
 
-  private static func start(_ connection: NWConnection) {
+  private static func start(_ connection: NWConnection, owner: LineConnection) {
     let observe = connection.stateUpdateHandler
-    connection.stateUpdateHandler = { [weak connection] state in
+    connection.stateUpdateHandler = { [weak owner] state in
       observe?(state)
-      // A refused service does not change the network path. Release this
-      // attempt so the session's retry loop can reconnect after a restart.
-      if case .waiting(.posix(.ECONNREFUSED)) = state { connection?.cancel() }
+      // Network.framework waits for a path change. The session already owns
+      // reconnection and backoff, including service restarts on the same path.
+      if case .waiting(let error) = state { Task { await owner?.fail(error) } }
     }
     connection.start(queue: .global(qos: .userInitiated))
+  }
+
+  private func fail(_ error: NWError) {
+    guard readState == .open else { return }
+    readState = .failed(error)
+    close()
   }
 
   private static func tunnelAddress() throws -> String {
@@ -173,13 +189,14 @@ actor LineConnection {
     throw ConnectionError.vpnUnavailable
   }
   func close() {
-    readState = .closed
+    if readState == .open || readState == .eof { readState = .closed }
     buffer.removeAll()
     scannedBytes = 0
     connection.cancel()
   }
 
   func send(_ request: NativeRequest) async throws {
+    if let error = terminalError { throw error }
     guard readState == .open else { throw ConnectionError.closed }
     let command = NativeCommand.native(.init(request: request))
     var bytes = try JSONEncoder().encode(command)
@@ -201,8 +218,9 @@ actor LineConnection {
         connection.cancel()
       }
     } catch {
+      let cause = terminalError ?? error
       close()
-      throw error
+      throw cause
     }
   }
 
@@ -217,15 +235,16 @@ actor LineConnection {
     } catch {
       // A rejected or interrupted read must release the peer's pending write,
       // even when the owner has not resumed to observe this error yet.
+      let cause = terminalError ?? error
       close()
-      throw error
+      throw cause
     }
   }
 
   private func receiveFrame() async throws -> NativeEvent {
     while true {
       try Task.checkCancellation()
-      guard readState != .closed else { throw ConnectionError.closed }
+      if let error = terminalError { throw error }
       // Fragmented frames are scanned once, rather than rescanning every byte
       // already received while the peer continues writing.
       let start = buffer.index(buffer.startIndex, offsetBy: scannedBytes)
@@ -255,7 +274,7 @@ actor LineConnection {
           }
         }
       }
-      guard readState != .closed else { throw ConnectionError.closed }
+      if let error = terminalError { throw error }
       buffer.append(data)
       if complete { readState = .eof }
     }
