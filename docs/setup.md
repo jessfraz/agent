@@ -482,6 +482,11 @@ A clean stop records `service_shutdown` with `SIGINT` or `SIGTERM` and its
 timestamp before pending requests close, distinguishing a managed restart from
 a runtime failure.
 
+Failures before the listener opens are recorded in `diagnostics/startup.jsonl`.
+It retains initialization stages, durations and native numeric failure codes
+without SQL, paths or error payloads, capped at 64 KiB. A restart loop can be a
+storage failure; preserve the database and its WAL before attempting recovery.
+
 `diagnostics/retention.json` records the policy, expiry watermark and cumulative
 timestamp bounds of capacity evictions, including uncertain timestamp coverage.
 It also flags unknown history when upgrading legacy rotations. Read actual
@@ -511,6 +516,8 @@ configuration file that already exists outside the Nix store:
 
 Include Rex, Switchboard and enabled provider CLIs in `extraPackages` as well.
 The worker's TOML must set `coordinator`; the coordinator's must omit it.
+The macOS module installs a user LaunchAgent: it starts at login and launchd
+restarts it after exit. It does not run before a user logs in after reboot.
 Model settings, source configuration, credentials and context stay in private
 runtime files. Restart the service after changing its settings.
 

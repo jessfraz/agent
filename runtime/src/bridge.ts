@@ -2,7 +2,6 @@ import { join } from "node:path";
 import { AttachmentStore, AttachmentError, validateInput } from "./attachments.js";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { AssistantEntry, createRegistry, Harness, ROOT_CONVERSATION_ID, type Conversation, type Submission } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
@@ -41,6 +40,8 @@ import type { ApnsConfig } from "./generated/ApnsConfig.js";
 import { annotateTranscript, TranscriptAnnotationError } from "./transcript_visibility.js";
 import { DiagnosticsTelemetry } from "./telemetry.js";
 import { conversationUsage } from "./usage.js";
+import { StartupDiagnostics } from "./startup-diagnostics.js";
+import { openConversationDatabase } from "./conversation-database.js";
 
 function notificationConfig(): ApnsConfig | undefined {
   const saved = process.env.AGENT_APNS_CONFIG;
@@ -101,19 +102,21 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
 
 type Application = TriageApplication & { stopPlacements(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore; notifications: Notifications;
   histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler;
-  telemetry: DiagnosticsTelemetry };
+  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics };
 async function openApplication(): Promise<Application> {
-  const database = await openNodeSqliteDatabase(join(state, "session.sqlite"));
-  await database.exec("PRAGMA synchronous = FULL");
-  const storage = await SqliteStorage.open(database);
+  const startup = new StartupDiagnostics(state);
+  const storage = await startup.run("storage_open", async () => {
+    const database = await openConversationDatabase(join(state, "session.sqlite"));
+    return SqliteStorage.open(database);
+  });
   const registry = createRegistry();
   const telemetry = await DiagnosticsTelemetry.open(state);
   let harness: Harness;
   try {
-    harness = await Harness.open(storage, { models, registry, identity: { attribution: null }, telemetry: telemetry.context,
-      settings: { steeringMode: "all", followUpMode: "one-at-a-time" } }, BACKGROUND_CONTEXT);
+    harness = await startup.run("harness_recovery", () => Harness.open(storage, { models, registry, identity: { attribution: null }, telemetry: telemetry.context,
+      settings: { steeringMode: "all", followUpMode: "one-at-a-time" } }, BACKGROUND_CONTEXT));
   } catch (error) { await telemetry.close(); throw error; }
-  try {
+  try { return await startup.run("application_recovery", async () => {
   const notifications = new Notifications(harness, registry, notificationConfig());
   const tasks = new TaskStore(harness, inference);
   const attachments = new AttachmentStore(state); tasks.useAttachments(attachments);
@@ -187,8 +190,8 @@ async function openApplication(): Promise<Application> {
   const jobTools = createJobTools(background, executions); registry.install(jobTools);
   const toolsets = createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools });
   if (await notifications.start()) harness.resume();
-  return { ...core, background, toolsets };
-  } catch (error) {
+  return { ...core, background, toolsets, startup };
+  }); } catch (error) {
     await harness.close(BACKGROUND_CONTEXT).catch(() => {}); await telemetry.close(); throw error;
   }
 }
@@ -359,10 +362,16 @@ async function handle(request: RuntimeRequest): Promise<void> {
       case "list_jobs": emit(id, { type: "scheduled_jobs", jobs: await (await app()).background.listJobs() }); break;
       case "read_job": emit(id, { type: "scheduled_job", job: await (await app()).background.getJob(command.job_id) }); break;
       case "run_job": emit(id, { type: "job_run", run: await (await app()).background.runJob(command) }); break;
-      case "configure_coordinator":
-        await (await app()).environment.configure(command.bootstrap); emit(id, { type: "configured" }); break;
-      case "register_node":
-        await (await app()).environment.register(command.node); emit(id, { type: "node_registered", host_id: command.node.host_id }); break;
+      case "configure_coordinator": {
+        const application = await app();
+        await application.startup.run("environment_configure", () => application.environment.configure(command.bootstrap));
+        emit(id, { type: "configured" }); break;
+      }
+      case "register_node": {
+        const application = await app();
+        await application.startup.run("node_registration", () => application.environment.register(command.node));
+        emit(id, { type: "node_registered", host_id: command.node.host_id }); break;
+      }
       case "set_connected_nodes":
         (await app()).environment.setConnected(command.host_ids); emit(id, { type: "configured" }); break;
       case "environment": emit(id, await (await app()).environment.environment(command.telemetry ? (operation) => hostRequests.call(id, operation) : undefined)); break;

@@ -117,6 +117,12 @@ ledgers using cached vectors; opening history never waits for that scan.
 
 ## Native Pi storage, inert history
 
+Every canonical Pi database connection uses `synchronous=FULL` and
+[`fullfsync=ON`](https://www.sqlite.org/pragma.html#pragma_fullfsync). The latter
+requests macOS `F_FULLFSYNC` and has no effect on unsupported platforms. Native
+tests verify these connection settings and committed history after reopening;
+they do not simulate hardware failure or establish power-loss durability.
+
 Create ownerless Pi conversations and append application `data` entries through
 ordinary transactions. Commit each batch with its import ledger/checkpoint.
 Do not submit inputs or passive submissions: even a submission can resume Pi's
