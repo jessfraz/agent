@@ -56,7 +56,8 @@ in {
     environment.systemPackages = [cfg.package];
     launchd.user.agents.agent = {
       serviceConfig = {
-        ProgramArguments = ["${cfg.package}/bin/beep-boop" "--config" cfg.configFile]
+        # The legacy entry point also supports older package overrides.
+        ProgramArguments = ["${cfg.package}/bin/agent" "--config" cfg.configFile]
           ++ lib.optionals (cfg.stateDirectory != null) ["--state-dir" cfg.stateDirectory]
           ++ [(if cfg.role == "coordinator" then "serve" else "maintain")]
           ++ lib.optionals (cfg.role == "coordinator") ["--coordinator-only"]
