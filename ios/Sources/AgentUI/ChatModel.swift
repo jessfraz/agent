@@ -31,6 +31,7 @@ final class ChatModel {
   var canLoadEarlier = false
   var loadingHistory = false
   var includesLatest = true
+  var sourceWarning: String?
   var error: String?
   var revision = 0
   var draft = ""
@@ -280,6 +281,7 @@ final class ChatModel {
     canLoadEarlier = update.olderCursor != nil
     loadingHistory = update.loadingHistory
     includesLatest = update.includesLatest
+    sourceWarning = update.sourceWarning
     error = update.error
   }
 }

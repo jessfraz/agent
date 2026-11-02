@@ -64,14 +64,14 @@ fn ty(schema: &Value) -> Result<String> {
         _ => bail!("Unsupported native schema: {schema}"),
     })
 }
-fn fields(schema: &Value) -> Result<Vec<(String, String)>> {
+fn fields(schema: &Value, tag: Option<&str>) -> Result<Vec<(String, String)>> {
     let properties = schema
         .get("properties")
         .and_then(Value::as_object)
         .context("Missing object properties")?;
     properties
         .iter()
-        .filter(|(name, _)| name.as_str() != "type")
+        .filter(|(name, _)| Some(name.as_str()) != tag)
         .map(|(name, value)| Ok((name.clone(), ty(value)?)))
         .collect()
 }
@@ -119,7 +119,7 @@ fn definition(name: &str, schema: &Value) -> Result<String> {
         return Ok(format!("public typealias {name} = {}\n\n", ty(schema)?));
     }
     let Some(variants) = schema.get("oneOf").and_then(Value::as_array) else {
-        return Ok(structure(name, &fields(schema)?));
+        return Ok(structure(name, &fields(schema, None)?));
     };
     if variants
         .iter()
@@ -139,12 +139,34 @@ fn definition(name: &str, schema: &Value) -> Result<String> {
     }
     let mut cases = Vec::new();
     let mut out = String::new();
+    let tags = variants
+        .first()
+        .and_then(|variant| variant.get("properties"))
+        .and_then(Value::as_object)
+        .context("Missing variant properties")?
+        .keys()
+        .filter(|name| {
+            variants.iter().all(|variant| {
+                variant
+                    .get("properties")
+                    .and_then(|properties| properties.get(*name))
+                    .and_then(|property| property.get("const"))
+                    .and_then(Value::as_str)
+                    .is_some()
+            })
+        })
+        .collect::<Vec<_>>();
+    let [tag_name] = tags.as_slice() else {
+        bail!("Expected one common string variant tag")
+    };
     for variant in variants {
         let tag = variant
-            .pointer("/properties/type/const")
+            .get("properties")
+            .and_then(|properties| properties.get(*tag_name))
+            .and_then(|property| property.get("const"))
             .and_then(Value::as_str)
             .context("Missing variant tag")?;
-        let fields = fields(variant)?;
+        let fields = fields(variant, Some(tag_name))?;
         let payload = name.to_owned() + &upper(tag);
         if !fields.is_empty() {
             out += &structure(&payload, &fields);
@@ -163,7 +185,15 @@ fn definition(name: &str, schema: &Value) -> Result<String> {
             }
         );
     }
-    out += "    enum CodingKeys: String, CodingKey { case type }\n    public init(from decoder: any Decoder) throws {\n        let tag = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .type)\n        switch tag {\n";
+    let tag_key = camel(tag_name);
+    out += &format!(
+        "    enum CodingKeys: String, CodingKey {{ case {tag_key}{} }}\n    public init(from decoder: any Decoder) throws {{\n        let tag = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .{tag_key})\n        switch tag {{\n",
+        if tag_key == **tag_name {
+            String::new()
+        } else {
+            format!(" = \"{tag_name}\"")
+        }
+    );
     for (tag, payload, associated) in &cases {
         out += &format!(
             "        case \"{tag}\": self = .{}{}\n",
@@ -182,7 +212,7 @@ fn definition(name: &str, schema: &Value) -> Result<String> {
             ident(name),
             if *associated { "(let value)" } else { "" }
         );
-        out += &format!("            try tag.encode(\"{name}\", forKey: .type)\n");
+        out += &format!("            try tag.encode(\"{name}\", forKey: .{tag_key})\n");
         if *associated {
             out += "            try value.encode(to: encoder)\n";
         }

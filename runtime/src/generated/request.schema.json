@@ -1792,6 +1792,12 @@
                 "type": "string"
               }
             },
+            "source_status": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "type": {
               "type": "string",
               "const": "observe"

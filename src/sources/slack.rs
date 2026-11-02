@@ -111,7 +111,11 @@ impl SlackSource {
         Ok(window)
     }
 
-    fn normalize(&self, output: ReadOutput, mut window: Window) -> SourceBatch {
+    fn normalize(&self, output: ReadOutput, window: Window) -> SourceBatch {
+        output.normalize(|output| self.normalize_output(output, window))
+    }
+
+    fn normalize_output(&self, output: ReadOutput, mut window: Window) -> SourceBatch {
         let key = self.key();
         if output.truncated {
             return SourceBatch::unavailable(
@@ -443,6 +447,19 @@ else process.exit(23);"#
         );
         assert!(matches!(batch.coverage, SourceCoverage::Unavailable { .. }));
         assert!(batch.checkpoint.is_none());
+    }
+
+    #[test]
+    fn helper_storage_failure_does_not_claim_slack_authorization_is_missing() {
+        let source = source();
+        let batch = source.normalize(
+            output(crate::sources::tests::STORAGE_FAILURE),
+            source.window(None, 1_700_000_000).unwrap(),
+        );
+        assert!(batch.events.is_empty() && batch.checkpoint.is_none());
+        assert!(
+            matches!(batch.coverage, SourceCoverage::Unavailable { message } if message.starts_with("Source helper storage failure during persistence;") && !message.contains("private-token"))
+        );
     }
 
     #[test]

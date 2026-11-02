@@ -245,6 +245,7 @@ impl State {
             .editor_height(size.width, 6)
             .saturating_add(2)
             .saturating_add(u16::from(self.status() != "Ready"))
+            .saturating_add(u16::from(self.source_warning.is_some()))
             .saturating_add(u16::try_from(self.attachment_count()).unwrap_or(u16::MAX));
         let minimum = u16::try_from(body)
             .unwrap_or(u16::MAX)

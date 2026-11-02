@@ -656,6 +656,7 @@ struct State {
     exiting: bool,
     worker: bool,
     observation: Option<ObservationState>,
+    source_warning: Option<String>,
     history_offset: Option<usize>,
     history_entry: Option<HistoryEntry>,
     loading_history: Option<HistoryLoad>,
@@ -700,6 +701,7 @@ impl State {
             exiting: false,
             worker: false,
             observation: None,
+            source_warning: None,
             history_offset: Some(0),
             history_entry: None,
             loading_history: None,
@@ -1159,6 +1161,29 @@ impl State {
     }
     fn event(&mut self, event: RuntimeEventKind) {
         match event {
+            RuntimeEventKind::Sources { sources } => {
+                // Coverage is current UI state, never a transcript entry. Do
+                // not surface provider diagnostics or private account IDs here.
+                let gaps = sources.iter().filter_map(|source| {
+                    let status = match &source.coverage {
+                        crate::sources::SourceCoverage::Partial { .. } => "partial",
+                        crate::sources::SourceCoverage::Unavailable { .. } => "unavailable",
+                        _ => return None,
+                    };
+                    let name = match source.source.provider.as_str() {
+                        "google" => "Gmail",
+                        "google_calendar" => "Calendar",
+                        "github" => "GitHub",
+                        "slack" => "Slack",
+                        "messages" => "Messages",
+                        _ => "Other source",
+                    };
+                    Some(format!("{name} {status}"))
+                }).collect::<std::collections::BTreeSet<_>>();
+                self.source_warning = (!gaps.is_empty()).then(|| format!(
+                    "Source checks incomplete: {}", gaps.into_iter().collect::<Vec<_>>().join("; ")
+                ));
+            }
             RuntimeEventKind::ConversationReady { conversation, model, cwd, working } => {
                 self.reset_observed_activity();
                 self.info = TuiInfo { title: conversation.title, model: Some(model), cwd };
@@ -1932,7 +1957,8 @@ impl State {
             return;
         }
         self.prepare_editor();
-        let status_height = u16::from(self.status() != "Ready");
+        let working_height = u16::from(self.status() != "Ready");
+        let status_height = working_height + u16::from(self.source_warning.is_some());
         let attachment_height = u16::try_from(self.attachment_count()).unwrap_or(u16::MAX);
         let height = self.editor_height(
             frame.area().width,
@@ -2108,7 +2134,7 @@ impl State {
             frame.render_widget(ClearWidget, area);
             frame.render_widget(Paragraph::new(lines), area);
         }
-        if status_height > 0 {
+        if working_height > 0 {
             let mut spans = vec![
                 Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
                 Span::styled(
@@ -2136,7 +2162,23 @@ impl State {
                     Style::default().add_modifier(Modifier::DIM),
                 ));
             }
-            frame.render_widget(Paragraph::new(Line::from(spans)), areas[2]);
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)),
+                Rect {
+                    height: 1,
+                    ..areas[2]
+                },
+            );
+        }
+        if let Some(warning) = &self.source_warning {
+            frame.render_widget(
+                Paragraph::new(Line::styled(warning, Style::default().fg(Color::Yellow))),
+                Rect {
+                    y: areas[2].y + working_height,
+                    height: 1,
+                    ..areas[2]
+                },
+            );
         }
         // Codex keeps the input unbordered, with one prompt gutter and padded
         // rows. Terminal foreground/background own the theme, not role colors.
@@ -3264,6 +3306,58 @@ mod tests {
         assert!(!recovered.contains("Reconnecting"));
         assert_eq!(view.messages.len(), rows);
         assert_eq!(view.composer_draft().text, "An unfinished correction");
+    }
+
+    #[test]
+    fn source_coverage_is_transient_deduplicated_and_clears_after_recovery() {
+        use crate::{
+            protocol::SourceState,
+            sources::{SourceCoverage, SourceKey},
+        };
+        let mut view = state();
+        view.editor.insert_str("An unfinished request");
+        let source = |coverage, checked_at| SourceState {
+            source: SourceKey {
+                provider: "google".into(),
+                account: "private-account".into(),
+            },
+            checkpoint: None,
+            coverage,
+            checked_at,
+        };
+        for checked_at in 1..=2 {
+            view.event(RuntimeEventKind::Sources {
+                sources: vec![source(
+                    SourceCoverage::Unavailable {
+                        message: "private-diagnostic".into(),
+                    },
+                    checked_at,
+                )],
+            });
+        }
+        let warning = rendered(&mut view, 130, 35);
+        assert_eq!(warning.matches("Gmail unavailable").count(), 1);
+        assert!(!warning.contains("private-account"));
+        assert!(!warning.contains("private-diagnostic"));
+        assert!(view.messages.is_empty());
+        view.event(RuntimeEventKind::Sources {
+            sources: vec![source(
+                SourceCoverage::Partial {
+                    message: "private-diagnostic".into(),
+                },
+                3,
+            )],
+        });
+        assert!(rendered(&mut view, 130, 35).contains("Gmail partial"));
+        for coverage in [SourceCoverage::More, SourceCoverage::Complete] {
+            view.event(RuntimeEventKind::Sources {
+                sources: vec![source(coverage, 4)],
+            });
+            assert!(!rendered(&mut view, 130, 35).contains("Source checks incomplete"));
+        }
+        assert!(view.messages.is_empty());
+        assert_eq!(view.composer_draft().text, "An unfinished request");
+        assert_eq!(view.status(), "Ready");
     }
 
     #[test]

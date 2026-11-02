@@ -90,10 +90,7 @@ impl GoogleSource {
             "--json".into(),
         ])
         .await?;
-        ensure!(
-            output.exit_code == 0 && !output.truncated,
-            "Switchboard namespace discovery is unavailable"
-        );
+        output.check_discovery()?;
         Self::from_registry(&output.stdout, selected)
     }
 
@@ -145,7 +142,11 @@ impl GoogleSource {
         Ok(window)
     }
 
-    fn normalize(&self, output: ReadOutput, mut window: Window) -> SourceBatch {
+    fn normalize(&self, output: ReadOutput, window: Window) -> SourceBatch {
+        output.normalize(|output| self.normalize_output(output, window))
+    }
+
+    fn normalize_output(&self, output: ReadOutput, mut window: Window) -> SourceBatch {
         let key = self.key();
         if output.truncated {
             return SourceBatch::unavailable(
@@ -167,8 +168,8 @@ impl GoogleSource {
             .messages
             .into_iter()
             .filter_map(|message| {
-                let (Some(thread_id), Some(subject), Some(body_text)) =
-                    (message.gmail_thread_id, message.subject, message.body_text)
+                let (Some(thread_id), Some(body_text)) =
+                    (message.gmail_thread_id, message.body_text)
                 else {
                     // Failed native hydration rows retain IDs but omit content.
                     // Never admit those placeholders as immutable message events.
@@ -202,7 +203,10 @@ impl GoogleSource {
                         account: key.account.clone(),
                         thread_id,
                     },
-                    title: subject,
+                    title: message
+                        .subject
+                        .filter(|subject| !subject.trim().is_empty())
+                        .unwrap_or_else(|| "(no subject)".into()),
                     text,
                 })
             })
@@ -437,6 +441,25 @@ mod tests {
     }
 
     #[test]
+    fn native_mail_without_a_subject_keeps_its_content_identity_and_checkpoint() {
+        let source = GoogleSource::new("google.alpha".into()).unwrap();
+        let titled = source.normalize(output(COMPLETE), source.window(None, 800_000).unwrap());
+        for subject in [r#""subject":null,"#, "", r#""subject":"","#] {
+            let native = COMPLETE.replace(r#""subject":"Board revision","#, subject);
+            let batch = source.normalize(output(&native), source.window(None, 800_000).unwrap());
+            assert_eq!(batch.events.len(), 1);
+            let message = &batch.events[0];
+            assert_eq!(message.title, "(no subject)");
+            assert_eq!(message.id, titled.events[0].id);
+            assert_eq!(message.version, titled.events[0].version);
+            assert_eq!(message.source.thread_id, titled.events[0].source.thread_id);
+            assert_eq!(message.text, titled.events[0].text);
+            assert_eq!(batch.coverage, SourceCoverage::Complete);
+            assert_eq!(batch.checkpoint, titled.checkpoint);
+        }
+    }
+
+    #[test]
     fn native_failed_rows_retain_hydrated_events_without_advancing_the_cursor() {
         let source = GoogleSource::new("google.alpha".into()).unwrap();
         let checkpoint = SourceCheckpoint {
@@ -475,5 +498,99 @@ mod tests {
             assert!(matches!(batch.coverage, SourceCoverage::Unavailable { .. }));
             assert!(batch.checkpoint.is_none());
         }
+    }
+
+    #[test]
+    fn helper_storage_failure_retains_the_account_checkpoint_and_successful_partial_messages() {
+        let source = GoogleSource::new("google.alpha".into()).unwrap();
+        let complete = source.normalize(output(COMPLETE), source.window(None, 800_000).unwrap());
+        let checkpoint = complete.checkpoint.unwrap();
+        let saved = checkpoint.value.clone();
+        let failed = source.normalize(
+            output(crate::sources::tests::STORAGE_FAILURE),
+            source.window(Some(&checkpoint), 800_100).unwrap(),
+        );
+        assert!(failed.events.is_empty());
+        assert_eq!(failed.source, source.key());
+        assert!(failed.checkpoint.is_none());
+        assert_eq!(failed.coverage, SourceCoverage::Unavailable {
+            message: "Source helper storage failure during persistence; inspect its local database before retrying. Checkpoint retained.".into(),
+        });
+        assert_eq!(checkpoint.value, saved);
+        let partial = COMPLETE.replace("\"status\":\"executed\"", "\"status\":\"partial\",\"failure\":{\"code\":\"storage\",\"phase\":\"persistence\",\"message\":\"private-token\"}");
+        let partial = source.normalize(
+            output(&partial),
+            source.window(Some(&checkpoint), 800_100).unwrap(),
+        );
+        assert_eq!(partial.events.len(), 1);
+        assert_eq!(partial.events[0].id, "m1");
+        assert!(partial.checkpoint.is_none());
+        assert!(
+            matches!(partial.coverage, SourceCoverage::Partial { ref message } if message.contains("storage failure during persistence") && !message.contains("private-token"))
+        );
+        let other = GoogleSource::new("google.other".into()).unwrap();
+        let other = other.normalize(output(COMPLETE), other.window(None, 800_100).unwrap());
+        assert_eq!(other.source.account, "google.other");
+        assert_eq!(other.events.len(), 1);
+        assert_eq!(other.coverage, SourceCoverage::Complete);
+        let empty = source.normalize(output(r#"{"status":"executed","fields":{"status":"ok","messages":[],"has_more":false,"failures":[]},"coverage":{"status":"complete","next_cursor":null}}"#), source.window(Some(&checkpoint), 800_100).unwrap());
+        assert!(empty.events.is_empty());
+        assert_eq!(empty.coverage, SourceCoverage::Complete);
+        assert!(empty.checkpoint.is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the installed Switchboard CLI; uses no credentials or network"]
+    async fn installed_cli_storage_failure_survives_source_normalization() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"[secret.google_oauth]
+kind = "file"
+path = "oauth.json"
+[auth.google_example]
+provider = "google"
+kind = "google_oauth_file"
+account = "reader@example.test"
+credentials = "google_oauth"
+[namespace.google.example]
+provider = "google"
+account = "reader@example.test"
+auth = "google_example"
+default_read = true
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("operations.sqlite3"),
+            b"corrupt synthetic SQLite database",
+        )
+        .unwrap();
+        let native = crate::sources::read_command(&[
+            "env".into(),
+            "-u".into(),
+            "SWITCHBOARD_STATE_DB".into(),
+            "-u".into(),
+            "SWITCHBOARD_STATE_DIR".into(),
+            "switchboard".into(),
+            "--config".into(),
+            config.to_str().unwrap().into(),
+            "google.mail.search".into(),
+            "--ns".into(),
+            "google.example".into(),
+            "--json".into(),
+            "--query".into(),
+            "after:1".into(),
+        ])
+        .await
+        .unwrap();
+        assert_ne!(native.exit_code, 0);
+        let source = GoogleSource::new("google.example".into()).unwrap();
+        let batch = source.normalize(native, source.window(None, 800_000).unwrap());
+        assert!(batch.events.is_empty() && batch.checkpoint.is_none());
+        assert_eq!(batch.coverage, SourceCoverage::Unavailable {
+            message: "Source helper storage failure during persistence; inspect its local database before retrying. Checkpoint retained.".into(),
+        });
     }
 }

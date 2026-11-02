@@ -226,6 +226,13 @@ Messages and Slack. CLIs own authentication and refresh. An API adapter, such
 as a future Home Assistant source, returns the same normalized events,
 checkpoint and coverage. The coordinator rediscovers configured accounts and
 polls bounded pages, with separate cursors and coverage per account.
+Main-chat clients show unavailable or partial coverage as current status,
+outside conversation history. Repeated polls do not repeat notices; a healthy
+snapshot clears the warning.
+Source review reclaims parked native work only after binding its execution
+context. Pi handles tool recovery: interrupted unsafe effects are recorded as
+interrupted, not replayed. Existing submissions and source decisions remain
+authoritative.
 Admit events durably before advancing a cursor. Partial reads never
 pretend to be complete, and repeated event versions do not create duplicate
 work. New batches rotate across provider/account streams and alternate oldest

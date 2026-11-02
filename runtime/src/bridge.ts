@@ -660,6 +660,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const observer: MainObserver = { buffer: [], bytes: 0, overflow: false, finish };
         mainObservers.set(id, observer);
         const stopNotices = await watchMainNotices(application.harness, root, (event) => queueMainObserver(id, observer, event));
+        let stopSources: (() => Promise<void>) | undefined;
         try {
           emit(id, { type: "main_ready", conversation_id: root.id.toString(),
             model: await inference.legacy(root, await application.environment.model(null)), cwd: "" });
@@ -673,6 +674,8 @@ async function handle(request: RuntimeRequest): Promise<void> {
           if (observer.overflow) { failure(id, "internal", "Observation fell behind during history load. Reconnect to recover saved history."); break; }
           for (const frame of observer.buffer ?? []) emit(id, frame);
           delete observer.buffer;
+          stopSources = await application.sources.watchStates((sources) => emit(id, { type: "sources", sources }),
+            () => failure(id, "internal", "Integration status could not be read. Reconnect to check source coverage."));
           // Native work outlives its transport owner. Publish a blocked run only
           // after history makes the observer ready, so it stays connected.
           const work = await inspectMainWork(application.harness, root);
@@ -682,7 +685,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
               : "Main conversation paused. Worker/runtime update required before it can resume.");
           else if (work.type === "idle" && mainTurns.size === 0) emit(id, { type: "worker_idle" });
           await finished;
-        } finally { stopNotices(); mainObservers.delete(id); }
+        } finally { await stopSources?.(); stopNotices(); mainObservers.delete(id); }
         break;
       }
       case "attach_main": {

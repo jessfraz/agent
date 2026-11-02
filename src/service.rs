@@ -367,6 +367,17 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     let native = matches!(command, RuntimeCommand::Native { .. });
+    // Older native clients use a closed event enum. Their observation stream
+    // keeps its original wire until the client explicitly requests coverage.
+    let native_sources = matches!(
+        &command,
+        RuntimeCommand::Native {
+            request: crate::native::NativeRequest::Observe {
+                source_status: Some(true),
+                ..
+            }
+        }
+    );
     let command = match command {
         RuntimeCommand::Native { request } => {
             match crate::native::prepare(request).unwrap_or_else(|error| {
@@ -488,6 +499,9 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                         continue;
                     }
                     let done = matches!(event, RuntimeEventKind::Done);
+                    if native && !native_sources && matches!(event, RuntimeEventKind::Sources { .. }) {
+                        continue;
+                    }
                     let written = if native {
                         match crate::native::project(&event) {
                             Some(event) if !output_closed => write_frame(&mut writer, &event).await,
@@ -662,6 +676,10 @@ mod tests {
           emit(id,{type:'worker_idle'});
         } else if(command.type==='chat') {
           emit(id,{type:'notice',task_id:null,text:'Chat ready'});
+        } else if(command.type==='observe_main') {
+          emit(id,{type:'sources',sources:[{source:{provider:'google',account:'mail-primary'},checkpoint:null,
+            coverage:{status:'unavailable',message:'Provider read failed'},checked_at:1}]});
+          emit(id,{type:'worker_idle'}); emit(id,{type:'done'});
         } else if(command.type==='submit_input') {
           publish('input-'+command.input_id+'.json',JSON.stringify({id,input:command.input,mode:command.mode}));
           emit(id,{type:'input_accepted',input_id:command.input_id});
@@ -872,6 +890,60 @@ mod tests {
             }
             path
         }
+    }
+
+    #[tokio::test]
+    async fn source_coverage_reaches_opted_in_native_observers_and_raw_clients_only() {
+        use crate::native::{NativeEvent, NativeRequest};
+        let service = Running::start().await;
+        for source_status in [None, Some(false), Some(true)] {
+            let mut socket = service.client().await;
+            let command = RuntimeCommand::Native {
+                request: NativeRequest::Observe {
+                    input_ids: vec![],
+                    source_status,
+                },
+            };
+            write_frame(&mut socket, &command).await.unwrap();
+            let mut reader = FrameReader::new(BufReader::new(socket));
+            let mut sources = 0;
+            loop {
+                let bytes = timeout(Duration::from_secs(3), reader.next_frame())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                match serde_json::from_slice::<NativeEvent>(&bytes).unwrap() {
+                    NativeEvent::Sources { sources: states } => {
+                        sources += 1;
+                        assert_eq!(states.len(), 1);
+                        assert!(matches!(
+                            states[0].coverage,
+                            crate::sources::SourceCoverage::Unavailable { .. }
+                        ));
+                    }
+                    NativeEvent::Done => break,
+                    NativeEvent::Commands { .. } | NativeEvent::Idle => {}
+                    event => panic!("Unexpected observation event: {event:?}"),
+                }
+            }
+            assert_eq!(sources, usize::from(source_status == Some(true)));
+        }
+        let mut socket = service.client().await;
+        write_frame(
+            &mut socket,
+            &RuntimeCommand::ObserveMain { input_ids: vec![] },
+        )
+        .await
+        .unwrap();
+        let mut reader = FrameReader::new(BufReader::new(socket));
+        let bytes = reader.next_frame().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<RuntimeEventKind>(&bytes).unwrap(),
+            RuntimeEventKind::Sources { .. }
+        ));
+        drop(reader);
+        service.stop().await;
     }
 
     #[tokio::test]

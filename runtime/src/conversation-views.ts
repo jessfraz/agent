@@ -5,6 +5,7 @@ import { AgentDoc, ROOT_CONVERSATION_ID, type Conversation, type Harness } from 
 import type { ConversationCatalog } from "./catalog.js";
 import type { CoordinatorEnvironment } from "./environment.js";
 import type { HistoryStore } from "./history.js";
+import type { SourceJournal } from "./sources.js";
 import { inspectMainWork, reconcileMainInput } from "./main_observation.js";
 import type { ConversationModels } from "./models.js";
 import { TaskError, type HostCall, type TaskStore } from "./tasks.js";
@@ -22,6 +23,7 @@ export interface ConversationServices {
   inference: ConversationModels;
   environment: CoordinatorEnvironment;
   catalog: ConversationCatalog;
+  sources: SourceJournal;
 }
 type Emit = (event: RuntimeEventKind) => void;
 type View = { conversation_id: string; closed: boolean; finish(): void };
@@ -46,7 +48,7 @@ export class ConversationViews {
     let finish = () => {};
     const finished = new Promise<void>((resolve) => { finish = resolve; });
     const view: View = { conversation_id, closed: false, finish }; this.views.set(id, view);
-    let stop: (() => Promise<void>) | undefined;
+    let stop: (() => Promise<void>) | undefined, stopSources: (() => Promise<void>) | undefined;
     try {
       const app = await this.services();
       if (view.closed) return;
@@ -72,9 +74,14 @@ export class ConversationViews {
         for (const event of await reconcileMainInput(conversation, input_id, app.harness, receiptWork) ?? []) emit(event);
       }
       ready = true; for (const event of buffered) emit(event);
+      if (conversation.id === ROOT_CONVERSATION_ID) {
+        stopSources = await app.sources.watchStates((sources) => publish({ type: "sources", sources }),
+          () => publish({ type: "failure", code: "internal", message: "Integration status could not be read. Reconnect to check source coverage." }));
+      }
       await finished;
     } finally {
       if (this.views.get(id) === view) this.views.delete(id);
+      await stopSources?.();
       await stop?.();
     }
   }

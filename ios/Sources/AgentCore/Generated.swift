@@ -761,6 +761,16 @@ public struct NativeEventHistory: Codable, Sendable, Equatable {
     }
 }
 
+public struct NativeEventSources: Codable, Sendable, Equatable {
+    public var `sources`: [SourceState]
+    public init(`sources`: [SourceState]) {
+        self.`sources` = `sources`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `sources` = "sources"
+    }
+}
+
 public struct NativeEventToolDetails: Codable, Sendable, Equatable {
     public var `details`: ToolDetails
     public init(`details`: ToolDetails) {
@@ -889,6 +899,7 @@ public enum NativeEvent: Codable, Sendable, Equatable {
     case `commands`(NativeEventCommands)
     case `ready`(NativeEventReady)
     case `history`(NativeEventHistory)
+    case `sources`(NativeEventSources)
     case `toolDetails`(NativeEventToolDetails)
     case `message`(NativeEventMessage)
     case `answer`(NativeEventAnswer)
@@ -912,6 +923,7 @@ public enum NativeEvent: Codable, Sendable, Equatable {
         case "commands": self = .`commands`(try NativeEventCommands(from: decoder))
         case "ready": self = .`ready`(try NativeEventReady(from: decoder))
         case "history": self = .`history`(try NativeEventHistory(from: decoder))
+        case "sources": self = .`sources`(try NativeEventSources(from: decoder))
         case "tool_details": self = .`toolDetails`(try NativeEventToolDetails(from: decoder))
         case "message": self = .`message`(try NativeEventMessage(from: decoder))
         case "answer": self = .`answer`(try NativeEventAnswer(from: decoder))
@@ -946,6 +958,9 @@ public enum NativeEvent: Codable, Sendable, Equatable {
             try value.encode(to: encoder)
         case .`history`(let value):
             try tag.encode("history", forKey: .type)
+            try value.encode(to: encoder)
+        case .`sources`(let value):
+            try tag.encode("sources", forKey: .type)
             try value.encode(to: encoder)
         case .`toolDetails`(let value):
             try tag.encode("tool_details", forKey: .type)
@@ -1002,11 +1017,14 @@ public struct NativeRequestAttachment: Codable, Sendable, Equatable {
 
 public struct NativeRequestObserve: Codable, Sendable, Equatable {
     public var `inputIds`: [String]
-    public init(`inputIds`: [String]) {
+    public var `sourceStatus`: Bool?
+    public init(`inputIds`: [String], `sourceStatus`: Bool? = nil) {
         self.`inputIds` = `inputIds`
+        self.`sourceStatus` = `sourceStatus`
     }
     enum CodingKeys: String, CodingKey {
         case `inputIds` = "input_ids"
+        case `sourceStatus` = "source_status"
     }
 }
 
@@ -1215,6 +1233,101 @@ public struct SlashCommand: Codable, Sendable, Equatable {
     enum CodingKeys: String, CodingKey {
         case `description` = "description"
         case `usage` = "usage"
+    }
+}
+
+public struct SourceCheckpoint: Codable, Sendable, Equatable {
+    public var `value`: String
+    public init(`value`: String) {
+        self.`value` = `value`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `value` = "value"
+    }
+}
+
+public struct SourceCoveragePartial: Codable, Sendable, Equatable {
+    public var `message`: String
+    public init(`message`: String) {
+        self.`message` = `message`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `message` = "message"
+    }
+}
+
+public struct SourceCoverageUnavailable: Codable, Sendable, Equatable {
+    public var `message`: String
+    public init(`message`: String) {
+        self.`message` = `message`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `message` = "message"
+    }
+}
+
+public enum SourceCoverage: Codable, Sendable, Equatable {
+    case `complete`
+    case `more`
+    case `partial`(SourceCoveragePartial)
+    case `unavailable`(SourceCoverageUnavailable)
+    enum CodingKeys: String, CodingKey { case status }
+    public init(from decoder: any Decoder) throws {
+        let tag = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .status)
+        switch tag {
+        case "complete": self = .`complete`
+        case "more": self = .`more`
+        case "partial": self = .`partial`(try SourceCoveragePartial(from: decoder))
+        case "unavailable": self = .`unavailable`(try SourceCoverageUnavailable(from: decoder))
+        default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported protocol event: \(tag)"))
+        }
+    }
+    public func encode(to encoder: any Encoder) throws {
+        var tag = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .`complete`:
+            try tag.encode("complete", forKey: .status)
+        case .`more`:
+            try tag.encode("more", forKey: .status)
+        case .`partial`(let value):
+            try tag.encode("partial", forKey: .status)
+            try value.encode(to: encoder)
+        case .`unavailable`(let value):
+            try tag.encode("unavailable", forKey: .status)
+            try value.encode(to: encoder)
+        }
+    }
+}
+
+public struct SourceKey: Codable, Sendable, Equatable {
+    public var `account`: String
+    public var `provider`: String
+    public init(`account`: String, `provider`: String) {
+        self.`account` = `account`
+        self.`provider` = `provider`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `account` = "account"
+        case `provider` = "provider"
+    }
+}
+
+public struct SourceState: Codable, Sendable, Equatable {
+    public var `checkedAt`: Int
+    public var `checkpoint`: SourceCheckpoint?
+    public var `coverage`: SourceCoverage
+    public var `source`: SourceKey
+    public init(`checkedAt`: Int, `checkpoint`: SourceCheckpoint? = nil, `coverage`: SourceCoverage, `source`: SourceKey) {
+        self.`checkedAt` = `checkedAt`
+        self.`checkpoint` = `checkpoint`
+        self.`coverage` = `coverage`
+        self.`source` = `source`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `checkedAt` = "checked_at"
+        case `checkpoint` = "checkpoint"
+        case `coverage` = "coverage"
+        case `source` = "source"
     }
 }
 

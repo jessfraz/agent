@@ -302,7 +302,11 @@ impl CalendarSource {
         })
     }
 
-    fn normalize(&self, output: ReadOutput, mut window: Window) -> Result<SourceBatch> {
+    fn normalize(&self, output: ReadOutput, window: Window) -> Result<SourceBatch> {
+        output.normalize_result(self.key(), |output| self.normalize_output(output, window))
+    }
+
+    fn normalize_output(&self, output: ReadOutput, mut window: Window) -> Result<SourceBatch> {
         match std::mem::replace(&mut window.phase, Phase::Settled) {
             Phase::Calendars {
                 mut calendars,
@@ -616,6 +620,27 @@ mod tests {
         let batch = source.normalize(truncated, events_window(&source)).unwrap();
         assert!(matches!(batch.coverage, SourceCoverage::Unavailable { .. }));
         assert!(batch.checkpoint.is_none());
+    }
+
+    #[test]
+    fn helper_storage_failure_explains_unavailable_calendar_pages() {
+        let source = source();
+        for window in [source.window(None, NOW).unwrap(), events_window(&source)] {
+            let batch = source
+                .normalize(
+                    ReadOutput {
+                        exit_code: 1,
+                        truncated: false,
+                        stdout: crate::sources::tests::STORAGE_FAILURE.into(),
+                    },
+                    window,
+                )
+                .unwrap();
+            assert!(batch.events.is_empty() && batch.checkpoint.is_none());
+            assert!(
+                matches!(batch.coverage, SourceCoverage::Unavailable { message } if message.starts_with("Source helper storage failure during persistence;") && !message.contains("private-token"))
+            );
+        }
     }
 
     #[test]

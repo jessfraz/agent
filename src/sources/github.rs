@@ -97,10 +97,7 @@ impl GitHubSource {
             "--json".into(),
         ])
         .await?;
-        ensure!(
-            output.exit_code == 0 && !output.truncated,
-            "Switchboard namespace discovery is unavailable"
-        );
+        output.check_discovery()?;
         Self::from_registry(&output.stdout, selected)
     }
 
@@ -152,7 +149,11 @@ impl GitHubSource {
         Ok(window)
     }
 
-    fn normalize(&self, output: ReadOutput, mut window: Window, now: u64) -> SourceBatch {
+    fn normalize(&self, output: ReadOutput, window: Window, now: u64) -> SourceBatch {
+        output.normalize(|output| self.normalize_output(output, window, now))
+    }
+
+    fn normalize_output(&self, output: ReadOutput, mut window: Window, now: u64) -> SourceBatch {
         let key = self.key();
         let Ok(envelope) = serde_json::from_str::<Envelope>(&output.stdout) else {
             return SourceBatch::unavailable(
@@ -507,6 +508,24 @@ mod tests {
         assert!(batch.events.is_empty());
         assert!(matches!(batch.coverage, SourceCoverage::Unavailable { .. }));
         assert!(batch.checkpoint.is_none());
+    }
+
+    #[test]
+    fn helper_storage_failure_explains_unavailable_notification_coverage() {
+        let source = source();
+        let batch = source.normalize(
+            ReadOutput {
+                exit_code: 1,
+                truncated: false,
+                stdout: crate::sources::tests::STORAGE_FAILURE.into(),
+            },
+            source.window(None, 1_700_000_000).unwrap(),
+            1_700_000_000,
+        );
+        assert!(batch.events.is_empty() && batch.checkpoint.is_none());
+        assert!(
+            matches!(batch.coverage, SourceCoverage::Unavailable { message } if message.starts_with("Source helper storage failure during persistence;") && !message.contains("private-token"))
+        );
     }
 
     #[test]

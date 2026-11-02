@@ -35,6 +35,11 @@ recovery; [history](history.md) describes import and retrieval.
   Deployed per-account old/new selection and separate polling/triage lanes
   passed live checks with older mail pending. Interrupted source claims
   settled; restart and retry regression tests pass.
+- [x] Surface failed source checks in CLI and native clients without adding
+  repeated history notices. Retain typed helper failures and accept mail
+  without a Subject header.
+- [ ] Verify incoming shipment and spam signals complete their owning workflows
+  and user notifications after source-storage recovery.
 - [ ] Verify chat reuse and native worktree inventory display live.
 - [x] Ship private lifecycle logs, `/machines`, local usage-reset times and
   countdowns, and the remaining viewport correction.

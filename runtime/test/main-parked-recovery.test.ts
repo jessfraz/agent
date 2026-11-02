@@ -128,6 +128,87 @@ async function records(session: NativeHarness) {
   }), BACKGROUND_CONTEXT);
 }
 
+test("source triage recovers its parked tool without replaying an unsafe effect or unrelated work", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-parked-")), path = join(directory, "session.sqlite");
+  let peer: ReturnType<typeof bridge> | undefined;
+  try {
+    await new ChatGptAuth(directory).status();
+    peer = bridge(directory, { denyNetwork: true });
+    peer.send(1, { type: "ingest_source", expected_checkpoint: null, batch: {
+      source: { provider: "mail", account: "fixture" }, checkpoint: { value: "retained" }, coverage: { status: "complete" },
+      events: [{ id: "retained-event", version: "original", source: { provider: "mail", account: "fixture", thread_id: "original" },
+        title: "Original source evidence", text: "Continue the existing hardware question." }],
+    } }); await peer.done(1);
+    peer.send(2, { type: "triage_sources", instructions: "", model: { ...DEFAULT_MODEL, model_id: "missing-fixture-model" }, cwd: "/tmp", hosts: [] });
+    await peer.done(2);
+    assert.ok(peer.events(2).some((event) => event.type === "failure"), "The real triage path must retain a claim when model preflight fails");
+    peer.child.stdin.end(); assert.equal(await peer.closed, 0, peer.errors()); await peer.reader;
+
+    const app = await open(path);
+    const round = await (async () => {
+      try {
+        const conversations = (await app.storage.scanConversations({}, 10, undefined, BACKGROUND_CONTEXT)).items;
+        const candidates = conversations.filter((record) => record.id !== app.root.id);
+        assert.equal(candidates.length, 1, "Production triage must create exactly one owning source conversation");
+        const record = candidates[0]; assert.ok(record);
+        const conversation = await app.session.conversation(record.id, BACKGROUND_CONTEXT); assert.ok(conversation);
+        const created = await conversation.commit(async (tx) => {
+          const user = await tx.appendEntry(UserEntry, conversation.id, { model: [{ role: "user", content: "Original admitted source review", timestamp: 1 }] });
+          const submission = await tx.createSubmission({ type: "input", conversationId: conversation.id,
+            requestId: "interrupted-source-review", status: "placed", entry: user.id });
+          const generation = await tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" } });
+          const message: AssistantMessage = { role: "assistant", content: [{ type: "toolCall", id: "interrupted-source",
+            name: "dismiss_source_events", arguments: { keys: ["retained-event"], reason: "Existing judgment" } }], api: "openai-responses",
+            provider: "openai", model: DEFAULT_MODEL.model_id, stopReason: "toolUse", timestamp: 1,
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+          const assistant = await tx.appendEntry(AssistantEntry, conversation.id, { model: [message] });
+          const tool = await tx.createTask(ToolTask, { kind: "model", assistant: assistant.id, callId: "interrupted-source" },
+            { ownership: { kind: "task", taskId: generation } });
+          const unrelated = await tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" }, background: true });
+          const live = await tx.doc(LiveDoc, conversation.id);
+          live.run = { taskId: generation, inputs: [submission.id] };
+          live.tools = [{ taskId: tool, callId: "interrupted-source", name: "dismiss_source_events", status: "running" }];
+          return { generation, tool, assistant: assistant.id, unrelated, conversation: conversation.id };
+        }, BACKGROUND_CONTEXT);
+        const saved = await app.session.commit(async (tx) => ({
+          generation: await tx.task(created.generation), tool: await tx.task(created.tool), unrelated: await tx.task(created.unrelated),
+        }), BACKGROUND_CONTEXT);
+        assert.ok(saved.generation && saved.tool && saved.unrelated);
+        const unrelated = { ...saved.unrelated, restarts: 5 };
+        await app.storage.commit([
+          { type: "task", value: { ...saved.generation, restarts: 0, state: { status: "waiting", on: [created.tool], policy: "allSettled",
+            checkpoint: { phase: "tools", assistant: created.assistant, tools: [created.tool], pending: [] } } } },
+          { type: "task", value: { ...saved.tool, restarts: 5, state: { status: "pending", checkpoint: { phase: "execute",
+            arguments: { keys: ["retained-event"], reason: "Existing judgment" }, replay: "unsafe" } } } },
+          { type: "task", value: unrelated },
+        ], BACKGROUND_CONTEXT);
+        return { ...created, unrelatedRecord: unrelated };
+      } finally { await app.session.close(BACKGROUND_CONTEXT); }
+    })();
+
+    peer = bridge(directory, { denyNetwork: true });
+    peer.send(3, { type: "triage_sources", instructions: "", model: DEFAULT_MODEL, cwd: "/tmp", hosts: [] });
+    const readback = await SqliteStorage.open(await openNodeSqliteDatabase(path));
+    try {
+      const deadline = Date.now() + 5_000;
+      while ((await readback.task(round.tool, BACKGROUND_CONTEXT))?.state.status !== "terminal") {
+        assert.ok(Date.now() < deadline, "Production source triage must release its parked native tool: " + JSON.stringify(peer.events(3)) + peer.errors());
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const entries = (await readback.scanEntries({ conversationId: round.conversation }, 100, undefined, BACKGROUND_CONTEXT)).items;
+      const result = entries.find((entry) => ToolResultEntry.is(entry)); assert.ok(result);
+      assert.ok(result.model?.some((message) => message.role === "toolResult" && message.isError &&
+        message.content.some((part) => part.type === "text" && part.text.includes("was interrupted"))),
+      "Native recovery must retain an interrupted result, never execute the unsafe tool again");
+      assert.deepEqual(await readback.task(round.unrelated, BACKGROUND_CONTEXT), round.unrelatedRecord,
+        "Source recovery must not retry unrelated background work");
+    } finally { await readback.close(BACKGROUND_CONTEXT); }
+  } finally {
+    peer?.child.kill("SIGKILL"); await peer?.closed; await peer?.reader.catch(() => {});
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 for (const input_id of ["placed", "queued"]) test(`explicit retry reclaims the saved ${input_id} input's execution owner`, { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-main-parked-")), path = join(directory, "session.sqlite");
   let peer: ReturnType<typeof bridge> | undefined;

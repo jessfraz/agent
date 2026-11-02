@@ -14,6 +14,7 @@ private actor ReconnectCoordinator {
   private var sockets: [UUID: NWConnection] = [:]
   private var observers: Set<UUID> = []
   private var observations: [[String]] = []
+  private var sourceStatusRequests: [Bool?] = []
   private var submissions: [NativeRequestSubmit] = []
   private var acceptedWork: InputWorkState?
   private var release: CheckedContinuation<Void, Never>?
@@ -23,6 +24,7 @@ private actor ReconnectCoordinator {
 
   init(_ behavior: ReconnectBehavior) { self.behavior = behavior }
   func observedIDs() -> [[String]] { observations }
+  func requestedSourceStatus() -> [Bool?] { sourceStatusRequests }
   func submitted() -> [NativeRequestSubmit] { submissions }
   func describeWork(_ work: InputWorkState?) { acceptedWork = work }
   func placeSubmissions() async throws {
@@ -82,6 +84,7 @@ private actor ReconnectCoordinator {
       case .observe(let request):
         observers.insert(id)
         observations.append(request.inputIds)
+        sourceStatusRequests.append(request.sourceStatus)
         if behavior == .reject {
           try await emit(.failure(.init(message: "This client is not authorized.")), to: socket)
           try await emit(.done, to: socket)
@@ -380,6 +383,48 @@ private func actionFailureDoesNotStopTheObserversActiveWorkOrUndoAdmission() asy
   while !predicate() {
     guard ContinuousClock.now < deadline else { throw ConnectionError.timedOut }
     try await Task.sleep(for: .milliseconds(5))
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+private func sourceCoverageShowsOneTransientWarningAndClearsWithoutChangingHistory() async throws {
+  try await withReconnectCoordinator(.recover) { model, fixture, _ in
+    try await waitForReconnectState { model.connection == .connected }
+    #expect(await fixture.requestedSourceStatus() == [true])
+    let state: (SourceCoverage, Int) -> SourceState = { coverage, checkedAt in
+      SourceState(
+        checkedAt: checkedAt, checkpoint: nil, coverage: coverage,
+        source: SourceKey(account: "private-account", provider: "google"))
+    }
+    for checkedAt in 1...2 {
+      try await fixture.observerEvent(
+        .sources(
+          .init(sources: [state(.unavailable(.init(message: "private-diagnostic")), checkedAt)])))
+      try await fixture.observerEvent(
+        .ready(.init(conversationId: "fixture-root", model: "coverage-\(checkedAt)")))
+      try await fixture.observerEvent(.idle)
+      try await waitForReconnectState { model.model == "coverage-\(checkedAt)" && !model.busy }
+      #expect(model.sourceWarning == "Source checks incomplete: Gmail unavailable")
+      #expect(model.rows.isEmpty)
+      #expect(model.error == nil)
+    }
+    try await fixture.observerEvent(
+      .sources(.init(sources: [state(.partial(.init(message: "private-diagnostic")), 3)])))
+    try await fixture.observerEvent(
+      .ready(.init(conversationId: "fixture-root", model: "coverage-3")))
+    try await waitForReconnectState { model.model == "coverage-3" }
+    #expect(model.sourceWarning == "Source checks incomplete: Gmail partial")
+    for (index, coverage) in [SourceCoverage.more, .complete].enumerated() {
+      try await fixture.observerEvent(.sources(.init(sources: [state(coverage, index + 4)])))
+      try await fixture.observerEvent(
+        .ready(.init(conversationId: "fixture-root", model: "healthy-\(index)")))
+      try await fixture.observerEvent(.idle)
+      try await waitForReconnectState { model.model == "healthy-\(index)" && !model.busy }
+      #expect(model.sourceWarning == nil)
+    }
+    #expect(model.rows.isEmpty)
+    #expect(model.error == nil)
+    #expect(await fixture.submitted().isEmpty)
   }
 }
 

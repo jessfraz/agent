@@ -27,6 +27,7 @@ public struct ChatSnapshot: Sendable {
   public var olderCursor: String?
   public var loadingHistory = false
   public var includesLatest = true
+  public var sourceWarning: String?
   public var error: String?
 }
 
@@ -395,7 +396,8 @@ public actor CoordinatorSession {
         connection = opened
         let stream = opened
         var ready = false
-        try await timedSend(stream, .observe(.init(inputIds: pending.map(\.request.inputId))))
+        try await timedSend(
+          stream, .observe(.init(inputIds: pending.map(\.request.inputId), sourceStatus: true)))
         while !Task.isCancelled {
           let event =
             try await (snapshot.connection == .connected ? stream.next() : timedNext(stream))
@@ -764,6 +766,31 @@ public actor CoordinatorSession {
     let previousTail = transcript.lastReceivedRowID
     switch event {
     case .commands(let value): snapshot.commands = value.commands
+    case .sources(let value):
+      // Coverage belongs to the current connection, not conversation history.
+      // Keep provider diagnostics and private account identifiers out of the banner.
+      let gaps = Set(
+        value.sources.compactMap { state -> String? in
+          let status: String
+          switch state.coverage {
+          case .partial: status = "partial"
+          case .unavailable: status = "unavailable"
+          case .complete, .more: return nil
+          }
+          let name: String
+          switch state.source.provider {
+          case "google": name = "Gmail"
+          case "google_calendar": name = "Calendar"
+          case "github": name = "GitHub"
+          case "slack": name = "Slack"
+          case "messages": name = "Messages"
+          default: name = "Other source"
+          }
+          return "\(name) \(status)"
+        }
+      ).sorted()
+      snapshot.sourceWarning =
+        gaps.isEmpty ? nil : "Source checks incomplete: \(gaps.joined(separator: "; "))"
     case .ready(let value):
       snapshot.error = nil
       snapshot.conversationID = value.conversationId

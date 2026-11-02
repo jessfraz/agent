@@ -67,6 +67,14 @@ public struct MainChatView: View {
           .frame(maxWidth: .infinity, alignment: .leading)
           .padding(.horizontal, 16).padding(.vertical, 8)
         }
+        if let warning = model.sourceWarning {
+          Label(warning, systemImage: "exclamationmark.triangle")
+            .font(.footnote).foregroundStyle(.primary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16).padding(.vertical, 8)
+            .background(.orange.opacity(0.1))
+            .accessibilityIdentifier("sourceCoverageWarning")
+        }
         transcript
         if let error = model.error {
           Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)

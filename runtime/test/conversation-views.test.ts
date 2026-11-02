@@ -13,10 +13,12 @@ import { ConversationViews } from "../src/conversation-views.js";
 import { CoordinatorEnvironment } from "../src/environment.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
+import type { SourceBatch } from "../src/generated/SourceBatch.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
 import type { HostCommand } from "../src/generated/HostCommand.js";
 import { HistoryStore } from "../src/history.js";
 import { ConversationModels } from "../src/models.js";
+import { SourceJournal } from "../src/sources.js";
 import { validEvent } from "../src/protocol.js";
 import { conversationSettings } from "../src/settings.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
@@ -41,7 +43,8 @@ async function open(directory: string) {
     settings: { model: fixtureModel, instructions: "Fixture guidance", context_repositories: [], sources: [] } });
   environment.setConnected([binding.host_id]);
   const catalog = new ConversationCatalog(harness, histories, tasks);
-  const services = { harness, tasks, histories, inference, environment, catalog };
+  const sources = new SourceJournal(harness, tasks);
+  const services = { harness, tasks, histories, inference, environment, catalog, sources };
   const views = new ConversationViews(async () => services, () => {});
   return { ...services, views, faux, async imported() {
     return (await histories.import({ host_id: binding.host_id, thread: { id: "original-source", title: "Saved hardware work", cwd: "/example/project",
@@ -60,6 +63,35 @@ function observe(app: Awaited<ReturnType<typeof open>>, id: number, conversation
     await new Promise<void>((resolve) => { const check = () => { if (predicate()) { listeners.delete(check); resolve(); } }; listeners.add(check); check(); });
   }, async detach() { app.views.detach(id); await running; } };
 }
+
+test("main views show live source outages once, clear on recovery and never store status in history", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-status-view-"));
+  const app = await open(directory);
+  const source = { provider: "google", account: "google.fixture" };
+  const failed: SourceBatch = { source, events: [], checkpoint: null,
+    coverage: { status: "unavailable", message: "Saved integration state is damaged; email checking is paused." } };
+  let view: ReturnType<typeof observe> | undefined;
+  try {
+    await app.harness.root(BACKGROUND_CONTEXT);
+    await app.sources.admit(failed, null);
+    view = observe(app, 1, ROOT_CONVERSATION_ID.toString());
+    await view.until(() => view?.frames.some((frame) => frame.type === "sources") === true);
+    const snapshots = () => view?.frames.filter((frame) => frame.type === "sources") ?? [];
+    assert.equal(snapshots().length, 1);
+    await app.sources.admit(failed, null);
+    await app.sources.admit({ source, events: [], checkpoint: { value: "caught-up" }, coverage: { status: "complete" } }, null);
+    await view.until(() => snapshots().some((frame) => frame.sources.some((state) => state.source.account === source.account && state.coverage.status === "complete")));
+    assert.equal(snapshots().length, 2, "Repeated failed polls must not repeat the warning");
+    await view.detach();
+    await app.sources.admit(failed, { value: "caught-up" });
+    assert.equal(snapshots().length, 2, "Detached views must release their coverage subscription");
+    view = observe(app, 2, ROOT_CONVERSATION_ID.toString());
+    await view.until(() => snapshots().some((frame) => frame.sources.some((state) => state.coverage.status === "unavailable")));
+    const root = await app.harness.root(BACKGROUND_CONTEXT);
+    assert.equal((await root.entries({}, 20, undefined, BACKGROUND_CONTEXT)).items.length, 0, "Coverage status must stay out of saved conversation history");
+    assert.equal(app.faux.state.callCount, 0, "Status reporting must not call a model");
+  } finally { await view?.detach(); app.views.close(); app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
 function input(conversation_id: string, input_id: string, text: string): Extract<RuntimeCommand, { type: "conversation_input" }> {
   return { type: "conversation_input", conversation_id, input_id, input: text, mode: "steer" };
 }

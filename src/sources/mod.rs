@@ -75,6 +75,119 @@ impl SourceBatch {
             },
         }
     }
+
+    fn with_helper_failure(mut self, failure: Option<HelperFailure>) -> Self {
+        if let Some(failure) = failure {
+            self.checkpoint = None;
+            let message = failure.to_string();
+            self.coverage = if self.events.is_empty() {
+                SourceCoverage::Unavailable { message }
+            } else {
+                SourceCoverage::Partial { message }
+            };
+        }
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureCode {
+    Storage,
+    Configuration,
+    Authentication,
+    WrongAccount,
+    AuthenticationTimeout,
+    BrowserConsentRequired,
+    RecoveryExhausted,
+    InvalidArguments,
+    PolicyDenied,
+    Unsupported,
+    ProviderFailed,
+    Timeout,
+    OutcomeUnknown,
+    Internal,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FailurePhase {
+    Validation,
+    Authentication,
+    Execution,
+    Persistence,
+    Verification,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Read only closed metadata. Helper messages may contain SQL, paths, secrets
+/// or provider bodies and must never become source-status text.
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct HelperFailure {
+    code: FailureCode,
+    phase: FailurePhase,
+}
+
+impl std::fmt::Display for HelperFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (kind, action) = match self.code {
+            FailureCode::Storage => ("storage", "inspect its local database before retrying"),
+            FailureCode::Configuration => {
+                ("configuration", "check the scoped helper configuration")
+            }
+            FailureCode::Authentication
+            | FailureCode::AuthenticationTimeout
+            | FailureCode::BrowserConsentRequired
+            | FailureCode::RecoveryExhausted => {
+                ("authentication", "check authentication for this account")
+            }
+            FailureCode::WrongAccount => (
+                "account mismatch",
+                "check the configured account before retrying",
+            ),
+            FailureCode::InvalidArguments => ("arguments", "check the source command arguments"),
+            FailureCode::PolicyDenied => {
+                ("authorization", "check the helper's configured read access")
+            }
+            FailureCode::Unsupported => (
+                "unsupported operation",
+                "check the installed helper version",
+            ),
+            FailureCode::ProviderFailed => ("provider", "inspect the provider before retrying"),
+            FailureCode::Timeout => ("timeout", "check provider availability before retrying"),
+            FailureCode::OutcomeUnknown => (
+                "unconfirmed outcome",
+                "verify the prior operation before retrying",
+            ),
+            FailureCode::Internal | FailureCode::Unknown => (
+                "internal",
+                "inspect the helper's diagnostics before retrying",
+            ),
+        };
+        let phase = match self.phase {
+            FailurePhase::Validation => "validation",
+            FailurePhase::Authentication => "authentication",
+            FailurePhase::Execution => "execution",
+            FailurePhase::Persistence => "persistence",
+            FailurePhase::Verification => "verification",
+            FailurePhase::Unknown => "an unknown phase",
+        };
+        write!(
+            formatter,
+            "Source helper {kind} failure during {phase}; {action}. Checkpoint retained."
+        )
+    }
+}
+
+impl std::error::Error for HelperFailure {}
+
+fn discovery_failure(error: &anyhow::Error, fallback: &str) -> String {
+    error
+        .downcast_ref::<HelperFailure>()
+        .map_or_else(|| fallback.into(), ToString::to_string)
 }
 
 #[async_trait::async_trait]
@@ -153,7 +266,7 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                             sources.push(Box::new(source));
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
                         let accounts = namespaces
                             .clone()
                             .unwrap_or_else(|| vec!["discovery".into()]);
@@ -163,7 +276,10 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                                     provider: "google".into(),
                                     account,
                                 },
-                                "Google account discovery failed; coverage is unknown",
+                                discovery_failure(
+                                    &error,
+                                    "Google account discovery failed; coverage is unknown",
+                                ),
                             ));
                         }
                     }
@@ -188,7 +304,7 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                             .into_iter()
                             .map(|source| Box::new(source) as Box<dyn Source>),
                     ),
-                    Err(_) => {
+                    Err(error) => {
                         for account in namespaces
                             .clone()
                             .unwrap_or_else(|| vec!["discovery".into()])
@@ -198,7 +314,10 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                                     provider: "github".into(),
                                     account,
                                 },
-                                "GitHub account discovery failed; coverage is unknown",
+                                discovery_failure(
+                                    &error,
+                                    "GitHub account discovery failed; coverage is unknown",
+                                ),
                             ));
                         }
                     }
@@ -211,7 +330,7 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                             .into_iter()
                             .map(|source| Box::new(source) as Box<dyn Source>),
                     ),
-                    Err(_) => {
+                    Err(error) => {
                         for account in namespaces
                             .clone()
                             .unwrap_or_else(|| vec!["discovery".into()])
@@ -221,7 +340,10 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                                     provider: "messages".into(),
                                     account,
                                 },
-                                "Messages account discovery failed; coverage is unknown",
+                                discovery_failure(
+                                    &error,
+                                    "Messages account discovery failed; coverage is unknown",
+                                ),
                             ));
                         }
                     }
@@ -234,7 +356,7 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                             sources.push(Box::new(source));
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
                         for account in namespaces
                             .clone()
                             .unwrap_or_else(|| vec!["discovery".into()])
@@ -244,7 +366,10 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                                     provider: "google_calendar".into(),
                                     account,
                                 },
-                                "Calendar account discovery failed; coverage is unknown",
+                                discovery_failure(
+                                    &error,
+                                    "Calendar account discovery failed; coverage is unknown",
+                                ),
                             ));
                         }
                     }
@@ -260,6 +385,58 @@ pub struct ReadOutput {
     pub(crate) exit_code: i32,
     pub(crate) stdout: String,
     pub(crate) truncated: bool,
+}
+
+impl ReadOutput {
+    fn helper_failure(&self) -> Option<HelperFailure> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Status {
+            Error,
+            Partial,
+            #[serde(other)]
+            Other,
+        }
+        #[derive(Deserialize)]
+        struct Envelope {
+            status: Status,
+            failure: Option<HelperFailure>,
+        }
+        let envelope: Envelope = serde_json::from_str(&self.stdout).ok()?;
+        match envelope.status {
+            Status::Error | Status::Partial => envelope.failure,
+            Status::Other => None,
+        }
+    }
+
+    fn check_discovery(&self) -> Result<()> {
+        if let Some(failure) = self.helper_failure() {
+            return Err(failure.into());
+        }
+        ensure!(
+            self.exit_code == 0 && !self.truncated,
+            "Source namespace discovery is unavailable"
+        );
+        Ok(())
+    }
+
+    fn normalize(self, normalize: impl FnOnce(Self) -> SourceBatch) -> SourceBatch {
+        let failure = self.helper_failure();
+        normalize(self).with_helper_failure(failure)
+    }
+
+    fn normalize_result(
+        self,
+        source: SourceKey,
+        normalize: impl FnOnce(Self) -> Result<SourceBatch>,
+    ) -> Result<SourceBatch> {
+        let failure = self.helper_failure();
+        match (normalize(self), failure) {
+            (Ok(batch), failure) => Ok(batch.with_helper_failure(failure)),
+            (Err(_), Some(failure)) => Ok(SourceBatch::unavailable(source, failure.to_string())),
+            (Err(error), None) => Err(error),
+        }
+    }
 }
 
 pub(crate) async fn read_command(argv: &[String]) -> Result<ReadOutput> {
@@ -300,7 +477,45 @@ fn now_seconds() -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use crate::sources::{SourceConfig, configured};
+    use crate::sources::{ReadOutput, SourceConfig, configured};
+
+    pub(super) const STORAGE_FAILURE: &str = r#"{"status":"error","failure":{"code":"storage","phase":"persistence","message":"private-token /private/database SELECT private_body"}}"#;
+
+    #[test]
+    fn helper_failures_use_closed_metadata_and_unknown_codes_cannot_leak_provider_messages() {
+        for (code, phase, expected) in [
+            (
+                "authentication",
+                "authentication",
+                "Source helper authentication failure during authentication; check authentication for this account. Checkpoint retained.",
+            ),
+            (
+                "private-token-code",
+                "private-token-phase",
+                "Source helper internal failure during an unknown phase; inspect the helper's diagnostics before retrying. Checkpoint retained.",
+            ),
+        ] {
+            let output = ReadOutput {
+                exit_code: 1,
+                truncated: false,
+                stdout: format!(
+                    r#"{{"status":"error","failure":{{"code":"{code}","phase":"{phase}","message":"private-token-message","details":{{"sql":"private SQL"}}}}}}"#
+                ),
+            };
+            let error = output.check_discovery().unwrap_err();
+            assert_eq!(
+                crate::sources::discovery_failure(&error, "fallback"),
+                expected
+            );
+            assert!(expected.len() < 200);
+        }
+        let complete = ReadOutput {
+            exit_code: 0,
+            stdout: r#"{"status":"executed","namespaces":[]}"#.into(),
+            truncated: false,
+        };
+        assert!(complete.check_discovery().is_ok());
+    }
 
     #[tokio::test]
     async fn source_commands_capture_native_pages_beyond_the_model_output_budget_and_report_their_own_limit()

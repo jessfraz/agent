@@ -181,10 +181,7 @@ impl MessagesSource {
             "--json".into(),
         ])
         .await?;
-        ensure!(
-            output.exit_code == 0 && !output.truncated,
-            "Messages account discovery is unavailable"
-        );
+        output.check_discovery()?;
         Self::from_registry(&output.stdout, selected)
     }
 
@@ -379,7 +376,11 @@ impl MessagesSource {
         }
     }
 
-    fn normalize(&self, output: ReadOutput, mut window: Window) -> Result<SourceBatch> {
+    fn normalize(&self, output: ReadOutput, window: Window) -> Result<SourceBatch> {
+        output.normalize_result(self.key(), |output| self.normalize_output(output, window))
+    }
+
+    fn normalize_output(&self, output: ReadOutput, mut window: Window) -> Result<SourceBatch> {
         let (response, complete) = self.response(&output, &window)?;
         let mut partial = !complete;
         let mut events = Vec::new();
@@ -557,6 +558,25 @@ mod tests {
             stdout: serde_json::to_string(response).unwrap(),
             truncated: false,
         }
+    }
+
+    #[test]
+    fn helper_storage_failure_does_not_claim_messages_full_disk_access_is_missing() {
+        let source = MessagesSource::new("messages.example".into()).unwrap();
+        let batch = source
+            .normalize(
+                ReadOutput {
+                    exit_code: 1,
+                    truncated: false,
+                    stdout: crate::sources::tests::STORAGE_FAILURE.into(),
+                },
+                source.window(None, NOW).unwrap(),
+            )
+            .unwrap();
+        assert!(batch.events.is_empty() && batch.checkpoint.is_none());
+        assert!(
+            matches!(batch.coverage, SourceCoverage::Unavailable { message } if message.starts_with("Source helper storage failure during persistence;") && !message.contains("private-token"))
+        );
     }
     fn messages(chats: &[&str], cursor: Option<&str>) -> Window {
         let mut window = MessagesSource::local().window(None, NOW).unwrap();

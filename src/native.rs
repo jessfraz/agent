@@ -1,7 +1,9 @@
 //! Native presentation boundary. Pi owns conversation state; Clap owns controls.
 use crate::{
     chat_commands::ChatCommand,
-    protocol::{HistoryMessage, InputMode, ModelActivity, RuntimeCommand, RuntimeEventKind},
+    protocol::{
+        HistoryMessage, InputMode, ModelActivity, RuntimeCommand, RuntimeEventKind, SourceState,
+    },
 };
 use anyhow::{Result, ensure};
 use schemars::JsonSchema;
@@ -22,6 +24,9 @@ pub enum NativeRequest {
     },
     Observe {
         input_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        source_status: Option<bool>,
     },
     Submit {
         input_id: String,
@@ -103,6 +108,9 @@ pub enum NativeEvent {
         next_cursor: Option<String>,
         page_complete: bool,
     },
+    Sources {
+        sources: Vec<SourceState>,
+    },
     ToolDetails {
         details: ToolDetails,
     },
@@ -163,7 +171,7 @@ pub fn commands() -> Vec<SlashCommand> {
 pub fn prepare(request: NativeRequest) -> Result<Operation> {
     let command = match request {
         NativeRequest::Attachment { request } => RuntimeCommand::Attachment { request },
-        NativeRequest::Observe { input_ids } => {
+        NativeRequest::Observe { input_ids, .. } => {
             ensure!(input_ids.len() <= 32, "Too many pending inputs");
             for id in &input_ids {
                 validate_id(id)?;
@@ -325,6 +333,9 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
         RuntimeEventKind::ToolDetails { details } => NativeEvent::ToolDetails {
             details: details.clone(),
         },
+        RuntimeEventKind::Sources { sources } => NativeEvent::Sources {
+            sources: sources.clone(),
+        },
         RuntimeEventKind::Message { message } => NativeEvent::Message {
             message: message.clone(),
         },
@@ -409,6 +420,39 @@ mod tests {
         native::{NativeRequest, Operation, prepare},
         protocol::{InputMode, RuntimeCommand},
     };
+
+    #[test]
+    fn source_coverage_projects_through_the_native_wire_without_becoming_a_notice() {
+        use crate::{
+            protocol::{RuntimeEventKind, SourceState},
+            sources::{SourceCoverage, SourceKey},
+        };
+        let event = RuntimeEventKind::Sources {
+            sources: vec![SourceState {
+                source: SourceKey {
+                    provider: "google".into(),
+                    account: "mail-primary".into(),
+                },
+                checkpoint: None,
+                coverage: SourceCoverage::Unavailable {
+                    message: "Provider read failed".into(),
+                },
+                checked_at: 1,
+            }],
+        };
+        let native =
+            crate::native::project(&event).expect("Source coverage must reach native observers");
+        let decoded: RuntimeEventKind =
+            serde_json::from_slice(&serde_json::to_vec(&native).unwrap()).unwrap();
+        let RuntimeEventKind::Sources { sources } = decoded else {
+            panic!("Source status must remain typed")
+        };
+        assert_eq!(sources.len(), 1);
+        assert!(matches!(
+            sources[0].coverage,
+            SourceCoverage::Unavailable { .. }
+        ));
+    }
 
     #[test]
     fn omitted_attachment_fields_preserve_old_wire_and_new_feedback_has_a_correlated_receipt() {
@@ -524,12 +568,13 @@ mod tests {
         let command = crate::native::NativeCommand::Native {
             request: NativeRequest::Observe {
                 input_ids: vec![id.clone()],
+                source_status: None,
             },
         };
         let bytes = serde_json::to_vec(&command).unwrap();
         assert!(
             matches!(serde_json::from_slice::<RuntimeCommand>(&bytes).unwrap(),
-            RuntimeCommand::Native { request: NativeRequest::Observe { input_ids } } if input_ids == [id])
+            RuntimeCommand::Native { request: NativeRequest::Observe { input_ids, source_status: None } } if input_ids == [id])
         );
         for input_id in [String::new(), uuid::Uuid::nil().to_string()] {
             assert!(
@@ -544,7 +589,8 @@ mod tests {
         }
         assert!(
             prepare(NativeRequest::Observe {
-                input_ids: (0..33).map(|_| uuid::Uuid::new_v4().to_string()).collect()
+                input_ids: (0..33).map(|_| uuid::Uuid::new_v4().to_string()).collect(),
+                source_status: None,
             })
             .is_err()
         );
