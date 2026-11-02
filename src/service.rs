@@ -766,7 +766,7 @@ mod tests {
             let event: RuntimeEventKind =
                 serde_json::from_slice(&chat.next_frame().await.unwrap().unwrap()).unwrap();
             assert!(
-                matches!(event, RuntimeEventKind::InputAccepted { input_id: accepted } if accepted == input_id)
+                matches!(event, RuntimeEventKind::InputAccepted { input_id: accepted, .. } if accepted == input_id)
             );
         }
         let read = |name: &str| -> Submitted {

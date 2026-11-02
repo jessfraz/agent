@@ -58,8 +58,14 @@ pub(super) fn render(message: Content<'_>) -> CachedText {
             style,
         )
     };
-    if let MessageKind::Input { mode, delivery, .. } = message.kind {
-        let state = match (*mode, delivery) {
+    if let MessageKind::Input {
+        mode,
+        delivery,
+        work,
+        ..
+    } = message.kind
+    {
+        let state = crate::tui::input_work_label(work.as_ref()).or(match (*mode, delivery) {
             (_, InputDelivery::Submitting) => Some("sending…"),
             (_, InputDelivery::Uncertain) => Some("delivery unconfirmed; not resent"),
             (crate::protocol::InputMode::Steer, InputDelivery::Waiting) => {
@@ -67,7 +73,7 @@ pub(super) fn render(message: Content<'_>) -> CachedText {
             }
             (crate::protocol::InputMode::FollowUp, InputDelivery::Waiting) => Some("queued"),
             (_, InputDelivery::Placed { .. }) => None,
-        };
+        });
         if let Some(state) = state {
             rendered.append_line(Line::styled(state, dim()));
         }

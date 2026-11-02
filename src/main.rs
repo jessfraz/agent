@@ -1332,7 +1332,7 @@ impl UiSession {
     }
     fn view_event(&mut self, token: uuid::Uuid, event: RuntimeEventKind) -> Result<()> {
         let id = match &event {
-            RuntimeEventKind::InputAccepted { input_id }
+            RuntimeEventKind::InputAccepted { input_id, .. }
             | RuntimeEventKind::InputPlaced { input_id, .. }
             | RuntimeEventKind::InputRejected { input_id, .. } => Some(input_id),
             _ => None,

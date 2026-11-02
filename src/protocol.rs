@@ -1170,6 +1170,9 @@ pub enum RuntimeEventKind {
     },
     InputAccepted {
         input_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        work: Option<InputWorkState>,
     },
     /// The native submission has been placed into the conversation transcript.
     InputPlaced {
@@ -1410,6 +1413,26 @@ pub enum InputMode {
     Steer,
     #[value(name = "queue", aliases = ["follow_up", "follow-up"])]
     FollowUp,
+}
+
+/// Durable processing state, separate from acknowledgement of a saved input.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InputWorkState {
+    Queued,
+    Running,
+    Completed { answer_entry_id: String },
+    Blocked { reason: InputBlockReason },
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InputBlockReason {
+    MissingTask,
+    TaskTooOld,
+    MigrationFailed,
+    RestartLimit,
 }
 
 #[derive(

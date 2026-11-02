@@ -120,7 +120,7 @@ test("a stopped worker keeps its placed input on retry and SQLite reopen while i
     assert.ok(placedState.status === "unanswered" && placedState.entry !== undefined);
     assert.ok(queuedState.status === "unanswered" && queuedState.entry === undefined);
     assert.equal(placedState.reason, "aborted"); assert.equal(queuedState.reason, "aborted");
-    const expected: RuntimeEventKind[] = [{ type: "input_accepted", input_id: "placed-worker" },
+    const expected: RuntimeEventKind[] = [{ type: "input_accepted", input_id: "placed-worker", work: { type: "stopped" } },
       { type: "input_placed", input_id: "placed-worker", entry_id: placedState.entry.toString() }];
     const noDispatch: HostCall = async () => { throw new Error("A saved receipt cannot dispatch another worker"); };
     const receipts: RuntimeEventKind[] = [];

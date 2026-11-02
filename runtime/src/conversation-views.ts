@@ -5,7 +5,7 @@ import { AgentDoc, ROOT_CONVERSATION_ID, type Conversation, type Harness } from 
 import type { ConversationCatalog } from "./catalog.js";
 import type { CoordinatorEnvironment } from "./environment.js";
 import type { HistoryStore } from "./history.js";
-import { reconcileMainInput } from "./main_observation.js";
+import { inspectMainWork, reconcileMainInput } from "./main_observation.js";
 import type { ConversationModels } from "./models.js";
 import { TaskError, type HostCall, type TaskStore } from "./tasks.js";
 import { activity } from "./transcript.js";
@@ -66,9 +66,10 @@ export class ConversationViews {
       if (view.closed) return;
       emit({ type: "conversation_ready", conversation: summary, model,
         cwd: native?.cwd ?? imported?.thread.cwd ?? "/", working });
+      const receiptWork = inputIds.length === 0 ? undefined : await inspectMainWork(app.harness, conversation);
       for (const input_id of inputIds) {
         if (view.closed) return;
-        for (const event of await reconcileMainInput(conversation, input_id) ?? []) emit(event);
+        for (const event of await reconcileMainInput(conversation, input_id, app.harness, receiptWork) ?? []) emit(event);
       }
       ready = true; for (const event of buffered) emit(event);
       await finished;
@@ -94,7 +95,7 @@ export class ConversationViews {
     const app = await this.services(), summary = await this.summary(app, command.conversation_id);
     if (summary.conversation_id === ROOT_CONVERSATION_ID.toString()) throw new TaskError("The main conversation uses its existing main input path");
     const conversation = await app.tasks.conversation(summary.conversation_id);
-    const receipts = await reconcileMainInput(conversation, command.input_id);
+    const receipts = await reconcileMainInput(conversation, command.input_id, app.harness);
     if (receipts !== undefined) {
       for (const event of receipts) emit(event);
       return;

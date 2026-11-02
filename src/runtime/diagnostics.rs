@@ -450,7 +450,7 @@ impl Trace {
             RuntimeEventKind::MainReady { .. }
             | RuntimeEventKind::TaskReady { .. }
             | RuntimeEventKind::ConversationReady { .. } => Some(Event::Ready),
-            RuntimeEventKind::InputAccepted { input_id } => Some(Event::InputAccepted {
+            RuntimeEventKind::InputAccepted { input_id, .. } => Some(Event::InputAccepted {
                 input_id: token(input_id),
             }),
             RuntimeEventKind::InputPlaced { input_id, entry_id } => Some(Event::InputPlaced {

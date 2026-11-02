@@ -377,7 +377,7 @@ fn direct_task_messages_survive_offline_delivery_and_never_post_to_main() {
             .map(|line| serde_json::from_slice(line).unwrap())
             .collect();
         assert!(events.iter().any(|event| matches!(event,
-            RuntimeEventKind::InputAccepted { input_id: accepted } if accepted == input_id)));
+            RuntimeEventKind::InputAccepted { input_id: accepted, .. } if accepted == input_id)));
         let tasks = fixture.tasks();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, run.task_id);

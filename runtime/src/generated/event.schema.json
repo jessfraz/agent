@@ -2627,11 +2627,93 @@
         "gaps"
       ]
     },
+    "InputBlockReason": {
+      "type": "string",
+      "enum": [
+        "missing_task",
+        "task_too_old",
+        "migration_failed",
+        "restart_limit"
+      ]
+    },
     "InputMode": {
       "type": "string",
       "enum": [
         "steer",
         "follow_up"
+      ]
+    },
+    "InputWorkState": {
+      "description": "Durable processing state, separate from acknowledgement of a saved input.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "queued"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "running"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "answer_entry_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "completed"
+            }
+          },
+          "required": [
+            "type",
+            "answer_entry_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/InputBlockReason"
+            },
+            "type": {
+              "type": "string",
+              "const": "blocked"
+            }
+          },
+          "required": [
+            "type",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "stopped"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
       ]
     },
     "JobId": {
@@ -4437,6 +4519,16 @@
             "type": {
               "type": "string",
               "const": "input_accepted"
+            },
+            "work": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/InputWorkState"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [

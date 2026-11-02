@@ -604,6 +604,7 @@ async fn recovery_connection(
                 {
                     receipts.push(RuntimeEventKind::InputAccepted {
                         input_id: input.id.clone(),
+                        work: None,
                     });
                     receipts.push(RuntimeEventKind::InputPlaced {
                         input_id: input.id.clone(),
@@ -700,6 +701,7 @@ async fn recovery_connection(
             }
             let mut receipts = vec![RuntimeEventKind::InputAccepted {
                 input_id: input_id.clone(),
+                work: None,
             }];
             // The first chief input is durable, but its view misses placement.
             if !initial || case != RecoveryCase::AcceptedChief {
@@ -1195,6 +1197,7 @@ async fn chief_startup(mode: ChiefStartup) {
                         vec![
                             RuntimeEventKind::InputAccepted {
                                 input_id: input_id.clone(),
+                                work: None,
                             },
                             RuntimeEventKind::InputPlaced {
                                 input_id,

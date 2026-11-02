@@ -288,9 +288,73 @@ public enum HistoryRole: String, Codable, Sendable, Equatable {
     case `assistant` = "assistant"
 }
 
+public enum InputBlockReason: String, Codable, Sendable, Equatable {
+    case `missingTask` = "missing_task"
+    case `taskTooOld` = "task_too_old"
+    case `migrationFailed` = "migration_failed"
+    case `restartLimit` = "restart_limit"
+}
+
 public enum InputMode: String, Codable, Sendable, Equatable {
     case `steer` = "steer"
     case `followUp` = "follow_up"
+}
+
+public struct InputWorkStateCompleted: Codable, Sendable, Equatable {
+    public var `answerEntryId`: String
+    public init(`answerEntryId`: String) {
+        self.`answerEntryId` = `answerEntryId`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `answerEntryId` = "answer_entry_id"
+    }
+}
+
+public struct InputWorkStateBlocked: Codable, Sendable, Equatable {
+    public var `reason`: InputBlockReason
+    public init(`reason`: InputBlockReason) {
+        self.`reason` = `reason`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `reason` = "reason"
+    }
+}
+
+public enum InputWorkState: Codable, Sendable, Equatable {
+    case `queued`
+    case `running`
+    case `completed`(InputWorkStateCompleted)
+    case `blocked`(InputWorkStateBlocked)
+    case `stopped`
+    enum CodingKeys: String, CodingKey { case type }
+    public init(from decoder: any Decoder) throws {
+        let tag = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .type)
+        switch tag {
+        case "queued": self = .`queued`
+        case "running": self = .`running`
+        case "completed": self = .`completed`(try InputWorkStateCompleted(from: decoder))
+        case "blocked": self = .`blocked`(try InputWorkStateBlocked(from: decoder))
+        case "stopped": self = .`stopped`
+        default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported protocol event: \(tag)"))
+        }
+    }
+    public func encode(to encoder: any Encoder) throws {
+        var tag = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .`queued`:
+            try tag.encode("queued", forKey: .type)
+        case .`running`:
+            try tag.encode("running", forKey: .type)
+        case .`completed`(let value):
+            try tag.encode("completed", forKey: .type)
+            try value.encode(to: encoder)
+        case .`blocked`(let value):
+            try tag.encode("blocked", forKey: .type)
+            try value.encode(to: encoder)
+        case .`stopped`:
+            try tag.encode("stopped", forKey: .type)
+        }
+    }
 }
 
 public enum MediaOperation: String, Codable, Sendable, Equatable {
@@ -752,11 +816,14 @@ public struct NativeEventActivity: Codable, Sendable, Equatable {
 
 public struct NativeEventAccepted: Codable, Sendable, Equatable {
     public var `inputId`: String
-    public init(`inputId`: String) {
+    public var `work`: InputWorkState?
+    public init(`inputId`: String, `work`: InputWorkState? = nil) {
         self.`inputId` = `inputId`
+        self.`work` = `work`
     }
     enum CodingKeys: String, CodingKey {
         case `inputId` = "input_id"
+        case `work` = "work"
     }
 }
 

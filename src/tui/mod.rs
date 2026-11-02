@@ -441,7 +441,22 @@ enum MessageKind {
         input_id: String,
         mode: InputMode,
         delivery: InputDelivery,
+        work: Option<crate::protocol::InputWorkState>,
     },
+}
+
+fn input_work_label(work: Option<&crate::protocol::InputWorkState>) -> Option<&'static str> {
+    use crate::protocol::{InputBlockReason, InputWorkState};
+    match work? {
+        InputWorkState::Queued => Some("Saved; queued"),
+        InputWorkState::Running => Some("Saved; working"),
+        InputWorkState::Blocked {
+            reason: InputBlockReason::RestartLimit,
+        } => Some("Saved; paused after repeated restarts"),
+        InputWorkState::Blocked { .. } => Some("Saved; worker update required"),
+        InputWorkState::Stopped => Some("Saved; processing stopped"),
+        InputWorkState::Completed { .. } => Some("Saved; completed"),
+    }
 }
 
 struct HistoryEntry {
@@ -1007,6 +1022,7 @@ impl State {
                 input_id,
                 mode,
                 delivery: InputDelivery::Submitting,
+                work: None,
             };
         }
     }
@@ -1284,9 +1300,12 @@ impl State {
                 self.push(Role::Failure, self.error_context(format!("{label}\n\n{message}{recovery}")));
                 self.working(false);
             }
-            RuntimeEventKind::InputAccepted { input_id } => {
-                if let Some(index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Input { input_id: id, delivery: InputDelivery::Submitting | InputDelivery::Uncertain, .. } if id == &input_id)) {
-                    if let MessageKind::Input { delivery, .. } = &mut self.messages[index].kind { *delivery = InputDelivery::Waiting; }
+            RuntimeEventKind::InputAccepted { input_id, work } => {
+                if let Some(index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Input { input_id: id, .. } if id == &input_id)) {
+                    if let MessageKind::Input { delivery, work: saved, .. } = &mut self.messages[index].kind {
+                        if matches!(delivery, InputDelivery::Submitting | InputDelivery::Uncertain) { *delivery = InputDelivery::Waiting; }
+                        if work.is_some() && !matches!(saved, Some(crate::protocol::InputWorkState::Completed { .. } | crate::protocol::InputWorkState::Stopped)) { *saved = work; }
+                    }
                     self.messages[index].rendered = None;
                     self.invalidate(index);
                 }
@@ -1317,9 +1336,9 @@ impl State {
                     let message = &mut self.messages[index];
                     message.id = Some(entry_id.clone());
                     if message.output != CellOutput::Printed { message.output = CellOutput::Ready; }
-                    if let MessageKind::Input { delivery, .. } = &mut message.kind
-                        && !matches!(delivery, InputDelivery::Placed { .. }) {
+                    if let MessageKind::Input { delivery, work, .. } = &mut message.kind {
                         *delivery = InputDelivery::Placed { entry_id: entry_id.clone() };
+                        *work = None;
                     }
                     message.rendered = None;
                     self.input_history.sync(&self.messages, Some(&entry_id));
@@ -2544,6 +2563,54 @@ mod tests {
     }
 
     #[test]
+    fn saved_input_processing_is_distinct_from_delivery_and_completion_is_not_an_error() {
+        use crate::protocol::{InputBlockReason, InputMode, InputWorkState};
+        use crate::tui::Role;
+        let mut view = state();
+        view.pending_input(
+            "saved".into(),
+            "Continue the saved task".into(),
+            InputMode::Steer,
+        );
+        view.event(RuntimeEventKind::InputAccepted {
+            input_id: "saved".into(),
+            work: Some(InputWorkState::Blocked {
+                reason: InputBlockReason::RestartLimit,
+            }),
+        });
+        view.input_uncertain("saved");
+        let blocked = rendered(&mut view, 100, 24);
+        assert!(blocked.contains("Saved; paused after repeated restarts"));
+        assert!(!blocked.contains("delivery unconfirmed"));
+        view.event(RuntimeEventKind::InputAccepted {
+            input_id: "saved".into(),
+            work: Some(InputWorkState::Completed {
+                answer_entry_id: "answer".into(),
+            }),
+        });
+        view.event(RuntimeEventKind::InputAccepted {
+            input_id: "saved".into(),
+            work: Some(InputWorkState::Queued),
+        });
+        let completed = rendered(&mut view, 100, 24);
+        assert!(completed.contains("Saved; completed"));
+        assert!(!completed.contains("paused"));
+        assert!(
+            !view
+                .messages
+                .iter()
+                .any(|message| message.role == Role::Failure)
+        );
+        view.event(RuntimeEventKind::InputPlaced {
+            input_id: "saved".into(),
+            entry_id: "native".into(),
+        });
+        let placed = rendered(&mut view, 100, 24);
+        assert!(placed.contains("Continue the saved task"));
+        assert!(!placed.contains("Saved; completed"));
+    }
+
+    #[test]
     fn compact_pending_groups_keep_modes_uncertainty_and_bounded_unicode_previews() {
         use crate::protocol::InputMode;
         use ratatui::style::Modifier;
@@ -2555,6 +2622,7 @@ mod tests {
         view.pending_input("steer".into(), long.clone(), InputMode::Steer);
         view.event(RuntimeEventKind::InputAccepted {
             input_id: "steer".into(),
+            work: None,
         });
         view.pending_input(
             "queue".into(),
@@ -2563,6 +2631,7 @@ mod tests {
         );
         view.event(RuntimeEventKind::InputAccepted {
             input_id: "queue".into(),
+            work: None,
         });
         view.pending_input(
             "uncertain".into(),
@@ -2924,6 +2993,7 @@ mod tests {
         );
         history.event(RuntimeEventKind::InputAccepted {
             input_id: "next-input".into(),
+            work: None,
         });
         assert!(rendered(&mut history, 80, 20).contains("Queued follow-up inputs"));
         history.event(RuntimeEventKind::InputPlaced {
@@ -3209,6 +3279,7 @@ mod tests {
         assert!(rendered(&mut view, 130, 35).contains("delivery unconfirmed; not resent"));
         view.event(RuntimeEventKind::InputAccepted {
             input_id: "pending".into(),
+            work: None,
         });
         assert!(rendered(&mut view, 130, 35).contains("Steering messages, waiting"));
         view.event(RuntimeEventKind::InputPlaced {
@@ -3401,6 +3472,7 @@ mod tests {
                 if delivery != "sending" {
                     view.event(RuntimeEventKind::InputAccepted {
                         input_id: "input-reference".into(),
+                        work: None,
                     });
                 }
                 if delivery == "placed" {
@@ -4207,6 +4279,7 @@ mod tests {
         assert!(rendered(&mut view, 100, 30).contains("Sending steering messages"));
         view.event(RuntimeEventKind::InputAccepted {
             input_id: "one".into(),
+            work: None,
         });
         assert!(rendered(&mut view, 100, 30).contains("Steering messages, waiting"));
         view.pending_input(
@@ -4216,6 +4289,7 @@ mod tests {
         );
         view.event(RuntimeEventKind::InputAccepted {
             input_id: "two".into(),
+            work: None,
         });
         view.event(RuntimeEventKind::InputPlaced {
             input_id: "one".into(),
@@ -4295,6 +4369,7 @@ mod tests {
         assert_eq!(view.messages.len(), 2);
         view.event(RuntimeEventKind::InputAccepted {
             input_id: "input".into(),
+            work: None,
         });
         assert!(!rendered(&mut view, 100, 30).contains("waiting"));
     }

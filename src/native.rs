@@ -121,6 +121,9 @@ pub enum NativeEvent {
     },
     Accepted {
         input_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        work: Option<crate::protocol::InputWorkState>,
     },
     Placed {
         input_id: String,
@@ -336,8 +339,9 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
         RuntimeEventKind::Activity { activity } => NativeEvent::Activity {
             activity: activity.clone(),
         },
-        RuntimeEventKind::InputAccepted { input_id } => NativeEvent::Accepted {
+        RuntimeEventKind::InputAccepted { input_id, work } => NativeEvent::Accepted {
             input_id: input_id.clone(),
+            work: work.clone(),
         },
         RuntimeEventKind::InputPlaced { input_id, entry_id } => NativeEvent::Placed {
             input_id: input_id.clone(),
@@ -682,6 +686,37 @@ mod tests {
             }),
             Some(crate::native::NativeEvent::Notice { text }) if text == "No Agent-owned worktrees."
         ));
+    }
+
+    #[test]
+    fn native_input_receipts_preserve_legacy_acknowledgements_and_typed_processing_state() {
+        use crate::native::{NativeEvent, project};
+        use crate::protocol::{InputBlockReason, InputWorkState, RuntimeEventKind};
+        let legacy: RuntimeEventKind =
+            serde_json::from_str(r#"{"type":"input_accepted","input_id":"saved"}"#).unwrap();
+        assert!(matches!(
+            project(&legacy),
+            Some(NativeEvent::Accepted { work: None, .. })
+        ));
+        for work in [
+            InputWorkState::Blocked {
+                reason: InputBlockReason::RestartLimit,
+            },
+            InputWorkState::Completed {
+                answer_entry_id: "answer".into(),
+            },
+        ] {
+            let native = project(&RuntimeEventKind::InputAccepted {
+                input_id: "saved".into(),
+                work: Some(work.clone()),
+            })
+            .unwrap();
+            let bytes = serde_json::to_vec(&native).unwrap();
+            let decoded: NativeEvent = serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                matches!(decoded, NativeEvent::Accepted { work: Some(saved), .. } if saved == work)
+            );
+        }
     }
 
     #[test]

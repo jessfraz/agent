@@ -177,6 +177,14 @@
 {"type":"activity","activity":{"type":"compaction","active":false,"failed":false}}
 {"type":"activity","activity":{"type":"compaction","active":true,"failed":false}}
 {"type":"activity","activity":{"type":"compaction","active":false,"failed":true}}
+{"type":"accepted","input_id":"example","work":{"type":"queued"}}
+{"type":"accepted","input_id":"example","work":{"type":"running"}}
+{"type":"accepted","input_id":"example","work":{"type":"completed","answer_entry_id":"example"}}
+{"type":"accepted","input_id":"example","work":{"type":"blocked","reason":"missing_task"}}
+{"type":"accepted","input_id":"example","work":{"type":"blocked","reason":"task_too_old"}}
+{"type":"accepted","input_id":"example","work":{"type":"blocked","reason":"migration_failed"}}
+{"type":"accepted","input_id":"example","work":{"type":"blocked","reason":"restart_limit"}}
+{"type":"accepted","input_id":"example","work":{"type":"stopped"}}
 {"type":"accepted","input_id":"example"}
 {"type":"placed","input_id":"example","entry_id":"example"}
 {"type":"rejected","input_id":"example","message":"example"}

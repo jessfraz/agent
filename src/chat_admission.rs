@@ -93,7 +93,7 @@ impl Admission {
     }
     pub(crate) fn observe(&self, event: &RuntimeEventKind) -> Result<()> {
         let next = match event {
-            RuntimeEventKind::InputAccepted { input_id } if input_id == &self.id => {
+            RuntimeEventKind::InputAccepted { input_id, .. } if input_id == &self.id => {
                 Some(Stage::Accepted)
             }
             RuntimeEventKind::InputPlaced { input_id, .. } if input_id == &self.id => {
@@ -174,6 +174,7 @@ mod tests {
         sending
             .observe(&RuntimeEventKind::InputAccepted {
                 input_id: sending.id.clone(),
+                work: None,
             })
             .unwrap();
         assert_eq!(sending.stage().unwrap(), Stage::Placed);
@@ -191,6 +192,7 @@ mod tests {
         input
             .observe(&RuntimeEventKind::InputAccepted {
                 input_id: input.id.clone(),
+                work: None,
             })
             .unwrap();
         assert_eq!(input.stage().unwrap(), Stage::Accepted);

@@ -31,7 +31,7 @@ import type { SearchMode } from "./generated/SearchMode.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { conversationSettings } from "./settings.js";
 import { watchInputPlacements } from "./input_delivery.js";
-import { reconcileMainInput, watchMainNotices } from "./main_observation.js";
+import { inspectMainWork, reconcileMainInput, recoverMainGeneration, watchMainNotices } from "./main_observation.js";
 import { BackgroundScheduler } from "./background.js";
 import { openJobActor, runScheduled } from "./scheduled.js";
 import type { SourcePollCursor } from "./generated/SourcePollCursor.js";
@@ -213,6 +213,21 @@ function mainTurn(): MainTurn {
   const ready = new Promise<boolean>((resolve) => { start = resolve; });
   return { ready, start, accepting: true, admissions: 0, inputs: [] };
 }
+function trackMainInput(turn: MainTurn, input: MainTurn["inputs"][number]): void {
+  if (!turn.inputs.some((owned) => owned.submission.id === input.submission.id)) turn.inputs.push(input);
+}
+/** Reclaim native handles without changing their queued modes or placement.
+ * A commit can precede its admitting sender's registration, so deduplicate by ID.
+ */
+async function retainMainInputs(harness: Harness, root: Conversation, turn: MainTurn): Promise<void> {
+  for (const saved of (await harness.inspect(BACKGROUND_CONTEXT)).submissions) {
+    if (saved.conversationId !== root.id || saved.type !== "input" || saved.status !== "queued" && saved.status !== "placed" ||
+        turn.inputs.some((owned) => owned.submission.id === saved.id)) continue;
+    const submission = await harness.submission(saved.id, BACKGROUND_CONTEXT);
+    if (submission === undefined) throw new TaskError("An unfinished saved input could not be recovered; its original is retained");
+    trackMainInput(turn, { submission, ...(saved.requestId === undefined ? {} : { input_id: saved.requestId }) });
+  }
+}
 const mainTurns = new Map<number, MainTurn>();
 const mainViews = new Map<number, { owner: number; live: boolean; finish(): void }>();
 type MainObserver = { buffer?: RuntimeEventKind[]; bytes: number; overflow: boolean; finish(): void };
@@ -290,7 +305,7 @@ function submitInput(id: number, command: Extract<RuntimeCommand, { type: "submi
         await main.conversation.abort(BACKGROUND_CONTEXT);
         throw new TaskError("The turn ended while this input was being saved; its original is retained");
       }
-      main.inputs.push({ input_id: command.input_id, submission });
+      trackMainInput(main, { input_id: command.input_id, submission });
     }
     if (responseId !== id) emit(id, { type: "input_accepted", input_id: command.input_id });
     emit(responseId, { type: "input_accepted", input_id: command.input_id });
@@ -307,6 +322,7 @@ function submitInput(id: number, command: Extract<RuntimeCommand, { type: "submi
 async function handle(request: RuntimeRequest): Promise<void> {
   const { id } = request;
   let effective = request.command;
+  let reclaimedInput: Submission | undefined;
   const initial = request.command;
   const inputMode = initial.type === "main_input" || initial.type === "conversation_input" ? initial.mode : undefined;
   if (initial.type === "chat" || initial.type === "run_task" || initial.type === "attach_main" || initial.type === "attach_conversation") activeCommands.add(id);
@@ -323,10 +339,18 @@ async function handle(request: RuntimeRequest): Promise<void> {
       validateInput(effective.input, effective.attachments);
       const application = await app();
       const root = await application.harness.root(BACKGROUND_CONTEXT);
-      const reconciled = await reconcileMainInput(root, effective.input_id);
-      if (reconciled !== undefined) { for (const event of reconciled) emit(id, event); return; }
+      const input_id = effective.input_id;
+      const reconciled = await reconcileMainInput(root, input_id, application.harness);
+      if (reconciled !== undefined) {
+        for (const event of reconciled) emit(id, event);
+        const saved = await root.commit((tx) => tx.submissionByRequest(root.id, input_id), BACKGROUND_CONTEXT);
+        if (saved === undefined || saved.type !== "input" || saved.status === "done" || saved.status === "unanswered") return;
+        reclaimedInput = await application.harness.submission(saved.id, BACKGROUND_CONTEXT);
+        if (reclaimedInput === undefined) throw new TaskError("The saved input could not be recovered; its original is retained");
+      }
       const owner = [...mainTurns].find(([owner, turn]) => turn.accepting && !ending.has(owner))?.[0];
       if (owner !== undefined) {
+        if (reclaimedInput !== undefined) return;
         await submitInput(owner, { type: "submit_input", input_id: effective.input_id, input: effective.input, mode: effective.mode, ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) }, id);
         return;
       }
@@ -336,6 +360,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
       if (host === null) throw new TaskError("The coordinator execution host is offline");
       const admittedOwner = [...mainTurns].find(([owner, turn]) => turn.accepting && !ending.has(owner))?.[0];
       if (admittedOwner !== undefined) {
+        if (reclaimedInput !== undefined) return;
         await submitInput(admittedOwner, { type: "submit_input", input_id: effective.input_id, input: effective.input, mode: effective.mode, ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) }, id);
         return;
       }
@@ -640,14 +665,22 @@ async function handle(request: RuntimeRequest): Promise<void> {
             model: await inference.legacy(root, await application.environment.model(null)), cwd: "" });
           // Reconcile optimistic rows before history exposes their saved copies.
           // Page completion makes native clients ready, so receipts must precede it.
+          const receiptWork = command.input_ids.length === 0 ? undefined : await inspectMainWork(application.harness, root);
           for (const input_id of command.input_ids) {
-            for (const event of await reconcileMainInput(root, input_id) ?? []) emit(id, event);
+            for (const event of await reconcileMainInput(root, input_id, application.harness, receiptWork) ?? []) emit(id, event);
           }
           for (const frame of await history(root, null, application.harness)) emit(id, frame);
           if (observer.overflow) { failure(id, "internal", "Observation fell behind during history load. Reconnect to recover saved history."); break; }
           for (const frame of observer.buffer ?? []) emit(id, frame);
           delete observer.buffer;
-          if (mainTurns.size === 0) emit(id, { type: "worker_idle" });
+          // Native work outlives its transport owner. Publish a blocked run only
+          // after history makes the observer ready, so it stays connected.
+          const work = await inspectMainWork(application.harness, root);
+          if (work.type === "blocked") failure(id, "invalid_request", work.recovery === "message"
+            ? "Main conversation paused after repeated restarts. Send a message to resume."
+            : work.recovery === "inspect_outcome" ? "Main conversation paused while owned work is parked. Inspect its prior outcome before retrying it."
+              : "Main conversation paused. Worker/runtime update required before it can resume.");
+          else if (work.type === "idle" && mainTurns.size === 0) emit(id, { type: "worker_idle" });
           await finished;
         } finally { stopNotices(); mainObservers.delete(id); }
         break;
@@ -675,7 +708,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         break;
       }
       case "chat": {
-        let submissionAttempted = false;
+        let submissionAttempted = reclaimedInput !== undefined;
         const turn = mainQueue.then(async () => {
           if (interrupted.has(id)) { emit(id, { type: "interrupted" }); return; }
           if (command.model !== null) await inference.preflight(command.model);
@@ -704,8 +737,8 @@ async function handle(request: RuntimeRequest): Promise<void> {
             (message) => emit(id, { type: "message", message }), (text) => emit(id, { type: "text_delta", text }));
           const turn = mainTurns.get(id);
           try {
-            const related = await tasks.find(command.input, [], 8,
-              (query, refs, limit) => application.retrieval.snapshot(query, refs, limit));
+            const related = reclaimedInput === undefined ? await tasks.find(command.input, [], 8,
+              (query, refs, limit) => application.retrieval.snapshot(query, refs, limit)) : { matches: [], gaps: [] };
             if (interrupted.has(id)) { await interrupts.get(id); return; }
             const relatedContext = related.matches.length === 0 && related.gaps.length === 0 ? "" : "\n\nRelated saved conversations and retrieval coverage (read and reuse matching work):\n" +
               JSON.stringify(related);
@@ -713,22 +746,36 @@ async function handle(request: RuntimeRequest): Promise<void> {
               instructions: (await environment.instructions(command.instructions)) + relatedContext, cwd: command.cwd, extensions: toolsets.main });
             executions.setModel(root.id.toString(), selected);
             if (interrupted.has(id)) { await interrupts.get(id); return; }
-            const prepared = await application.attachments.input(command.input, command.attachments, executions.get(root.id.toString()).call);
-            const submission = await application.attachments.admit(command.attachments, () => {
-              if (interrupted.has(id)) return undefined;
-              submissionAttempted = true;
-              return root.submit({ type: "input", ...prepared, whenBusy: inputMode === "steer" ? "steer" : "followUp",
-                ...(command.input_id === undefined ? {} : { requestId: command.input_id }) }, BACKGROUND_CONTEXT);
-            });
-            if (submission === undefined) { await interrupts.get(id); return; }
-            if (command.input_id !== undefined) emit(id, { type: "input_accepted", input_id: command.input_id });
             if (turn === undefined) throw new TaskError("The main execution owner is unavailable");
             turn.conversation = root; turn.info = { type: "main_ready", conversation_id: root.id.toString(), model: selected, cwd: command.cwd };
-            turn.inputs.push({ submission, ...(command.input_id === undefined ? {} : { input_id: command.input_id }) }); turn.start(true);
+            // One owner must retain every saved root input. Completing the
+            // selected input can hand Pi directly to an older queued follow-up.
+            await retainMainInputs(harness, root, turn);
+            await recoverMainGeneration(harness, root);
+            let submission = reclaimedInput;
+            if (submission === undefined) {
+              const prepared = await application.attachments.input(command.input, command.attachments, executions.get(root.id.toString()).call);
+              submission = await application.attachments.admit(command.attachments, () => {
+                if (interrupted.has(id)) return undefined;
+                submissionAttempted = true;
+                return root.submit({ type: "input", ...prepared, whenBusy: inputMode === "steer" ? "steer" : "followUp",
+                  ...(command.input_id === undefined ? {} : { requestId: command.input_id }) }, BACKGROUND_CONTEXT);
+              });
+            }
+            if (submission === undefined) { await interrupts.get(id); return; }
+            if (command.input_id !== undefined) {
+              if (reclaimedInput === undefined) emit(id, { type: "input_accepted", input_id: command.input_id });
+              else for (const event of await reconcileMainInput(root, command.input_id, harness) ?? []) emit(id, event);
+            }
+            trackMainInput(turn, { submission, ...(command.input_id === undefined ? {} : { input_id: command.input_id }) });
+            turn.inputs.sort((left, right) => left.submission.id < right.submission.id ? -1 : left.submission.id > right.submission.id ? 1 : 0);
+            turn.start(true);
             const answers = new Set<string>(); let next = 0;
             for (;;) {
               const input = turn.inputs[next];
               if (input === undefined) {
+                await retainMainInputs(harness, root, turn);
+                if (turn.inputs[next] !== undefined) continue;
                 if (turn.admissions === 0) { turn.accepting = false; break; }
                 const active = turn;
                 await new Promise<void>((resolve) => { active.wake = resolve; }); delete turn.wake; continue;
@@ -736,7 +783,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
               next += 1;
               const settled = await input.submission.wait(BACKGROUND_CONTEXT);
               if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted") {
-                if (input.input_id !== undefined) for (const event of await reconcileMainInput(root, input.input_id) ?? []) emit(id, event);
+                if (input.input_id !== undefined) for (const event of await reconcileMainInput(root, input.input_id, harness) ?? []) emit(id, event);
                 continue;
               }
               if (settled.type !== "input" || settled.status !== "done") throw new TaskError(await modelFailureMessage(root, "The model turn did not complete; its state is retained"));
@@ -751,7 +798,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
             if (turn !== undefined) {
               turn.accepting = false; await root.abort(BACKGROUND_CONTEXT);
               for (const input of turn.inputs) if (input.input_id !== undefined && (await input.submission.status(BACKGROUND_CONTEXT)).status === "unanswered") {
-                for (const event of await reconcileMainInput(root, input.input_id) ?? []) emit(id, event);
+                for (const event of await reconcileMainInput(root, input.input_id, harness) ?? []) emit(id, event);
               }
             }
             throw error;

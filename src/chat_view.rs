@@ -301,6 +301,7 @@ pub(crate) async fn open(
             if input.stage()? == crate::chat_admission::Stage::Accepted {
                 ui.handle.event(RuntimeEventKind::InputAccepted {
                     input_id: input.id.clone(),
+                    work: None,
                 })?;
             } else if input.stage()? == crate::chat_admission::Stage::Uncertain {
                 ui.handle.input_uncertain(input.id.clone())?;

@@ -474,6 +474,7 @@ mod tests {
         for input_id in ["first", "second"] {
             state.event(RuntimeEventKind::InputAccepted {
                 input_id: input_id.into(),
+                work: None,
             });
         }
         terminal.draw(|frame| state.draw(frame)).unwrap();

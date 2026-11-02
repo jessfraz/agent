@@ -23,24 +23,26 @@ pub(super) struct Preview<'a> {
 struct Group<'a> {
     mode: InputMode,
     delivery: &'a InputDelivery,
+    work: Option<&'a crate::protocol::InputWorkState>,
     messages: Vec<&'a Message>,
 }
 
 impl Group<'_> {
     fn header(&self) -> Paragraph<'static> {
-        let label = match (self.mode, self.delivery) {
-            (InputMode::Steer, InputDelivery::Submitting) => "Sending steering messages",
-            (InputMode::FollowUp, InputDelivery::Submitting) => "Sending follow-up inputs",
-            (InputMode::Steer, InputDelivery::Waiting) => "Steering messages, waiting",
-            (InputMode::FollowUp, InputDelivery::Waiting) => "Queued follow-up inputs",
-            (InputMode::Steer, InputDelivery::Uncertain) => {
-                "Steering delivery unconfirmed; not resent"
-            }
-            (InputMode::FollowUp, InputDelivery::Uncertain) => {
-                "Follow-up delivery unconfirmed; not resent"
-            }
-            (_, InputDelivery::Placed { .. }) => "",
-        };
+        let label =
+            crate::tui::input_work_label(self.work).unwrap_or(match (self.mode, self.delivery) {
+                (InputMode::Steer, InputDelivery::Submitting) => "Sending steering messages",
+                (InputMode::FollowUp, InputDelivery::Submitting) => "Sending follow-up inputs",
+                (InputMode::Steer, InputDelivery::Waiting) => "Steering messages, waiting",
+                (InputMode::FollowUp, InputDelivery::Waiting) => "Queued follow-up inputs",
+                (InputMode::Steer, InputDelivery::Uncertain) => {
+                    "Steering delivery unconfirmed; not resent"
+                }
+                (InputMode::FollowUp, InputDelivery::Uncertain) => {
+                    "Follow-up delivery unconfirmed; not resent"
+                }
+                (_, InputDelivery::Placed { .. }) => "",
+            });
         Paragraph::new(Line::from(vec![
             Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
             Span::raw(label),
@@ -98,7 +100,13 @@ impl<'a> Preview<'a> {
     pub(super) fn new(messages: &'a [Message]) -> Self {
         let mut groups: Vec<Group<'a>> = Vec::new();
         for message in messages {
-            let MessageKind::Input { mode, delivery, .. } = &message.kind else {
+            let MessageKind::Input {
+                mode,
+                delivery,
+                work,
+                ..
+            } = &message.kind
+            else {
                 continue;
             };
             if matches!(delivery, InputDelivery::Placed { .. }) {
@@ -106,6 +114,7 @@ impl<'a> Preview<'a> {
             }
             let group = groups.iter_mut().find(|group| {
                 group.mode == *mode
+                    && group.work == work.as_ref()
                     && std::mem::discriminant(group.delivery) == std::mem::discriminant(delivery)
             });
             if let Some(group) = group {
@@ -114,6 +123,7 @@ impl<'a> Preview<'a> {
                 groups.push(Group {
                     mode: *mode,
                     delivery,
+                    work: work.as_ref(),
                     messages: vec![message],
                 });
             }
