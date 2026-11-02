@@ -34,7 +34,10 @@ final class ChatModel {
   var sourceWarning: String?
   var error: String?
   var revision = 0
-  var draft = ""
+  var draft = "" {
+    didSet { draftRevision &+= 1 }
+  }
+  @ObservationIgnored private var draftRevision = 0
   var attachments: [LocalAttachment] = []
   var previewURL: URL?
   private(set) var preparingAttachments = false
@@ -134,6 +137,7 @@ final class ChatModel {
     admitting = true
     defer { admitting = false }
     let text = draft
+    let submittedDraftRevision = draftRevision
     let mode = mode
     let generation = generation
     let admit = admit
@@ -163,7 +167,9 @@ final class ChatModel {
     // Keep the draft until the owned actor has validated and saved the input.
     // Failures also remain available in the input row for copy/retry.
     if await admit(text, mode, files), self.generation == generation {
-      if draft == text { draft = "" }
+      // A later editor assignment can contain identical text. Clear only the
+      // exact draft revision that was durably admitted.
+      if draftRevision == submittedDraftRevision { draft = "" }
       let sentIDs = Set(files.map(\.id))
       attachments.removeAll { sentIDs.contains($0.id) }
       if let id = feedbackScreenshotID, sentIDs.contains(id) { feedbackScreenshotID = nil }

@@ -45,6 +45,41 @@ func sendPreservesNewTypingAndCannotAdmitTheSameDraftTwice() async {
   #expect(!model.admitting)
 }
 
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
+func durableAdmissionDoesNotEraseANewerDraftWithIdenticalText(afterClearing: Bool) async throws {
+  try await withCoordinator { session, _, outbox in
+    let gate = AdmissionGate()
+    let model = await MainActor.run {
+      ChatModel(admit: { text, mode, files in
+        let admitted = await session.submit(text, mode: mode, files: files)
+        #expect(admitted)
+        return await gate.admit(text)
+      })
+    }
+    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    for await update in session.updates where update.connection == .connected { break }
+    await MainActor.run {
+      model.connection = .connected
+      model.draft = "The same text in a different draft"
+    }
+    let sending = Task { await model.send() }
+    for await _ in gate.entered { break }
+    let pending = try JSONDecoder().decode(
+      [NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    #expect(pending.count == 1)
+    await MainActor.run {
+      if afterClearing { model.draft = "" }
+      model.draft = "The same text in a different draft"
+    }
+    await model.send()
+    #expect(await gate.count() == 1)
+    await gate.finish(true)
+    await sending.value
+    #expect(await model.draft == "The same text in a different draft")
+    #expect(await !model.admitting)
+  }
+}
+
 @MainActor @Test(.timeLimit(.minutes(1)))
 func sendKeepsAnUnadmittedDraftAndClearsOnlyItsAdmittedOriginal() async {
   let model = ChatModel(admit: { _, _, _ in false })
