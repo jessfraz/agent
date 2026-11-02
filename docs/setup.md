@@ -108,6 +108,11 @@ older client preserves server-owned work and saved history.
 
 Temporary connection loss shows `Reconnecting` until the same chat reattaches.
 Drafts and queued inputs stay in place; saved input IDs reconcile delivery.
+The phone persists coordinator acknowledgements, so returning to the app does
+not turn a saved message into an uncertain send. Delivery and processing are
+separate: work can be queued, running, completed, stopped or blocked. Completed
+work is normal; blocked work explains the required recovery. Sending a message
+can resume a parked main generation. Reconnecting alone never retries work.
 An unconfirmed write is never resent automatically. Exiting during an outage
 saves pending input under the local state directory.
 

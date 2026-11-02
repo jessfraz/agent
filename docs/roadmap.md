@@ -20,6 +20,10 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Test native outbox recovery against the production coordinator and Pi
   storage across reconnects and server restarts, without fake peers. CI runs
   the wire test on both platforms and the Swift client on macOS.
+- [x] Persist acknowledged sends across iOS suspension and app restart.
+  Delivery and processing have separate states; completed work is normal,
+  blocked work is visible, and explicit continuation can recover a parked
+  main generation without duplicating its saved inputs.
 - [x] Use shared typed cells for live and imported messages, with Codex-style
   terminal formatting and retained command output on reopen.
 - [x] Pin and activate scheduled-chat reuse, recovery and shared worktree

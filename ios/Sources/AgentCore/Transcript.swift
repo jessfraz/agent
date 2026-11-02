@@ -16,12 +16,15 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
   public var tool: ToolHistory?
   public var presentation: MessagePresentation?
   public var delivery: Delivery?
+  public var work: InputWorkState?
   public var inputID: String?
   public var attachments: [AttachmentRef]
 
   init(
     id: String, entryID: String? = nil, role: HistoryRole, text: String, tool: ToolHistory? = nil,
-    presentation: MessagePresentation? = nil, delivery: Delivery? = nil, inputID: String? = nil,
+    presentation: MessagePresentation? = nil, delivery: Delivery? = nil,
+    work: InputWorkState? = nil,
+    inputID: String? = nil,
     attachments: [AttachmentRef] = []
   ) {
     self.id = id
@@ -32,6 +35,7 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
     self.tool = tool
     self.presentation = presentation
     self.delivery = delivery
+    self.work = work
     self.inputID = inputID
     self.attachments = attachments
   }
@@ -78,6 +82,11 @@ struct Transcript: Sendable {
 
   mutating func reconnect() {
     pages.removeValue(forKey: nil)
+    // Delivery receipts survive reconnect. Execution badges require a fresh
+    // coordinator report, including when an older server omits work metadata.
+    for index in storage.indices where storage[index].inputID != nil {
+      storage[index].work = nil
+    }
     finishResponse()
     thinkingID = nil
     storage.removeAll { $0.id.hasPrefix("thinking:") }
@@ -85,7 +94,9 @@ struct Transcript: Sendable {
   }
   mutating func pending(_ request: NativeRequestSubmit, delivery: Delivery) {
     if let index = storage.firstIndex(where: { $0.inputID == request.inputId }) {
-      storage[index].delivery = delivery
+      if storage[index].entryID == nil {
+        storage[index].delivery = delivery
+      }
       return
     }
     append(
@@ -96,12 +107,16 @@ struct Transcript: Sendable {
   }
   mutating func delivery(_ id: String, _ state: Delivery, entryID: String? = nil) {
     guard let index = storage.firstIndex(where: { $0.inputID == id }) else { return }
-    storage[index].delivery = state
+    if storage[index].entryID == nil { storage[index].delivery = state }
     if let entryID {
       storage[index].entryID = entryID
       storage[index].delivery = nil
       storage.removeAll { $0.entryID == entryID && $0.inputID != id }
     }
+  }
+  mutating func work(_ id: String, _ state: InputWorkState?) {
+    guard let index = storage.firstIndex(where: { $0.inputID == id }) else { return }
+    storage[index].work = state
   }
   mutating func abandonHistory(_ requestID: UUID) { pages.removeValue(forKey: requestID) }
   mutating func beginLatestHistory(_ requestID: UUID) {

@@ -31,6 +31,7 @@ actor FixtureCoordinator {
   private let notificationObserved = AsyncStream<Void>.makeStream()
   nonisolated var observedNotifications: AsyncStream<Void> { notificationObserved.stream }
   private var delaySnapshot = false
+  private var dropInputAcknowledgements = false
   private var release: CheckedContinuation<Void, Never>?
   private var initialHistory: NativeEventHistory?
   private var latestHistory: NativeEventHistory?
@@ -50,6 +51,7 @@ actor FixtureCoordinator {
     closedToolContinuation = details.continuation
   }
   func replyToToolLookups(with events: [NativeEvent]) { toolReply = events }
+  func loseInputAcknowledgements() { dropInputAcknowledgements = true }
   func replyToHistory(initial: NativeEventHistory, pages: [String: NativeEventHistory]) {
     initialHistory = initial
     historyPages = pages
@@ -199,7 +201,9 @@ actor FixtureCoordinator {
           try? await emit(.done, on: socket)
           return
         }
-        try await emit(.accepted(.init(inputId: request.inputId)), on: socket)
+        if !dropInputAcknowledgements {
+          try await emit(.accepted(.init(inputId: request.inputId)), on: socket)
+        }
         socket.send(
           content: nil, contentContext: .finalMessage, isComplete: true, completion: .idempotent)
         return

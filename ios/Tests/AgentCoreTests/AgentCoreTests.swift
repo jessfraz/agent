@@ -48,6 +48,9 @@ import Testing
     tool: nil)
   transcript.history(.init(messages: [user], nextCursor: nil, pageComplete: true))
   transcript.delivery(request.inputId, .saved, entryID: "saved-user")
+  transcript.delivery(request.inputId, .uncertain)
+  transcript.pending(request, delivery: .uncertain)
+  #expect(transcript.rows.first(where: { $0.inputID == request.inputId })?.delivery == nil)
   transcript.history(.init(messages: [user], nextCursor: nil, pageComplete: true))
   #expect(transcript.rows.count == 1)
   #expect(transcript.rows.first?.id == stableID)
@@ -361,7 +364,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
   }
 }
 
-@Test(.timeLimit(.minutes(1))) func attachmentsSurviveUncertainDeliveryAndDownloadOnlyOnDemand()
+@Test(.timeLimit(.minutes(1))) func attachmentsSurviveAcknowledgedDeliveryAndDownloadOnlyOnDemand()
   async throws
 {
   try await withCoordinator { session, fixture, outbox in
@@ -373,8 +376,8 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     await session.connect(address)
     _ = try await until(session) { $0.connection == .connected }
     #expect(await session.submit("", files: [file]))
-    let uncertain = try await until(session) { $0.rows.contains { $0.delivery == .uncertain } }
-    #expect(uncertain.rows.last?.attachments == [file.reference])
+    let acknowledged = try await until(session) { $0.rows.contains { $0.delivery == .saved } }
+    #expect(acknowledged.rows.last?.attachments == [file.reference])
     #expect(await fixture.uploadCount() == 2)
     #expect(await fixture.uploaded(file.id) == bytes)
     let saved = try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
@@ -463,6 +466,7 @@ private func until(_ session: CoordinatorSession, _ predicate: @Sendable (ChatSn
 {
   try await withCoordinator { session, fixture, outbox in
     let address = try CoordinatorAddress(host: "100.64.1.2")
+    await fixture.loseInputAcknowledgements()
     await session.connect(address)
     _ = try await until(session) { $0.connection == .connected }
     #expect(await session.submit("Keep this original") == true)

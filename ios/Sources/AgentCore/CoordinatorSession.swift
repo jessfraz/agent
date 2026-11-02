@@ -39,6 +39,35 @@ public struct RestoredDraft: Sendable {
 /// Owns all network work, decoding, rendering preparation and the on-device outbox.
 /// Reconnect observes and reconciles. It never automatically replays an uncertain write.
 public actor CoordinatorSession {
+  private struct PendingInput: Codable {
+    enum State: String, Codable {
+      case unconfirmed, accepted, rejected
+      var delivery: Delivery {
+        switch self {
+        case .unconfirmed: .uncertain
+        case .accepted: .saved
+        case .rejected: .rejected
+        }
+      }
+    }
+    let request: NativeRequestSubmit
+    var state: State = .unconfirmed
+    private enum CodingKeys: String, CodingKey { case deliveryState }
+    init(_ request: NativeRequestSubmit) { self.request = request }
+    init(from decoder: any Decoder) throws {
+      request = try NativeRequestSubmit(from: decoder)
+      state =
+        try decoder.container(keyedBy: CodingKeys.self)
+        .decodeIfPresent(State.self, forKey: .deliveryState) ?? .unconfirmed
+    }
+    func encode(to encoder: any Encoder) throws {
+      // Add device-owned state to the existing request shape. Older outboxes
+      // remain readable, and the generated wire request stays unchanged.
+      try request.encode(to: encoder)
+      var fields = encoder.container(keyedBy: CodingKeys.self)
+      try fields.encode(state, forKey: .deliveryState)
+    }
+  }
   public nonisolated let updates: AsyncStream<ChatSnapshot>
   private let continuation: AsyncStream<ChatSnapshot>.Continuation
   private var snapshot = ChatSnapshot()
@@ -59,7 +88,8 @@ public actor CoordinatorSession {
   private var latestRowID: String?
   private var actionConnections: [UUID: LineConnection] = [:]
   private var previewRequests: Set<UUID> = []
-  private var pending: [NativeRequestSubmit] = []
+  private var pending: [PendingInput] = []
+  private var outboxLoaded = false
   private var attemptedInputs: Set<String> = []
   private var generation = UUID()
   private var flush: Task<Void, Never>?
@@ -97,19 +127,23 @@ public actor CoordinatorSession {
     await disconnect(generation: generation)
     guard self.generation == generation else { return }
     self.address = address
-    do {
-      pending = try JSONDecoder().decode(
-        [NativeRequestSubmit].self, from: Data(contentsOf: outboxURL))
-    } catch let error as CocoaError where error.code == .fileReadNoSuchFile { pending = [] } catch {
-      snapshot.error =
-        "The saved outbox could not be read. It was preserved; no messages were replayed."
-      publish()
-      return
+    if !outboxLoaded {
+      do {
+        pending = try JSONDecoder().decode(
+          [PendingInput].self, from: Data(contentsOf: outboxURL))
+      } catch let error as CocoaError where error.code == .fileReadNoSuchFile { pending = [] } catch
+      {
+        snapshot.error =
+          "The saved outbox could not be read. It was preserved; no messages were replayed."
+        publish()
+        return
+      }
+      outboxLoaded = true
     }
     // A different coordinator must never inherit another coordinator's outbox.
     // The UI supplies a per-endpoint outbox directory, not a shared queue.
-    attemptedInputs.formUnion(pending.map(\.inputId))
-    for request in pending { transcript.pending(request, delivery: .uncertain) }
+    attemptedInputs.formUnion(pending.map(\.request.inputId))
+    for input in pending { transcript.pending(input.request, delivery: input.state.delivery) }
     snapshot.error = nil
     observation = Task { [weak self] in await self?.observe(address, generation: generation) }
   }
@@ -130,7 +164,7 @@ public actor CoordinatorSession {
     snapshot.connection = .disconnected
     snapshot.busy = false
     snapshot.loadingHistory = false
-    for request in pending { transcript.delivery(request.inputId, .uncertain) }
+    for input in pending { transcript.delivery(input.request.inputId, input.state.delivery) }
     publish()
     for connection in ownedConnections { await connection.close() }
   }
@@ -184,7 +218,7 @@ public actor CoordinatorSession {
         publish()
         return false
       }
-      pending.append(request)
+      pending.append(PendingInput(request))
       do { try saveOutbox() } catch {
         pending.removeLast()
         snapshot.error = "The on-device outbox could not be saved. Nothing was sent."
@@ -201,14 +235,20 @@ public actor CoordinatorSession {
 
   public func retry(_ inputID: String) {
     guard actions.count < 32, snapshot.connection == .connected,
-      let request = pending.first(where: { $0.inputId == inputID })
+      let input = pending.first(where: { $0.request.inputId == inputID }),
+      input.state == .unconfirmed
     else { return }
     transcript.delivery(inputID, .sending)
-    perform(.submit(request), inputID: inputID)
+    perform(.submit(input.request), inputID: inputID)
     publish()
   }
   public func restore(_ inputID: String, to draftStore: AttachmentStore) async -> RestoredDraft? {
-    guard let request = pending.first(where: { $0.inputId == inputID }) else { return nil }
+    guard let input = pending.first(where: { $0.request.inputId == inputID }),
+      input.state != .accepted
+    else {
+      return nil
+    }
+    let request = input.request
     var files: [LocalAttachment] = []
     do {
       for reference in request.attachments ?? [] {
@@ -222,7 +262,10 @@ public actor CoordinatorSession {
       publish()
       return nil
     }
-    guard pending.contains(request) else { return nil }
+    guard pending.contains(where: { $0.request == request && $0.state != .accepted }) else {
+      for file in files { try? await draftStore.remove(file) }
+      return nil
+    }
     guard acknowledge(inputID) else {
       publish()
       return nil
@@ -352,7 +395,7 @@ public actor CoordinatorSession {
         connection = opened
         let stream = opened
         var ready = false
-        try await timedSend(stream, .observe(.init(inputIds: pending.map(\.inputId))))
+        try await timedSend(stream, .observe(.init(inputIds: pending.map(\.request.inputId))))
         while !Task.isCancelled {
           let event =
             try await (snapshot.connection == .connected ? stream.next() : timedNext(stream))
@@ -380,7 +423,7 @@ public actor CoordinatorSession {
         await stream?.close()
         guard !Task.isCancelled, self.generation == generation else { return }
         connection = nil
-        for request in pending { transcript.delivery(request.inputId, .uncertain) }
+        for input in pending { transcript.delivery(input.request.inputId, input.state.delivery) }
         snapshot.busy = false
         guard ConnectionError.shouldReconnect(after: error) else {
           let stoppedGeneration = UUID()
@@ -478,9 +521,7 @@ public actor CoordinatorSession {
         case .failure:
           failed = true
           consume(event, historyRequestID: id)
-          if let inputID, pending.contains(where: { $0.inputId == inputID }) {
-            transcript.delivery(inputID, .uncertain)
-          }
+          if let inputID { interruptedDelivery(inputID, fallback: .uncertain) }
         default: consume(event, historyRequestID: id)
         }
         schedulePublish()
@@ -491,8 +532,9 @@ public actor CoordinatorSession {
     } catch {
       failed = true
       if self.generation == generation && !Task.isCancelled {
-        if let inputID, pending.contains(where: { $0.inputId == inputID }) {
-          transcript.delivery(inputID, attemptedInputs.contains(inputID) ? .uncertain : .rejected)
+        if let inputID {
+          interruptedDelivery(
+            inputID, fallback: attemptedInputs.contains(inputID) ? .uncertain : .rejected)
         }
         if ConnectionError.shouldReconnect(after: error) {
           snapshot.connection = .reconnecting
@@ -723,6 +765,7 @@ public actor CoordinatorSession {
     switch event {
     case .commands(let value): snapshot.commands = value.commands
     case .ready(let value):
+      snapshot.error = nil
       snapshot.conversationID = value.conversationId
       snapshot.model = value.model
       snapshot.busy = true
@@ -754,26 +797,31 @@ public actor CoordinatorSession {
     case .message(let value): transcript.message(value.message)
     case .answer(let value): transcript.answer(value)
     case .textDelta(let value):
+      snapshot.error = nil
       snapshot.busy = true
       transcript.response(value.text)
     case .activity(let value):
+      snapshot.error = nil
       snapshot.busy = true
       transcript.activity(value.activity)
-    case .accepted(let value): transcript.delivery(value.inputId, .saved)
+    case .accepted(let value):
+      if pending.first(where: { $0.request.inputId == value.inputId })?.state != .rejected {
+        deliveryState(value.inputId, .accepted, work: value.work)
+      }
     case .placed(let value):
-      transcript.delivery(value.inputId, .saved, entryID: value.entryId)
-      acknowledge(value.inputId)
+      finishDelivery(value.inputId, entryID: value.entryId)
     case .feedbackReady(let value):
-      transcript.delivery(value.inputId, .saved)
+      finishDelivery(value.inputId)
       transcript.notice("Feedback saved. Repair task: \(value.receipt.taskId)")
-      acknowledge(value.inputId)
     case .rejected(let value):
+      deliveryState(value.inputId, .rejected)
       transcript.delivery(value.inputId, .rejected)
       // Keep the original on disk until the user explicitly restores it.
       // Rejections are not proof that a queued durable input never existed.
       snapshot.error = value.message
     case .notice(let value): transcript.notice(value.text)
     case .failure(let value):
+      if historyRequestID == nil { snapshot.busy = false }
       snapshot.error = value.message
     case .idle:
       snapshot.busy = false
@@ -808,17 +856,48 @@ public actor CoordinatorSession {
     }
     continuation.yield(snapshot)
   }
+  private func interruptedDelivery(_ inputID: String, fallback: Delivery) {
+    guard let input = pending.first(where: { $0.request.inputId == inputID }) else { return }
+    transcript.delivery(inputID, input.state == .unconfirmed ? fallback : input.state.delivery)
+  }
+  private func deliveryState(
+    _ inputID: String, _ state: PendingInput.State, work: InputWorkState? = nil,
+    persist: Bool = true
+  ) {
+    guard let index = pending.firstIndex(where: { $0.request.inputId == inputID }) else { return }
+    transcript.delivery(inputID, state.delivery)
+    transcript.work(inputID, state == .rejected ? nil : work)
+    guard pending[index].state != state else { return }
+    pending[index].state = state
+    guard persist else { return }
+    do { try saveOutbox() } catch {
+      // Admission already happened. Preserve that knowledge in memory even
+      // when a protected/full filesystem cannot save the acknowledgement.
+      snapshot.error =
+        "The coordinator reply could not be saved on this device. Original files were preserved."
+    }
+  }
+  private func finishDelivery(_ inputID: String, entryID: String? = nil) {
+    deliveryState(inputID, .accepted, persist: false)
+    // Placement confirms transcript storage, not execution completion. Once
+    // this ID leaves the outbox it no longer receives work-state reconciliation.
+    transcript.work(inputID, nil)
+    transcript.delivery(inputID, .saved, entryID: entryID)
+    acknowledge(inputID)
+  }
   @discardableResult private func acknowledge(_ inputID: String) -> Bool {
     let previous = pending
-    let completed = pending.filter { $0.inputId == inputID }.flatMap { $0.attachments ?? [] }
-    pending.removeAll { $0.inputId == inputID }
+    let completed = pending.filter { $0.request.inputId == inputID }.flatMap {
+      $0.request.attachments ?? []
+    }
+    pending.removeAll { $0.request.inputId == inputID }
     do { try saveOutbox() } catch {
       pending = previous
       snapshot.error = "The saved outbox could not be updated. Original files were preserved."
       return false
     }
     attemptedInputs.remove(inputID)
-    let retained = Set(pending.flatMap { $0.attachments ?? [] }.map(\.id))
+    let retained = Set(pending.flatMap { $0.request.attachments ?? [] }.map(\.id))
     let store = attachments
     Task {
       for reference in completed where !retained.contains(reference.id) {

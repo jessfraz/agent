@@ -79,6 +79,15 @@ Mode if requested, then Run.
   per-endpoint outbox before transmission. On iOS it
   uses complete file protection and is excluded from backup. History stays in
   memory; there is no separate phone conversation database.
+- Coordinator acknowledgements are saved with each outbox input. Accepted
+  messages stay saved through suspension, reconnect and app restart; they are
+  observed by their original IDs until placement and cannot be resubmitted.
+  **Saved** means coordinator admission, not finished work.
+  Pending inputs can separately show queued, working, completed or paused work
+  reported by the coordinator. Placement retires that badge, without implying
+  execution completed; the coordinator reports a paused main conversation.
+  Older outboxes without acknowledgement state remain unconfirmed and are
+  reconciled without automatic replay.
 - Transient network loss reconnects automatically. Disconnect, suspension and
   view removal release owned connections. Returning reconnects and reconciles
   the original input IDs. Uncertain writes are never automatically replayed.

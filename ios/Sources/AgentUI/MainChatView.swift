@@ -539,6 +539,11 @@ struct MessageRow: View {
           .font(.caption.weight(.medium)).foregroundStyle(.primary)
           .fixedSize(horizontal: false, vertical: true)
       }
+      if let work = model.row.work {
+        Label(work.label, systemImage: work.symbol)
+          .font(.caption).foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+      }
       if model.row.delivery == .uncertain, let id = model.row.inputID {
         Button {
           retry(id)
@@ -628,6 +633,33 @@ extension Delivery {
     case .saved: "checkmark.circle"
     case .uncertain: "questionmark.circle"
     case .rejected: "exclamationmark.triangle"
+    }
+  }
+}
+
+extension InputWorkState {
+  var label: String {
+    switch self {
+    case .queued: "Queued"
+    case .running: "Working"
+    case .completed: "Completed"
+    case .stopped: "Stopped"
+    case .blocked(let blocked):
+      switch blocked.reason {
+      case .restartLimit: "Processing paused after repeated restarts"
+      case .missingTask: "Processing paused: task definition unavailable"
+      case .taskTooOld: "Processing paused: task needs a compatible runtime"
+      case .migrationFailed: "Processing paused: task migration needs attention"
+      }
+    }
+  }
+  fileprivate var symbol: String {
+    switch self {
+    case .queued: "clock"
+    case .running: "ellipsis.circle"
+    case .completed: "checkmark.circle"
+    case .blocked: "pause.circle"
+    case .stopped: "stop.circle"
     }
   }
 }

@@ -6,7 +6,7 @@ import Testing
 @testable import AgentUI
 
 enum ReconnectBehavior: Sendable {
-  case recover, close, reject, malformed, turnFailure
+  case recover, close, reject, malformed, turnFailure, acknowledged, paused, active
 }
 
 private actor ReconnectCoordinator {
@@ -15,6 +15,7 @@ private actor ReconnectCoordinator {
   private var observers: Set<UUID> = []
   private var observations: [[String]] = []
   private var submissions: [NativeRequestSubmit] = []
+  private var acceptedWork: InputWorkState?
   private var release: CheckedContinuation<Void, Never>?
   private var released = false
   private var stopped = false
@@ -23,8 +24,23 @@ private actor ReconnectCoordinator {
   init(_ behavior: ReconnectBehavior) { self.behavior = behavior }
   func observedIDs() -> [[String]] { observations }
   func submitted() -> [NativeRequestSubmit] { submissions }
+  func describeWork(_ work: InputWorkState?) { acceptedWork = work }
+  func placeSubmissions() async throws {
+    for id in observers {
+      guard let socket = sockets[id] else { continue }
+      for input in submissions {
+        try await emit(
+          .placed(.init(entryId: "saved-\(input.inputId)", inputId: input.inputId)), to: socket)
+      }
+    }
+  }
   func activeSockets() -> Int { sockets.count }
   func errors() -> [String] { failures }
+  func observerEvent(_ event: NativeEvent) async throws {
+    for id in observers {
+      if let socket = sockets[id] { try await emit(event, to: socket) }
+    }
+  }
   func dropObservers() {
     for id in observers { sockets[id]?.cancel() }
   }
@@ -82,7 +98,7 @@ private actor ReconnectCoordinator {
         }
         guard !stopped else { return }
         let saved = submissions.filter { request.inputIds.contains($0.inputId) }
-        let messages = saved.map {
+        let messages = (behavior == .acknowledged ? [] : saved).map {
           HistoryMessage(
             continuation: false, entryId: "saved-\($0.inputId)", finalChunk: true,
             role: .user, text: $0.text)
@@ -90,19 +106,41 @@ private actor ReconnectCoordinator {
         try await emit(
           .history(.init(messages: messages, nextCursor: nil, pageComplete: true)), to: socket)
         for input in saved {
-          try await emit(
-            .placed(.init(entryId: "saved-\(input.inputId)", inputId: input.inputId)), to: socket)
+          if behavior == .acknowledged {
+            if let acceptedWork {
+              try await emit(
+                .accepted(.init(inputId: input.inputId, work: acceptedWork)), to: socket)
+            }
+          } else {
+            try await emit(
+              .placed(.init(entryId: "saved-\(input.inputId)", inputId: input.inputId)), to: socket)
+          }
         }
-        try await emit(.idle, to: socket)
+        if behavior == .paused {
+          try await emit(
+            .failure(.init(message: "Main processing is paused after repeated restarts.")),
+            to: socket)
+        } else if behavior == .active {
+          try await emit(
+            .activity(.init(activity: .toolStarted(.init(callId: "active-call", name: "check")))),
+            to: socket)
+        } else {
+          try await emit(.idle, to: socket)
+        }
         if behavior == .close { return }
         _ = try await receive(socket)
       case .submit(let input):
         submissions.append(input)
-        try await emit(.accepted(.init(inputId: input.inputId)), to: socket)
+        try await emit(.accepted(.init(inputId: input.inputId, work: acceptedWork)), to: socket)
         if behavior == .turnFailure {
           try await emit(
             .placed(.init(entryId: "saved-\(input.inputId)", inputId: input.inputId)), to: socket)
           try await emit(.done, to: socket)
+        } else if behavior == .active {
+          try await emit(.failure(.init(message: "The action status read failed.")), to: socket)
+          try await emit(.done, to: socket)
+        } else if behavior == .acknowledged {
+          _ = try await receive(socket)
         }
       // The server saved the input, then its reply connection disappeared.
       // Recovery must observe its original ID without repeating Submit.
@@ -149,6 +187,16 @@ private actor ReconnectCoordinator {
   _ behavior: ReconnectBehavior,
   _ body: (ChatModel, ReconnectCoordinator, URL) async throws -> Void
 ) async throws {
+  try await withReconnectCoordinator(behavior) { model, fixture, outbox, _ in
+    try await body(model, fixture, outbox)
+  }
+}
+
+@MainActor private func withReconnectCoordinator(
+  _ behavior: ReconnectBehavior,
+  _ body: (ChatModel, ReconnectCoordinator, URL, @Sendable () -> CoordinatorSession) async throws ->
+    Void
+) async throws {
   let parameters = NWParameters.tcp
   parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
   let listener = try NWListener(using: parameters)
@@ -166,15 +214,18 @@ private actor ReconnectCoordinator {
   let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: directory) }
   let outbox = directory.appending(path: "pending.json")
-  let session = CoordinatorSession(
-    outboxURL: outbox,
-    connectTransport: { _ in
-      LineConnection(connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
-    })
+  let makeSession: @Sendable () -> CoordinatorSession = {
+    CoordinatorSession(
+      outboxURL: outbox,
+      connectTransport: { _ in
+        LineConnection(connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+      })
+  }
+  let session = makeSession()
   let model = ChatModel()
   await model.connect(session: session, address: try CoordinatorAddress(host: "100.64.1.2"))
   do {
-    try await body(model, fixture, outbox)
+    try await body(model, fixture, outbox, makeSession)
     await model.stop()
     await fixture.stop()
     #expect(await fixture.errors().isEmpty)
@@ -182,6 +233,145 @@ private actor ReconnectCoordinator {
     await model.stop()
     await fixture.stop()
     throw error
+  }
+}
+
+private enum AcknowledgementReconnect: Sendable { case suspension, sessionReopen }
+
+@MainActor
+@Test(.timeLimit(.minutes(1)), arguments: [AcknowledgementReconnect.suspension, .sessionReopen])
+private func acknowledgedInputsRemainSavedAcrossClientLifecycleAndCannotBeResubmitted(
+  _ reconnect: AcknowledgementReconnect
+) async throws {
+  try await withReconnectCoordinator(.acknowledged) { model, fixture, outbox, makeSession in
+    try await waitForReconnectState { model.connection == .connected }
+    model.draft = "Continue the supplier drawing review"
+    await model.send()
+    try await waitForReconnectState { model.rows.first?.row.delivery == .saved }
+    let input = try #require(await fixture.submitted().first)
+    let originalID = try #require(model.rows.first?.id)
+    #expect(
+      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)) == [
+        input
+      ])
+    switch reconnect {
+    case .suspension:
+      await model.setActive(false)
+      #expect(
+        model.rows.first?.row.delivery == .saved, "Suspension cannot undo coordinator admission")
+      await model.setActive(true)
+    case .sessionReopen:
+      await model.stop()
+      await model.connect(
+        session: makeSession(), address: try CoordinatorAddress(host: "100.64.1.2"))
+    }
+    try await waitForReconnectFixture { await fixture.observedIDs().count == 2 }
+    try await waitForReconnectState { model.connection == .connected }
+    #expect(model.rows.map(\.id) == [originalID])
+    #expect(model.rows.first?.row.delivery == .saved)
+    #expect(model.rows.first?.row.work == nil)
+    #expect(await fixture.observedIDs().last == [input.inputId])
+    await model.restore(input.inputId)
+    #expect(model.draft.isEmpty, "A stale restore action cannot recreate an accepted input")
+    #expect(model.attachments.isEmpty)
+    #expect(
+      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)) == [
+        input
+      ])
+    await model.retry(input.inputId)
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(
+      await fixture.submitted() == [input], "An acknowledged input is observed, never resubmitted")
+    #expect(model.rows.first?.row.delivery == .saved)
+    #expect(model.error == nil)
+  }
+}
+
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)),
+  arguments: [
+    InputWorkState.queued, .running, .completed(.init(answerEntryId: "saved-answer")),
+    .blocked(.init(reason: .restartLimit)), .blocked(.init(reason: .missingTask)),
+    .blocked(.init(reason: .taskTooOld)), .blocked(.init(reason: .migrationFailed)), .stopped,
+  ])
+private func admittedInputWorkReconcilesAfterReopenWithoutBecomingADeliveryError(
+  _ work: InputWorkState
+)
+  async throws
+{
+  try await withReconnectCoordinator(.acknowledged) { model, fixture, _, makeSession in
+    try await waitForReconnectState { model.connection == .connected }
+    await fixture.describeWork(work)
+    model.draft = "Review the connector drawing"
+    await model.send()
+    try await waitForReconnectState { model.rows.first?.row.delivery == .saved }
+    #expect(model.rows.first?.row.work == work)
+    #expect(model.error == nil)
+    #expect(!work.label.isEmpty)
+    if case .completed = work { #expect(work.label == "Completed") }
+    if case .blocked = work { #expect(work.label.hasPrefix("Processing paused")) }
+    await model.stop()
+    await model.connect(session: makeSession(), address: try CoordinatorAddress(host: "100.64.1.2"))
+    try await waitForReconnectState {
+      model.connection == .connected && model.rows.first?.row.work == work
+    }
+    #expect(model.rows.first?.row.delivery == .saved)
+    #expect(model.rows.first?.row.work == work)
+    #expect(model.error == nil)
+    #expect(await fixture.submitted().count == 1)
+    await fixture.describeWork(nil)
+    await model.setActive(false)
+    await model.setActive(true)
+    try await waitForReconnectState { model.connection == .connected }
+    #expect(model.rows.first?.row.delivery == .saved)
+    #expect(
+      model.rows.first?.row.work == nil, "An older server cannot leave a stale execution badge")
+    try await fixture.placeSubmissions()
+    try await waitForReconnectState { model.rows.first?.row.delivery == nil }
+    #expect(
+      model.rows.first?.row.work == nil, "Placement retires the badge without inferring completion")
+    #expect(model.error == nil)
+  }
+}
+
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)),
+  arguments: [
+    NativeEvent.ready(.init(conversationId: "fixture-root", model: "fixture/model")),
+    .textDelta(.init(text: "Continuing the review")),
+    .activity(.init(activity: .toolStarted(.init(callId: "resumed-call", name: "check")))),
+  ])
+private func pausedObserverWithoutPendingInputsStopsWorkingAndClearsThePauseOnResume(
+  _ resume: NativeEvent
+)
+  async throws
+{
+  try await withReconnectCoordinator(.paused) { model, fixture, _ in
+    try await waitForReconnectState { model.connection == .connected && model.error != nil }
+    #expect(!model.busy, "A parked main conversation is paused, not still working")
+    #expect(model.rows.isEmpty, "The processing pause is connection state, not history")
+    #expect(await fixture.observedIDs() == [[]])
+    try await fixture.observerEvent(resume)
+    try await waitForReconnectState { model.busy && model.error == nil }
+    #expect(model.connection == .connected)
+    #expect(await fixture.observedIDs().count == 1)
+    #expect(await fixture.submitted().isEmpty)
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+private func actionFailureDoesNotStopTheObserversActiveWorkOrUndoAdmission() async throws {
+  try await withReconnectCoordinator(.active) { model, fixture, _ in
+    try await waitForReconnectState { model.connection == .connected && model.busy }
+    model.draft = "Check the related drawing"
+    await model.send()
+    try await waitForReconnectState { model.error != nil }
+    #expect(model.busy)
+    #expect(model.connection == .connected)
+    #expect(model.rows.first(where: { $0.row.role == .user })?.row.delivery == .saved)
+    #expect(await fixture.submitted().count == 1)
   }
 }
 
@@ -216,7 +406,9 @@ func terminalCoordinatorRejectionStopsRetryingAndStaysOutOfHistory(_ behavior: R
 }
 
 @MainActor @Test(.timeLimit(.minutes(1)))
-func lostActionReplyReconnectsAndReconcilesWithoutResendingOrClearingNewTyping() async throws {
+func acknowledgedActionReplyReconnectsAndReconcilesWithoutResendingOrClearingNewTyping()
+  async throws
+{
   try await withReconnectCoordinator(.recover) { model, fixture, outbox in
     try await waitForReconnectState { model.connection == .connected }
     model.draft = "The original submission"
@@ -227,6 +419,8 @@ func lostActionReplyReconnectsAndReconcilesWithoutResendingOrClearingNewTyping()
     #expect(model.error == nil)
     #expect(model.draft == "New typing survives reconnection")
     let original = try #require(model.rows.first(where: { $0.row.role == .user }))
+    #expect(
+      original.row.delivery == .saved, "A lost action socket cannot undo the accepted receipt")
     let originalID = original.id
     let submitted = try #require(await fixture.submitted().first)
     let pending = try JSONDecoder().decode(
