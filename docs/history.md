@@ -4,18 +4,18 @@ Conversations survive closed Rex sessions. Keyword and local semantic search
 find related history; import does not create work or revive old instructions.
 
 ```sh
-agent import codex                  # all registered online hosts
-agent import codex --host desktop   # one announced host name
-agent import codex --embedding-host workstation  # indexing compute only
-agent import status
-agent history search "fabrication files"
-agent history search "ERR_SURFACE_413" --mode keyword
-agent history read CONVERSATION_ID
-agent history open CONVERSATION_ID
-agent tasks send TASK_ID "Continue with this context" --mode steer
-agent tasks send TASK_ID "Check this afterward" --mode queue --input-id UUID
-agent history classify CONVERSATION_ID ENTRY_ID --as internal-receipt
-agent history classify CONVERSATION_ID ENTRY_ID --as visible
+beep-boop import codex                  # all registered online hosts
+beep-boop import codex --host desktop   # one announced host name
+beep-boop import codex --embedding-host workstation  # indexing compute only
+beep-boop import status
+beep-boop history search "fabrication files"
+beep-boop history search "ERR_SURFACE_413" --mode keyword
+beep-boop history read CONVERSATION_ID
+beep-boop history open CONVERSATION_ID
+beep-boop tasks send TASK_ID "Continue with this context" --mode steer
+beep-boop tasks send TASK_ID "Check this afterward" --mode queue --input-id UUID
+beep-boop history classify CONVERSATION_ID ENTRY_ID --as internal-receipt
+beep-boop history classify CONVERSATION_ID ENTRY_ID --as visible
 ```
 
 `tasks send` targets the existing task directly and leaves main chat quiet.
@@ -71,20 +71,19 @@ settings, then opens its named interactive session.
 
 ## Import boundary
 
-The `agent import codex` command gathers history from registered,
-online hosts through their existing worker connections. It reports checkpointed
+The `beep-boop import codex` command gathers history from registered, online
+hosts through their existing worker connections. It reports checkpointed
 progress and unavailable hosts; no copied host inventory or model run is needed.
 Use the installed Codex app-server's read-only APIs. Page `thread/list` for
 active and archived threads with `modelProviders: []` and every native
 `sourceKinds` value explicitly selected. Omitted filters select the configured
-provider and interactive sources. Read metadata with
-`thread/read`, then use full turn/item pagination where supported, or the
-installed full-history read. Thread IDs establish identity; filenames and
-directories are locators, not thread IDs or assumptions about which threads
-are roots.
-Read metadata once when starting a cursor walk. Continuations retain that
-observed version and native paging mode while validating their page and cursor;
-a later inventory discovers changed source versions.
+provider and interactive sources. Read metadata with `thread/read` , then use
+full turn/item pagination where supported, or the installed full-history read.
+Thread IDs establish identity; filenames and directories are locators, not
+thread IDs or assumptions about which threads are roots. Read metadata once when
+starting a cursor walk. Continuations retain that observed version and native
+paging mode while validating their page and cursor; a later inventory discovers
+changed source versions.
 
 Rust owns a small `HistorySource` trait for enumeration, transcript reads and
 asset reads. Codex is its first implementation. Rust also owns import records

@@ -58,7 +58,7 @@ async fn install_at(
 ) -> Result<InstallOutcome> {
     let identity = hex::encode(Sha256::digest(module_source.as_bytes()));
     let module_source = format!(
-        "{module_source}\nrex.action {{\n  name = 'agent_messages_identity',\n  title = 'Agent: Messages module identity',\n  run = function() return {{ sha256 = '{identity}' }} end,\n}}\n"
+        "{module_source}\nrex.action {{\n  name = 'agent_messages_identity',\n  title = 'Beep Boop: Messages module identity',\n  run = function() return {{ sha256 = '{identity}' }} end,\n}}\n"
     );
     let directory = config_path
         .parent()

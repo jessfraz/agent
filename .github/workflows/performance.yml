@@ -59,17 +59,20 @@ jobs:
         run: |
           nix develop .#ci --command bash -euo pipefail <<'BUILD'
             for source in ../baseline .; do
-              (cd "$source" && npm --prefix runtime ci --ignore-scripts && npm --prefix runtime run build && cargo build --locked --release --bin agent)
+              (cd "$source" && npm --prefix runtime ci --ignore-scripts && npm --prefix runtime run build && cargo build --locked --release)
             done
             cargo build --locked --release --example terminal-fixture --example cli-performance
           BUILD
       - name: Compare process-to-visible-conversation latency
         working-directory: candidate
         run: |
+          baseline=../baseline/target/release/beep-boop
+          # The comparison may straddle the CLI rename.
+          if [ ! -x "$baseline" ]; then baseline=../baseline/target/release/agent; fi
           nix develop .#ci --command target/release/examples/cli-performance \
-            --baseline ../baseline/target/release/agent \
+            --baseline "$baseline" \
             --baseline-runtime ../baseline/runtime/dist/src/bridge.js \
-            --candidate target/release/agent \
+            --candidate target/release/beep-boop \
             --candidate-runtime runtime/dist/src/bridge.js \
             --terminal target/release/examples/terminal-fixture \
             --seed runtime/dist/test/fixtures/performance.js \

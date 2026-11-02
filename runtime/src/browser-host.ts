@@ -416,7 +416,7 @@ export class BrowserHost {
     const token = rawToken?.trim().replace(/^PLAYWRIGHT_MCP_EXTENSION_TOKEN=/, "");
     if (token === undefined || !/^[A-Za-z0-9_-]{32,256}$/.test(token)) throw new ConnectionFailure("pairing");
     if (this.owner === undefined) throw new Error("Browser owner is missing");
-    const name = "Agent " + this.owner.session_id;
+    const name = "Beep Boop " + this.owner.session_id;
     const executable = fileURLToPath(new URL("./cli.js", import.meta.resolve("@playwright/mcp/package.json")));
     const args = this.options.serverArguments ?? ["--extension", "--browser", "chrome",
       ...(this.config.profile_dir_name === null ? [] : ["--profile-dir-name", this.config.profile_dir_name]),
@@ -718,7 +718,7 @@ export class BrowserHost {
           message: `${this.failureDetail(error)} Playwright code failed: ${this.redact(detail).slice(0, 8192)}. Earlier effects were not replayed. Inspect the page before running it again; native tab cleanup was not verified.` };
       }
       const recovery = this.config.debugging_port === undefined || this.config.debugging_port === null
-        ? "Confirm the Playwright extension is installed in the configured profile and its pairing token is available to Agent."
+        ? "Confirm the Playwright extension is installed in the configured profile and its pairing token is available to Beep Boop."
         : "Confirm the configured Chrome is running with its native debugging port enabled.";
       return { type: mutates(action) ? "uncertain" : "disconnected", session_id,
         message: `${this.failureDetail(error)} Chrome did not confirm this operation. Native tabs may still be open and cleanup was not verified. Inspect its outcome before repeating it. ${recovery} Old handles are invalid after disconnection.` };

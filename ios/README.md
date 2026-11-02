@@ -1,8 +1,12 @@
-# Native coordinator client
+# Beep Boop iPhone client
 
 A SwiftUI client for the coordinator's main conversation. The coordinator owns
 Pi, history, models, tools and Rex workers. The app connects through the existing
 authenticated NDJSON-over-Tailscale service.
+
+The visible app name is **Beep Boop**. The Xcode project, scheme, targets and
+executable remain `Agent`, and the bundle ID remains `dev.jessfraz.Agent`. Keep
+that identity and the existing signing configuration for updates to the same app.
 
 ## Build and connect
 
@@ -28,8 +32,8 @@ authenticated NDJSON-over-Tailscale service.
 ## Install on an iPhone
 
 Install Apple's TestFlight app, accept the invitation to the private internal
-group, install Agent, and enable **Automatic Updates**. Connect Tailscale before
-opening Agent. Internal testing requires no public App Store release; builds
+group, install Beep Boop, and enable **Automatic Updates**. Connect Tailscale before
+opening Beep Boop. Internal testing requires no public App Store release; builds
 expire after 90 days.
 
 The [Xcode Cloud workflow](ci_scripts/README.md) watches `main`, requires native

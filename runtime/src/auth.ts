@@ -312,7 +312,7 @@ export class ChatGptAuth {
     return this.serialized(async () => {
       const state = await this.read();
       const connection = state.connection;
-      if (connection.state !== "connected") throw new AuthError("needs_sign_in", "Not signed in to ChatGPT. Run agent login.");
+      if (connection.state !== "connected") throw new AuthError("needs_sign_in", "Not signed in to ChatGPT. Run beep-boop login.");
       let current = connection.tokens;
       if (current.expiresAt <= Math.floor(Date.now() / 1000) + 60) {
         try {
@@ -335,7 +335,7 @@ export class ChatGptAuth {
         } catch (error) {
           if (error instanceof oidc.ResponseBodyError && error.error === "invalid_grant") {
             await this.write({ ...state, connection: { state: "needs_sign_in", registration: connection.registration } });
-            throw new AuthError("needs_sign_in", "ChatGPT sign-in expired. Run agent login.");
+            throw new AuthError("needs_sign_in", "ChatGPT sign-in expired. Run beep-boop login.");
           }
           throw safeFailure(error, "refresh", "Could not refresh ChatGPT authentication; retry later.");
         }

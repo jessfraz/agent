@@ -616,7 +616,7 @@ pub fn decode_coordinator_event(frame: &[u8]) -> Result<RuntimeEventKind> {
             serde_json::error::Category::Eof => "incomplete JSON",
         };
         anyhow::anyhow!(
-            "Coordinator returned an invalid event ({category}; {} bytes at {}:{}). Reopen agent chat after an update; saved work is retained.",
+            "Coordinator returned an invalid event ({category}; {} bytes at {}:{}). Reopen beep-boop chat after an update; saved work is retained.",
             frame.len(), error.line(), error.column(),
         )
     })
