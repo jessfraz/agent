@@ -34,12 +34,16 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Verify current source events reach triage beside historical backlogs.
   Deployed per-account old/new selection and separate polling/triage lanes
   passed live checks with older mail pending. Interrupted source claims
-  settled; restart and retry regression tests pass.
+  settled; restart and retry regression tests pass. Provider-time ordering
+  covers later historical backfills and immutable legacy rereads.
 - [x] Surface failed source checks in CLI and native clients without adding
   repeated history notices. Retain typed helper failures and accept mail
   without a Subject header.
-- [ ] Verify incoming shipment and spam signals complete their owning workflows
-  and user notifications after source-storage recovery.
+- [x] Recover missed shipment and spam work after source-storage failure.
+  Verify source-bound shipment registration and carrier refresh, plus the spam
+  proposal's main-chat publication and accepted phone delivery.
+- [ ] Verify autonomous handoff under the revised source instructions, including
+  existing tasks with stale restrictions, without manual continuation.
 - [ ] Verify chat reuse and native worktree inventory display live.
 - [x] Ship private lifecycle logs, `/machines`, local usage-reset times and
   countdowns, and the remaining viewport correction.
