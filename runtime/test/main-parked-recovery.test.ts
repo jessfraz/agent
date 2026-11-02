@@ -181,8 +181,16 @@ test("a fresh main input resumes the parked foreground generation before waiting
     await peer.wait(2, (event) => event.type === "input_accepted");
     const readback = await SqliteStorage.open(await openNodeSqliteDatabase(path));
     try {
-      const recovered = await readback.task(task, BACKGROUND_CONTEXT);
+      let recovered = await readback.task(task, BACKGROUND_CONTEXT);
       assert.equal(recovered?.restarts ?? 0, 0, "A new explicit input must grant the old generation another attempt");
+      // Acceptance grants execution ownership; Pi may still be transitioning
+      // from running to the persisted retry sleep when that receipt arrives.
+      const deadline = Date.now() + 5_000;
+      while (recovered?.state.status === "running") {
+        assert.ok(Date.now() < deadline, "The recovered generation must enter its native retry sleep");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        recovered = await readback.task(task, BACKGROUND_CONTEXT);
+      }
       assert.equal(recovered?.state.status, "sleeping", "The original native retry checkpoint must resume before new admission waits");
       const root = (await readback.scanConversations({}, 1, undefined, BACKGROUND_CONTEXT)).items[0]; assert.ok(root);
       assert.equal((await readback.submissionByRequest(root.id, "new", BACKGROUND_CONTEXT))?.status, "queued");
