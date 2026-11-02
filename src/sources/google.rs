@@ -203,10 +203,7 @@ impl GoogleSource {
                         account: key.account.clone(),
                         thread_id,
                     },
-                    title: message
-                        .subject
-                        .filter(|subject| !subject.trim().is_empty())
-                        .unwrap_or_else(|| "(no subject)".into()),
+                    title: message.subject.unwrap_or_else(|| "(no subject)".into()),
                     text,
                 })
             })
@@ -444,12 +441,17 @@ mod tests {
     fn native_mail_without_a_subject_keeps_its_content_identity_and_checkpoint() {
         let source = GoogleSource::new("google.alpha".into()).unwrap();
         let titled = source.normalize(output(COMPLETE), source.window(None, 800_000).unwrap());
-        for subject in [r#""subject":null,"#, "", r#""subject":"","#] {
+        for (subject, title) in [
+            (r#""subject":null,"#, "(no subject)"),
+            ("", "(no subject)"),
+            (r#""subject":"","#, ""),
+            (r#""subject":"  \t  ","#, "  \t  "),
+        ] {
             let native = COMPLETE.replace(r#""subject":"Board revision","#, subject);
             let batch = source.normalize(output(&native), source.window(None, 800_000).unwrap());
             assert_eq!(batch.events.len(), 1);
             let message = &batch.events[0];
-            assert_eq!(message.title, "(no subject)");
+            assert_eq!(message.title, title);
             assert_eq!(message.id, titled.events[0].id);
             assert_eq!(message.version, titled.events[0].version);
             assert_eq!(message.source.thread_id, titled.events[0].source.thread_id);
