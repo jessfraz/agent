@@ -156,6 +156,7 @@ impl SlackSource {
                     &message.channel.name
                 };
                 Some(SourceEvent {
+                    occurred_at: None,
                     id,
                     version: message.edited.map_or(message.ts, |edited| edited.ts),
                     source: SourceRef {

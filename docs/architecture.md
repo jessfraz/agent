@@ -236,8 +236,10 @@ authoritative.
 Admit events durably before advancing a cursor. Partial reads never
 pretend to be complete, and repeated event versions do not create duplicate
 work. New batches rotate across provider/account streams and alternate oldest
-and newest pending events within each account. A large backlog cannot hide new
-arrivals, and new arrivals cannot starve old work. Account rotation and each
+and newest pending events within each account. Provider message times keep
+current mail ahead of historical pages admitted later; undated records retain
+their admission order. A large backlog cannot hide new arrivals, and new
+arrivals cannot starve old work. Account rotation and each
 account's selection direction persist across restarts, including accounts that
 receive only one slot per batch. Retries keep their exact claimed batch and
 admitted input.
@@ -256,10 +258,12 @@ grant.
 
 Email replies and due checks enter the same routing path. A tool must durably
 link each event to work or dismiss it with a reason; prose alone does not clear
-the inbox. A worker finishing does not resolve the user's outcome. Keep an
-explicit next actor/check, or resolution evidence. Brief updates include the
-proposed action when the user needs to decide; authorization already given in
-the conversation carries forward.
+the inbox. New actionable evidence should wake or steer its owning worker under
+current workflow authorization, rather than wait for the next scheduled pass.
+Linking evidence is not execution. A worker finishing does not resolve the
+user's outcome. Keep an explicit next actor/check, or resolution evidence. Brief
+updates include the proposed action when the user needs to decide; authorization
+already given in the conversation carries forward.
 
 Correcting or dismissing a settled event updates current task routing. Another
 event or version can keep the same source linked to its previous task. Original

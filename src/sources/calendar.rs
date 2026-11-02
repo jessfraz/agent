@@ -409,6 +409,7 @@ impl CalendarSource {
                         text.push_str("\n[Excerpt; read the original event for full details.]");
                     }
                     events.push(SourceEvent {
+                        occurred_at: None,
                         id: id.clone(),
                         version,
                         source: SourceRef {

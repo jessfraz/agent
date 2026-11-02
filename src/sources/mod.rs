@@ -43,6 +43,10 @@ pub struct SourceEvent {
     pub source: SourceRef,
     pub title: String,
     pub text: String,
+    /// Provider message time in Unix milliseconds. Missing times retain admission order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub occurred_at: Option<u64>,
 }
 
 /// Coverage concerns the adapter's documented polling window, not an archive of

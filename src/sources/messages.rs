@@ -465,6 +465,7 @@ impl MessagesSource {
                     let version =
                         hex::encode(Sha256::digest(serde_json::to_vec(&(&title, &text))?));
                     events.push(SourceEvent {
+                        occurred_at: None,
                         id: message.id,
                         version,
                         source: SourceRef {

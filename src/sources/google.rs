@@ -3,6 +3,7 @@
 //! discovers immutable messages, not historical label changes or a full archive.
 
 use anyhow::{Context, Result, ensure};
+use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -180,6 +181,12 @@ impl GoogleSource {
                     invalid = true;
                     return None;
                 }
+                let occurred_at = message.date.as_deref().and_then(|date| {
+                    DateTime::parse_from_rfc2822(date)
+                        .or_else(|_| DateTime::parse_from_rfc3339(date))
+                        .ok()
+                        .and_then(|date| u64::try_from(date.timestamp_millis()).ok())
+                });
                 let mut text = String::new();
                 if let Some(sender) = message.from {
                     text.push_str(&format!(
@@ -205,6 +212,7 @@ impl GoogleSource {
                     },
                     title: message.subject.unwrap_or_else(|| "(no subject)".into()),
                     text,
+                    occurred_at,
                 })
             })
             .collect();
@@ -459,6 +467,35 @@ mod tests {
             assert_eq!(batch.coverage, SourceCoverage::Complete);
             assert_eq!(batch.checkpoint, titled.checkpoint);
         }
+    }
+
+    #[test]
+    fn native_message_time_uses_only_the_structured_date_and_survives_the_wire() {
+        let source = GoogleSource::new("google.alpha".into()).unwrap();
+        for (date, expected) in [
+            ("Thu, 01 Jan 1970 00:00:01 +0000", Some(1000)),
+            ("1970-01-01T01:00:01+01:00", Some(1000)),
+            ("Wed, 31 Dec 1969 23:59:59 +0000", None),
+            ("not a date", None),
+        ] {
+            let native = COMPLETE.replace(
+                "\"body_text\":",
+                &format!(
+                    "\"date\":{},\"body_text\":",
+                    serde_json::to_string(date).unwrap()
+                ),
+            );
+            let batch = source.normalize(output(&native), source.window(None, 800_000).unwrap());
+            let wire = serde_json::to_string(&batch).unwrap();
+            let received: crate::sources::SourceBatch = serde_json::from_str(&wire).unwrap();
+            assert_eq!(received.events[0].occurred_at, expected);
+            assert_eq!(received.events[0].id, "m1");
+            assert_eq!(received.coverage, SourceCoverage::Complete);
+        }
+        let body_date =
+            COMPLETE.replace("Please check R2", "Date: Thu, 01 Jan 1970 00:00:01 +0000");
+        let batch = source.normalize(output(&body_date), source.window(None, 800_000).unwrap());
+        assert_eq!(batch.events[0].occurred_at, None);
     }
 
     #[test]
