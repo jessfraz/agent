@@ -86,7 +86,7 @@ jobs:
             --output performance/search.json
       - name: Upload raw samples
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: cli-performance
           path: candidate/performance/
