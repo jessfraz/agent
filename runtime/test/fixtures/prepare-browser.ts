@@ -7,9 +7,10 @@ import { chromium } from "playwright-core";
 
 // Test-only artifacts. Production connects to the user's installed Chrome.
 const extensionId = "mmlmfjhmonkocbjadbfplnigmagldckm";
-const extensionVersion = "0.4.0";
-const extensionSha256 = "e012b45f6170f627d275588ca1a37dffe5919c2635bbac512f11b74930e63835";
-const extensionUrl = "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=156.0.8078.49&acceptformat=crx3&x=id%3Dmmlmfjhmonkocbjadbfplnigmagldckm%26uc";
+const extensionVersion = "0.5.0";
+const extensionSha256 = "598517ba87d9f2f3b3642483cb6662bc0ea061401c5d3c1eb188a19847c92b0b";
+// Pin Google's versioned CRX blob, not the mutable update-service redirect.
+const extensionUrl = "https://clients2.googleusercontent.com/crx/blobs/ARGaeZIuYdHUb_HJVBZB_VVCuw5XJe3t-P_bbw9xOfm56r7GXUTwBqW3L-1SyLzSPT3a9W8fA8LnC52tcUeEs44eyJjNb5Y7cRakmTUDlv3UpBJOgLmNUi7yS8ZZZI8rKwUAxlKa5bBvgcjPOP-3tsAFqSY-EMXyrRRX/MMLMFJHMONKOCBJADBFPLNIGMAGLDCKM_0_5_0_0.crx";
 
 function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
