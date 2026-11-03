@@ -32,6 +32,7 @@ final class ChatModel {
   var loadingHistory = false
   var includesLatest = true
   var sourceWarning: String?
+  var sources: [SourceState] = []
   var error: String?
   var revision = 0
   var draft = "" {
@@ -288,6 +289,7 @@ final class ChatModel {
     loadingHistory = update.loadingHistory
     includesLatest = update.includesLatest
     sourceWarning = update.sourceWarning
+    sources = update.sources
     error = update.error
   }
 }

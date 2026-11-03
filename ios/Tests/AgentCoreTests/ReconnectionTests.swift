@@ -396,15 +396,19 @@ private func sourceCoverageShowsOneTransientWarningAndClearsWithoutChangingHisto
         checkedAt: checkedAt, checkpoint: nil, coverage: coverage,
         source: SourceKey(account: "private-account", provider: "google"))
     }
+    let healthy = SourceState(
+      checkedAt: 1_800_000_000_000, checkpoint: nil, coverage: .complete,
+      source: SourceKey(account: "local-messages", provider: "messages"))
     for checkedAt in 1...2 {
+      let states = [state(.unavailable(.init(message: "private-diagnostic")), checkedAt), healthy]
       try await fixture.observerEvent(
-        .sources(
-          .init(sources: [state(.unavailable(.init(message: "private-diagnostic")), checkedAt)])))
+        .sources(.init(sources: states)))
       try await fixture.observerEvent(
         .ready(.init(conversationId: "fixture-root", model: "coverage-\(checkedAt)")))
       try await fixture.observerEvent(.idle)
       try await waitForReconnectState { model.model == "coverage-\(checkedAt)" && !model.busy }
       #expect(model.sourceWarning == "Source checks incomplete: Gmail unavailable")
+      #expect(model.sources == states, "Retain per-account errors, healthy sources and check times")
       #expect(model.rows.isEmpty)
       #expect(model.error == nil)
     }
@@ -414,6 +418,7 @@ private func sourceCoverageShowsOneTransientWarningAndClearsWithoutChangingHisto
       .ready(.init(conversationId: "fixture-root", model: "coverage-3")))
     try await waitForReconnectState { model.model == "coverage-3" }
     #expect(model.sourceWarning == "Source checks incomplete: Gmail partial")
+    #expect(model.sources == [state(.partial(.init(message: "private-diagnostic")), 3)])
     for (index, coverage) in [SourceCoverage.more, .complete].enumerated() {
       try await fixture.observerEvent(.sources(.init(sources: [state(coverage, index + 4)])))
       try await fixture.observerEvent(
@@ -421,6 +426,8 @@ private func sourceCoverageShowsOneTransientWarningAndClearsWithoutChangingHisto
       try await fixture.observerEvent(.idle)
       try await waitForReconnectState { model.model == "healthy-\(index)" && !model.busy }
       #expect(model.sourceWarning == nil)
+      #expect(
+        model.sources == [state(coverage, index + 4)], "Recovered coverage replaces old errors")
     }
     #expect(model.rows.isEmpty)
     #expect(model.error == nil)

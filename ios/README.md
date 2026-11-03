@@ -94,7 +94,9 @@ Mode if requested, then Run.
   **Check / retry** retains the same ID;
   terminal rejection retains the original until **Restore to composer**.
 - Failed or partial source checks show one current coverage warning above the
-  conversation. Recovery clears it; repeated polls add no history or alerts.
+  conversation. Tap it for per-account status, full safe errors and local check
+  times, including healthy sources. The same view is in Connection → Sources.
+  Live recovery clears old errors; repeated polls add no history or alerts.
 - Do not restore an uncertain submission as a new message to bypass checking its
   original ID. Coordinator admission may already have succeeded.
 - Use the **+** menu for files, photos, commands and delivery mode, or drop files

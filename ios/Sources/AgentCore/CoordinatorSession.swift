@@ -28,6 +28,7 @@ public struct ChatSnapshot: Sendable {
   public var loadingHistory = false
   public var includesLatest = true
   public var sourceWarning: String?
+  public var sources: [SourceState] = []
   public var error: String?
 }
 
@@ -767,6 +768,7 @@ public actor CoordinatorSession {
     switch event {
     case .commands(let value): snapshot.commands = value.commands
     case .sources(let value):
+      snapshot.sources = value.sources
       // Coverage belongs to the current connection, not conversation history.
       // Keep provider diagnostics and private account identifiers out of the banner.
       let gaps = Set(
@@ -777,16 +779,7 @@ public actor CoordinatorSession {
           case .unavailable: status = "unavailable"
           case .complete, .more: return nil
           }
-          let name: String
-          switch state.source.provider {
-          case "google": name = "Gmail"
-          case "google_calendar": name = "Calendar"
-          case "github": name = "GitHub"
-          case "slack": name = "Slack"
-          case "messages": name = "Messages"
-          default: name = "Other source"
-          }
-          return "\(name) \(status)"
+          return "\(state.displayName) \(status)"
         }
       ).sorted()
       snapshot.sourceWarning =

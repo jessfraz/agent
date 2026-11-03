@@ -5,6 +5,78 @@ import XCTest
 
 @MainActor
 final class HistoryInteractionTests: XCTestCase {
+  func testSourceWarningShowsPerAccountErrorsAndUpdatesDuringRecovery() async throws {
+    continueAfterFailure = false
+    executionTimeAllowance = 90
+    let peer = InteractionPeer()
+    addTeardownBlock { await peer.stop() }
+    let history = NativeEventHistory(messages: [], nextCursor: nil, pageComplete: true)
+    await peer.history(initial: history, pages: [:], latest: history)
+    let diagnostic =
+      "Source helper authentication failure during authentication; check authentication for this account. Checkpoint retained."
+    let checkedAt = 1_800_000_000_000
+    var states = [
+      SourceState(
+        checkedAt: checkedAt, checkpoint: nil, coverage: .unavailable(.init(message: diagnostic)),
+        source: .init(account: "mail-primary", provider: "google")),
+      SourceState(
+        checkedAt: checkedAt, checkpoint: nil, coverage: .complete,
+        source: .init(account: "local-messages", provider: "messages")),
+    ]
+    try await peer.coverage(states)
+    let port = try await peer.start()
+    let app = XCUIApplication()
+    app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(port)
+    app.launchArguments += ["-notificationsEnabled", "NO"]
+    app.launch()
+    defer { app.terminate() }
+    let warning = app.buttons["sourceCoverageWarning"]
+    XCTAssertTrue(warning.waitForExistence(timeout: 5))
+    warning.tap()
+    XCTAssertTrue(app.navigationBars["Sources"].waitForExistence(timeout: 5))
+    // Native LabeledContent may expose its label and value as one AX element.
+    func text(_ value: String) -> XCUIElement {
+      app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", value)).firstMatch
+    }
+    XCTAssertTrue(text("mail-primary").waitForExistence(timeout: 3), app.debugDescription)
+    XCTAssertTrue(text("Unavailable").exists)
+    let error = app.staticTexts[diagnostic]
+    XCTAssertTrue(error.exists)
+    let localTime = Date(timeIntervalSince1970: Double(checkedAt) / 1000)
+      .formatted(date: .abbreviated, time: .standard)
+    XCTAssertTrue(text(localTime).exists)
+    let details = app.descendants(matching: .any).matching(identifier: "sourceDetails").firstMatch
+    if !text("local-messages").isHittable { details.swipeUp() }
+    XCTAssertTrue(text("local-messages").isHittable)
+    XCTAssertTrue(text("Current").exists)
+    if !error.isHittable { details.swipeDown() }
+    XCTAssertTrue(error.isHittable)
+    error.press(forDuration: 1)
+    let copy = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "Copy"))
+      .firstMatch
+    XCTAssertTrue(
+      copy.waitForExistence(timeout: 3), "The complete source error must support native copying")
+    copy.tap()
+    states[0].coverage = .complete
+    states[0].checkedAt += 60_000
+    try await peer.coverage(states)
+    XCTAssertTrue(
+      error.waitForNonExistence(timeout: 5),
+      "Recovered status must remove the old error while details stay open")
+    XCTAssertTrue(text("mail-primary").exists)
+    XCTAssertTrue(text("Unavailable").waitForNonExistence(timeout: 3))
+    let screenshot = XCTAttachment(screenshot: app.screenshot())
+    screenshot.name = "source-details-live-recovery"
+    screenshot.lifetime = .keepAlways
+    add(screenshot)
+    app.buttons["Done"].tap()
+    XCTAssertTrue(warning.waitForNonExistence(timeout: 3))
+    app.buttons["Connection"].tap()
+    app.buttons["Sources"].tap()
+    XCTAssertTrue(app.navigationBars["Sources"].waitForExistence(timeout: 3))
+    XCTAssertTrue(text("mail-primary").exists)
+  }
+
   private func eventually(
     file: StaticString = #filePath, line: UInt = #line,
     _ predicate: () async throws -> Bool
@@ -167,6 +239,7 @@ private actor InteractionPeer {
   private var pages: [String: NativeEventHistory] = [:]
   private var latest: NativeEventHistory?
   private var observer: NWConnection?
+  private var sourceStates: [SourceState]?
   private var requests: [String] = []
   private var held: Set<String> = []
   private var releases: [String: CheckedContinuation<Void, Never>] = [:]
@@ -179,6 +252,10 @@ private actor InteractionPeer {
     self.latest = latest
   }
   func cursors() -> [String] { requests }
+  func coverage(_ states: [SourceState]) async throws {
+    sourceStates = states
+    if let observer { try await emit(.sources(.init(sources: states)), to: observer) }
+  }
   func beginReply(_ text: String) async throws {
     try await emit(.textDelta(.init(text: text)), to: XCTUnwrap(observer))
   }
@@ -232,11 +309,14 @@ private actor InteractionPeer {
       let command = try JSONDecoder().decode(NativeCommand.self, from: data.prefix(upTo: end))
       guard case .native(let command) = command else { return }
       switch command.request {
-      case .observe:
+      case .observe(let request):
         observer = socket
         try await emit(
           .ready(.init(conversationId: "fixture-root", model: "fixture/model")), to: socket)
         try await emit(.history(try XCTUnwrap(initial)), to: socket)
+        if request.sourceStatus == true, let sourceStates {
+          try await emit(.sources(.init(sources: sourceStates)), to: socket)
+        }
         try await emit(.idle, to: socket)
       case .history(let request):
         let cursor = request.cursor ?? "<latest>"

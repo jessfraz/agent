@@ -15,6 +15,7 @@ public struct MainChatView: View {
   private let initialScrollTarget: String?
   private let notifications: AppNotifications?
   @State private var settings = false
+  @State private var sourceDetails = false
   @State private var followsLatest = true
   @State private var userScrolling = false
   @State private var atTop = false
@@ -68,12 +69,24 @@ public struct MainChatView: View {
           .padding(.horizontal, 16).padding(.vertical, 8)
         }
         if let warning = model.sourceWarning {
-          Label(warning, systemImage: "exclamationmark.triangle")
+          Button {
+            sourceDetails = true
+          } label: {
+            HStack {
+              Label(warning, systemImage: "exclamationmark.triangle")
+              Spacer(minLength: 8)
+              Image(systemName: "chevron.right").font(.caption)
+            }
             .font(.footnote).foregroundStyle(.primary)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 16).padding(.vertical, 8)
-            .background(.orange.opacity(0.1))
-            .accessibilityIdentifier("sourceCoverageWarning")
+            .frame(minHeight: 44)
+            .background(.orange.opacity(0.1), ignoresSafeAreaEdges: [])
+            .contentShape(Rectangle())
+          }
+          .buttonStyle(.plain)
+          .accessibilityIdentifier("sourceCoverageWarning")
+          .accessibilityHint("Show source accounts and errors")
         }
         transcript
         if let error = model.error {
@@ -108,6 +121,16 @@ public struct MainChatView: View {
       .sheet(isPresented: $settings) {
         connectionSettings.preferredColorScheme(appearance.colorScheme)
       }
+      .sheet(isPresented: $sourceDetails) {
+        NavigationStack {
+          SourceDetailsView(model: model)
+            .toolbar {
+              ToolbarItem(placement: .confirmationAction) {
+                Button("Done") { sourceDetails = false }
+              }
+            }
+        }.preferredColorScheme(appearance.colorScheme)
+      }
       .fileImporter(
         isPresented: $importingFiles, allowedContentTypes: [.item], allowsMultipleSelection: true
       ) { result in
@@ -140,14 +163,13 @@ public struct MainChatView: View {
         await model.runUntilCancelled()
       }
       .onChange(of: scenePhase) { _, phase in
-        notifications?.mainVisible = phase == .active && !settings
+        notifications?.mainVisible = mainVisible
         if managesConnection { Task { await model.setActive(phase == .active) } }
       }
-      .onAppear { notifications?.mainVisible = scenePhase == .active && !settings }
+      .onAppear { notifications?.mainVisible = mainVisible }
       .onDisappear { notifications?.mainVisible = false }
-      .onChange(of: settings) { _, presented in
-        notifications?.mainVisible = scenePhase == .active && !presented
-      }
+      .onChange(of: settings) { _, _ in notifications?.mainVisible = mainVisible }
+      .onChange(of: sourceDetails) { _, _ in notifications?.mainVisible = mainVisible }
       .onChange(of: model.connection) { _, state in
         if state == .connected, let registration = notifications?.registration {
           Task { await model.connectNotifications(registration) }
@@ -158,12 +180,14 @@ public struct MainChatView: View {
       .onChange(of: notifications?.openedTarget) { _, target in
         if target != nil {
           settings = false
+          sourceDetails = false
           followsLatest = true
         }
       }
     }
     .preferredColorScheme(appearance.colorScheme)
   }
+  private var mainVisible: Bool { scenePhase == .active && !settings && !sourceDetails }
   private var transcript: some View {
     let items = model.transcriptItems
     return ScrollViewReader { scroll in
@@ -413,6 +437,7 @@ public struct MainChatView: View {
         Section {
           LabeledContent("Status", value: model.connection.label)
           LabeledContent("Model", value: model.model)
+          NavigationLink("Sources") { SourceDetailsView(model: model) }
           Picker("Appearance", selection: $appearance) {
             ForEach(AppAppearance.allCases) { appearance in
               Text(appearance.label).tag(appearance)
