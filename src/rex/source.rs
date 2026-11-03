@@ -22,6 +22,94 @@ use crate::{
 pub const MODULE: &str = include_str!("source.lua");
 const MAX_HELPER_BYTES: usize = 32 * 1024 * 1024;
 
+#[derive(Debug)]
+pub(crate) enum ReadFailure {
+    Rex {
+        stage: ReadStage,
+        reason: crate::rex::RexError,
+    },
+    HelperExited(i32),
+    HelperOverflow,
+    InvalidCapture,
+    CommandExited(i32),
+    CursorInvalidated,
+    Busy,
+    Deadline,
+    LostCapture,
+}
+
+#[derive(Debug)]
+pub(crate) enum ReadStage {
+    Admission,
+    Collection,
+    Cancellation,
+}
+
+impl std::fmt::Display for ReadStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Admission => "admission",
+            Self::Collection => "collection",
+            Self::Cancellation => "cancellation",
+        })
+    }
+}
+
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rex { stage, reason } => write!(f, "Messages Rex {stage} failed: {reason}")?,
+            Self::HelperExited(code) => write!(f, "Messages helper exited with code {code}")?,
+            Self::HelperOverflow => {
+                f.write_str("Messages helper capture exceeded its size limit")?
+            }
+            Self::InvalidCapture => f.write_str("Messages helper returned an invalid capture")?,
+            Self::CommandExited(code) => {
+                write!(f, "Messages native command exited with code {code}")?
+            }
+            Self::CursorInvalidated => {
+                f.write_str("Messages cursor no longer matches its filters or database")?
+            }
+            Self::Busy => f.write_str("Messages Rex admission remained busy until the deadline")?,
+            Self::Deadline => f.write_str("Messages helper collection exceeded its deadline")?,
+            Self::LostCapture => f.write_str("Messages Rex collection lost its owned capture")?,
+        }
+        f.write_str("; checkpoint retained")
+    }
+}
+
+impl std::error::Error for ReadFailure {}
+
+fn check_source_capture(result: &HostResult) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Failure {
+        status: String,
+        message: String,
+    }
+    if let HostResult::Process {
+        exit_code,
+        stdout,
+        stderr,
+        ..
+    } = result
+        && *exit_code != 0
+    {
+        // The native CLI emits JSON errors on stderr. Recognize only this
+        // closed diagnostic; provider text and arbitrary stderr stay private.
+        if serde_json::from_str::<Failure>(stderr).is_ok_and(|failure| {
+            failure.status == "error"
+                && failure.message == "cursor belongs to different filters or a different database"
+        }) {
+            return Err(ReadFailure::CursorInvalidated.into());
+        }
+        // Switchboard error envelopes on stdout retain their own typed handling.
+        if stdout.trim().is_empty() {
+            return Err(ReadFailure::CommandExited(*exit_code).into());
+        }
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct Start<'a> {
     id: Uuid,
@@ -76,17 +164,41 @@ async fn action<T: Serialize, R: serde::de::DeserializeOwned>(
             "--json".into(),
         ])
         .await
-        .map_err(crate::rex::read_failure)
-        .context("Messages Rex actions are unavailable; run agent rex install on this machine")?;
-    serde_json::from_slice(&bytes).context("Rex returned an invalid Messages read result")
+        .map_err(|error| ReadFailure::Rex {
+            stage: match name {
+                "agent_messages_start" => ReadStage::Admission,
+                "agent_messages_cancel" => ReadStage::Cancellation,
+                _ => ReadStage::Collection,
+            },
+            reason: crate::rex::read_failure(error),
+        })?;
+    serde_json::from_slice(&bytes).map_err(|_| ReadFailure::InvalidCapture.into())
 }
 
 struct ActiveRead {
     id: Uuid,
     client: RexClient,
+    released: bool,
+}
+impl ActiveRead {
+    async fn release(&mut self) {
+        if let Ok(Identity { id }) = action(
+            &self.client,
+            "agent_messages_cancel",
+            &Identity { id: self.id },
+        )
+        .await
+            && id == self.id
+        {
+            self.released = true;
+        }
+    }
 }
 impl Drop for ActiveRead {
     fn drop(&mut self) {
+        if self.released {
+            return;
+        }
         let id = self.id;
         let client = self.client.clone();
         // Normal cancellation releases the native child. On abrupt shutdown,
@@ -156,62 +268,85 @@ async fn read_with(
 ) -> Result<HostResult> {
     request.validate()?;
     let id = Uuid::new_v4();
-    let _owned = ActiveRead {
+    let mut owned = ActiveRead {
         id,
         client: client.clone(),
+        released: false,
     };
-    let deadline = Instant::now() + Duration::from_secs(request.timeout_seconds.into());
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(HostResult::Process {
-                exit_code: 124,
-                stdout: String::new(),
-                stderr: "Messages reader was busy until the command deadline.".into(),
-                truncated: false,
-            });
-        }
-        let seconds = u16::try_from(remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0))
-            .context("Messages deadline is out of range")?;
-        let pending = Request {
-            argv: request.argv.clone(),
-            cwd: request.cwd.clone(),
-            timeout_seconds: seconds,
-            capture: request.capture,
-        };
-        let arguments = pending.arguments()?;
-        // Only an explicit busy response permits another admission attempt.
-        // A lost start reply may already own a child and is never replayed.
-        let admitted: Admission = action(
-            client,
-            "agent_messages_start",
-            &Start {
-                id,
-                program,
-                argv: &arguments,
-                path,
-                timeout_seconds: seconds,
-            },
-        )
-        .await?;
-        match admitted {
-            Admission::Started { id: started } => {
-                ensure!(started == id, "Rex returned another Messages read identity");
-                break;
+    let result = async {
+        let deadline = Instant::now() + Duration::from_secs(request.timeout_seconds.into());
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if matches!(request.capture, Capture::Source) {
+                    return Err(ReadFailure::Busy.into());
+                }
+                return Ok(HostResult::Process {
+                    exit_code: 124,
+                    stdout: String::new(),
+                    stderr: "Messages reader was busy until the command deadline.".into(),
+                    truncated: false,
+                });
             }
-            Admission::Busy => sleep(Duration::from_millis(100).min(remaining)).await,
+            let seconds =
+                u16::try_from(remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0))
+                    .context("Messages deadline is out of range")?;
+            let pending = Request {
+                argv: request.argv.clone(),
+                cwd: request.cwd.clone(),
+                timeout_seconds: seconds,
+                capture: request.capture,
+            };
+            let arguments = pending.arguments()?;
+            // Only an explicit busy response permits another admission attempt.
+            // A lost start reply may already own a child and is never replayed.
+            let admitted: Admission = action(
+                client,
+                "agent_messages_start",
+                &Start {
+                    id,
+                    program,
+                    argv: &arguments,
+                    path,
+                    timeout_seconds: seconds,
+                },
+            )
+            .await?;
+            match admitted {
+                Admission::Started { id: started } => {
+                    ensure!(started == id, "Rex returned another Messages read identity");
+                    break;
+                }
+                Admission::Busy => sleep(Duration::from_millis(100).min(remaining)).await,
+            }
         }
+        let result = timeout(
+            deadline.saturating_duration_since(Instant::now())
+                + Duration::from_secs(match request.capture {
+                    Capture::Exec => 8,
+                    Capture::Source => 30,
+                }),
+            collect(client, id),
+        )
+        .await
+        .map_err(|_| ReadFailure::Deadline)?
+        .map_err(|error| {
+            if error.is::<ReadFailure>() {
+                error
+            } else {
+                ReadFailure::InvalidCapture.into()
+            }
+        })?;
+        if matches!(request.capture, Capture::Source) {
+            check_source_capture(&result)?;
+        }
+        Ok(result)
     }
-    timeout(
-        deadline.saturating_duration_since(Instant::now())
-            + Duration::from_secs(match request.capture {
-                Capture::Exec => 8,
-                Capture::Source => 30,
-            }),
-        collect(client, id),
-    )
-    .await
-    .context("Messages read exceeded its helper deadline")?
+    .await;
+    // Settle the owned slot before returning, including a rejected cursor or
+    // failed helper. Drop remains the cancellation path for an aborted caller.
+    owned.release().await;
+    result
 }
 
 async fn collect(client: &RexClient, expected: Uuid) -> Result<HostResult> {
@@ -235,7 +370,7 @@ async fn collect(client: &RexClient, expected: Uuid) -> Result<HostResult> {
                 );
                 sleep(Duration::from_millis(100)).await;
             }
-            State::Missing => anyhow::bail!("Rex lost the Messages read; checkpoint retained"),
+            State::Missing => return Err(ReadFailure::LostCapture.into()),
             State::Finished {
                 id,
                 code,
@@ -244,10 +379,13 @@ async fn collect(client: &RexClient, expected: Uuid) -> Result<HostResult> {
                 total_bytes,
                 overflow,
             } => {
-                ensure!(
-                    id == expected && code == 0 && !overflow,
-                    "Messages helper did not complete"
-                );
+                ensure!(id == expected, "Messages read identity changed");
+                if code != 0 {
+                    return Err(ReadFailure::HelperExited(code).into());
+                }
+                if overflow {
+                    return Err(ReadFailure::HelperOverflow.into());
+                }
                 ensure!(
                     total_bytes <= MAX_HELPER_BYTES,
                     "Messages helper output is too large"
@@ -294,6 +432,91 @@ mod tests {
         },
         sources::messages_read::{Capture, Request},
     };
+
+    #[tokio::test]
+    #[ignore = "requires local Rex actions, agent, messages and sqlite3; reads only synthetic history"]
+    async fn native_stale_cursor_preserves_the_safe_source_failure() {
+        #[derive(serde::Deserialize)]
+        struct Page {
+            next_cursor: String,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("chat.db");
+        let schema = "CREATE TABLE chat(guid TEXT,display_name TEXT,service_name TEXT); CREATE TABLE handle(id TEXT); CREATE TABLE message(guid TEXT,text TEXT,attributedBody BLOB,date INTEGER,handle_id INTEGER,is_from_me INTEGER,is_read INTEGER,is_finished INTEGER,item_type INTEGER,associated_message_guid TEXT,associated_message_type INTEGER); CREATE TABLE chat_message_join(chat_id INTEGER,message_id INTEGER,message_date INTEGER); CREATE TABLE chat_handle_join(chat_id INTEGER,handle_id INTEGER); CREATE TABLE attachment(guid TEXT,filename TEXT,transfer_name TEXT,mime_type TEXT,total_bytes INTEGER); CREATE TABLE message_attachment_join(message_id INTEGER,attachment_id INTEGER); INSERT INTO chat VALUES('example-chat','Example','iMessage'); INSERT INTO message(guid,text,date,is_from_me,is_read,is_finished) VALUES('first','Example one',800000000000000000,0,0,1),('second','Example two',800000001000000000,0,0,1); INSERT INTO chat_message_join VALUES(1,1,800000000000000000),(1,2,800000001000000000);";
+        assert!(
+            std::process::Command::new("sqlite3")
+                .arg(&database)
+                .arg(schema)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let page = std::process::Command::new("messages")
+            .arg("--db")
+            .arg(&database)
+            .args(["read", "--json", "--limit=1", "--", "example-chat"])
+            .output()
+            .unwrap();
+        assert!(
+            page.status.success(),
+            "native synthetic page should succeed"
+        );
+        let page: Page = serde_json::from_slice(&page.stdout).unwrap();
+        let replacement = directory.path().join("replacement.db");
+        std::fs::copy(&database, &replacement).unwrap();
+        std::fs::rename(&replacement, &database).unwrap();
+        let program = std::env::var("AGENT_TEST_BIN").unwrap_or_else(|_| "agent".into());
+        let result = read_with(
+            &RexClient::new(None),
+            &program,
+            &std::env::var("PATH").unwrap(),
+            &Request {
+                argv: vec![
+                    "messages".into(),
+                    "read".into(),
+                    "--json".into(),
+                    "--db".into(),
+                    database.to_str().unwrap().into(),
+                    "--limit=1".into(),
+                    format!("--cursor={}", page.next_cursor),
+                    "--".into(),
+                    "example-chat".into(),
+                ],
+                cwd: "/".into(),
+                timeout_seconds: 30,
+                capture: Capture::Source,
+            },
+        )
+        .await;
+        let message = result
+            .expect_err("a native cursor rejection must remain a typed failure")
+            .to_string();
+        assert!(message.contains("cursor no longer matches"), "{message}");
+        assert!(message.contains("checkpoint retained"), "{message}");
+        assert!(!message.contains("Full Disk Access") && !message.contains("chat.db"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Rex actions; executes only the native false utility"]
+    async fn native_helper_exit_preserves_its_stage_and_code() {
+        let error = read_with(
+            &RexClient::new(None),
+            "/usr/bin/false",
+            &std::env::var("PATH").unwrap(),
+            &Request {
+                argv: vec!["messages".into(), "doctor".into()],
+                cwd: "/".into(),
+                timeout_seconds: 30,
+                capture: Capture::Source,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Messages helper exited with code 1; checkpoint retained"
+        );
+    }
 
     #[test]
     #[ignore = "requires the native Rex CLI; runs local Lua only, without installing actions or connecting to a server"]

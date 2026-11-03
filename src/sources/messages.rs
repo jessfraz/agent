@@ -28,6 +28,35 @@ pub struct MessagesSource {
     namespace: Option<String>,
 }
 
+#[derive(Debug)]
+enum PollFailure {
+    Checkpoint,
+    Command,
+    Response,
+}
+
+impl std::fmt::Display for PollFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stage = match self {
+            Self::Checkpoint => "checkpoint validation",
+            Self::Command => "command preparation",
+            Self::Response => "response validation",
+        };
+        write!(f, "Messages {stage} failed; checkpoint retained")
+    }
+}
+impl std::error::Error for PollFailure {}
+
+fn failure_message(error: &anyhow::Error) -> String {
+    if let Some(failure) = error.downcast_ref::<crate::rex::source::ReadFailure>() {
+        failure.to_string()
+    } else if let Some(failure) = error.downcast_ref::<PollFailure>() {
+        failure.to_string()
+    } else {
+        "Messages helper transport or capture validation failed; checkpoint retained".into()
+    }
+}
+
 #[derive(Deserialize)]
 struct Registry {
     namespaces: Vec<Namespace>,
@@ -380,6 +409,46 @@ impl MessagesSource {
         output.normalize_result(self.key(), |output| self.normalize_output(output, window))
     }
 
+    fn finish_read(&self, result: Result<ReadOutput>, mut window: Window) -> Result<SourceBatch> {
+        match result {
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<crate::rex::source::ReadFailure>(),
+                    Some(crate::rex::source::ReadFailure::CursorInvalidated)
+                ) && matches!(
+                    &window.phase,
+                    Phase::Chats {
+                        cursor: Some(_),
+                        ..
+                    } | Phase::Messages {
+                        cursor: Some(_),
+                        ..
+                    }
+                ) =>
+            {
+                // Revisit the same frozen window from discovery. Native event
+                // identities deduplicate prior pages; no unread history is skipped.
+                window.phase = Phase::Chats {
+                    chats: Vec::new(),
+                    cursor: None,
+                    page: 1,
+                };
+                Ok(SourceBatch {
+                    source: self.key(),
+                    events: Vec::new(),
+                    checkpoint: Some(SourceCheckpoint {
+                        value: serde_json::to_string(&window)?,
+                    }),
+                    coverage: SourceCoverage::More,
+                })
+            }
+            Err(error) => Err(error),
+            Ok(output) => self
+                .normalize(output, window)
+                .context(PollFailure::Response),
+        }
+    }
+
     fn normalize_output(&self, output: ReadOutput, mut window: Window) -> Result<SourceBatch> {
         let (response, complete) = self.response(&output, &window)?;
         let mut partial = !complete;
@@ -529,15 +598,15 @@ impl Source for MessagesSource {
 
     async fn poll(&self, checkpoint: Option<&SourceCheckpoint>) -> Result<SourceBatch> {
         let result = async {
-            let window = self.window(checkpoint, now_seconds()?)?;
-            let output = crate::rex::source::read_command(&self.argv(&window)?).await?;
-            self.normalize(output, window)
+            let window = self
+                .window(checkpoint, now_seconds()?)
+                .context(PollFailure::Checkpoint)?;
+            let argv = self.argv(&window).context(PollFailure::Command)?;
+            self.finish_read(crate::rex::source::read_command(&argv).await, window)
         }
         .await;
-        Ok(result.unwrap_or_else(|_| SourceBatch::unavailable(
-            self.key(),
-            "Messages reads are unavailable; run agent rex install and check Rex Server's Full Disk Access",
-        )))
+        Ok(result
+            .unwrap_or_else(|error| SourceBatch::unavailable(self.key(), failure_message(&error))))
     }
 }
 
@@ -552,6 +621,50 @@ mod tests {
     };
 
     const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn a_rejected_cursor_restarts_the_frozen_lookback_without_skipping_history() {
+        let source = MessagesSource::local();
+        let mut window = messages(&["first-chat", "second-chat"], Some("old-cursor"));
+        let range = (window.since, window.until);
+        let batch = source
+            .finish_read(
+                Err(crate::rex::source::ReadFailure::CursorInvalidated.into()),
+                window,
+            )
+            .unwrap();
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.coverage, SourceCoverage::More);
+        window = serde_json::from_str(&batch.checkpoint.unwrap().value).unwrap();
+        assert_eq!((window.since, window.until), range);
+        assert!(
+            matches!(window.phase, Phase::Chats { chats, cursor: None, page: 1 } if chats.is_empty())
+        );
+        assert!(
+            source
+                .finish_read(
+                    Err(crate::rex::source::ReadFailure::CursorInvalidated.into()),
+                    source.window(None, NOW).unwrap()
+                )
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_checkpoints_report_the_safe_stage_without_access_advice() {
+        let source = MessagesSource::local();
+        let batch = source
+            .poll(Some(&SourceCheckpoint {
+                value: "private-checkpoint-value".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(batch.events.is_empty() && batch.checkpoint.is_none());
+        assert!(
+            matches!(batch.coverage, SourceCoverage::Unavailable { message }
+            if message == "Messages checkpoint validation failed; checkpoint retained")
+        );
+    }
 
     fn output(response: &Response) -> ReadOutput {
         ReadOutput {

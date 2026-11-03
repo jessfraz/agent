@@ -42,8 +42,9 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Recover missed shipment and spam work after source-storage failure.
   Verify source-bound shipment registration and carrier refresh, plus the spam
   proposal's main-chat publication and accepted phone delivery.
-- [ ] Verify autonomous handoff under the revised source instructions, including
+- [x] Verify autonomous handoff under the revised source instructions, including
   existing tasks with stale restrictions, without manual continuation.
+  A fresh shipping notice resumed the existing task and its source investigation.
 - [ ] Verify chat reuse and native worktree inventory display live.
 - [x] Ship private lifecycle logs, `/machines`, local usage-reset times and
   countdowns, and the remaining viewport correction.

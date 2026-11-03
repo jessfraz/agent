@@ -254,7 +254,9 @@ action starts a headless Rust helper; subsequent calls collect bounded chunks.
 The helper owns the read deadline and process group cleanup. Rex retains one
 bounded job slot, without creating sessions or terminals. Agent upgrades pass
 the current helper path to the same actions and require no new disk-access
-grant.
+grant. A rejected native cursor restarts discovery within its frozen scan
+window; retained event identities deduplicate earlier pages. Other failures
+preserve a safe stage and exit code in source coverage.
 
 Email replies and due checks enter the same routing path. A tool must durably
 link each event to work or dismiss it with a reason; prose alone does not clear
