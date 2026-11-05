@@ -122,7 +122,7 @@ test("new canonical replies and curated notices reach APNs once per device, with
     assert.ok(verify("sha256", Buffer.from(encoded[0] + "." + encoded[1]), { key: f.keys.publicKey, dsaEncoding: "ieee-p1363" }, Buffer.from(encoded[2]!, "base64url")));
     assert.equal(request.headers["apns-topic"], f.config.topic); assert.equal(request.headers["apns-push-type"], "alert");
     assert.ok(Number(request.headers["apns-expiration"]) > Date.now() / 1000); assert.ok(object(request.body) && object(request.body.agent));
-    assert.deepEqual(request.body.aps, { alert: { title: "Agent", body: request.body.agent.entry_id === reply.id.toString()
+    assert.deepEqual(request.body.aps, { alert: { title: "Beep Boop", body: request.body.agent.entry_id === reply.id.toString()
       ? "Private fixture response" : "A useful curated update" }, sound: "default" });
     assert.equal(request.body.agent.conversation_id, ROOT_CONVERSATION_ID.toString());
     assert.ok([reply.id.toString(), notice.id.toString()].includes(String(request.body.agent.entry_id)));
@@ -159,7 +159,7 @@ test("APNs previews contain readable bounded reply or explicit notice text, neve
     model: [fauxAssistantMessage("INTERNAL_CONTEXT_STAYS_PRIVATE")] }), BACKGROUND_CONTEXT);
   await until(app.session, t.signal, async () => (await delivery(app.session, first, notice))?.state === "accepted");
   const sent = f.requests[1]; assert.ok(sent && object(sent.body));
-  assert.deepEqual(sent.body.aps, { alert: { title: "Agent", body: "The drawing needs your review." }, sound: "default" });
+  assert.deepEqual(sent.body.aps, { alert: { title: "Beep Boop", body: "The drawing needs your review." }, sound: "default" });
   assert.equal(JSON.stringify(sent.body).includes("INTERNAL_CONTEXT"), false);
   assert.deepEqual(sent.body.agent, { conversation_id: "1", entry_id: notice.id.toString() });
 });

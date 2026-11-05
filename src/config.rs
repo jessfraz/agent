@@ -94,7 +94,7 @@ pub fn apply(path: &Path, settings_path: &Path) -> Result<ApplyResult> {
     .context("Invalid managed agent TOML")?;
     let path = std::path::absolute(path)?;
     let metadata = fs::symlink_metadata(&path)
-        .context("Private agent configuration must already exist; run agent init first")?;
+        .context("Private agent configuration must already exist; run beep-boop init first")?;
     ensure!(
         metadata.is_file(),
         "Private agent configuration must be a regular file, not a symlink"
@@ -145,7 +145,7 @@ pub fn apply(path: &Path, settings_path: &Path) -> Result<ApplyResult> {
         // Refuse to clobber an edit made while preparing the replacement.
         ensure!(
             fs::read_to_string(&path)? == original,
-            "Agent configuration changed while applying preferences; retry after reviewing it"
+            "Beep Boop configuration changed while applying preferences; retry after reviewing it"
         );
         fs::rename(&temporary, &path).context("Could not replace private agent configuration")?;
         Ok(())
@@ -374,7 +374,8 @@ pub fn tailnet_address(value: &str) -> Result<std::net::SocketAddr> {
 
 pub fn program() -> Result<PathBuf> {
     let executable = env::current_exe()?;
-    let wrapper = executable.with_file_name("agent");
+    // Nix starts the unwrapped binary; children must retain its runtime wrapper.
+    let wrapper = executable.with_file_name("beep-boop");
     Ok(if wrapper.is_file() {
         wrapper
     } else {
