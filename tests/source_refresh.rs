@@ -1,4 +1,4 @@
-use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+use std::{fs, path::Path};
 
 use agent_cli::{
     background::{self, BackgroundRequest, BackgroundResponse},
@@ -70,9 +70,9 @@ fn helper(directory: &Path, text_bytes: &[usize]) -> Vec<String> {
         )
         .unwrap();
     }
-    let executable = directory.join("source-read");
+    let script = directory.join("source-read");
     fs::write(
-        &executable,
+        &script,
         r#"#!/bin/sh
 for argument in "$@"; do
     case "$argument" in cursor=*) cursor="${argument#cursor=}" ;; esac
@@ -86,9 +86,11 @@ exec cat "$1/$page.json"
 "#,
     )
     .unwrap();
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    // Read the freshly written fixture as data instead of executing it. On Linux,
+    // another test's concurrent spawn can briefly inherit its writable descriptor.
     vec![
-        executable.to_str().unwrap().to_owned(),
+        "sh".into(),
+        script.to_str().unwrap().to_owned(),
         directory.to_str().unwrap().to_owned(),
     ]
 }
@@ -237,4 +239,20 @@ async fn normalization_that_exceeds_the_page_budget_preserves_the_supplied_check
     ));
     assert!(read.batch.events.is_empty());
     assert!(read.batch.checkpoint.is_none());
+}
+
+#[tokio::test]
+async fn local_helper_can_run_while_its_script_is_open_for_writing() {
+    let directory = tempfile::tempdir().unwrap();
+    let command = helper(directory.path(), &[32]);
+    // A concurrent fork can retain this descriptor after the fixture writer closes.
+    let _writer = fs::OpenOptions::new()
+        .write(true)
+        .open(directory.path().join("source-read"))
+        .unwrap();
+    let source = SlackSource::new(command, "workspace-fixture".into()).unwrap();
+    let batch = source.poll(None).await.unwrap();
+    assert_eq!(batch.coverage, SourceCoverage::Complete);
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.events[0].text.len(), 32);
 }
