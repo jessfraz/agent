@@ -28,13 +28,13 @@ async function groupAlive(group: number): Promise<boolean> {
     if (object(error) && error.code === "ESRCH") return false;
     if (!object(error) || error.code !== "EPERM") throw error;
     // Darwin's killpg filters zombies and returns EPERM when none remain
-    // signalable. Prove that this exact owned group has no live writers rather
-    // than treating every permission failure as successful cleanup.
+    // signalable. A denied probe does not mean the group is gone: keep waiting
+    // for live members, leaving actual signal permission failures authoritative.
     const { stdout } = await promisify(execFile)("/bin/ps", ["-ax", "-o", "pgid=,stat="]);
     for (const line of stdout.split("\n").filter(line => line.trim() !== "")) {
       const fields = line.trim().split(/\s+/);
       assert.ok(fields.length === 2 && /^\d+$/.test(fields[0]!), "Native group inspection must provide group and state");
-      if (fields[0] === String(group) && !fields[1]!.startsWith("Z")) throw error;
+      if (fields[0] === String(group) && !fields[1]!.startsWith("Z")) return true;
     }
     return false;
   }
@@ -65,6 +65,25 @@ test("owned Chrome group cleanup recognizes exited native children before their 
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     await exited;
   }
+});
+
+test("a permission-limited native group probe preserves live membership", {
+  skip: process.platform !== "darwin" || process.getuid?.() === 0,
+}, async () => {
+  // Probe only: signal 0 and ps cannot terminate or modify foreign processes.
+  // A protected system group supplies the real EPERM boundary without mocks.
+  const { stdout } = await promisify(execFile)("/bin/ps", ["-ax", "-o", "pgid=,stat="]);
+  const groups = [...new Set(stdout.split("\n").flatMap(line => {
+    const [pgid, state] = line.trim().split(/\s+/);
+    const group = Number(pgid);
+    return Number.isInteger(group) && group > 1 && state !== undefined && !state.startsWith("Z") ? [group] : [];
+  }))].sort((left, right) => left - right);
+  const group = groups.find(candidate => {
+    try { process.kill(-candidate, 0); return false; }
+    catch (error) { return object(error) && error.code === "EPERM"; }
+  });
+  assert.ok(group !== undefined, "Darwin must expose a live permission-protected process group");
+  assert.equal(await groupAlive(group), true, "A denied existence probe cannot imply exit or abort the drain wait");
 });
 
 function reply(value: unknown): value is BrowserReply {
