@@ -306,7 +306,8 @@ final class AgentUITests: XCTestCase {
           thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8)),
           withVelocity: .slow, thenHoldForDuration: 0.1)
       }
-      XCTAssertTrue(app.buttons["dismissConnection"].waitForExistence(timeout: 3), app.debugDescription)
+      XCTAssertTrue(
+        app.buttons["dismissConnection"].waitForExistence(timeout: 3), app.debugDescription)
       app.buttons["Done"].tap()
       try audit(app)
       capture("main-accessibility-\(appearance.rawValue)", app: app)
@@ -325,7 +326,8 @@ final class AgentUITests: XCTestCase {
     let hasGuidance = guidance.exists
     let overflow = hasGuidance ? max(0, guidance.frame.maxY - window.frame.maxY) : 0
     let distance = overflow > 0 ? max(44, overflow + 8) : 0
-    let keepsFirstRow = hasGuidance
+    let keepsFirstRow =
+      hasGuidance
       && status.frame.minY - distance >= app.navigationBars["Connection"].frame.maxY
     if !keepsFirstRow {
       // A short viewport can neither materialize the lazy final row nor fit
@@ -338,7 +340,8 @@ final class AgentUITests: XCTestCase {
       hierarchy.lifetime = .keepAlways
       add(hierarchy)
       try audit(app)
-      XCTAssertTrue(app.buttons["dismissConnection"].waitForExistence(timeout: 3), app.debugDescription)
+      XCTAssertTrue(
+        app.buttons["dismissConnection"].waitForExistence(timeout: 3), app.debugDescription)
     }
     if !hasGuidance {
       let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75))
@@ -382,7 +385,8 @@ final class AgentUITests: XCTestCase {
     continueAfterFailure = true
     defer { continueAfterFailure = previous }
     try app.performAccessibilityAudit(for: types) { issue in
-      let nativeElement = XCTAttachment(string: issue.element?.debugDescription ?? "No native element")
+      let nativeElement = XCTAttachment(
+        string: issue.element?.debugDescription ?? "No native element")
       nativeElement.name = "native-audit-issue-element"
       nativeElement.lifetime = .keepAlways
       self.add(nativeElement)

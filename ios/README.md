@@ -55,7 +55,7 @@ Mode if requested, then Run.
 
 ## Behavior and data
 
-- Saved history, streamed answer text, provider-exposed thinking, tool status,
+- Saved history, streamed answer text, provider-shareable summaries, tool status,
   commentary, durable notices and compaction state use native views. Markdown
   uses Foundation's parser, with native headings, quotes, lists, code blocks and
   tables. Changed rows are prepared once per published snapshot, outside SwiftUI
@@ -70,9 +70,12 @@ Mode if requested, then Run.
   **Latest** returns to a fresh recent page, retaining concurrent replies and
   pending messages. It stays available if paging evicted recent history;
   otherwise it disappears at the bottom.
-- Consecutive tool calls and thinking share a compact disclosure. Progress
-  messages stay visible. Expand activity to read the returned reasoning text
-  or inspect a command's arguments, output, errors and status.
+- Consecutive tool calls and summaries share a compact disclosure. Progress
+  messages stay visible. Expand activity to read every supplied summary or
+  inspect a command's arguments, output, errors and status.
+- Long-press a message, summary or tool output for **Copy message**, **Select
+  text** or **Share text**. Selection opens native text handles on a stable
+  snapshot, so streaming cannot move the selected range.
 - Tool details are read on demand from Pi's stored call and result. Each text
   section is limited to 32 KiB; missing content and truncation are shown.
   History pages carry tool identity and status without the full output.
@@ -86,7 +89,9 @@ Mode if requested, then Run.
 - Coordinator acknowledgements are saved with each outbox input. Accepted
   messages stay saved through suspension, reconnect and app restart; they are
   observed by their original IDs until placement and cannot be resubmitted.
-  **Saved** means coordinator admission, not finished work.
+  **Sending** becomes **Sent** after coordinator acknowledgement, not after a
+  local outbox write. **Sent** does not mean the work is finished. Confirmed
+  history keeps that receipt; reconnecting cannot turn it into a retry badge.
   Pending inputs can separately show queued, working, completed or paused work
   reported by the coordinator. Placement retires that badge, without implying
   execution completed; the coordinator reports a paused main conversation.
@@ -108,6 +113,12 @@ Mode if requested, then Run.
   eight files of 16 MiB each use the shared chunked attachment protocol. Photos
   are resized and encoded as JPEG. History includes file metadata; bytes are
   downloaded and verified only when opening a preview.
+- **Paste images** imports clipboard images as removable **Unsent attachments**.
+  Import preserves the note and existing files, and sending remains explicit.
+  A failed or cancelled import removes only its newly staged files.
+- The shared protocol retains typed CLI/iOS input origins and scheduled-notice
+  lineage. Missing legacy origin stays unknown. Live and restored rows use the
+  same durable identities and causal ordering.
 - `/feedback` captures the current app window before sending and includes it
   with the report. Failed admission keeps that exact screenshot for retry.
   Pi's existing adapter handles model image input; other files remain available
@@ -168,3 +179,8 @@ network latency, decoding, SwiftUI drawing and device frame pacing. Ordering,
 memory bounds and durable identity are also asserted.
 Runtime tests exercise the actual Pi/bridge with
 synthetic external model responses and host effects, never real accounts.
+
+Native UI checks exercise copy/partial-selection, clipboard-image drafts and
+actual appearance. Release acceptance also requires protected CI, a matching
+coordinator and signed build/source readback. Current acceptance is tracked in
+the [roadmap](../docs/roadmap.md#finish-the-current-pass).
