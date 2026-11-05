@@ -116,6 +116,63 @@ test("real bridge reads canonical settings and node history before a default-mod
   } finally { lines.close(); child.stdin.end(); child.kill(); await closed; await rm(directory, { recursive: true, force: true }); }
 });
 
+test("ready observation streams do not consume coordinator request admission", { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-stream-admission-"));
+  await chmod(directory, 0o700);
+  const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("../src/bridge.js", import.meta.url)), directory],
+    { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, OPENAI_API_KEY: "" } });
+  const closed = new Promise<number | null>((resolve, reject) => { child.once("close", resolve); child.once("error", reject); });
+  const lines = createInterface({ input: child.stdout });
+  const frames: RuntimeEvent[] = [];
+  const listeners = new Set<() => void>();
+  let errors = "";
+  child.stderr.setEncoding("utf8").on("data", (chunk: string) => { errors += chunk; });
+  lines.on("line", (line) => {
+    const frame: unknown = JSON.parse(line); assert.ok(validEvent(frame));
+    frames.push(frame); for (const listener of listeners) listener();
+  });
+  const send = (id: number, command: RuntimeCommand) => child.stdin.write(JSON.stringify({ version: 1, id, command }) + "\n");
+  const wait = async (id: number, type: RuntimeEventKind["type"]) => {
+    const settled = () => frames.some((frame) => frame.id === id &&
+      (frame.event.type === type || (type !== "done" && frame.event.type === "failure")));
+    if (!settled()) await new Promise<void>((resolve) => {
+      const check = () => { if (settled()) { listeners.delete(check); resolve(); } };
+      listeners.add(check); check();
+    });
+    const found = frames.find((frame) => frame.id === id && frame.event.type === type);
+    assert.ok(found, JSON.stringify(frames.filter((frame) => frame.id === id)));
+    return found.event;
+  };
+  try {
+    for (let id = 1; id <= 64; id += 1) {
+      send(id, { type: "observe_main", input_ids: [] });
+      await wait(id, "main_ready");
+    }
+    send(65, { type: "list_tasks" });
+    await wait(65, "tasks"); await wait(65, "done");
+    send(66, { type: "status" });
+    await wait(66, "auth_status"); await wait(66, "done");
+    const held: { id: number; call_id: string }[] = [];
+    for (let id = 100; id < 164; id += 1) {
+      send(id, { type: "search_history", query: `disposable admission query ${id}`, limit: 1, mode: "semantic" });
+      const call = await wait(id, "host_call"); assert.ok(call.type === "host_call");
+      held.push({ id, call_id: call.call_id });
+    }
+    send(164, { type: "status" });
+    const busy = await wait(164, "failure"); assert.ok(busy.type === "failure");
+    assert.equal(busy.code, "coordinator_unavailable"); await wait(164, "done");
+    const space: EmbeddingSpace = { id: "synthetic", model_revision: "fixture", model_digest: "fixture", dimensions: 3,
+      pooling: "last", normalization: "l2", instruction_version: 1 };
+    for (const request of held) send(request.id, { type: "host_reply", call_id: request.call_id,
+      result: { type: "embeddings", batch: { space, vectors: [[1, 0, 0]] } } });
+    for (const request of held) await wait(request.id, "done");
+    send(165, { type: "status" }); await wait(165, "auth_status"); await wait(165, "done");
+    for (let id = 1; id <= 64; id += 1) send(id, { type: "detach_main" });
+    for (let id = 1; id <= 64; id += 1) await wait(id, "done");
+    child.stdin.end(); assert.equal(await closed, 0, errors);
+  } finally { lines.close(); child.kill(); await closed; await rm(directory, { recursive: true, force: true }); }
+});
+
 test("real bridge ignores a delayed interrupt after Done and still interrupts active chat", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-late-interrupt-")); await chmod(directory, 0o700);
   const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("../src/bridge.js", import.meta.url)), directory],
