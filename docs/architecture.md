@@ -116,6 +116,10 @@ default same-user rule. The connected /32 and node owner must match native
 WhoIs metadata. See [trust configuration](setup.md#trust).
 
 The SwiftUI iPhone client uses this same coordinator and main conversation.
+Runtime admission bounds initialization rather than the lifetime of attached
+workers and observers. Typed ready events release admission capacity while
+streams retain their existing control and shutdown ownership. Replies and
+detach controls remain available when initialization capacity is full.
 It loads recent history first and fetches earlier conversation when scrolling
 to the top, coalescing activity-only pages in bounded batches. The visible
 position stays anchored; Latest restores the recent window. At most 500 display

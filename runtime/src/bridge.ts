@@ -62,9 +62,13 @@ function stateDirectory(): string {
 const state = stateDirectory();
 const auth = new ChatGptAuth(state);
 let activeLoginRequestId: number | undefined;
+// Admission bounds initialization, not the lifetime of an attached worker or
+// observer. Ready streams remain in `pending` for owned shutdown and controls.
+const admissions = new Set<number>();
 function emit(id: number, event: RuntimeEventKind): void {
   const frame: RuntimeEvent = { version: VERSION, id, event };
   if (!validEvent(frame)) throw new Error("Invalid runtime event");
+  if (event.type === "main_ready" || event.type === "task_ready" || event.type === "conversation_ready" || event.type === "worker_ready" || event.type === "done") admissions.delete(id);
   // Text deltas are an ObserveMain opt-in. Existing Chat clients deserialize a
   // closed event enum and must keep receiving their original canonical wire.
   if (event.type !== "text_delta" || mainObservers.has(id)) process.stdout.write(`${JSON.stringify(frame)}\n`);
@@ -378,6 +382,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const stopped = new Promise<void>((resolve) => { stopBackground = resolve; });
         try {
           await (await app()).background.start(command.settings);
+          admissions.delete(id);
           await stopped;
         } finally { backgroundOwner = undefined; stopBackground = undefined; }
         break;
@@ -904,9 +909,10 @@ try {
       }
       continue;
     }
-    if (pending.size >= 64) {
-      failure(request.id, "invalid_request", "The coordinator is busy; retry later"); emit(request.id, { type: "done" }); continue;
+    if (admissions.size >= 64) {
+      failure(request.id, "coordinator_unavailable", "The coordinator is admitting other requests; retry shortly"); emit(request.id, { type: "done" }); continue;
     }
+    admissions.add(request.id);
     const operation = handle(request).finally(() => pending.delete(operation));
     pending.add(operation);
   }
