@@ -106,7 +106,7 @@ impl Default for ModelSelection {
         Self {
             provider: ModelProvider::OpenAi,
             model_id: "gpt-6.1-sol".into(),
-            reasoning: None,
+            reasoning: Some(Reasoning::Xhigh),
             fast: false,
         }
     }
@@ -155,6 +155,9 @@ impl<'de> Deserialize<'de> for ModelSelection {
             ModelSelection::default().model_id
         }
         let input = Input::deserialize(deserializer)?;
+        // A present selection with omitted effort means provider default, including
+        // TOML roundtrips of None. Only an absent application model preference
+        // uses ModelSelection::default().
         let selection = Self {
             provider: input.provider,
             model_id: input.model_id,
@@ -195,7 +198,26 @@ mod tests {
     #[test]
     fn model_selection_defaults_and_validation_keep_dynamic_ids_typed() {
         let default: ModelSelection = serde_json::from_str("{}").unwrap();
-        assert_eq!(default, ModelSelection::default());
+        assert_eq!(
+            default,
+            ModelSelection {
+                reasoning: None,
+                ..ModelSelection::default()
+            }
+        );
+        assert_eq!(ModelSelection::default().reasoning, Some(Reasoning::Xhigh));
+        for input in [
+            r#"{"reasoning":null}"#,
+            r#"{"model_id":"another-model"}"#,
+            r#"{"provider":"anthropic","model_id":"gpt-6.1-sol"}"#,
+        ] {
+            assert_eq!(
+                serde_json::from_str::<ModelSelection>(input)
+                    .unwrap()
+                    .reasoning,
+                None
+            );
+        }
         let selected: ModelSelection = serde_json::from_str(r#"{"provider":"anthropic","model_id":"future-model-version","reasoning":"high","fast":true}"#).unwrap();
         assert_eq!(selected.provider, ModelProvider::Anthropic);
         assert_eq!(selected.model_id, "future-model-version");
