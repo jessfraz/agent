@@ -220,6 +220,34 @@ final class ChatModel {
       }
     } catch { self.error = error.localizedDescription }
   }
+  func attach(providers: [NSItemProvider]) async {
+    guard !preparingAttachments else { return }
+    preparingAttachments = true
+    defer { preparingAttachments = false }
+    var staged: [LocalAttachment] = []
+    do {
+      guard providers.count <= AttachmentLimits.maximumCount - attachments.count else {
+        throw AttachmentError.tooMany
+      }
+      let images = try await ItemProviderImages.load(providers)
+      let store = try attachmentStore()
+      for image in images {
+        try Task.checkCancellation()
+        staged.append(
+          try await store.stage(data: image.data, name: image.name, mediaType: image.mediaType))
+      }
+      try Task.checkCancellation()
+      guard staged.count <= AttachmentLimits.maximumCount - attachments.count else {
+        throw AttachmentError.tooMany
+      }
+      // Adopt the complete selection once. Neither the note nor existing files
+      // belong to this import, including when a provider fails or is cancelled.
+      attachments.append(contentsOf: staged)
+    } catch {
+      for file in staged { try? await draftStore?.remove(file) }
+      if !(error is CancellationError) { self.error = error.localizedDescription }
+    }
+  }
   func attach(data: Data, name: String, mediaType: String) async {
     do {
       guard attachments.count < AttachmentLimits.maximumCount else { throw AttachmentError.tooMany }

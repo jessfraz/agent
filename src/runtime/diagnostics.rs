@@ -1529,6 +1529,7 @@ mod tests {
         let mut diagnostics = Diagnostics { sender, dropped: 0 };
         let commands = [
             RuntimeCommand::MainInput {
+                origin: None,
                 attachments: None,
                 input_id: "main-input".into(),
                 input: "A private input body".into(),
@@ -1541,6 +1542,7 @@ mod tests {
                 }),
             },
             RuntimeCommand::ConversationInput {
+                origin: None,
                 attachments: None,
                 conversation_id: "saved-conversation".into(),
                 input_id: "saved-input".into(),

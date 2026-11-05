@@ -330,8 +330,12 @@ private func admittedInputWorkReconcilesAfterReopenWithoutBecomingADeliveryError
     #expect(model.rows.first?.row.delivery == .saved)
     #expect(
       model.rows.first?.row.work == nil, "An older server cannot leave a stale execution badge")
+    let submitted = try #require(await fixture.submitted().first)
     try await fixture.placeSubmissions()
-    try await waitForReconnectState { model.rows.first?.row.delivery == nil }
+    try await waitForReconnectState {
+      model.rows.first?.row.entryID == "saved-\(submitted.inputId)"
+        && model.rows.first?.row.delivery == .saved
+    }
     #expect(
       model.rows.first?.row.work == nil, "Placement retires the badge without inferring completion")
     #expect(model.error == nil)
@@ -485,7 +489,9 @@ func acknowledgedActionReplyReconnectsAndReconcilesWithoutResendingOrClearingNew
     #expect(!model.canSend)
     await fixture.releaseSnapshot()
     try await waitForReconnectState {
-      model.connection == .connected && model.rows.first?.row.delivery == nil
+      model.connection == .connected
+        && model.rows.first?.row.entryID == "saved-\(submitted.inputId)"
+        && model.rows.first?.row.delivery == .saved
     }
     #expect(model.error == nil)
     #expect(model.draft == "New typing survives reconnection")
@@ -582,7 +588,11 @@ func establishedObservationSurvivesTurnFailureAndAdmitsTheNextInput() async thro
     try #require(model.canSend)
     await model.send()
     try await waitForReconnectFixture { await fixture.submitted().count == 1 }
-    try await waitForReconnectState { model.rows.first?.row.delivery == nil && !model.rows.isEmpty }
+    let submitted = try #require(await fixture.submitted().first)
+    try await waitForReconnectState {
+      model.rows.first?.row.entryID == "saved-\(submitted.inputId)"
+        && model.rows.first?.row.delivery == .saved
+    }
     #expect(model.connection == .connected)
     #expect(model.error == nil)
     #expect(model.draft.isEmpty)

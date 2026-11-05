@@ -166,10 +166,25 @@ test("the real bridge changes busy settings without prompting and uses them afte
   };
   try {
     await configure();
+    const observed = peer.request({ type: "observe_main", input_ids: [] });
+    const deadline = Date.now() + 5_000;
+    while (!peer.frames.some((frame) => frame.id === observed.id && frame.event.type === "worker_idle")) {
+      assert.ok(Date.now() < deadline, "Idle observation did not become ready");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    const updates = () => peer.frames.filter((frame) => frame.id === observed.id && frame.event.type === "conversation_settings");
+    const idle = updates().length;
+    await peer.request(control({ type: "set_reasoning", reasoning: null })).response;
+    assert.equal(updates().length, idle + 1, "An idle observer receives one configured-state update");
+    const cleared = updates().at(-1)?.event; assert.ok(cleared?.type === "conversation_settings");
+    assert.equal(cleared.settings.model.reasoning, null, "Explicit provider-default None is not promoted to a built-in effort");
+    assert.equal(cleared.settings.model.fast, false);
     const current = peer.request(chat("held-start")); await started;
+    const busy = updates().length;
     await peer.request(control({ type: "set_fast", mode: "on" })).response;
     const configured = await peer.request(control({ type: "set_reasoning", reasoning: "low" })).response;
     assert.ok(configured.some((event) => event.type === "conversation_settings" && event.settings.model.fast && event.settings.model.reasoning === "low"));
+    assert.equal(updates().length, busy + 2, "Each busy settings mutation reaches the main observer once, not via a second idle fanout");
     assert.ok(peer.frames.some((frame) => frame.id === current.id && frame.event.type === "conversation_settings" && frame.event.settings.model.fast));
     const requestsBeforeRelease = (await readFile(queue + ".requests", "utf8")).trim().split("\n");
     assert.equal(requestsBeforeRelease.length, 1, "Local controls must not trigger another provider generation");
@@ -177,6 +192,7 @@ test("the real bridge changes busy settings without prompting and uses them afte
       result: { type: "process", exit_code: 0, stdout: "Completed", stderr: "", truncated: false } });
     const completed = await current.response;
     assert.ok(completed.some((event) => event.type === "answer" && event.text === "Current request completed"));
+    peer.send(observed.id, { type: "detach_main" }); await observed.response;
     await peer.close(); peer = openBridge(); await configure();
     const saved = await peer.request(control(null)).response;
     assert.ok(saved.some((event) => event.type === "conversation_settings" && event.settings.model.fast && event.settings.model.reasoning === "low"));

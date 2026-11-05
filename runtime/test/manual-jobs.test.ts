@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { ToolResultEntry, UserEntry, type Harness } from "@earendil-works/pi-durable";
+import { ToolResultEntry, type Harness } from "@earendil-works/pi-durable";
 import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { BackgroundScheduler, JobRunReceiptEntry } from "../src/background.js";
 import { runScheduled, scheduledTaskId } from "../src/scheduled.js";
@@ -206,7 +206,7 @@ test("native run_job tool memo replays its original admission after SIGKILL with
     const input = await app.root.submit({ type: "input", content: "Run the example review now.", requestId: "manual-tool-input" }, BACKGROUND_CONTEXT);
     assert.equal((await input.wait(BACKGROUND_CONTEXT)).status, "done");
     const entries = await app.root.entries({}, 100, undefined, BACKGROUND_CONTEXT);
-    assert.equal(entries.items.filter((entry) => UserEntry.is(entry)).length, 1);
+    assert.equal(entries.items.filter((entry) => entry.model?.some((message) => message.role === "user")).length, 1);
     const result = entries.items.find((entry) => ToolResultEntry.is(entry)); assert.ok(result);
     const content = result.model?.filter((message) => message.role === "toolResult").flatMap((message) => message.content);
     assert.ok(content?.some((part) => part.type === "text" && part.text.includes(original.task_id)));
@@ -270,7 +270,7 @@ test("a manually admitted task executes its reviewed focus through the actual sc
     const input = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, "manual:real-worker"), BACKGROUND_CONTEXT);
     assert.equal(input?.status, "done");
     const page = await conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT);
-    assert.equal(page.items.filter((entry) => UserEntry.is(entry)).length, 1);
+    assert.equal(page.items.filter((entry) => entry.model?.some((message) => message.role === "user")).length, 1);
     const effect = app.commands.find((command) => command.type === "exec"); assert.ok(effect?.type === "exec"); assert.equal(effect.cwd, job.cwd);
     assert.deepEqual(await scheduler.runJob(request("real-worker")), receipt);
     assert.equal((await app.tasks.list()).length, 1); assert.equal(app.commands.filter((command) => command.type === "exec").length, 1);

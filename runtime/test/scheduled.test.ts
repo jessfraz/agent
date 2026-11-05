@@ -9,7 +9,6 @@ import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
-import { UserEntry } from "@earendil-works/pi-durable";
 import { BackgroundScheduler } from "../src/background.js";
 import { openJobActor, runScheduled } from "../src/scheduled.js";
 import type { ScheduledOccurrence } from "../src/generated/ScheduledOccurrence.js";
@@ -38,7 +37,7 @@ test("scheduled work uses the existing task actor, current guidance and exact na
     const input = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, scheduledOccurrence.id), BACKGROUND_CONTEXT);
     assert.ok(input); assert.equal(input.status, "done");
     const page = await conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT);
-    assert.equal(page.items.filter((entry) => UserEntry.is(entry)).length, 1);
+    assert.equal(page.items.filter((entry) => entry.model?.some((message) => message.role === "user")).length, 1);
     assert.equal(app.commands.filter((command) => command.type === "spawn_worker").length, 1);
     assert.equal(app.commands.filter((command) => command.type === "exec").length, 1,
       JSON.stringify(page.items.flatMap((entry) => entry.model?.filter((message) => message.role === "toolResult") ?? [])));
@@ -243,7 +242,7 @@ for (const recoveredState of ["waiting", "resolved"]) {
       const retained = await app.session.commit((tx) => tx.submissionByRequest(restored.id, occurrence.id), BACKGROUND_CONTEXT);
       assert.equal(retained?.id, original.id); assert.equal(retained?.status, "unanswered");
       const page = await restored.entries({}, 100, undefined, BACKGROUND_CONTEXT);
-      assert.equal(page.items.filter((entry) => UserEntry.is(entry)).length, 6, "The next occurrence joins the original input, explicit recovery, steering and native follow-ups");
+      assert.equal(page.items.filter((entry) => entry.model?.some((message) => message.role === "user")).length, 6, "The next occurrence joins the original input, explicit recovery, steering and native follow-ups");
       assert.equal(app.commands.filter((command) => command.type === "exec" && command.program === "perform-effect").length, 0);
     } finally {
       release(); allowVerification(); allowFollowup(); controller.abort(); await worker?.catch(() => {});
@@ -251,6 +250,26 @@ for (const recoveredState of ["waiting", "resolved"]) {
     }
   });
 }
+
+test("silent scheduled completion does not produce a main-chat response or receipt", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-scheduled-quiet-")), app = await openScheduled(directory);
+  const controller = new AbortController();
+  let worker: Promise<unknown> | undefined, scheduled: Promise<void> | undefined;
+  try {
+    app.faux.setResponses([fauxAssistantMessage("")]);
+    scheduled = runScheduled(scheduledOccurrence, controller.signal, app);
+    await pump(async () => (await app.tasks.list())[0]?.worker.state === "bound");
+    const task = (await app.tasks.list())[0]; assert.ok(task);
+    worker = app.worker(task.id, controller); await Promise.all([scheduled, worker]);
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    assert.deepEqual((await root.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items, [],
+      "Only direct main inputs require a response; successful quiet jobs stay quiet");
+    assert.equal(app.faux.state.callCount, 1);
+  } finally {
+    controller.abort(); await Promise.allSettled([worker, scheduled]);
+    await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("SIGKILL after scheduled input placement restores its actor without duplicating task, input or host work", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-scheduled-kill-"));
@@ -289,7 +308,7 @@ test("SIGKILL after scheduled input placement restores its actor without duplica
     const recovered = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, scheduledOccurrence.id), BACKGROUND_CONTEXT);
     assert.equal(recovered?.id, prior.id);
     const page = await conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT);
-    assert.equal(page.items.filter((entry) => UserEntry.is(entry)).length, 1);
+    assert.equal(page.items.filter((entry) => entry.model?.some((message) => message.role === "user")).length, 1);
     assert.equal(app.commands.filter((command) => command.type === "spawn_worker").length, 0);
     assert.equal(app.commands.filter((command) => command.type === "resume_worker").length, 1);
     assert.equal(app.commands.filter((command) => command.type === "exec").length, 1,

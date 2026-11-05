@@ -50,11 +50,11 @@ import Testing
   transcript.delivery(request.inputId, .saved, entryID: "saved-user")
   transcript.delivery(request.inputId, .uncertain)
   transcript.pending(request, delivery: .uncertain)
-  #expect(transcript.rows.first(where: { $0.inputID == request.inputId })?.delivery == nil)
+  #expect(transcript.rows.first(where: { $0.inputID == request.inputId })?.delivery == .saved)
   transcript.history(.init(messages: [user], nextCursor: nil, pageComplete: true))
   #expect(transcript.rows.count == 1)
   #expect(transcript.rows.first?.id == stableID)
-  #expect(transcript.rows.first?.delivery == nil)
+  #expect(transcript.rows.first?.delivery == .saved)
 }
 
 @Test func historyReconstructsMultipleBlocksChunksAndToolFailure() {
@@ -378,6 +378,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     #expect(await session.submit("", files: [file]))
     let acknowledged = try await until(session) { $0.rows.contains { $0.delivery == .saved } }
     #expect(acknowledged.rows.last?.attachments == [file.reference])
+    let inputID = try #require(acknowledged.rows.last?.inputID)
     #expect(await fixture.uploadCount() == 2)
     #expect(await fixture.uploaded(file.id) == bytes)
     let saved = try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
@@ -396,7 +397,11 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     #expect(await fixture.count() == 1, "A rejected control must not admit or clear its files")
     await session.disconnect()
     await session.connect(address)
-    _ = try await until(session) { $0.connection == .connected && $0.rows.last?.delivery == nil }
+    _ = try await until(session) {
+      $0.connection == .connected
+        && $0.rows.last?.entryID == "placed-\(inputID)"
+        && $0.rows.last?.delivery == .saved
+    }
     #expect(await fixture.count() == 1)
     #expect(
       try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)

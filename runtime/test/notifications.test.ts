@@ -155,12 +155,14 @@ test("APNs previews contain readable bounded reply or explicit notice text, neve
   assert.ok(!body.includes("\ufffd")); assert.equal(body.includes("INTERNAL_REASONING"), false);
   assert.ok(Buffer.byteLength(JSON.stringify(request.body)) < 4096, "The actual JSON request must fit Apple's alert payload limit");
   const notice = await app.session.commit((tx) => tx.appendEntry(ROOT_CONVERSATION_ID, { kind: UserNoticeEntry.kind,
-    data: { task_id: null, source_conversation_id: "synthetic-source", source_entry_id: "synthetic-entry", text: "The **drawing** needs your review." },
+    data: { task_id: null, source_conversation_id: "synthetic-source", source_entry_id: "synthetic-entry", text: "The **drawing** needs your review.",
+      notice_origin: { job_id: "private-job-label", title: "PRIVATE_JOB_TITLE_NOT_A_PREVIEW" } },
     model: [fauxAssistantMessage("INTERNAL_CONTEXT_STAYS_PRIVATE")] }), BACKGROUND_CONTEXT);
   await until(app.session, t.signal, async () => (await delivery(app.session, first, notice))?.state === "accepted");
   const sent = f.requests[1]; assert.ok(sent && object(sent.body));
   assert.deepEqual(sent.body.aps, { alert: { title: "Beep Boop", body: "The drawing needs your review." }, sound: "default" });
   assert.equal(JSON.stringify(sent.body).includes("INTERNAL_CONTEXT"), false);
+  assert.doesNotMatch(JSON.stringify(sent.body), /private-job-label|PRIVATE_JOB_TITLE/);
   assert.deepEqual(sent.body.agent, { conversation_id: "1", entry_id: notice.id.toString() });
 });
 

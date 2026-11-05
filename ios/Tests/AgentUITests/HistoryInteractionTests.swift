@@ -5,6 +5,132 @@ import XCTest
 
 @MainActor
 final class HistoryInteractionTests: XCTestCase {
+  private func launchMessages(_ messages: [HistoryMessage]) async throws -> XCUIApplication {
+    continueAfterFailure = false
+    executionTimeAllowance = 90
+    let peer = InteractionPeer()
+    addTeardownBlock { await peer.stop() }
+    let history = NativeEventHistory(messages: messages, nextCursor: nil, pageComplete: true)
+    await peer.history(initial: history, pages: [:], latest: history)
+    let app = XCUIApplication()
+    app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(try await peer.start())
+    app.launchArguments += ["-notificationsEnabled", "NO"]
+    app.launch()
+    addTeardownBlock { @MainActor in app.terminate() }
+    return app
+  }
+
+  private func action(_ label: String, app: XCUIApplication) -> XCUIElement {
+    app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label)).firstMatch
+  }
+
+  private func editor(_ app: XCUIApplication) -> XCUIElement {
+    app.descendants(matching: .any).matching(identifier: "Message the coordinator").firstMatch
+  }
+
+  func testWholeMessageCopyAndPartialNativeSelectionPasteThroughComposer() async throws {
+    let text = "Alpha bracket Charlie.\n\nSecond paragraph from the same answer."
+    let app = try await launchMessages([
+      .init(continuation: false, entryId: "1", finalChunk: true, role: .final, text: text)
+    ])
+    let first = app.staticTexts["Alpha bracket Charlie."]
+    XCTAssertTrue(first.waitForExistence(timeout: 5))
+    first.press(forDuration: 1)
+    let copy = action("Copy message", app: app)
+    XCTAssertTrue(copy.waitForExistence(timeout: 3))
+    copy.tap()
+    let composer = editor(app)
+    func pasteCopiedText(_ expected: String) {
+      composer.tap()
+      composer.press(forDuration: 1)
+      let paste = action("Paste", app: app)
+      XCTAssertTrue(paste.waitForExistence(timeout: 3), app.debugDescription)
+      paste.tap()
+      let pasted = XCTNSPredicateExpectation(
+        predicate: NSPredicate(format: "value == %@", expected), object: composer)
+      XCTAssertEqual(
+        XCTWaiter.wait(for: [pasted], timeout: 3), .completed,
+        "The actual native Paste action must update the composer: \(composer.debugDescription)")
+    }
+    pasteCopiedText(text)
+    XCTAssertEqual(composer.value as? String, text)
+    composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: text.count))
+    XCTAssertEqual(composer.value as? String, "")
+    first.press(forDuration: 1)
+    let select = action("Select text", app: app)
+    XCTAssertTrue(select.waitForExistence(timeout: 3))
+    select.tap()
+    let selection = app.textViews["Selectable message text"]
+    XCTAssertTrue(selection.waitForExistence(timeout: 3))
+    // Touch a word in the real, noneditable UITextView, not a test-only menu.
+    selection.coordinate(withNormalizedOffset: .zero).withOffset(
+      CGVector(dx: 35, dy: 27)
+    ).press(forDuration: 1)
+    let selectedCopy = action("Copy", app: app)
+    XCTAssertTrue(selectedCopy.waitForExistence(timeout: 3))
+    let screenshot = XCTAttachment(screenshot: app.screenshot())
+    screenshot.name = "partial-message-selection-handles"
+    screenshot.lifetime = .keepAlways
+    add(screenshot)
+    selectedCopy.tap()
+    app.buttons["Done"].tap()
+    pasteCopiedText("Alpha")
+    XCTAssertEqual(composer.value as? String, "Alpha")
+  }
+
+  func testPasteImagesKeepsTheNoteAndCreatesOnlyRemovableUnsentAttachments() async throws {
+    let app = try await launchMessages([
+      .init(continuation: false, entryId: "1", finalChunk: true, role: .final, text: "Ready")
+    ])
+    let composer = editor(app)
+    XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    let note = "Keep this note with the selected image."
+    composer.tap()
+    composer.typeText(note)
+    let renderer = UIGraphicsImageRenderer(size: CGSize(width: 32, height: 24))
+    UIPasteboard.general.image = renderer.image { context in
+      UIColor.systemTeal.setFill()
+      context.fill(CGRect(x: 0, y: 0, width: 32, height: 24))
+    }
+    let paste = app.buttons["Paste images"]
+    XCTAssertTrue(paste.waitForExistence(timeout: 3))
+    XCTAssertTrue(paste.isEnabled)
+    paste.tap()
+    let remove = app.buttons["Remove Image.jpg"]
+    XCTAssertTrue(remove.waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts["Unsent attachments"].exists)
+    XCTAssertEqual(composer.value as? String, note)
+    XCTAssertTrue(app.buttons["Send message"].isEnabled)
+    XCTAssertFalse(app.staticTexts["Sending"].exists)
+    XCTAssertFalse(app.staticTexts["Sent"].exists)
+    remove.tap()
+    XCTAssertTrue(remove.waitForNonExistence(timeout: 3))
+    XCTAssertEqual(composer.value as? String, note)
+  }
+
+  func testOneActivityExpansionShowsEverySuppliedSummaryWithoutFetchingHiddenThinking()
+    async throws
+  {
+    let app = try await launchMessages([
+      .init(
+        continuation: false, entryId: "1", finalChunk: true, role: .thinking,
+        text: "First supplied summary.\n\nEvery provider-supplied line stays visible."),
+      .init(
+        continuation: false, entryId: "2", finalChunk: true, role: .thinking,
+        text: "Second supplied summary.\n\nNo hidden thinking is fetched."),
+    ])
+    let group = app.buttons["activity:entry:1:0"]
+    XCTAssertTrue(group.waitForExistence(timeout: 5))
+    group.tap()
+    XCTAssertTrue(app.staticTexts["Every provider-supplied line stays visible."].exists)
+    XCTAssertTrue(app.staticTexts["No hidden thinking is fetched."].exists)
+    XCTAssertFalse(app.buttons["Retry details"].exists)
+    let screenshot = XCTAttachment(screenshot: app.screenshot())
+    screenshot.name = "all-provider-shareable-summaries-one-expansion"
+    screenshot.lifetime = .keepAlways
+    add(screenshot)
+  }
+
   func testSourceWarningShowsPerAccountErrorsAndUpdatesDuringRecovery() async throws {
     continueAfterFailure = false
     executionTimeAllowance = 90

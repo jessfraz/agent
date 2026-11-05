@@ -336,6 +336,10 @@ public struct MainChatView: View {
   private var composer: some View {
     VStack(spacing: 6) {
       if !model.attachments.isEmpty {
+        HStack {
+          Text("Unsent attachments").font(.caption).foregroundStyle(.secondary)
+          Spacer()
+        }
         ScrollView(.horizontal) {
           HStack(spacing: 8) {
             ForEach(model.attachments) { file in
@@ -385,6 +389,15 @@ public struct MainChatView: View {
         }
         .tint(.primary).accessibilityLabel("Add attachments or commands")
         .accessibilityIdentifier("composerMenu")
+        PasteButton(supportedContentTypes: [.image]) { providers in
+          Task { await model.attach(providers: providers) }
+        }
+        .labelStyle(.iconOnly).buttonBorderShape(.circle)
+        .frame(minWidth: 44, minHeight: 44)
+        .accessibilityLabel("Paste images")
+        .disabled(
+          model.preparingAttachments || model.admitting
+            || model.attachments.count >= AttachmentLimits.maximumCount)
         TextField(
           model.mode == .steer ? "Message Beep Boop" : "Queue a follow-up", text: $model.draft,
           axis: .vertical
@@ -494,6 +507,7 @@ public struct MainChatView: View {
               }
             } else if model.connection != .connected {
               Text("Connect to the coordinator to receive updates.").font(.footnote)
+                .fixedSize(horizontal: false, vertical: true)
             } else if !registration.configured {
               Text("APNs setup is required on the coordinator.").font(.footnote)
             } else if registration.enabled, !registration.registered {
@@ -600,9 +614,7 @@ struct MessageRow: View {
     .padding(.leading, isUser && !typeSize.isAccessibilitySize ? 32 : 0)
     .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
     .accessibilityElement(children: .contain).accessibilityLabel(title)
-    .contextMenu {
-      ShareLink(item: model.row.text) { Label("Share text", systemImage: "square.and.arrow.up") }
-    }
+    .messageTextActions(model.row.text)
   }
   private var isUser: Bool { model.row.role == .user }
   private var showsHeader: Bool {

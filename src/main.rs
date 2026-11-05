@@ -702,6 +702,7 @@ async fn main() -> Result<()> {
                 mode,
                 input_id,
             } => RuntimeCommand::TaskInput {
+                origin: Some(agent_cli::protocol::InputOrigin::Cli),
                 task_id,
                 input_id: input_id.unwrap_or_else(uuid::Uuid::new_v4).to_string(),
                 input,
@@ -1637,6 +1638,7 @@ fn selected_input(
                     directory: &directory,
                 },
                 RuntimeCommand::ConversationInput {
+                    origin: Some(agent_cli::protocol::InputOrigin::Cli),
                     conversation_id: admission.conversation_id.clone(),
                     input_id: admission.id.clone(),
                     input: admission.text.clone(),
@@ -3142,6 +3144,7 @@ async fn chat_command(
         );
     }
     Ok(RuntimeCommand::Chat {
+        origin: Some(agent_cli::protocol::InputOrigin::Cli),
         input,
         attachments: None,
         input_id: None,
@@ -3532,7 +3535,8 @@ async fn request_presented(
                                 let input_id = uuid::Uuid::new_v4().to_string();
                                 ui.handle.pending_composer(input_id.clone(), &input, mode)?;
                                 ui.submitted.push_back(QueuedInput {id:input_id.clone(), input:input.clone(), mode});
-                                write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: input.text, attachments: (!input.attachments.is_empty()).then_some(input.attachments), mode }).await?;
+                                write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput {
+                                    origin: Some(agent_cli::protocol::InputOrigin::Cli), input_id, input: input.text, attachments: (!input.attachments.is_empty()).then_some(input.attachments), mode }).await?;
                             } else { ui.enqueue(input, mode)?; }
                         }
                     }
@@ -3640,6 +3644,7 @@ async fn request_presented(
                         }
                     } else if !line.trim().is_empty() {
                         write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput {
+                            origin: Some(agent_cli::protocol::InputOrigin::Cli),
                             input_id: uuid::Uuid::new_v4().to_string(), input: line, attachments:None, mode: InputMode::Steer,
                         }).await?;
                     }
@@ -3793,7 +3798,8 @@ async fn request_presented(
                     while let Some(input) = ui.queued.pop_front() {
                         let input_id = input.id.clone();
                         ui.submitted.push_back(input.clone());
-                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: input.input.text, attachments: (!input.input.attachments.is_empty()).then_some(input.input.attachments), mode: input.mode }).await?;
+                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput {
+                            origin: Some(agent_cli::protocol::InputOrigin::Cli), input_id, input: input.input.text, attachments: (!input.input.attachments.is_empty()).then_some(input.input.attachments), mode: input.mode }).await?;
                     }
                 }
                 if arguments.json { display(&event, true)?; }
@@ -3808,7 +3814,8 @@ async fn request_presented(
                     while let Some(input) = ui.queued.pop_front() {
                         let input_id = input.id.clone();
                         ui.submitted.push_back(input.clone());
-                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: input.input.text, attachments: (!input.input.attachments.is_empty()).then_some(input.input.attachments), mode: input.mode }).await?;
+                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput {
+                            origin: Some(agent_cli::protocol::InputOrigin::Cli), input_id, input: input.input.text, attachments: (!input.input.attachments.is_empty()).then_some(input.input.attachments), mode: input.mode }).await?;
                     }
                 } else if arguments.json {
                     display(&event, true)?;

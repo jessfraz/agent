@@ -2,7 +2,8 @@ import Foundation
 
 public enum Delivery: String, Sendable, Equatable {
   case sending = "Sending"
-  case saved = "Saved"
+  // A coordinator receipt, never merely a local outbox write.
+  case saved = "Sent"
   case uncertain = "Delivery unconfirmed"
   case rejected = "Needs attention"
 }
@@ -10,6 +11,8 @@ public enum Delivery: String, Sendable, Equatable {
 public struct ChatRow: Identifiable, Sendable, Equatable {
   public let id: String
   public var entryID: String?
+  // Coalesced tools retain their original causal position for ordering.
+  fileprivate var positionID: NativeEntryID?
   public var role: HistoryRole
   public var blocks: [RichBlock]
   public var text: String
@@ -29,12 +32,13 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
   ) {
     self.id = id
     self.entryID = entryID
+    positionID = entryID.flatMap(NativeEntryID.init)
     self.role = role
     self.text = text
     blocks = []
     self.tool = tool
     self.presentation = presentation
-    self.delivery = delivery
+    self.delivery = delivery ?? (role == .user && entryID != nil ? .saved : nil)
     self.work = work
     self.inputID = inputID
     self.attachments = attachments
@@ -60,7 +64,13 @@ struct Transcript: Sendable {
   }
 
   private mutating func append(_ row: ChatRow) {
-    storage.append(row)
+    if let position = row.positionID,
+      let index = storage.firstIndex(where: { $0.positionID.map { $0 > position } ?? false })
+    {
+      storage.insert(row, at: index)
+    } else {
+      storage.append(row)
+    }
     dirtyRows.insert(row.id)
   }
   private struct Page: Sendable {
@@ -93,10 +103,8 @@ struct Transcript: Sendable {
     dirtyRows = dirtyRows.filter { !$0.hasPrefix("thinking:") }
   }
   mutating func pending(_ request: NativeRequestSubmit, delivery: Delivery) {
-    if let index = storage.firstIndex(where: { $0.inputID == request.inputId }) {
-      if storage[index].entryID == nil {
-        storage[index].delivery = delivery
-      }
+    if storage.contains(where: { $0.inputID == request.inputId }) {
+      self.delivery(request.inputId, delivery)
       return
     }
     append(
@@ -107,11 +115,43 @@ struct Transcript: Sendable {
   }
   mutating func delivery(_ id: String, _ state: Delivery, entryID: String? = nil) {
     guard let index = storage.firstIndex(where: { $0.inputID == id }) else { return }
-    if storage[index].entryID == nil { storage[index].delivery = state }
+    if entryID == nil {
+      // A socket closing is not a new receipt. Foreground reconciliation must
+      // not discard known acceptance/rejection or regress confirmed placement.
+      guard storage[index].entryID == nil else { return }
+      if state == .uncertain,
+        storage[index].delivery == .saved || storage[index].delivery == .rejected
+      {
+        return
+      }
+    }
+    storage[index].delivery = state
     if let entryID {
       storage[index].entryID = entryID
-      storage[index].delivery = nil
-      storage.removeAll { $0.entryID == entryID && $0.inputID != id }
+      storage[index].positionID = NativeEntryID(entryID)
+      storage[index].delivery = .saved
+      if let canonical = storage.firstIndex(where: {
+        $0.entryID == entryID && $0.inputID != id && $0.role == .user
+      }) {
+        if historicalEntries.contains(entryID) || storage[index].positionID != nil {
+          // Canonical history, or a native-ID-ordered live echo, already owns
+          // the position. Do not keep an optimistic row below its replies.
+          let canonicalID = storage[canonical].id
+          let placed = storage[index]
+          storage = storage.compactMap { row in
+            if row.inputID == id { return nil }
+            return row.id == canonicalID ? placed : row
+          }
+        } else {
+          // A late live echo has no authoritative history position. Keep the
+          // optimistic row's position and remove just its duplicate block.
+          storage.remove(at: canonical)
+        }
+      } else if storage[index].positionID != nil {
+        // The user block may be outside the received history window. Its
+        // acknowledged native ID still places it before later native replies.
+        append(storage.remove(at: index))
+      }
     }
   }
   mutating func work(_ id: String, _ state: InputWorkState?) {
@@ -126,7 +166,9 @@ struct Transcript: Sendable {
       replacedRows: Dictionary(
         uniqueKeysWithValues:
           rows.filter {
-            $0.delivery == nil && $0.id != responseID && $0.id != thinkingID
+            // Only unplaced local inputs survive independently of this window.
+            ($0.entryID != nil || $0.delivery == nil)
+              && $0.id != responseID && $0.id != thinkingID
           }.map { ($0.id, $0) }))
   }
   mutating func history(
@@ -171,6 +213,11 @@ struct Transcript: Sendable {
           && (!olderPage || current.entryID == nil || current.entryID == row.entryID
             || saved.status == .running || saved.status == .unknown)
         var merged = preferIncoming ? row : current
+        if let saved = current.positionID, let incoming = row.positionID {
+          merged.positionID = min(saved, incoming)
+        } else {
+          merged.positionID = current.positionID ?? row.positionID
+        }
         merged.presentation = mergePresentation(
           current.presentation, row.presentation, preferIncoming: preferIncoming)
         return merged
@@ -225,7 +272,13 @@ struct Transcript: Sendable {
   }
   mutating func message(_ message: HistoryMessage, historical: Bool = false) {
     if !historical && message.role == .commentary { finishResponse() }
-    if !historical && historicalEntries.contains(message.entryId) { return }
+    if !historical {
+      let visible = hasVisibleAnswer(message.entryId)
+      let repairsMissingAnswer =
+        message.role.carriesAnswer
+        && !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !visible
+      if historicalEntries.contains(message.entryId) && !repairsMissingAnswer { return }
+    }
     if message.role == .user,
       storage.contains(where: { $0.entryID == message.entryId && $0.inputID != nil })
     {
@@ -234,6 +287,11 @@ struct Transcript: Sendable {
     if let tool = message.tool {
       let id = "tool:\(tool.callId)"
       if let index = storage.firstIndex(where: { $0.id == id }) {
+        if let incoming = NativeEntryID(message.entryId),
+          storage[index].positionID.map({ incoming < $0 }) ?? true
+        {
+          storage[index].positionID = incoming
+        }
         let stale = storage[index].tool.map { staleTool($0.status, tool.status) } ?? false
         storage[index].presentation = mergePresentation(
           storage[index].presentation, message.presentation, preferIncoming: !stale)
@@ -278,14 +336,25 @@ struct Transcript: Sendable {
   }
   mutating func answer(_ answer: NativeEventAnswer) {
     finishResponse()
-    guard !answer.text.isEmpty else { return }
-    if let id = answer.entryId, storage.contains(where: { $0.entryID == id }) { return }
+    guard !answer.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+    if let id = answer.entryId, hasVisibleAnswer(id) { return }
+    let entry = answer.entryId ?? UUID().uuidString
+    let segment = segmentCounts[entry, default: 0]
+    if answer.entryId != nil {
+      segmentCounts[entry] = segment + 1
+    }
     append(
       ChatRow(
-        id: "entry:\(answer.entryId ?? UUID().uuidString):0", entryID: answer.entryId, role: .final,
+        id: "entry:\(entry):\(segment)", entryID: answer.entryId, role: .final,
         text: boundedText(answer.text)))
     thinkingID = nil
     bound()
+  }
+  private func hasVisibleAnswer(_ entryID: String) -> Bool {
+    storage.contains {
+      $0.entryID == entryID && $0.role.carriesAnswer
+        && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
   }
   mutating func activity(_ activity: ModelActivity) {
     switch activity {
@@ -342,12 +411,15 @@ struct Transcript: Sendable {
     return String(text.prefix(Self.maximumRowCharacters))
       + "\n\n[Display limit reached. Full content remains on the coordinator.]"
   }
-  var lastReceivedRowID: String? { storage.last { $0.delivery == nil }?.id }
+  var lastReceivedRowID: String? {
+    storage.last { $0.entryID != nil || $0.delivery == nil }?.id
+  }
   private mutating func bound(olderPage: Bool = false, preserving anchorID: String? = nil) {
     textBytes = storage.reduce(0) { $0 + $1.text.utf8.count }
     while storage.count > Self.maximumRows || textBytes > Self.maximumTextBytes {
       let candidates = storage.indices.filter {
-        storage[$0].delivery == nil && storage[$0].id != anchorID
+        (storage[$0].entryID != nil || storage[$0].delivery == nil)
+          && storage[$0].id != anchorID
       }
       guard let index = olderPage ? candidates.last : candidates.first else { break }
       let removed = storage.remove(at: index)
@@ -392,5 +464,27 @@ private func mergePresentation(
           ? second.receiverThreadIds : first.receiverThreadIds,
         senderThreadId: first.senderThreadId ?? second.senderThreadId))
   default: return preferIncoming ? incoming ?? saved : saved ?? incoming
+  }
+}
+
+// Only canonical, positive native sequence IDs carry ordering information.
+// UUIDs, prefixed legacy IDs and malformed numbers keep arrival/history order.
+private struct NativeEntryID: Sendable, Equatable, Comparable {
+  let value: UInt64
+
+  init?(_ raw: String) {
+    guard let value = UInt64(raw), value > 0, String(value) == raw else { return nil }
+    self.value = value
+  }
+
+  static func < (left: Self, right: Self) -> Bool { left.value < right.value }
+}
+
+extension HistoryRole {
+  fileprivate var carriesAnswer: Bool {
+    switch self {
+    case .assistant, .final, .commentary: true
+    case .thinking, .tool, .user, .notice, .partialAnswer: false
+    }
   }
 }

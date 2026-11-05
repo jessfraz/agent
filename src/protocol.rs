@@ -284,6 +284,15 @@ pub struct SavedConversation {
     pub source_thread_id: Option<String>,
 }
 
+/// Trusted direct-input transport metadata, never inferred from text or host.
+/// Omission is unknown, including legacy clients and non-human work.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum InputOrigin {
+    Cli,
+    Ios,
+}
+
 /// Used only when an idle chief starts a new turn; active work keeps its context.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct MainInputContext {
@@ -369,6 +378,9 @@ pub enum RuntimeCommand {
     },
     /// Owner-independent admission using Pi's durable request identity.
     MainInput {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        origin: Option<InputOrigin>,
         input_id: String,
         input: String,
         mode: InputMode,
@@ -406,6 +418,9 @@ pub enum RuntimeCommand {
     },
     Logout,
     Chat {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        origin: Option<InputOrigin>,
         input: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -437,6 +452,9 @@ pub enum RuntimeCommand {
     DetachConversation,
     /// Admit input independently of any observing terminal's lifetime.
     ConversationInput {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        origin: Option<InputOrigin>,
         conversation_id: String,
         input_id: String,
         input: String,
@@ -491,6 +509,9 @@ pub enum RuntimeCommand {
     },
     ImportStatus,
     TaskInput {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        origin: Option<InputOrigin>,
         task_id: TaskId,
         input_id: String,
         input: String,
@@ -546,6 +567,9 @@ pub enum RuntimeCommand {
         attachments: Option<Vec<crate::attachments::AttachmentRef>>,
     },
     SubmitInput {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        origin: Option<InputOrigin>,
         input_id: String,
         input: String,
         mode: InputMode,
@@ -764,6 +788,10 @@ pub enum TaskAgentState {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TaskInput {
+    /// Direct transport metadata retained in the durable task outbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub origin: Option<InputOrigin>,
     pub id: String,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1128,6 +1156,14 @@ pub enum RuntimeEventKind {
         settings: ConversationSettings,
     },
     MainReady {
+        /// Advertised by the runtime that persists and projects transport provenance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        input_origins: Option<bool>,
+        /// Missing on legacy runtimes; native clients gate typed settings per connection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        conversation_settings: Option<bool>,
         conversation_id: String,
         model: ModelSelection,
         cwd: String,
@@ -1199,8 +1235,18 @@ pub enum RuntimeEventKind {
     Done,
 }
 
+/// Immutable scheduled-run lineage copied onto the published notice.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+pub struct NoticeOrigin {
+    pub job_id: crate::jobs::JobId,
+    pub title: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct HistoryMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub notice_origin: Option<NoticeOrigin>,
     pub entry_id: String,
     pub role: HistoryRole,
     pub text: String,
@@ -1716,6 +1762,7 @@ mod tests {
         assert!(legacy.tool.is_none());
         assert!(!legacy.final_chunk);
         let message = HistoryMessage {
+            notice_origin: None,
             presentation: None,
             attachments: None,
             entry_id: "result".into(),

@@ -1739,6 +1739,16 @@
           "type": "boolean",
           "default": false
         },
+        "notice_origin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NoticeOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "presentation": {
           "anyOf": [
             {
@@ -2643,6 +2653,14 @@
         "follow_up"
       ]
     },
+    "InputOrigin": {
+      "description": "Trusted direct-input transport metadata, never inferred from text or host.\nOmission is unknown, including legacy clients and non-human work.",
+      "type": "string",
+      "enum": [
+        "cli",
+        "ios"
+      ]
+    },
     "InputWorkState": {
       "description": "Durable processing state, separate from acknowledgement of a saved input.",
       "oneOf": [
@@ -3442,6 +3460,22 @@
         "git_dir",
         "branch",
         "head"
+      ]
+    },
+    "NoticeOrigin": {
+      "description": "Immutable scheduled-run lineage copied onto the published notice.",
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id",
+        "title"
       ]
     },
     "NotificationStatus": {
@@ -4321,8 +4355,22 @@
             "conversation_id": {
               "type": "string"
             },
+            "conversation_settings": {
+              "description": "Missing on legacy runtimes; native clients gate typed settings per connection.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "cwd": {
               "type": "string"
+            },
+            "input_origins": {
+              "description": "Advertised by the runtime that persists and projects transport provenance.",
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "model": {
               "$ref": "#/$defs/ModelSelection"
@@ -5278,6 +5326,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/InputMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin": {
+          "description": "Direct transport metadata retained in the durable task outbox.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InputOrigin"
             },
             {
               "type": "null"

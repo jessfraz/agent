@@ -8,10 +8,16 @@ final class AgentUITests: XCTestCase {
     case dark = "Dark"
   }
 
-  private func launch(appearance: Appearance? = nil, smallText: Bool = false) -> XCUIApplication {
+  private func launch(
+    appearance: Appearance? = nil, smallText: Bool = false, notificationsEnabled: Bool? = nil
+  ) -> XCUIApplication {
     continueAfterFailure = false
     executionTimeAllowance = 60
     let app = XCUIApplication()
+    if let notificationsEnabled {
+      // This is the existing user preference, not a test-only app interface.
+      app.launchArguments += ["-notificationsEnabled", notificationsEnabled ? "YES" : "NO"]
+    }
     if smallText {
       app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryXS"]
     }
@@ -216,28 +222,33 @@ final class AgentUITests: XCTestCase {
     _ appearance: Appearance, app: XCUIApplication, file: StaticString = #filePath,
     line: UInt = #line
   ) {
-    var lastScreenshot: XCUIScreenshot?
-    var lastBrightness: Double?
-    let predicate = NSPredicate { [self] _, _ in
-      guard let screenshot = foregroundScreenshot(app) else { return false }
-      lastScreenshot = screenshot
-      lastBrightness = screenshot.image.cgImage.flatMap(backgroundBrightness)
-      guard let brightness = lastBrightness else { return false }
-      return appearance == .light ? brightness > 0.8 : brightness < 0.2
+    // Native interactions already wait for UI idleness. Measure one foreground
+    // window; screenshot acquisition time is diagnostic, not appearance state.
+    let started = ContinuousClock.now
+    guard let screenshot = foregroundScreenshot(app) else {
+      XCTFail(
+        "Expected a visible foreground application window; acquisition unavailable after "
+          + "\(started.duration(to: .now))", file: file, line: line)
+      return
     }
-    let rendered = XCTNSPredicateExpectation(predicate: predicate, object: nil)
-    let result = XCTWaiter.wait(for: [rendered], timeout: 3)
-    if result != .completed, let lastScreenshot {
-      let receipt = XCTAttachment(screenshot: lastScreenshot)
-      receipt.name = "\(appearance.rawValue.lowercased())-background-failure"
-      receipt.lifetime = .keepAlways
-      add(receipt)
+    let acquired = started.duration(to: .now)
+    let brightness = screenshot.image.cgImage.flatMap(backgroundBrightness)
+    let completed = started.duration(to: .now)
+    let matches = brightness.map { appearance == .light ? $0 > 0.8 : $0 < 0.2 } ?? false
+    let measured = brightness.map { String(format: "%.3f", $0) } ?? "unavailable"
+    let measurement =
+      "median brightness: \(measured); acquired: \(acquired); completed: \(completed)"
+    XCTContext.runActivity(named: "\(appearance.rawValue) background; \(measurement)") { activity in
+      if !matches {
+        let receipt = XCTAttachment(screenshot: screenshot)
+        receipt.name = "\(appearance.rawValue.lowercased())-background-failure"
+        receipt.lifetime = .keepAlways
+        activity.add(receipt)
+      }
+      XCTAssertTrue(
+        matches, "Expected \(appearance.rawValue) background; \(measurement)",
+        file: file, line: line)
     }
-    let measured = lastBrightness.map { String(format: "%.3f", $0) } ?? "unavailable"
-    XCTAssertEqual(
-      result, .completed,
-      "Expected \(appearance.rawValue) background; median brightness: \(measured)",
-      file: file, line: line)
   }
 
   nonisolated private func backgroundBrightness(_ image: CGImage) -> Double? {
@@ -279,13 +290,74 @@ final class AgentUITests: XCTestCase {
     let previous = XCUIDevice.shared.appearance
     defer { XCUIDevice.shared.appearance = previous }
     for appearance in Appearance.allCases {
-      let app = launch(appearance: appearance)
+      // An unsigned, offline simulator cannot enroll with APNs. Keep its
+      // notification preference off so an asynchronous enrollment failure cannot
+      // replace the disconnected guidance while this view is being audited.
+      let app = launch(appearance: appearance, notificationsEnabled: false)
       defer { app.terminate() }
+      try revealCompleteConnectionForm(app)
       try audit(app)
       capture("connection-accessibility-\(appearance.rawValue)", app: app)
+      if !app.buttons["dismissConnection"].exists {
+        let window = app.windows.firstMatch
+        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+        start.press(
+          forDuration: 0.05,
+          thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8)),
+          withVelocity: .slow, thenHoldForDuration: 0.1)
+      }
+      XCTAssertTrue(app.buttons["dismissConnection"].waitForExistence(timeout: 3), app.debugDescription)
       app.buttons["Done"].tap()
       try audit(app)
       capture("main-accessibility-\(appearance.rawValue)", app: app)
+    }
+  }
+
+  private func revealCompleteConnectionForm(_ app: XCUIApplication) throws {
+    let window = app.windows.firstMatch
+    let status = app.cells.containing(.staticText, identifier: "Status").firstMatch
+    let guidance = app.cells.containing(
+      .staticText, identifier: "Connect to the coordinator to receive updates."
+    ).firstMatch
+    XCTAssertTrue(status.exists)
+    XCTAssertTrue(status.isHittable, app.debugDescription)
+    XCTAssertTrue(window.frame.contains(status.frame), "The first form row must be fully onscreen")
+    let hasGuidance = guidance.exists
+    let overflow = hasGuidance ? max(0, guidance.frame.maxY - window.frame.maxY) : 0
+    let distance = overflow > 0 ? max(44, overflow + 8) : 0
+    let keepsFirstRow = hasGuidance
+      && status.frame.minY - distance >= app.navigationBars["Connection"].frame.maxY
+    if !keepsFirstRow {
+      // A short viewport can neither materialize the lazy final row nor fit
+      // both endpoints at once. Audit the complete top viewport before moving,
+      // then the original caller audits the complete final viewport. Neither
+      // endpoint nor either appearance/main-screen audit is exempted.
+      capture("connection-top-accessibility", app: app)
+      let hierarchy = XCTAttachment(string: app.debugDescription)
+      hierarchy.name = "connection-top-native-hierarchy"
+      hierarchy.lifetime = .keepAlways
+      add(hierarchy)
+      try audit(app)
+      XCTAssertTrue(app.buttons["dismissConnection"].waitForExistence(timeout: 3), app.debugDescription)
+    }
+    if !hasGuidance {
+      let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75))
+      start.press(
+        forDuration: 0.05,
+        thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.2)),
+        withVelocity: .slow, thenHoldForDuration: 0.1)
+    } else if distance > 0 {
+      let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.65))
+      start.press(
+        forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -distance)),
+        withVelocity: .slow, thenHoldForDuration: 0.1)
+    }
+    XCTAssertTrue(guidance.waitForExistence(timeout: 3), app.debugDescription)
+    XCTAssertTrue(guidance.isHittable, app.debugDescription)
+    XCTAssertTrue(window.frame.contains(guidance.frame), "The last form row must be fully onscreen")
+    if keepsFirstRow {
+      XCTAssertTrue(status.isHittable, app.debugDescription)
+      XCTAssertTrue(window.frame.contains(status.frame), "The first form row must remain onscreen")
     }
   }
 
@@ -310,6 +382,10 @@ final class AgentUITests: XCTestCase {
     continueAfterFailure = true
     defer { continueAfterFailure = previous }
     try app.performAccessibilityAudit(for: types) { issue in
+      let nativeElement = XCTAttachment(string: issue.element?.debugDescription ?? "No native element")
+      nativeElement.name = "native-audit-issue-element"
+      nativeElement.lifetime = .keepAlways
+      self.add(nativeElement)
       // WCAG 1.4.3 excludes inactive controls from text-contrast requirements.
       // https://www.w3.org/WAI/WCAG21/Understanding/contrast-minimum#inactive-user-interface-components
       if issue.auditType == .contrast, issue.element?.isEnabled == false { return true }

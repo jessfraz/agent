@@ -119,7 +119,7 @@ struct ActivityGroup: Identifiable {
       interrupted == 0 ? nil : "\(interrupted) interrupted",
       unknown == 0 ? nil : "\(unknown) unknown",
       tools == 0 ? nil : "\(tools) tool \(tools == 1 ? "call" : "calls")",
-      thoughts == 0 ? nil : "\(thoughts) \(thoughts == 1 ? "thought" : "thoughts")",
+      thoughts == 0 ? nil : "\(thoughts) \(thoughts == 1 ? "summary" : "summaries")",
       events == 0 ? nil : "\(events) \(events == 1 ? "event" : "events")",
     ].compactMap { $0 }.joined(separator: " · ")
   }
@@ -158,20 +158,28 @@ struct ActivityGroupView: View {
       if expanded {
         LazyVStack(alignment: .leading, spacing: 4) {
           ForEach(Array(group.rows.enumerated()), id: \.element.id) { index, row in
-            ActivityItemView(
-              model: row,
-              expanded: Binding(
-                get: { expansion.items.contains(row.id) },
-                set: { value in
-                  if value {
-                    expansion.items.insert(row.id)
-                  } else {
-                    expansion.items.remove(row.id)
-                  }
-                }),
-              details: { row in try await queue.load(row, using: details) },
-              ordinal: group.rows[..<index].filter { $0.row.tool != nil }.count + 1,
-              onExpand: onExpand)
+            if row.row.role == .thinking, row.row.tool == nil {
+              RichMessage(blocks: row.row.blocks, textStyle: .callout, compact: true)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 8)
+                .messageTextActions(row.row.text)
+            } else {
+              ActivityItemView(
+                model: row,
+                expanded: Binding(
+                  get: { expansion.items.contains(row.id) },
+                  set: { value in
+                    if value {
+                      expansion.items.insert(row.id)
+                    } else {
+                      expansion.items.remove(row.id)
+                    }
+                  }),
+                details: { row in try await queue.load(row, using: details) },
+                ordinal: group.rows[..<index].filter { $0.row.tool != nil }.count + 1,
+                onExpand: onExpand)
+            }
           }
         }
         .padding(.leading, 8)
@@ -280,9 +288,7 @@ struct ActivityItemView: View {
       }
     }
     .frame(maxWidth: .infinity, alignment: .leading)
-    .contextMenu {
-      ShareLink(item: model.row.text) { Label("Share text", systemImage: "square.and.arrow.up") }
-    }
+    .messageTextActions(model.row.text)
     .task(
       id:
         "\(expanded):\(model.row.entryID ?? ""):\(model.row.tool?.status.rawValue ?? ""):\(reload)"
@@ -528,6 +534,7 @@ private struct ToolText: View {
           .fixedSize(horizontal: true, vertical: false)
       }
     }.frame(maxWidth: .infinity, alignment: .leading)
+      .messageTextActions(text)
   }
 }
 

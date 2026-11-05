@@ -29,6 +29,9 @@ pub enum NativeRequest {
         source_status: Option<bool>,
     },
     Submit {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        origin: Option<crate::protocol::InputOrigin>,
         input_id: String,
         text: String,
         mode: InputMode,
@@ -38,6 +41,12 @@ pub enum NativeRequest {
     },
     History {
         cursor: Option<String>,
+    },
+    /// Main-only local controls. Never submits a composer input.
+    Settings {
+        change: Option<crate::protocol::ConversationChange>,
+        #[serde(default)]
+        catalog: bool,
     },
     ToolDetails {
         entry_id: String,
@@ -86,6 +95,17 @@ pub struct SlashCommand {
     pub description: String,
 }
 
+/// Confirmed configured preference and catalog, not an in-flight request claim.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct NativeSettingsSnapshot {
+    /// Catalog is populated only when requested. Empty fanout catalogs do not
+    /// replace a client's separately fetched catalog.
+    pub configured: crate::protocol::ConversationSettings,
+    /// Unknown: the settings producer does not expose a generation's captured
+    /// provider request. None must not be replaced with configured/default effort.
+    pub effective: Option<crate::models::ModelSelection>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NativeEvent {
@@ -100,6 +120,12 @@ pub enum NativeEvent {
         commands: Vec<SlashCommand>,
     },
     Ready {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        input_origins: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        conversation_settings: Option<bool>,
         conversation_id: String,
         model: String,
     },
@@ -143,6 +169,10 @@ pub enum NativeEvent {
     },
     Notice {
         text: String,
+        /// Additive to the legacy notice shape, so older observers still decode it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        settings: Option<NativeSettingsSnapshot>,
     },
     Failure {
         message: String,
@@ -178,6 +208,13 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
             }
             RuntimeCommand::ObserveMain { input_ids }
         }
+        NativeRequest::Settings { change, catalog } => RuntimeCommand::ConversationSettings {
+            task_id: None,
+            agent_id: None,
+            conversation_id: None,
+            change,
+            catalog,
+        },
         NativeRequest::History { cursor } => RuntimeCommand::ReadHistory {
             task_id: None,
             agent_id: None,
@@ -206,6 +243,7 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
             RuntimeCommand::Notifications { request }
         }
         NativeRequest::Submit {
+            origin,
             input_id,
             text,
             mode,
@@ -250,6 +288,7 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                 match control {
                     ChatCommand::Help => {
                         return Ok(Operation::Local(NativeEvent::Notice {
+                            settings: None,
                             text: commands().into_iter().map(|command| format!("{}  {}", command.usage, command.description)).collect::<Vec<_>>().join("\n"),
                         }));
                     }
@@ -272,6 +311,7 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                 }
             } else {
                 RuntimeCommand::MainInput {
+                    origin,
                     input_id,
                     input: text,
                     mode,
@@ -306,17 +346,24 @@ fn model_label(model: &crate::models::ModelSelection) -> String {
 
 pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
     if let Some(text) = crate::job_view::event(event) {
-        return Some(NativeEvent::Notice { text });
+        return Some(NativeEvent::Notice {
+            text,
+            settings: None,
+        });
     }
     Some(match event {
         RuntimeEventKind::Attachment { response } => NativeEvent::Attachment {
             response: response.clone(),
         },
         RuntimeEventKind::MainReady {
+            input_origins,
+            conversation_settings,
             conversation_id,
             model,
             ..
         } => NativeEvent::Ready {
+            input_origins: *input_origins,
+            conversation_settings: *conversation_settings,
             conversation_id: conversation_id.clone(),
             model: model_label(model),
         },
@@ -365,10 +412,17 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
         RuntimeEventKind::Failure { message, .. } => NativeEvent::Failure {
             message: message.clone(),
         },
-        RuntimeEventKind::Notice { text, .. } => NativeEvent::Notice { text: text.clone() },
+        RuntimeEventKind::Notice { text, .. } => NativeEvent::Notice {
+            settings: None,
+            text: text.clone(),
+        },
         RuntimeEventKind::Interrupted | RuntimeEventKind::WorkerIdle => NativeEvent::Idle,
         RuntimeEventKind::Done => NativeEvent::Done,
         RuntimeEventKind::ConversationSettings { settings } => NativeEvent::Notice {
+            settings: Some(NativeSettingsSnapshot {
+                configured: settings.clone(),
+                effective: None,
+            }),
             text: std::iter::once(model_label(&settings.model))
                 .chain(settings.catalog.iter().map(|model| {
                     format!(
@@ -387,6 +441,7 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             unavailable_host_ids,
             ..
         } => NativeEvent::Notice {
+            settings: None,
             text: crate::machines::MachineInventory {
                 nodes: nodes.clone(),
                 online_host_ids: online_host_ids.clone(),
@@ -395,6 +450,7 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             .format(std::time::SystemTime::now()),
         },
         RuntimeEventKind::Resources { resources } => NativeEvent::Notice {
+            settings: None,
             text: crate::resources::format_inventory(resources),
         },
         RuntimeEventKind::FeedbackReady {
@@ -408,6 +464,7 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             receipt,
             input_id: None,
         } => NativeEvent::Notice {
+            settings: None,
             text: format!("Feedback saved. Repair task: {}", receipt.task_id),
         },
         _ => return None,
@@ -417,9 +474,196 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        native::{NativeRequest, Operation, prepare},
+        native::{NativeEvent, NativeRequest, Operation, prepare},
         protocol::{InputMode, RuntimeCommand},
     };
+
+    #[test]
+    fn native_settings_prepare_main_only_explicit_defaults_and_truthful_ready_capabilities() {
+        use crate::protocol::{ConversationChange, FastMode, RuntimeEventKind};
+        for change in [
+            ConversationChange::SetReasoning { reasoning: None },
+            ConversationChange::SetFast { mode: FastMode::On },
+            ConversationChange::SetFast {
+                mode: FastMode::Off,
+            },
+        ] {
+            let request = NativeRequest::Settings {
+                change: Some(change.clone()),
+                catalog: true,
+            };
+            let decoded = serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+            let Operation::Runtime(command) = prepare(decoded).unwrap() else {
+                panic!("Expected local settings")
+            };
+            let RuntimeCommand::ConversationSettings {
+                task_id,
+                agent_id,
+                conversation_id,
+                change: actual,
+                catalog,
+            } = *command
+            else {
+                panic!("Settings must not submit a chat input")
+            };
+            assert!(task_id.is_none() && agent_id.is_none() && conversation_id.is_none());
+            assert!(catalog);
+            match (change, actual) {
+                (
+                    ConversationChange::SetReasoning { reasoning: None },
+                    Some(ConversationChange::SetReasoning { reasoning: None }),
+                ) => {}
+                (
+                    ConversationChange::SetFast { mode: expected },
+                    Some(ConversationChange::SetFast { mode: actual }),
+                ) => assert_eq!(actual, expected),
+                _ => panic!("An explicit preference changed in transport"),
+            }
+        }
+        for advertised in [None, Some(false), Some(true)] {
+            let event = RuntimeEventKind::MainReady {
+                conversation_id: "1".into(),
+                cwd: "/".into(),
+                model: crate::models::ModelSelection::default(),
+                input_origins: advertised,
+                conversation_settings: advertised,
+            };
+            let Some(NativeEvent::Ready {
+                input_origins,
+                conversation_settings,
+                ..
+            }) = crate::native::project(&event)
+            else {
+                panic!("Expected main ready")
+            };
+            assert_eq!(input_origins, advertised);
+            assert_eq!(conversation_settings, advertised);
+        }
+        let legacy: RuntimeEventKind = serde_json::from_str(r#"{"type":"main_ready","conversation_id":"1","cwd":"/","model":{"provider":"openai","model_id":"fixture","reasoning":null,"fast":false}}"#).unwrap();
+        assert!(matches!(
+            crate::native::project(&legacy),
+            Some(NativeEvent::Ready {
+                input_origins: None,
+                conversation_settings: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn native_notice_origin_survives_live_and_historical_projection() {
+        use crate::protocol::{HistoryMessage, HistoryRole, NoticeOrigin, RuntimeEventKind};
+        let origin = NoticeOrigin {
+            job_id: "package-tracking".to_string().try_into().unwrap(),
+            title: "Package tracking".into(),
+        };
+        let row = HistoryMessage {
+            notice_origin: Some(origin.clone()),
+            entry_id: "10".into(),
+            role: HistoryRole::Notice,
+            text: "A concrete decision is needed.".into(),
+            continuation: false,
+            final_chunk: true,
+            presentation: None,
+            tool: None,
+            attachments: None,
+        };
+        for event in [
+            RuntimeEventKind::Message {
+                message: row.clone(),
+            },
+            RuntimeEventKind::History {
+                conversation_id: "1".into(),
+                messages: vec![row],
+                next_cursor: None,
+                page_complete: true,
+            },
+        ] {
+            let projected = crate::native::project(&event).unwrap();
+            let wire = serde_json::to_vec(&projected).unwrap();
+            let decoded: NativeEvent = serde_json::from_slice(&wire).unwrap();
+            let actual = match decoded {
+                NativeEvent::Message { message } => message,
+                NativeEvent::History { mut messages, .. } => messages.remove(0),
+                other => panic!("Unexpected native projection: {other:?}"),
+            };
+            assert_eq!(actual.notice_origin, Some(origin.clone()));
+            assert_eq!(actual.entry_id, "10");
+            #[derive(serde::Deserialize)]
+            struct LegacyRow {
+                text: String,
+            }
+            let legacy: LegacyRow =
+                serde_json::from_slice(&serde_json::to_vec(&actual).unwrap()).unwrap();
+            assert_eq!(legacy.text, actual.text);
+        }
+        let legacy: HistoryMessage = serde_json::from_str(r#"{"entry_id":"1","role":"notice","text":"Legacy notice","continuation":false,"final_chunk":true}"#).unwrap();
+        assert_eq!(legacy.notice_origin, None);
+    }
+
+    #[test]
+    fn native_settings_keep_confirmed_values_and_capabilities_without_a_new_event_variant() {
+        use crate::{
+            models::{ModelProvider, ModelSelection, Reasoning},
+            protocol::{ConversationSettings, ModelOption, RuntimeEventKind},
+        };
+        let settings = ConversationSettings {
+            conversation_id: "1".into(),
+            task_id: None,
+            agent_id: None,
+            model: ModelSelection::default(),
+            catalog: vec![ModelOption {
+                provider: ModelProvider::OpenAi,
+                model_id: "gpt-6.1-sol".into(),
+                name: "Native catalog entry".into(),
+                reasoning: vec![Reasoning::Low, Reasoning::High, Reasoning::Xhigh],
+                fast: true,
+            }],
+        };
+        let event = crate::native::project(&RuntimeEventKind::ConversationSettings {
+            settings: settings.clone(),
+        })
+        .unwrap();
+        let NativeEvent::Notice {
+            ref text,
+            settings: Some(ref current),
+        } = event
+        else {
+            panic!("Settings must retain the legacy notice shape")
+        };
+        assert!(text.starts_with("openai/gpt-6.1-sol · xhigh"));
+        assert_eq!(current.configured.model, settings.model);
+        assert_eq!(
+            current.configured.catalog[0].reasoning,
+            settings.catalog[0].reasoning
+        );
+        assert!(current.configured.catalog[0].fast);
+        assert!(
+            current.effective.is_none(),
+            "Configured settings are not captured in-flight settings"
+        );
+        #[derive(serde::Deserialize)]
+        struct LegacyNotice {
+            text: String,
+        }
+        let old: LegacyNotice =
+            serde_json::from_slice(&serde_json::to_vec(&event).unwrap()).unwrap();
+        assert_eq!(old.text, *text);
+        let old: NativeEvent =
+            serde_json::from_str(r#"{"type":"notice","text":"Legacy notice"}"#).unwrap();
+        assert!(matches!(old, NativeEvent::Notice { settings: None, .. }));
+        let old: NativeEvent = serde_json::from_str(
+            r#"{"type":"ready","conversation_id":"1","model":"Legacy model"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            old,
+            NativeEvent::Ready {
+                input_origins: None,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn source_coverage_projects_through_the_native_wire_without_becoming_a_notice() {
@@ -475,6 +719,7 @@ mod tests {
             }
         ));
         let Operation::Runtime(command) = prepare(NativeRequest::Submit {
+            origin: None,
             input_id: input_id.clone(),
             text: "/feedback report".into(),
             mode: InputMode::Steer,
@@ -514,6 +759,7 @@ mod tests {
             sha256: "0".repeat(64),
         };
         let request = |text: &str| NativeRequest::Submit {
+            origin: None,
             input_id: uuid::Uuid::new_v4().to_string(),
             text: text.into(),
             mode: InputMode::Steer,
@@ -531,6 +777,7 @@ mod tests {
     fn manual_job_controls_reuse_native_input_identity_across_retries() {
         let input_id = uuid::Uuid::new_v4().to_string();
         let request = || NativeRequest::Submit {
+            origin: None,
             attachments: None,
             input_id: input_id.clone(),
             text: "/run-job Daily_Review.v2 --schedule Morning.v1".into(),
@@ -579,6 +826,7 @@ mod tests {
         for input_id in [String::new(), uuid::Uuid::nil().to_string()] {
             assert!(
                 prepare(NativeRequest::Submit {
+                    origin: None,
                     attachments: None,
                     input_id,
                     text: "Hello".into(),
@@ -597,6 +845,7 @@ mod tests {
         for text in [" ".to_owned(), "🦀".repeat(16385)] {
             assert!(
                 prepare(NativeRequest::Submit {
+                    origin: None,
                     attachments: None,
                     input_id: uuid::Uuid::new_v4().to_string(),
                     text,
@@ -659,6 +908,7 @@ mod tests {
         );
         assert!(matches!(
             prepare(NativeRequest::Submit {
+                origin: None,
                 attachments: None,
                 input_id: uuid::Uuid::new_v4().to_string(),
                 text: "/resume saved-chat".into(),
@@ -673,6 +923,7 @@ mod tests {
     fn worktree_control_uses_existing_inventory_without_model_input() {
         for mode in [InputMode::Steer, InputMode::FollowUp] {
             let operation = prepare(NativeRequest::Submit {
+                origin: None,
                 attachments: None,
                 input_id: uuid::Uuid::new_v4().to_string(),
                 text: "/worktrees".into(),
@@ -708,7 +959,7 @@ mod tests {
             }),
             reason: "Task is still open".into(),
         };
-        let Some(crate::native::NativeEvent::Notice { text }) =
+        let Some(crate::native::NativeEvent::Notice { text, .. }) =
             crate::native::project(&crate::protocol::RuntimeEventKind::Resources {
                 resources: vec![resource],
             })
@@ -730,7 +981,7 @@ mod tests {
             crate::native::project(&crate::protocol::RuntimeEventKind::Resources {
                 resources: vec![],
             }),
-            Some(crate::native::NativeEvent::Notice { text }) if text == "No Beep Boop-owned worktrees."
+            Some(crate::native::NativeEvent::Notice { text, .. }) if text == "No Beep Boop-owned worktrees."
         ));
     }
 
@@ -780,6 +1031,7 @@ mod tests {
             "/quit",
         ] {
             let operation = prepare(NativeRequest::Submit {
+                origin: None,
                 attachments: None,
                 input_id: uuid::Uuid::new_v4().to_string(),
                 text: text.into(),
@@ -796,6 +1048,7 @@ mod tests {
         }
         assert!(
             prepare(NativeRequest::Submit {
+                origin: None,
                 attachments: None,
                 input_id: "invalid".into(),
                 text: "Hi".into(),

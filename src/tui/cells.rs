@@ -19,6 +19,7 @@ pub(super) struct Content<'a> {
     pub(super) text: &'a str,
     pub(super) kind: &'a MessageKind,
     pub(super) presentation: Option<&'a MessagePresentation>,
+    pub(super) notice_title: Option<&'a str>,
     pub(super) tool_name: &'a str,
     pub(super) attachments: &'a [AttachmentLabel],
 }
@@ -41,22 +42,34 @@ pub(super) fn render(message: Content<'_>) -> CachedText {
         } else {
             message.text.to_owned()
         };
-        CachedText::markdown(
-            Span::styled(
-                if message.role == Role::Failure {
-                    "■ "
-                } else {
-                    "• "
-                },
-                if message.role == Role::Failure {
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().add_modifier(Modifier::DIM)
-                },
-            ),
-            &body,
-            style,
-        )
+        let marker = Span::styled(
+            if message.role == Role::Failure {
+                "■ "
+            } else {
+                "• "
+            },
+            if message.role == Role::Failure {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::DIM)
+            },
+        );
+        if let Some(title) = message
+            .notice_title
+            .filter(|title| message.role == Role::Notice && !title.trim().is_empty())
+        {
+            CachedText::markdown_heading(
+                Line::styled(
+                    markdown::plain(title),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                marker,
+                &body,
+                style,
+            )
+        } else {
+            CachedText::markdown(marker, &body, style)
+        }
     };
     if let MessageKind::Input {
         mode,
@@ -475,6 +488,7 @@ mod tests {
         });
         state.event(RuntimeEventKind::Message {
             message: HistoryMessage {
+                notice_origin: None,
                 entry_id: "entry".into(),
                 role: HistoryRole::Tool,
                 text: body.into(),

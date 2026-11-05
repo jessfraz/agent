@@ -115,13 +115,13 @@ export class ConversationViews {
     }
     if (task === undefined) throw new TaskError("This saved conversation has no task");
     if (summary.agent_id === null) {
-      await app.tasks.enqueue(task.id, command.input, command.input_id, undefined, command.mode, command.attachments);
+      await app.tasks.enqueue(task.id, command.input, command.input_id, undefined, command.mode, command.attachments, command.origin);
       emit({ type: "input_accepted", input_id: command.input_id });
       const dispatched = await app.tasks.dispatch(task.id, await this.host(app, task, imported?.thread.id, imported?.thread.cwd), call);
       if (dispatched.worker.state !== "bound") throw new TaskError("Session allocation is unconfirmed; its saved input is retained.");
     } else {
       const dispatched = await app.tasks.continueAgent(task.id, summary.agent_id, command.input, command.input_id, call, command.mode,
-        () => emit({ type: "input_accepted", input_id: command.input_id }), command.attachments);
+        () => emit({ type: "input_accepted", input_id: command.input_id }), command.attachments, command.origin);
       if (dispatched.agents.find((agent) => agent.id === summary.agent_id)?.worker.state !== "bound") {
         throw new TaskError("Agent allocation is unconfirmed; its saved input is retained.");
       }
