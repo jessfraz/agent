@@ -121,7 +121,7 @@ export class ApnsClient {
           finish({ state: status === 429 || (status >= 500 && status <= 599) ? "retrying" : "rejected", status, invalid_device });
         });
         const target: NotificationTarget = { conversation_id: delivery.conversation_id, entry_id: delivery.entry_id };
-        request.end(JSON.stringify({ aps: { alert: { title: "Agent", body: preview }, sound: "default" }, agent: target }));
+        request.end(JSON.stringify({ aps: { alert: { title: "Beep Boop", body: preview }, sound: "default" }, agent: target }));
       });
     } catch { return uncertain; }
   }

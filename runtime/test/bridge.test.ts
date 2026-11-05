@@ -57,7 +57,7 @@ test("real Pi bridge gives signed-out chat the login command before starting Pi 
       { version: 1, id: 3, event: { type: "input_rejected", input_id: "initial-input",
         message: "Input was not submitted; its draft is restored." } },
       { version: 1, id: 3, event: { type: "failure", code: "authentication_required",
-        message: "Not signed in to ChatGPT. Run agent login." } },
+        message: "Not signed in to ChatGPT. Run beep-boop login." } },
       { version: 1, id: 3, event: { type: "done" } },
     ]);
     assert.equal(events.filter((event) => event.event.type === "failure").length, 3);
@@ -111,7 +111,7 @@ test("real bridge reads canonical settings and node history before a default-mod
     const response = await request({ type: "chat", input: "Hello", instructions: "Project instructions.", model: null,
       origin_host_id: node.host_id, cwd: "/home/fixture/project", hosts: [] });
     assert.deepEqual(response.map((frame) => frame.event), [
-      { type: "failure", code: "authentication_required", message: "Not signed in to ChatGPT. Run agent login." }, { type: "done" },
+      { type: "failure", code: "authentication_required", message: "Not signed in to ChatGPT. Run beep-boop login." }, { type: "done" },
     ]);
   } finally { lines.close(); child.stdin.end(); child.kill(); await closed; await rm(directory, { recursive: true, force: true }); }
 });

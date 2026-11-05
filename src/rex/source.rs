@@ -255,7 +255,7 @@ pub(crate) async fn execute(
 async fn execute_request(request: Request) -> Result<HostResult> {
     request.validate()?;
     let program = config::program()?;
-    let program = program.to_str().context("Agent path is not UTF-8")?;
+    let program = program.to_str().context("Beep Boop path is not UTF-8")?;
     let path = std::env::var("PATH").context("Source command PATH is unavailable")?;
     read_with(&RexClient::new(None), program, &path, &request).await
 }

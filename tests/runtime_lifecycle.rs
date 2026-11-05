@@ -64,7 +64,7 @@ fn killing_supervisor_preserves_lock_until_pi_child_exits() {
     )
     .unwrap();
     let command = || {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agent"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_beep-boop"));
         command
             .arg("--state-dir")
             .arg(state.path())

@@ -174,7 +174,7 @@ test("signed-out credentials return the login command before contacting the prov
     await assert.rejects(f.auth.credential(), (error: unknown) => {
       assert.ok(error instanceof AuthError); assert.equal(error.code, "needs_sign_in");
       assert.deepEqual(errorEvent(error), { type: "failure", code: "authentication_required",
-        message: "Not signed in to ChatGPT. Run agent login." });
+        message: "Not signed in to ChatGPT. Run beep-boop login." });
       return true;
     });
     assert.equal(f.provider.control.calls, 0);
@@ -342,7 +342,7 @@ test("transient refresh failure retains tokens; invalid_grant transitions to nee
     await assert.rejects(f.auth.credential(), (error: unknown) => {
       assert.ok(authError("needs_sign_in")(error));
       assert.ok(error instanceof AuthError);
-      assert.equal(error.message, "ChatGPT sign-in expired. Run agent login.");
+      assert.equal(error.message, "ChatGPT sign-in expired. Run beep-boop login.");
       return true;
     });
     assert.equal((await f.auth.status()).state, "needs_sign_in");

@@ -41,7 +41,7 @@ export class FeedbackDispatcher {
     if (task === undefined) {
       const model = context.model ?? host.launch?.model ?? await this.environment.model(null);
       await this.tasks.inference.preflight(model);
-      task = await this.tasks.create({ title: "Agent feedback", outcome: "Fix reported Agent behavior and report verified results in the main chat.",
+      task = await this.tasks.create({ title: "Beep Boop feedback", outcome: "Fix reported Beep Boop behavior and report verified results in the main chat.",
         sources: [source], model });
     }
     const taskId = task.id;
