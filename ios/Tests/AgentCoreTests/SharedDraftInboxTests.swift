@@ -320,7 +320,9 @@ import UniformTypeIdentifiers
   }
 
   #if os(macOS)
-    @Test @MainActor func crossProcessConsumerCrashReleasesOwnershipWithoutLosingDurableAdoption()
+    // Process waits must not stall the main-actor client tests running beside
+    // this case. Only the image-provider setup needs its explicit actor hop.
+    @Test func crossProcessConsumerCrashReleasesOwnershipWithoutLosingDurableAdoption()
       async throws
     {
       let root = try temporaryRoot()
