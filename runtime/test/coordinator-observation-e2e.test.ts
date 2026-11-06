@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
@@ -16,7 +17,7 @@ import { protocolLines, validEvent } from "../src/protocol.js";
 
 type Server = { child: ChildProcessWithoutNullStreams; closed: Promise<number | null>; errors(): string };
 
-test("production coordinator reconciles saved input before history across a real socket and restart", { timeout: 180_000 }, async (t) => {
+test("production coordinator reconciles saved input before history across a real socket and restart", { timeout: 300_000 }, async (t) => {
   const directory = await mkdtemp("/tmp/agent-observation-e2e-");
   const state = join(directory, "state"), bin = join(directory, "bin"), socket = join(state, "agent.sock");
   const input = "11111111-1111-4111-8111-111111111111", text = "Keep the original saved request.";
@@ -49,6 +50,7 @@ test("production coordinator reconciles saved input before history across a real
     } finally { await harness.close(BACKGROUND_CONTEXT); }
 
     async function start() {
+      const started = performance.now();
       const child = spawn(binary, ["--state-dir", state, "--config", join(directory, "config.toml"),
         "--runtime", runtime, "--instructions", join(directory, "AGENTS.md"),
         "serve", "--local-only", "--no-sources"], {
@@ -65,12 +67,20 @@ test("production coordinator reconciles saved input before history across a real
       });
       void closed.catch(() => {});
       const owned = { child, closed, errors: () => stderr }; children.push(owned);
-      while (!await stat(socket).then((value) => value.isSocket(), () => false)) {
+      for (;;) {
         assert.equal(child.exitCode, null, stderr);
+        assert.equal(child.signalCode, null, stderr);
         t.signal.throwIfAborted();
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        try {
+          await observe();
+          t.diagnostic(`Production coordinator ready after ${Math.round(performance.now() - started)}ms`);
+          return owned;
+        } catch (error) {
+          if (!(error instanceof Error && "code" in error &&
+            (error.code === "ENOENT" || error.code === "ECONNREFUSED"))) throw error;
+          await delay(10, undefined, { signal: t.signal });
+        }
       }
-      return owned;
     }
     async function observe(): Promise<RuntimeEventKind[]> {
       const channel = createConnection({ path: socket, signal: t.signal });
@@ -94,18 +104,20 @@ test("production coordinator reconciles saved input before history across a real
       assert.equal(await stat(socket).then(() => true, () => false), false,
         "Shutdown must release the real coordinator's socket");
     }
-    async function nativeClient(server: Server): Promise<Server> {
+    async function nativeClient(server: Server, restartDelayMs: number): Promise<Server> {
       const project = fileURLToPath(new URL("../../../ios", import.meta.url));
       const scratch = fileURLToPath(new URL("../../../target/native-client-integration", import.meta.url));
       const restart = join(directory, "native-restart-requested"), reconnecting = join(directory, "native-reconnecting");
-      await rm(restart, { force: true }); await rm(reconnecting, { force: true });
+      const restartReady = join(directory, "native-restart-ready");
+      await rm(restart, { force: true }); await rm(reconnecting, { force: true }); await rm(restartReady, { force: true });
       const child = spawn("/usr/bin/xcrun", ["--sdk", "macosx", "swift", "test", "--package-path", project,
         "--scratch-path", scratch, "--filter", "nativeClientReconcilesAgainstTheProductionCoordinator"], {
         detached: true, stdio: ["ignore", "pipe", "pipe"],
         env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", HOME: directory, TMPDIR: directory,
           AGENT_E2E_SOCKET: socket, AGENT_E2E_DIRECTORY: directory,
           AGENT_E2E_INPUT: input, AGENT_E2E_ENTRY: entry, AGENT_E2E_TEXT: text,
-          AGENT_E2E_RESTART_REQUEST: restart, AGENT_E2E_RECONNECTING: reconnecting },
+          AGENT_E2E_RESTART_REQUEST: restart, AGENT_E2E_RECONNECTING: reconnecting,
+          AGENT_E2E_RESTART_READY: restartReady },
       });
       const closed = new Promise<number | null>((resolve, reject) => {
         child.once("close", resolve); child.once("error", reject);
@@ -137,8 +149,11 @@ test("production coordinator reconciles saved input before history across a real
         // Keep the same native session and its composer alive while the real
         // service is absent. Restart only once that client observes the loss.
         await untilSignal(reconnecting);
+        // One real outage exceeds the former 20-second client check. Recovery
+        // must be measured from service readiness, not from this setup delay.
+        await delay(restartDelayMs, undefined, { signal: t.signal });
         const restarted = await start();
-        await observe();
+        await writeFile(restartReady, "");
         assert.equal(await closed, 0, output + restarted.errors());
         return restarted;
       } finally {
@@ -162,7 +177,7 @@ test("production coordinator reconciles saved input before history across a real
       }
       // macOS CI also runs the actual Swift session, outbox and reducer against
       // this same coordinator. Linux exercises the production wire path above.
-      if (process.platform === "darwin") server = await nativeClient(server);
+      if (process.platform === "darwin") server = await nativeClient(server, run === 0 ? 22_000 : 0);
       await stop(server);
     }
   } finally {
