@@ -88,10 +88,14 @@ private actor ReconnectCoordinator {
         if behavior == .reject {
           try await emit(.failure(.init(message: "This client is not authorized.")), to: socket)
           try await emit(.done, to: socket)
+          _ = try await receive(socket)
           return
         }
         if behavior == .malformed {
           try await send(Data("{\"type\":\"unsupported_event\"}\n".utf8), to: socket)
+          // A queued send is not proof of peer consumption. Keep the terminal
+          // frame alive until the real reader rejects it and closes its socket.
+          _ = try await receive(socket)
           return
         }
         try await emit(

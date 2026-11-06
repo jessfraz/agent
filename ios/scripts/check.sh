@@ -138,7 +138,7 @@ xcodebuild -quiet -workspace "$run_dir/NativeTests.xcworkspace" -scheme AgentCor
   CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES test
 xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
   -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
-  -parallel-testing-enabled NO -derivedDataPath "$run_dir/app" \
+  -parallel-testing-enabled NO -test-timeouts-enabled YES -derivedDataPath "$run_dir/app" \
   -resultBundlePath "$run_dir/ios-rendering-tests.xcresult" CODE_SIGNING_ALLOWED=NO test
 for suite in core performance rendering; do
   xcrun xcresulttool get test-results summary --path "$run_dir/ios-$suite-tests.xcresult" \
