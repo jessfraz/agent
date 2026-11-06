@@ -158,11 +158,25 @@ test("manual failure retries preserve the original task, request and immutable w
     await app.scheduler.start({ poll_interval_seconds: 60, sources: true, jobs: [exampleJob()] });
     const receipt = await app.scheduler.runJob(request("retry"));
     await pump(async () => (await app.scheduler.status()).errors.some((error) => error.message === "Synthetic host unavailable"));
-    const updated = exampleJob("two", "Use later instructions."); await app.scheduler.syncJobs([updated]);
+    const failed = (await app.scheduler.getJob("example-review")).last_run;
+    assert.ok(failed);
+    assert.deepEqual(failed.state, { status: "retrying", at: START + 60_000, message: "Synthetic host unavailable" });
+    assert.equal(failed.started_at, START); assert.equal(failed.finished_at, null);
+    assert.equal(failed.output, null, "An earlier task summary is not this run's answer");
+    const updated = exampleJob("two", "Use later instructions.");
+    const replacement = updated.schedules[0]; assert.ok(replacement); replacement.id = "replacement";
+    await app.scheduler.syncJobs([updated]);
+    assert.deepEqual((await app.scheduler.getJob(updated.id)).last_run?.state, failed.state,
+      "Replacing the schedule cannot hide its admitted execution error");
     clock.advance(60_000);
     await pump(async () => attempts.length === 2 && (await app.scheduler.status()).pending === 0);
     assert.equal(attempts[0]?.id, attempts[1]?.id); assert.equal(attempts[1]?.job.revision, "one");
     assert.equal((await app.tasks.list()).length, 1); assert.deepEqual(await savedReceipt(app, "retry"), receipt);
+    const finished = (await app.scheduler.getJob("example-review")).last_run;
+    assert.ok(finished);
+    assert.deepEqual(finished.state, { status: "completed" });
+    assert.equal(finished.revision, "one", "An edited catalog cannot relabel an admitted run");
+    assert.equal(finished.started_at, START); assert.equal(finished.finished_at, START + 60_000);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -269,6 +283,13 @@ test("a manually admitted task executes its reviewed focus through the actual sc
     assert.deepEqual(task.model, job.model); assert.ok(task.worker.state === "bound"); assert.equal(task.worker.host.cwd, job.cwd);
     const input = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, "manual:real-worker"), BACKGROUND_CONTEXT);
     assert.equal(input?.status, "done");
+    const finished = (await scheduler.getJob(job.id)).last_run;
+    assert.ok(finished);
+    assert.deepEqual(finished.state, { status: "completed" });
+    assert.equal(finished.task_id, receipt.task_id);
+    assert.equal(finished.output, "The requested manual review completed.");
+    assert.equal(finished.output_truncated, false);
+    assert.ok(finished.started_at !== null && finished.finished_at !== null && finished.finished_at >= finished.started_at);
     const page = await conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT);
     assert.equal(page.items.filter((entry) => entry.model?.some((message) => message.role === "user")).length, 1);
     const effect = app.commands.find((command) => command.type === "exec"); assert.ok(effect?.type === "exec"); assert.equal(effect.cwd, job.cwd);

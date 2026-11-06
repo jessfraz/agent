@@ -15,9 +15,9 @@ Configure one release workflow:
 | --- | --- |
 | Project | `ios/Agent.xcodeproj` |
 | Scheme | `Agent` |
-| Start condition | Branch Changes, exact branch `main`, all files |
+| Start condition | Branch Changes, exact branch `main`, any file in `/ios` |
 | Superseded builds | Auto-cancel enabled |
-| Environment | Latest released Xcode and macOS |
+| Environment | Xcode 27.1 (27A9275), latest released macOS |
 | Test action | iOS, `Agent`, Use Scheme Settings, **Required To Pass** |
 | Test destination | A supported iPhone simulator |
 | Archive action | iOS, `Agent`, **TestFlight (Internal Testing Only)** |
@@ -29,6 +29,14 @@ the Swift package's behavioral tests and isolated Release performance budgets.
 An error exits the hook and fails the archive. The hook also rejects archives
 from other branches or pull requests. It installs no dependencies and uses no
 model credentials or live coordinator.
+
+The `/ios` filter includes the app, generated native contracts, package tests
+and release scripts. CLI-only and runtime-only changes do not create a signed
+iOS build. Manual starts from `main` remain available.
+
+Keep Xcode pinned to the qualified version. Xcode 27.2's native contrast audit
+stalled before returning on the compact Cloud simulator; its cause remains
+unverified. Qualify both appearance audits before advancing the pin.
 
 Keep GitHub's native and shared-protocol checks enabled for pull requests and
 `main`. Xcode Cloud provides the signed delivery step and its own required

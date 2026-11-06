@@ -81,6 +81,10 @@ impl Fixture {
     }
 
     fn command(&self, args: &[&str]) -> Command {
+        self.command_format(args, true)
+    }
+
+    fn command_format(&self, args: &[&str], json: bool) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_beep-boop"));
         let runtime = std::env::var_os("AGENT_RUNTIME_PATH")
             .map(PathBuf::from)
@@ -89,8 +93,11 @@ impl Fixture {
             });
         let mut paths = vec![self.bin.clone()];
         paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        if json {
+            command.arg("--json");
+        }
         command
-            .args(["--json", "--config"])
+            .arg("--config")
             .arg(&self.config)
             .arg("--state-dir")
             .arg(&self.state)
@@ -109,8 +116,12 @@ impl Fixture {
     }
 
     fn cli(&self, args: &[&str]) -> Output {
+        self.cli_format(args, true)
+    }
+
+    fn cli_format(&self, args: &[&str], json: bool) -> Output {
         let mut child = self
-            .command(args)
+            .command_format(args, json)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -338,6 +349,62 @@ fn replay(run: &JobRunReceipt, schedule_id: Option<&str>) -> RuntimeCommand {
         schedule_id: schedule_id.map(|id| ScheduleId::try_from(id.to_owned()).unwrap()),
         request_id: run.request_id.clone(),
     }
+}
+
+#[test]
+fn real_cli_source_diagnostics_keep_account_errors_and_check_times_visible() {
+    use agent_cli::sources::{SourceBatch, SourceCoverage, SourceKey};
+    let fixture = Fixture::new();
+    let mut server = fixture.start();
+    for (account, coverage) in [
+        (
+            "mail.fixture",
+            SourceCoverage::Unavailable {
+                message: "Authentication expired; sign in to this account.".into(),
+            },
+        ),
+        (
+            "calendar.fixture",
+            SourceCoverage::Partial {
+                message: "A calendar page could not be read.".into(),
+            },
+        ),
+    ] {
+        let events = fixture.rpc(RuntimeCommand::IngestSource {
+            batch: SourceBatch {
+                source: SourceKey {
+                    provider: "example".into(),
+                    account: account.into(),
+                },
+                coverage,
+                checkpoint: None,
+                events: Vec::new(),
+            },
+            expected_checkpoint: None,
+        });
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEventKind::Failure { .. }))
+        );
+    }
+    let output = fixture.cli_format(&["sources"], false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("example / mail.fixture: unavailable"));
+    assert!(text.contains("Authentication expired; sign in to this account."));
+    assert!(text.contains("example / calendar.fixture: partial"));
+    assert!(text.contains("A calendar page could not be read."));
+    assert!(text.contains("Last checked:"));
+    let states = fixture.events(&["sources"]);
+    assert!(states.iter().any(|event| matches!(event, RuntimeEventKind::Sources { sources }
+        if sources.iter().any(|source| source.source.account == "mail.fixture" && source.checked_at > 0 && matches!(source.coverage, SourceCoverage::Unavailable { .. })))));
+    assert!(!fixture.directory.path().join("external-calls").exists());
+    server.stop();
 }
 
 #[test]

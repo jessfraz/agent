@@ -12,14 +12,15 @@ import type { EmbeddingSpace } from "../../src/generated/EmbeddingSpace.js";
 import type { Embed, SearchIndex, SearchRecord, SearchResult } from "../../src/search.js";
 
 const conversations = 64, entries = 256, dimensions = 1024;
-enum Scenario { Dense = "dense", Keyword = "keyword", CachedIndex = "cached_index" }
+export enum Scenario { Dense = "dense", Keyword = "keyword", CachedIndex = "cached_index" }
 const scenarios = Object.values(Scenario);
+const relativeAllowance = 0.25, absoluteAllowanceMs = 20;
 type Version = "baseline" | "candidate";
 type Request = { type: "sample"; scenario: Scenario; pair: number } | { type: "close" };
 type Reply = { type: "ready"; seeded_ms: number; document_vectors: number }
   | { type: "sample"; elapsed_ms: number; signature: string; operations: number }
   | { type: "closed" };
-type Sample = Extract<Reply, { type: "sample" }> & { scenario: Scenario; version: Version; pair: number; warmup: boolean };
+export type Sample = Extract<Reply, { type: "sample" }> & { scenario: Scenario; version: Version; pair: number; warmup: boolean };
 const space: EmbeddingSpace = { id: "native-performance-v1", model_revision: "deterministic", model_digest: "synthetic",
   dimensions, pooling: "last", normalization: "l2", instruction_version: 1 };
 const target = 17 * entries + 42, targetConversation = "conversation-17";
@@ -141,14 +142,30 @@ class Runner {
 
 export function comparisons(samples: Sample[]) {
   return scenarios.map(scenario => {
-    const median = (version: Version) => {
-      const values = samples.filter(sample => sample.scenario === scenario && sample.version === version && !sample.warmup)
-        .map(sample => sample.elapsed_ms).sort((left, right) => left - right);
-      assert.ok(values.length >= 3); return values[Math.floor(values.length / 2)]!;
+    const pairs = new Map<number, Partial<Record<Version, number>>>();
+    for (const sample of samples.filter(sample => sample.scenario === scenario && !sample.warmup)) {
+      assert.ok(Number.isFinite(sample.elapsed_ms) && sample.elapsed_ms >= 0);
+      const pair = pairs.get(sample.pair) ?? {};
+      assert.equal(pair[sample.version], undefined, "A paired measurement cannot repeat a version");
+      pair[sample.version] = sample.elapsed_ms; pairs.set(sample.pair, pair);
+    }
+    const baseline: number[] = [], candidate: number[] = [], fractions: number[] = [];
+    for (const pair of pairs.values()) {
+      assert.ok(pair.baseline !== undefined && pair.candidate !== undefined, "A measurement pair is incomplete");
+      baseline.push(pair.baseline); candidate.push(pair.candidate);
+      const allowed = Math.max(pair.baseline * (1 + relativeAllowance), pair.baseline + absoluteAllowanceMs);
+      assert.ok(Number.isFinite(allowed), "A measurement budget is not finite");
+      fractions.push(pair.candidate / allowed);
+    }
+    const median = (values: number[]) => {
+      assert.ok(values.length >= 3); values.sort((left, right) => left - right);
+      return values[Math.floor(values.length / 2)]!;
     };
-    const baseline_median_ms = median("baseline"), candidate_median_ms = median("candidate");
-    const allowed_ms = Math.max(baseline_median_ms * 1.25, baseline_median_ms + 20);
-    return { scenario, baseline_median_ms, candidate_median_ms, allowed_ms, passed: candidate_median_ms <= allowed_ms };
+    // Keep alternating measurements paired. Separate medians can turn uneven
+    // runner stalls into a false regression without a slower candidate.
+    const paired_budget_median = median(fractions);
+    return { scenario, baseline_median_ms: median(baseline), candidate_median_ms: median(candidate),
+      paired_budget_median, passed: paired_budget_median <= 1 };
   });
 }
 
@@ -179,11 +196,11 @@ async function run(): Promise<void> {
       }
     }
     const results = comparisons(samples);
-    await writeFile(output, JSON.stringify({ schema: 1, metric: "native_search_and_cached_index_batch", conversations,
-      entries_per_conversation: entries, dimensions, relative_allowance: 0.25, absolute_allowance_ms: 20,
+    await writeFile(output, JSON.stringify({ schema: 2, metric: "native_search_and_cached_index_batch", conversations,
+      entries_per_conversation: entries, dimensions, relative_allowance: relativeAllowance, absolute_allowance_ms: absoluteAllowanceMs,
       baseline_seed: baselineSeed, candidate_seed: candidateSeed, samples, comparisons: results }, null, 2) + "\n");
     for (const result of results) console.log(`${result.scenario}: base ${result.baseline_median_ms.toFixed(1)} ms, ` +
-      `candidate ${result.candidate_median_ms.toFixed(1)} ms, limit ${result.allowed_ms.toFixed(1)} ms, ${result.passed ? "pass" : "REGRESSION"}`);
+      `candidate ${result.candidate_median_ms.toFixed(1)} ms, paired budget ${result.paired_budget_median.toFixed(2)}x (max 1.00x), ${result.passed ? "pass" : "REGRESSION"}`);
     assert.ok(results.every(result => result.passed), `Native search/index performance regressed; raw samples: ${raw}`);
   } catch (error) { errors.push(error); }
   for (const result of await Promise.allSettled(runners.map(runner => runner.close()))) if (result.status === "rejected") errors.push(result.reason);

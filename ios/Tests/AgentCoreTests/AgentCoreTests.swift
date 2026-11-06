@@ -193,6 +193,7 @@ func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: Unava
   try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
   defer { try? FileManager.default.removeItem(at: directory) }
   let socket: NWConnection
+  let expectedFailure: NWError
   switch peer {
   case .refusedTCP:
     let listener = try NWListener(using: .tcp, on: .any)
@@ -213,19 +214,12 @@ func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: Unava
     listener.cancel()
     for try await _ in listening.stream {}
     socket = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)
+    expectedFailure = .posix(.ECONNREFUSED)
   case .missingUnixSocket:
     socket = NWConnection(
       to: .unix(path: directory.appending(path: "missing.sock").path), using: .tcp)
+    expectedFailure = .posix(.ENOENT)
   }
-  let failures = AsyncStream<NWError>.makeStream()
-  socket.stateUpdateHandler = { state in
-    switch state {
-    case .waiting(let error), .failed(let error): failures.continuation.yield(error)
-    case .cancelled: failures.continuation.finish()
-    default: break
-    }
-  }
-  defer { failures.continuation.finish() }
   let client = LineConnection(connection: socket)
   defer { socket.cancel() }
   let sending = Task { try await client.send(.observe(.init(inputIds: []))) }
@@ -245,8 +239,8 @@ func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: Unava
     }
   } catch {
     #expect(!(error is ConnectionError), "Refusal must release the send before its timeout")
-    let original = await failures.stream.first(where: { _ in true })
-    #expect(error as? NWError == original, "The owner must classify the original network failure")
+    #expect(
+      error as? NWError == expectedFailure, "The owner must classify the original network failure")
     #expect(ConnectionError.shouldReconnect(after: error))
   }
   await client.close()

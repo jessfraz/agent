@@ -465,7 +465,8 @@ mod tests {
         let replacement = directory.path().join("replacement.db");
         std::fs::copy(&database, &replacement).unwrap();
         std::fs::rename(&replacement, &database).unwrap();
-        let program = std::env::var("AGENT_TEST_BIN").unwrap_or_else(|_| "agent".into());
+        let program =
+            std::env::var("AGENT_TEST_BIN").unwrap_or_else(|_| env!("CARGO_PKG_NAME").into());
         let result = read_with(
             &RexClient::new(None),
             &program,

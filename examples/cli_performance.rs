@@ -1,6 +1,7 @@
 //! Paired process-to-visible-conversation benchmarks, using the real CLI and Pi.
 
 use std::{
+    collections::BTreeMap,
     fs,
     io::Write,
     num::NonZeroU16,
@@ -20,6 +21,8 @@ use tokio::{
 };
 
 const DEADLINE: Duration = Duration::from_secs(20);
+const RELATIVE_ALLOWANCE: f64 = 0.25;
+const ABSOLUTE_ALLOWANCE_MS: f64 = 20.0;
 
 #[derive(Parser)]
 #[command(about = "Measure actual CLI conversation rendering against a paired baseline")]
@@ -88,7 +91,7 @@ struct Comparison {
     scenario: Scenario,
     baseline_median_ms: f64,
     candidate_median_ms: f64,
-    allowed_ms: f64,
+    paired_budget_median: f64,
     passed: bool,
 }
 
@@ -355,31 +358,73 @@ async fn sample(
     })
 }
 
-fn comparisons(samples: &[Sample]) -> Vec<Comparison> {
+fn comparisons(samples: &[Sample]) -> Result<Vec<Comparison>> {
     Scenario::value_variants()
         .iter()
         .map(|scenario| {
-            let median = |version| {
-                let mut values = samples
-                    .iter()
-                    .filter(|sample| {
-                        sample.scenario == *scenario && sample.version == version && !sample.warmup
-                    })
-                    .map(|sample| sample.first_conversation_ms)
-                    .collect::<Vec<_>>();
-                values.sort_by(f64::total_cmp);
-                values[values.len() / 2]
-            };
-            let baseline = median(Version::Baseline);
-            let candidate = median(Version::Candidate);
-            let allowed = (baseline * 1.25).max(baseline + 20.0);
-            Comparison {
-                scenario: *scenario,
-                baseline_median_ms: baseline,
-                candidate_median_ms: candidate,
-                allowed_ms: allowed,
-                passed: candidate <= allowed,
+            let mut pairs: BTreeMap<u8, (Option<f64>, Option<f64>)> = BTreeMap::new();
+            for sample in samples
+                .iter()
+                .filter(|sample| sample.scenario == *scenario && !sample.warmup)
+            {
+                ensure!(
+                    sample.first_conversation_ms.is_finite() && sample.first_conversation_ms >= 0.0,
+                    "{scenario:?} pair {} has an invalid measurement",
+                    sample.pair
+                );
+                let pair = pairs.entry(sample.pair).or_default();
+                let measurement = match sample.version {
+                    Version::Baseline => &mut pair.0,
+                    Version::Candidate => &mut pair.1,
+                };
+                ensure!(
+                    measurement.is_none(),
+                    "{scenario:?} pair {} repeats {:?}",
+                    sample.pair,
+                    sample.version
+                );
+                *measurement = Some(sample.first_conversation_ms);
             }
+            let mut baseline = Vec::new();
+            let mut candidate = Vec::new();
+            let mut fractions = Vec::new();
+            for (pair, (before, after)) in pairs {
+                let before = before
+                    .with_context(|| format!("{scenario:?} pair {pair} is missing its baseline"))?;
+                let after = after.with_context(|| {
+                    format!("{scenario:?} pair {pair} is missing its candidate")
+                })?;
+                let allowed =
+                    (before * (1.0 + RELATIVE_ALLOWANCE)).max(before + ABSOLUTE_ALLOWANCE_MS);
+                ensure!(
+                    allowed.is_finite(),
+                    "{scenario:?} pair {pair} has an invalid budget"
+                );
+                baseline.push(before);
+                candidate.push(after);
+                fractions.push(after / allowed);
+            }
+            let median = |mut values: Vec<f64>| -> Result<f64> {
+                ensure!(
+                    values.len() >= 3,
+                    "{scenario:?} requires at least three measurement pairs"
+                );
+                values.sort_by(f64::total_cmp);
+                values
+                    .get(values.len() / 2)
+                    .copied()
+                    .context("Measurement median is unavailable")
+            };
+            // Alternating measurements must stay paired: separate medians can
+            // turn uneven runner stalls into a regression in a faster candidate.
+            let paired_budget_median = median(fractions)?;
+            Ok(Comparison {
+                scenario: *scenario,
+                baseline_median_ms: median(baseline)?,
+                candidate_median_ms: median(candidate)?,
+                paired_budget_median,
+                passed: paired_budget_median <= 1.0,
+            })
         })
         .collect()
 }
@@ -509,25 +554,25 @@ async fn run(mut options: Arguments) -> Result<()> {
     closed_baseline?;
     closed_candidate?;
     let report = Report {
-        schema: 1,
+        schema: 2,
         metric: "process_spawn_to_visible_conversation",
         terminal_rows: 32,
         terminal_columns: 100,
         long_history_messages: 5_000,
         unrelated_saved_conversations: 3_000,
-        relative_allowance: 0.25,
-        absolute_allowance_ms: 20.0,
-        comparisons: comparisons(&samples),
+        relative_allowance: RELATIVE_ALLOWANCE,
+        absolute_allowance_ms: ABSOLUTE_ALLOWANCE_MS,
+        comparisons: comparisons(&samples)?,
         samples,
     };
     fs::write(&options.output, serde_json::to_vec_pretty(&report)?)?;
     for comparison in &report.comparisons {
         println!(
-            "{:?}: base {:.1} ms, candidate {:.1} ms, limit {:.1} ms, {}",
+            "{:?}: base {:.1} ms, candidate {:.1} ms, paired budget {:.3} (limit 1.000), {}",
             comparison.scenario,
             comparison.baseline_median_ms,
             comparison.candidate_median_ms,
-            comparison.allowed_ms,
+            comparison.paired_budget_median,
             if comparison.passed {
                 "pass"
             } else {
@@ -600,10 +645,111 @@ mod tests {
                     })
             })
             .collect::<Vec<_>>();
-        for result in comparisons(&samples) {
+        for result in comparisons(&samples).unwrap() {
             assert_eq!(result.baseline_median_ms, 100.0);
-            assert_eq!(result.allowed_ms, 125.0);
+            assert_eq!(result.candidate_median_ms, 140.0);
+            assert_eq!(result.paired_budget_median, 140.0 / 125.0);
             assert!(!result.passed);
         }
+    }
+
+    fn paired_samples(baseline: &[f64], candidate: &[f64]) -> Vec<Sample> {
+        assert_eq!(baseline.len(), candidate.len());
+        Scenario::value_variants()
+            .iter()
+            .flat_map(|scenario| {
+                baseline.iter().zip(candidate).enumerate().flat_map(
+                    move |(index, (before, after))| {
+                        [(Version::Baseline, *before), (Version::Candidate, *after)].map(
+                            |(version, milliseconds)| Sample {
+                                scenario: *scenario,
+                                version,
+                                pair: u8::try_from(index + 1).unwrap(),
+                                warmup: false,
+                                first_conversation_ms: milliseconds,
+                                received_bytes: 1,
+                            },
+                        )
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn paired_gate_preserves_faster_pairs_despite_uneven_runner_stalls() {
+        let baseline = [
+            439.37029, 1310.91328, 366.57530, 904.75781, 298.85085, 302.64821, 929.83019,
+        ];
+        let candidate = [
+            284.22749, 1163.28675, 266.54889, 300.55142, 610.78433, 758.52455, 703.86416,
+        ];
+        assert_eq!(
+            baseline
+                .iter()
+                .zip(candidate)
+                .filter(|(before, after)| after < *before)
+                .count(),
+            5
+        );
+        for result in comparisons(&paired_samples(&baseline, &candidate)).unwrap() {
+            assert!(
+                result.candidate_median_ms
+                    > (result.baseline_median_ms * 1.25).max(result.baseline_median_ms + 20.0)
+            );
+            assert!(
+                result.passed,
+                "{:?} has five faster measurement pairs",
+                result.scenario
+            );
+        }
+    }
+
+    #[test]
+    fn paired_gate_preserves_relative_and_absolute_budget_boundaries() {
+        for (baseline, candidate, passed) in [
+            (100.0, 125.0, true),
+            (100.0, 125.1, false),
+            (10.0, 30.0, true),
+            (10.0, 30.1, false),
+            (0.0, 20.0, true),
+            (0.0, 20.1, false),
+        ] {
+            for result in comparisons(&paired_samples(&[baseline; 3], &[candidate; 3])).unwrap() {
+                assert_eq!(result.passed, passed);
+            }
+        }
+    }
+
+    #[test]
+    fn paired_gate_rejects_incomplete_duplicate_and_invalid_measurements() {
+        let valid = || paired_samples(&[100.0; 3], &[100.0; 3]);
+        for version in [Version::Baseline, Version::Candidate] {
+            let mut incomplete = valid();
+            incomplete.retain(|sample| {
+                !(sample.scenario == Scenario::Chief
+                    && sample.pair == 2
+                    && sample.version == version)
+            });
+            assert!(comparisons(&incomplete).is_err());
+        }
+        let mut duplicate = valid();
+        duplicate.push(Sample {
+            scenario: Scenario::Chief,
+            version: Version::Baseline,
+            pair: 1,
+            warmup: false,
+            first_conversation_ms: 100.0,
+            received_bytes: 1,
+        });
+        assert!(comparisons(&duplicate).is_err());
+        for milliseconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let mut invalid = valid();
+            invalid[0].first_conversation_ms = milliseconds;
+            assert!(comparisons(&invalid).is_err());
+        }
+        assert!(comparisons(&paired_samples(&[100.0; 2], &[100.0; 2])).is_err());
+        assert!(comparisons(&paired_samples(&[f64::MAX; 3], &[f64::MAX; 3])).is_err());
+        assert!(comparisons(&[]).is_err());
     }
 }

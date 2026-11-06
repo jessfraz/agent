@@ -141,7 +141,6 @@ export class TaskStore {
   private readonly running = new Map<string, AttachedWorker>();
   private readonly resuming = new Set<string>();
   private readonly nativeIds = new Map<string, ConversationId>();
-  private scanning: Promise<void> | undefined;
   private resources: { attach(taskId: string): Promise<void> } | undefined;
   private outcomes: OutcomeSink | undefined;
   private environment: CoordinatorEnvironment | undefined;
@@ -355,15 +354,11 @@ export class TaskStore {
     const imported = await this.histories?.conversation(id);
     if (imported !== undefined) { this.nativeIds.set(id, imported.id); return imported; }
     if (!this.nativeIds.has(id)) {
-      this.scanning ??= (async () => {
-        let cursor: Cursor | undefined;
-        do {
-          const page = await this.session.commit((tx) => tx.scanConversations({}, 100, cursor), BACKGROUND_CONTEXT);
-          for (const native of page.items) this.nativeIds.set(native.id.toString(), native.id);
-          cursor = page.next;
-        } while (cursor !== undefined);
-      })().finally(() => { this.scanning = undefined; });
-      await this.scanning;
+      // Pi IDs are canonical positive safe integers. A known identity needs
+      // one indexed lookup, independent of the retained conversation corpus.
+      const native: unknown = Number(id);
+      if (!conversationIdentity(native) || native.toString() !== id) throw new TaskError("Task conversation is unavailable");
+      this.nativeIds.set(id, native);
     }
     const native = this.nativeIds.get(id);
     if (native !== undefined) {

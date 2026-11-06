@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { defineDoc, defineEntry, defineTask, ROOT_CONVERSATION_ID, type Harness, type Registry,
-  type NextTaskState, type Task, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
+  type HarnessInspection, type NextTaskState, type Task, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
 import type { BackgroundCadence } from "./generated/BackgroundCadence.js";
 import type { BackgroundCheckpoint } from "./generated/BackgroundCheckpoint.js";
 import type { BackgroundSettings } from "./generated/BackgroundSettings.js";
@@ -16,6 +16,8 @@ import type { ScheduledJobStatus } from "./generated/ScheduledJobStatus.js";
 import type { JobSchedule } from "./generated/JobSchedule.js";
 import type { JobSyncReport } from "./generated/JobSyncReport.js";
 import type { JobRunReceipt } from "./generated/JobRunReceipt.js";
+import type { JobExecution } from "./generated/JobExecution.js";
+import type { JobExecutionState } from "./generated/JobExecutionState.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { TaskError, TaskStore } from "./tasks.js";
 import { scheduledTaskId } from "./scheduled.js";
@@ -25,7 +27,8 @@ type Trigger = { key: BackgroundTriggerKey; generation: number; revision: string
   error: string | null; error_scope: "plan" | "work" | null };
 type QueuedWork = { key: BackgroundTriggerKey; work: BackgroundWork };
 type JobPreparation = { type: "replay"; receipt: JobRunReceipt } | { type: "admit"; job: ScheduledJob };
-type Lane = { id: string; active: NativeTaskId<null> | null; pending: QueuedWork[]; actor_task_id: string | null };
+type RunReference = { task: NativeTaskId<null>; request_id: string; schedule_id: string; scheduled_at: number; revision: string; actor_task_id?: string };
+type Lane = { id: string; active: NativeTaskId<null> | null; pending: QueuedWork[]; actor_task_id: string | null; last_run?: RunReference };
 type State = { triggers: Trigger[]; lanes: Lane[]; jobs: ScheduledJob[] };
 const State = defineDoc<State>({ kind: "agent.background", scope: "session", version: 1,
   initial: () => ({ triggers: [], lanes: [], jobs: [] }), checkpointWhen: () => true });
@@ -139,8 +142,13 @@ export class BackgroundScheduler {
                   const legacy = await this.session.commit(async (tx) =>
                     (await this.tasks.findIn(tx, scheduledTaskId(occurrence.id)))?.id, context);
                   const candidate = legacy ?? await this.actorCandidate(occurrence.job);
-                  const created = await this.session.commit(async (tx) =>
-                    this.actorIn(tx, await tx.doc(State), occurrence.job, candidate, legacy !== undefined), context);
+                  const created = await this.session.commit(async (tx) => {
+                    const state = await tx.doc(State);
+                    const created = await this.actorIn(tx, state, occurrence.job, candidate, legacy !== undefined);
+                    const reference = state.lanes.find((lane) => lane.id === laneId(input.key))?.last_run;
+                    if (reference?.task === runtime.taskId) reference.actor_task_id = created.id;
+                    return created;
+                  }, context);
                   if (created.native !== undefined) this.tasks.rememberConversation(created.native);
                   actorId = await runtime.memo("job_actor_task_id", created.id, context);
                 }
@@ -183,9 +191,19 @@ export class BackgroundScheduler {
   }
   private async createWorkIn(tx: Tx, work: QueuedWork): Promise<NativeTaskId<null>> {
     // Work is conversation-owned, so replacing its timer cannot abort an admitted run.
-    return tx.createTask(this.task, { type: "work", ...work }, {
+    const task = await tx.createTask(this.task, { type: "work", ...work }, {
       ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true,
     });
+    if (work.work.type === "job" || work.work.type === "manual_job") {
+      const occurrence = work.work.occurrence;
+      // Retain only a lookup reference. Pi remains authoritative for timing,
+      // lifecycle and the exact submission's answer, including after reopen.
+      this.laneIn(await tx.doc(State), laneId(work.key)).last_run = {
+        task, request_id: occurrence.id, schedule_id: occurrence.schedule_id,
+        scheduled_at: occurrence.scheduled_at, revision: occurrence.job.revision,
+      };
+    }
+    return task;
   }
   private async enqueueIn(tx: Tx, state: State, work: QueuedWork): Promise<void> {
     const lane = this.laneIn(state, laneId(work.key));
@@ -360,8 +378,8 @@ export class BackgroundScheduler {
         return message === undefined ? [] : [{ key: trigger.key, message }];
       }) };
   }
-  private async errors(state: State | undefined): Promise<Map<string, string>> {
-    const inspection = await this.session.inspect(BACKGROUND_CONTEXT);
+  private async errors(state: State | undefined, inspected?: HarnessInspection): Promise<Map<string, string>> {
+    const inspection = inspected ?? await this.session.inspect(BACKGROUND_CONTEXT);
     const blocked = new Map<NativeTaskId, string>();
     for (const task of inspection.tasks) if (task.record.kind === "agent.background" && task.state.kind === "blocked") {
       blocked.set(task.record.id, task.state.reason === "restart_limit"
@@ -378,9 +396,9 @@ export class BackgroundScheduler {
     }
     return errors;
   }
-  async listJobs(): Promise<ScheduledJobStatus[]> {
+  async listJobs(inspected?: HarnessInspection): Promise<ScheduledJobStatus[]> {
     const state = await this.session.snapshot(State, BACKGROUND_CONTEXT);
-    const errors = await this.errors(state);
+    const errors = await this.errors(state, inspected);
     return (state?.jobs ?? []).map((job) => ({ job: structuredClone(job), schedules: job.schedules.map((schedule) => {
       const trigger = state?.triggers.find((item) => item.key.type === "job" && item.key.job_id === job.id && item.key.schedule_id === schedule.id);
       return { schedule_id: schedule.id, next_at: trigger?.next ?? null, last_at: trigger?.last ?? null,
@@ -388,8 +406,56 @@ export class BackgroundScheduler {
     }) }));
   }
   async getJob(id: string): Promise<ScheduledJobStatus> {
-    const job = (await this.listJobs()).find((item) => item.job.id === id);
+    const inspection = await this.session.inspect(BACKGROUND_CONTEXT);
+    const job = (await this.listJobs(inspection)).find((item) => item.job.id === id);
     if (job === undefined) throw new Error("Unknown scheduled job");
-    return job;
+    const state = await this.session.snapshot(State, BACKGROUND_CONTEXT);
+    const lane = state?.lanes.find((item) => item.id === JSON.stringify(["job", id]));
+    const reference = lane?.last_run;
+    // Older state has no reference; never invent execution times from an
+    // admission timestamp or present another occurrence's summary as its output.
+    if (reference === undefined) return job;
+    const live = inspection.tasks.find((item) => item.record.id === reference.task);
+    const record = live?.record ?? await this.session.getTask(reference.task, BACKGROUND_CONTEXT);
+    if (record === undefined) return job;
+    const trigger = state?.triggers.find((item) => item.key.type === "job" && item.key.job_id === id && item.key.schedule_id === reference.schedule_id);
+    let execution: JobExecutionState;
+    if (live?.state.kind === "blocked") execution = { status: "blocked", message: live.state.reason };
+    else if (live?.state.kind === "ready" || record.state.status === "pending") execution = { status: "queued" };
+    else switch (record.state.status) {
+      case "running": execution = { status: "running" }; break;
+      case "waiting":
+      case "completing": execution = { status: "waiting" }; break;
+      case "sleeping": execution = { status: "retrying", at: record.state.until,
+        message: lane?.active === reference.task && trigger?.error_scope === "work" ? trigger.error : null }; break;
+      case "terminal": {
+        const outcome = record.state.outcome;
+        execution = outcome.status === "completed" ? { status: "completed" }
+          : outcome.status === "failed" ? { status: "failed", message: outcome.error.message }
+          : outcome.status === "orphaned" ? { status: "blocked", message: outcome.reason ?? "Task definition unavailable" }
+          : { status: "stopped" };
+        break;
+      }
+    }
+    const actor = reference.actor_task_id === undefined ? undefined : await this.tasks.get(reference.actor_task_id);
+    let output: string | null = null;
+    if (actor !== undefined) {
+      const conversation = await this.tasks.conversation(actor.conversation_id);
+      const answer = await this.session.commit(async (tx) => {
+        const submission = await tx.submissionByRequest(conversation.id, reference.request_id);
+        return submission?.type === "input" && submission.status === "done" ? tx.entry(submission.answer) : undefined;
+      }, BACKGROUND_CONTEXT);
+      if (answer !== undefined) {
+        output = answer.model?.flatMap((message) => message.role !== "assistant" ? []
+          : typeof message.content === "string" ? [message.content]
+            : message.content.flatMap((part) => part.type === "text" ? [part.text] : [])).join("\n") ?? null;
+      }
+    }
+    const characters = output === null ? [] : Array.from(output);
+    const last_run: JobExecution = { schedule_id: reference.schedule_id, scheduled_at: reference.scheduled_at,
+      started_at: record.startedAt ?? null, finished_at: record.endedAt ?? null, revision: reference.revision,
+      state: execution, task_id: actor?.id ?? null, output: output === null ? null : characters.slice(0, 16000).join(""),
+      output_truncated: characters.length > 16000 };
+    return { ...job, last_run };
   }
 }

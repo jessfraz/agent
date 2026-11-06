@@ -23,6 +23,7 @@ pub mod intake;
 pub mod job_view;
 pub mod jobs;
 pub mod machines;
+pub mod source_view;
 pub mod sources;
 pub mod tailnet;
 pub mod tui;
