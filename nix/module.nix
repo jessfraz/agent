@@ -46,20 +46,29 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
-    assertions = [{
-      assertion = lib.hasPrefix "/" cfg.configFile && !(lib.hasPrefix "/nix/store/" cfg.configFile);
-      message = "services.agent.configFile must reference a private runtime file outside /nix/store.";
-    } {
-      assertion = cfg.role == "coordinator" || cfg.tailnetPort == null;
-      message = "Only the coordinator may listen on a Tailscale port.";
-    }];
+    assertions = [
+      {
+        assertion = lib.hasPrefix "/" cfg.configFile && !(lib.hasPrefix "/nix/store/" cfg.configFile);
+        message = "services.agent.configFile must reference a private runtime file outside /nix/store.";
+      }
+      {
+        assertion = cfg.role == "coordinator" || cfg.tailnetPort == null;
+        message = "Only the coordinator may listen on a Tailscale port.";
+      }
+    ];
     environment.systemPackages = [cfg.package];
     launchd.user.agents.agent = {
       serviceConfig = {
-        # The legacy entry point also supports older package overrides.
-        ProgramArguments = ["${cfg.package}/bin/agent" "--config" cfg.configFile]
+        ProgramArguments =
+          ["${cfg.package}/bin/beep-boop" "--config" cfg.configFile]
           ++ lib.optionals (cfg.stateDirectory != null) ["--state-dir" cfg.stateDirectory]
-          ++ [(if cfg.role == "coordinator" then "serve" else "maintain")]
+          ++ [
+            (
+              if cfg.role == "coordinator"
+              then "serve"
+              else "maintain"
+            )
+          ]
           ++ lib.optionals (cfg.role == "coordinator") ["--coordinator-only"]
           ++ lib.optionals (cfg.tailnetPort != null) ["--tailnet-port" (toString cfg.tailnetPort)];
         WorkingDirectory = cfg.workingDirectory;
@@ -70,7 +79,8 @@ in {
         # drive launchd's XPC-based Adaptive classification.
         ProcessType = "Interactive";
       };
-      environment.PATH = lib.makeBinPath ([cfg.package] ++ cfg.extraPackages)
+      environment.PATH =
+        lib.makeBinPath ([cfg.package] ++ cfg.extraPackages)
         + ":/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin";
     };
   };

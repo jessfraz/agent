@@ -3334,10 +3334,14 @@ async fn connection(
             "1455:127.0.0.1:1455",
         ]);
     }
-    // Older coordinators still expose agent; the package keeps that alias.
     let remote = format!(
         "{} rpc",
-        quoted(config.coordinator_program.as_deref().unwrap_or("agent"))
+        quoted(
+            config
+                .coordinator_program
+                .as_deref()
+                .unwrap_or(env!("CARGO_PKG_NAME"))
+        )
     );
     command
         .arg("--")

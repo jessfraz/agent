@@ -4,16 +4,6 @@ Install [Rex](https://www.superlogical.com/rex) and Tailscale on each execution
 machine. Connect them to the same authorized tailnet. Provider CLIs keep their
 own accounts and credentials; agent does not duplicate that setup.
 
-## Compatibility
-
-The executable is `beep-boop` . Nix also installs an `agent` alias for existing
-launches. Configuration stays at `~/.config/agent/config.toml` ; state stays in
-the existing OS-specific `agent` directory, including its database and socket.
-`AGENT_*` environment variables, `services.agent` , launchd identity and saved
-worker launch paths remain compatible. The SSH fallback still calls `agent` to
-reach older coordinators; an explicit `coordinator_program` is unchanged. The
-repository rename does not require moving local clones or worktrees.
-
 ## Coordinator
 
 Choose one machine that stays on. It owns conversations, shared settings,

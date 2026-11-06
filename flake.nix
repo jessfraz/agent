@@ -49,7 +49,6 @@
           cp -r dist/src "$out/lib/beep-boop-runtime/dist/"
           cp -r node_modules package.json "$out/lib/beep-boop-runtime/"
           cp src/generated/*.schema.json "$out/lib/beep-boop-runtime/src/generated/"
-          ln -s beep-boop-runtime "$out/lib/agent-runtime"
           runHook postInstall
         '';
       };
@@ -95,12 +94,11 @@
             --set AGENT_SQLITE_VEC "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}" \
             --prefix PATH : "${pkgs.lib.makeBinPath [pkgs.nodejs_26 pkgs.git pkgs.lsof pkgs.openssh]}" \
             --suffix PATH : /run/current-system/sw/bin
-          # Saved worker launches and older service configurations still use agent.
-          ln -s beep-boop "$out/bin/agent"
         '';
       };
     in {
       default = cli;
+      beep-boop = cli;
       inherit runtime embeddingModel embeddingRuntime;
       sqliteVec = pkgs.sqlite-vec;
     });

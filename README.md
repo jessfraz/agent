@@ -2,11 +2,6 @@
 
 An agent, regrettably.
 
-The CLI is `beep-boop` ; the app is **Beep Boop**. The Nix package retains
-`agent` as a compatibility alias for saved launches and older integrations.
-Existing configuration, state, conversations and service identities keep their
-`agent` paths. No data migration or coordinator behavior change is needed.
-
 A Rust CLI around [Pi Durable](https://github.com/earendil-works/pi), with
 ChatGPT plan sign-in, persistent conversations and workers in
 [Rex](https://www.superlogical.com/rex). One main conversation finds existing
