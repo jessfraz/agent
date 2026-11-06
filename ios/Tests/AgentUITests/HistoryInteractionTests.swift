@@ -276,11 +276,24 @@ final class HistoryInteractionTests: XCTestCase {
       XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 3), .completed, app.debugDescription)
     }
     func toggleFast() {
-      // A native Form can expose a labeled row and its actual UISwitch.
+      // Touch the native switch, not the Form's labeled wrapper.
       let control = fast.switches.firstMatch
-      let target = control.exists ? control : fast
-      XCTAssertTrue(target.isHittable)
-      target.tap()
+      let form = app.collectionViews.containing(.switch, identifier: "conversationFastToggle")
+        .firstMatch
+      XCTAssertTrue(control.exists, app.debugDescription)
+      if !control.isHittable {
+        // The draft keyboard can cover Fast and the default Form swipe origin.
+        XCTAssertTrue(reasoning.isHittable, app.debugDescription)
+        let start = reasoning.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        let end = form.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.2))
+        start.press(forDuration: 0.05, thenDragTo: end)
+      }
+      let viewport = app.windows.firstMatch.frame.intersection(form.frame)
+      XCTAssertTrue(
+        !control.frame.isEmpty && viewport.contains(control.frame), app.debugDescription)
+      XCTAssertTrue(control.isEnabled, app.debugDescription)
+      XCTAssertTrue(control.isHittable, app.debugDescription)
+      control.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
     }
     waitForFast("1")
     toggleFast()
