@@ -52,8 +52,11 @@ recovery; [history](history.md) describes import and retrieval.
   updates through protected CI and a matching coordinator deployment. Verify
   the signed TestFlight build's source; local simulator checks alone do not
   establish delivery.
-- [ ] Finish native provenance/settings display, share imports, reference
-  rendering and the matched production-coordinator restart check.
+- [x] Show native input and scheduled-notice provenance and main-conversation
+  model settings; retain unsent drafts across reopen. Native consumer and UI
+  checks pass, including the matched production-coordinator restart check.
+- [ ] Provision and ship an iOS Share target backed by the shared-draft queue.
+- [ ] Verify native rendering against the original visual references.
 - [x] Ship private lifecycle logs, `/machines`, local usage-reset times and
   countdowns, and the remaining viewport correction.
 

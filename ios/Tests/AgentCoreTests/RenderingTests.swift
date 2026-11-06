@@ -298,6 +298,53 @@
       }
     }
 
+    @MainActor @Test func flatProseCompactActivityAndLiteralExpandedOutputKeepTheirNativeHierarchy()
+      async throws
+    {
+      var transcript = Transcript()
+      transcript.pending(
+        .init(
+          inputId: "native-example", mode: .steer, origin: .ios,
+          text: "Check the saved request without changing its owner."), delivery: .saved)
+      transcript.message(
+        .init(
+          continuation: false, entryId: "explanation", finalChunk: true,
+          role: .assistant,
+          text: """
+            The saved request and the current connection can be inspected independently. Neither observation should submit another message.
+
+            Keep the original input identifier while the coordinator reconnects. A receipt confirms storage, not completion of the work.
+
+            Tool activity stays compact until it is opened. The answer remains ordinary readable prose, not a terminal transcript.
+            """))
+      transcript.message(
+        .init(
+          continuation: false, entryId: "command", finalChunk: true,
+          presentation: .command(.init(command: "inspect-example --read-only", exitCode: 0)),
+          role: .tool, text: "A bounded diagnostic result",
+          tool: .init(callId: "read-only", name: "exec", status: .finished)))
+      let output = ToolDetailsAvailable(
+        callId: "read-only", input: .unavailable(.init(reason: .notRecorded)),
+        name: "exec",
+        output: .text(
+          .init(
+            text: """
+              1: **literal output**, not Markdown emphasis
+              2: let diagnostic = "a deliberately long line that remains horizontal native output rather than forcing the entire conversation wider";
+              3: <result status="saved">unchanged</result>
+              """, truncated: false)), status: .finished)
+      for scheme in [ColorScheme.light, .dark] {
+        let compact = try await renderRows(transcript.rows, scheme: scheme)
+        let expanded = try await renderRows(
+          transcript.rows, scheme: scheme, expandedActivity: true, inspection: output)
+        #expect(compact.width >= 390)
+        #expect(expanded.width == compact.width)
+        #expect(expanded.height > compact.height)
+        Attachment.record(compact, named: "native-reference-hierarchy-\(scheme)", as: .png)
+        Attachment.record(expanded, named: "native-reference-literal-output-\(scheme)", as: .png)
+      }
+    }
+
     @MainActor @Test func nonSuccessToolStatesHaveDistinctNativeIconsAndCollapsedSummaries()
       async throws
     {

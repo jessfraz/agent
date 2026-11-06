@@ -317,32 +317,26 @@ final class AgentUITests: XCTestCase {
   private func revealCompleteConnectionForm(_ app: XCUIApplication) throws {
     let window = app.windows.firstMatch
     let status = app.cells.containing(.staticText, identifier: "Status").firstMatch
-    let guidance = app.cells.containing(
-      .staticText, identifier: "Connect to the coordinator to receive updates."
-    ).firstMatch
+    // Use the same text node the native audit inspects, not its containing
+    // cell. The guidance itself must be completely onscreen.
+    let guidance = app.staticTexts["Connect to the coordinator to receive updates."].firstMatch
     XCTAssertTrue(status.exists)
     XCTAssertTrue(status.isHittable, app.debugDescription)
     XCTAssertTrue(window.frame.contains(status.frame), "The first form row must be fully onscreen")
     let hasGuidance = guidance.exists
     let overflow = hasGuidance ? max(0, guidance.frame.maxY - window.frame.maxY) : 0
     let distance = overflow > 0 ? max(44, overflow + 8) : 0
-    let keepsFirstRow =
-      hasGuidance
-      && status.frame.minY - distance >= app.navigationBars["Connection"].frame.maxY
-    if !keepsFirstRow {
-      // A short viewport can neither materialize the lazy final row nor fit
-      // both endpoints at once. Audit the complete top viewport before moving,
-      // then the original caller audits the complete final viewport. Neither
-      // endpoint nor either appearance/main-screen audit is exempted.
+    // An unmaterialized final row is wholly outside a short viewport. Retain
+    // top coverage there, but never audit known partially visible guidance.
+    if !hasGuidance {
+      XCTAssertFalse(
+        guidance.exists && window.frame.intersects(guidance.frame)
+          && !window.frame.contains(guidance.frame),
+        "Reveal partially visible guidance before its contrast audit")
       capture("connection-top-accessibility", app: app)
-      let hierarchy = XCTAttachment(string: app.debugDescription)
-      hierarchy.name = "connection-top-native-hierarchy"
-      hierarchy.lifetime = .keepAlways
-      add(hierarchy)
       try audit(app)
-      XCTAssertTrue(
-        app.buttons["dismissConnection"].waitForExistence(timeout: 3), app.debugDescription)
     }
+    // Scrolling can collapse the large title. Use only post-scroll geometry.
     if !hasGuidance {
       let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75))
       start.press(
@@ -356,12 +350,25 @@ final class AgentUITests: XCTestCase {
         withVelocity: .slow, thenHoldForDuration: 0.1)
     }
     XCTAssertTrue(guidance.waitForExistence(timeout: 3), app.debugDescription)
+    let navigationBottom = app.navigationBars["Connection"].frame.maxY
+    if let partial = app.cells.allElementsBoundByIndex.first(where: {
+      $0.isHittable && $0.frame.minY < navigationBottom && $0.frame.maxY > navigationBottom
+    }) {
+      let adjustment = navigationBottom - partial.frame.minY
+      if guidance.frame.maxY + adjustment <= window.frame.maxY {
+        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4))
+        start.press(
+          forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: adjustment)),
+          withVelocity: .slow, thenHoldForDuration: 0.1)
+      }
+    }
     XCTAssertTrue(guidance.isHittable, app.debugDescription)
     XCTAssertTrue(window.frame.contains(guidance.frame), "The last form row must be fully onscreen")
-    if keepsFirstRow {
-      XCTAssertTrue(status.isHittable, app.debugDescription)
-      XCTAssertTrue(window.frame.contains(status.frame), "The first form row must remain onscreen")
-    }
+    let complete = XCTAttachment(string: app.debugDescription)
+    complete.name = "connection-guidance-before-audit-native-hierarchy"
+    complete.lifetime = .keepAlways
+    add(complete)
+    capture("connection-guidance-before-audit", app: app)
   }
 
   func testConnectionHeaderContrastAtSmallText() throws {

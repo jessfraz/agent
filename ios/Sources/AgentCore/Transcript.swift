@@ -22,13 +22,22 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
   public var work: InputWorkState?
   public var inputID: String?
   public var attachments: [AttachmentRef]
+  public var inputOrigin: InputOrigin?
+  public var noticeOrigin: NoticeOrigin?
+
+  public var provenanceLabel: String? {
+    if role == .user { return inputOrigin.map { $0 == .ios ? "iOS" : "CLI" } }
+    if role == .notice, let noticeOrigin { return "Job: \(noticeOrigin.title)" }
+    return nil
+  }
 
   init(
     id: String, entryID: String? = nil, role: HistoryRole, text: String, tool: ToolHistory? = nil,
     presentation: MessagePresentation? = nil, delivery: Delivery? = nil,
     work: InputWorkState? = nil,
     inputID: String? = nil,
-    attachments: [AttachmentRef] = []
+    attachments: [AttachmentRef] = [], inputOrigin: InputOrigin? = nil,
+    noticeOrigin: NoticeOrigin? = nil
   ) {
     self.id = id
     self.entryID = entryID
@@ -42,6 +51,8 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
     self.work = work
     self.inputID = inputID
     self.attachments = attachments
+    self.inputOrigin = inputOrigin
+    self.noticeOrigin = noticeOrigin
   }
 }
 
@@ -110,7 +121,8 @@ struct Transcript: Sendable {
     append(
       ChatRow(
         id: "input:\(request.inputId)", role: .user, text: request.text, delivery: delivery,
-        inputID: request.inputId, attachments: request.attachments ?? []))
+        inputID: request.inputId, attachments: request.attachments ?? [],
+        inputOrigin: request.origin))
     bound()
   }
   mutating func delivery(_ id: String, _ state: Delivery, entryID: String? = nil) {
@@ -318,6 +330,7 @@ struct Transcript: Sendable {
     {
       storage[index].text = boundedText(storage[index].text + message.text)
       storage[index].presentation = message.presentation ?? storage[index].presentation
+      storage[index].noticeOrigin = message.noticeOrigin ?? storage[index].noticeOrigin
       dirtyRows.insert(storage[index].id)
       for attachment in message.attachments ?? []
       where !storage[index].attachments.contains(where: { $0.id == attachment.id }) {
@@ -330,7 +343,7 @@ struct Transcript: Sendable {
         ChatRow(
           id: "entry:\(message.entryId):\(segment)", entryID: message.entryId, role: message.role,
           text: boundedText(message.text), presentation: message.presentation,
-          attachments: message.attachments ?? []))
+          attachments: message.attachments ?? [], noticeOrigin: message.noticeOrigin))
     }
     if !historical { bound() }
   }

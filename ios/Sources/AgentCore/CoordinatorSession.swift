@@ -29,6 +29,8 @@ public struct ChatSnapshot: Sendable {
   public var includesLatest = true
   public var sourceWarning: String?
   public var sources: [SourceState] = []
+  public var settingsSupported = false
+  public var settings: NativeSettingsSnapshot?
   public var error: String?
 }
 
@@ -73,6 +75,8 @@ public actor CoordinatorSession {
   public nonisolated let updates: AsyncStream<ChatSnapshot>
   private let continuation: AsyncStream<ChatSnapshot>.Continuation
   private var snapshot = ChatSnapshot()
+  private var inputOrigins = false
+  private var capabilityGeneration = UUID()
   private var transcript = Transcript()
   private var address: CoordinatorAddress?
   private var observation: Task<Void, Never>?
@@ -163,6 +167,7 @@ public actor CoordinatorSession {
     let ownedConnections = Array(actionConnections.values) + [connection].compactMap { $0 }
     actionConnections = [:]
     connection = nil
+    resetCapabilities()
     snapshot.connection = .disconnected
     snapshot.busy = false
     snapshot.loadingHistory = false
@@ -212,7 +217,7 @@ public actor CoordinatorSession {
     }
     let request = NativeRequestSubmit(
       attachments: files.isEmpty && !feedback ? nil : files.map(\.reference),
-      inputId: UUID().uuidString, mode: mode, text: text)
+      inputId: UUID().uuidString, mode: mode, origin: inputOrigins ? .ios : nil, text: text)
     let durable = !control || feedback
     if durable {
       guard pending.count < 32 else {
@@ -385,6 +390,7 @@ public actor CoordinatorSession {
     while !Task.isCancelled && self.generation == generation {
       var stream: LineConnection?
       do {
+        resetCapabilities()
         transcript.reconnect()
         snapshot.connection = attempt == 0 ? .connecting : .reconnecting
         publish()
@@ -436,6 +442,7 @@ public actor CoordinatorSession {
           publish()
           return
         }
+        resetCapabilities()
         snapshot.connection = .reconnecting
         snapshot.error = nil
         publish()
@@ -540,6 +547,7 @@ public actor CoordinatorSession {
             inputID, fallback: attemptedInputs.contains(inputID) ? .uncertain : .rejected)
         }
         if ConnectionError.shouldReconnect(after: error) {
+          resetCapabilities()
           snapshot.connection = .reconnecting
           snapshot.error = nil
           snapshot.busy = false
@@ -603,6 +611,76 @@ public actor CoordinatorSession {
         return
       }
     } while true
+  }
+
+  private func resetCapabilities() {
+    capabilityGeneration = UUID()
+    inputOrigins = false
+    snapshot.settingsSupported = false
+    snapshot.settings = nil
+  }
+
+  private func validMainSettings(_ value: NativeSettingsSnapshot) -> Bool {
+    value.configured.conversationId == snapshot.conversationID
+      && value.configured.taskId == nil && value.configured.agentId == nil
+  }
+
+  /// Main-conversation control traffic. Never a composer input or task selector.
+  public func settings(change: ConversationChange? = nil, catalog: Bool = true) async throws
+    -> NativeSettingsSnapshot
+  {
+    guard snapshot.settingsSupported else {
+      throw CoordinatorRejection(
+        message: "This coordinator does not support conversation settings.")
+    }
+    guard snapshot.connection == .connected, let address,
+      actions.count + previewRequests.count < 32
+    else { throw ConnectionError.closed }
+    let id = UUID()
+    previewRequests.insert(id)
+    defer { previewRequests.remove(id) }
+    let generation = generation
+    let capabilityGeneration = capabilityGeneration
+    let stream = try await connectTransport(address)
+    guard self.generation == generation, self.capabilityGeneration == capabilityGeneration,
+      !Task.isCancelled
+    else {
+      await stream.close()
+      throw CancellationError()
+    }
+    actionConnections[id] = stream
+    return try await withTaskCancellationHandler {
+      do {
+        try await timedSend(stream, .settings(.init(catalog: catalog, change: change)))
+        var result: NativeSettingsSnapshot?
+        while true {
+          let event = try await timedNext(stream)
+          guard self.generation == generation, self.capabilityGeneration == capabilityGeneration,
+            !Task.isCancelled
+          else { throw CancellationError() }
+          switch event {
+          case .notice(let notice):
+            guard result == nil, let settings = notice.settings, validMainSettings(settings) else {
+              throw ConnectionError.incompleteFrame
+            }
+            result = settings
+          case .done:
+            guard let result else { throw ConnectionError.incompleteFrame }
+            snapshot.settings = result
+            publish()
+            await actionConnections.removeValue(forKey: id)?.close()
+            return result
+          case .failure(let value): throw CoordinatorRejection(message: value.message)
+          default: throw ConnectionError.incompleteFrame
+          }
+        }
+      } catch {
+        await actionConnections.removeValue(forKey: id)?.close()
+        throw error
+      }
+    } onCancel: {
+      Task { await stream.close() }
+    }
   }
 
   /// Device controls share trusted transport, never model input or transcript rows.
@@ -787,6 +865,8 @@ public actor CoordinatorSession {
     case .ready(let value):
       snapshot.error = nil
       snapshot.conversationID = value.conversationId
+      inputOrigins = value.inputOrigins == true
+      snapshot.settingsSupported = value.conversationSettings == true
       snapshot.model = value.model
       snapshot.busy = true
     case .history(let value):
@@ -839,7 +919,9 @@ public actor CoordinatorSession {
       // Keep the original on disk until the user explicitly restores it.
       // Rejections are not proof that a queued durable input never existed.
       snapshot.error = value.message
-    case .notice(let value): transcript.notice(value.text)
+    case .notice(let value):
+      if let settings = value.settings, validMainSettings(settings) { snapshot.settings = settings }
+      transcript.notice(value.text)
     case .failure(let value):
       if historyRequestID == nil { snapshot.busy = false }
       snapshot.error = value.message

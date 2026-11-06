@@ -27,6 +27,11 @@ final class ChatModel {
   var connection: ConnectionState = .disconnected
   var model = "Main conversation"
   var commands: [SlashCommand] = []
+  private(set) var settingsSupported = false
+  private(set) var conversationSettings: NativeSettingsSnapshot?
+  private(set) var settingsBusy = false
+  var settingsError: String?
+  @ObservationIgnored private var settingsRequest: UUID?
   var busy = false
   var canLoadEarlier = false
   var loadingHistory = false
@@ -36,27 +41,43 @@ final class ChatModel {
   var error: String?
   var revision = 0
   var draft = "" {
-    didSet { draftRevision &+= 1 }
+    didSet {
+      draftRevision &+= 1
+      scheduleDraftSave()
+    }
   }
   @ObservationIgnored private var draftRevision = 0
-  var attachments: [LocalAttachment] = []
+  var attachments: [LocalAttachment] = [] { didSet { scheduleDraftSave() } }
   var previewURL: URL?
   private(set) var preparingAttachments = false
-  var mode: InputMode = .steer
+  var mode: InputMode = .steer { didSet { scheduleDraftSave() } }
+  private(set) var draftReady: Bool
+  private(set) var pendingSharedImport = false
+  var draftError: String?
+  @ObservationIgnored private let persistence: ComposerDraftStore?
+  @ObservationIgnored private let sharedInbox: SharedDraftInbox?
+  @ObservationIgnored private var persistentRevision: UInt64 = 0
+  @ObservationIgnored private var consumedTransfers: Set<UUID> = []
+  @ObservationIgnored private var changingDraft = false
+  @ObservationIgnored private var restoringDraft = false
   private(set) var admitting = false
   @ObservationIgnored private var generation = UUID()
   @ObservationIgnored private var admit:
     @Sendable (String, InputMode, [LocalAttachment]) async -> Bool
   @ObservationIgnored private var draftStore: AttachmentStore?
-  @ObservationIgnored private var feedbackScreenshotID: String?
+  @ObservationIgnored private var feedbackScreenshotID: String? { didSet { scheduleDraftSave() } }
 
   init(
-    draftStore: AttachmentStore? = nil,
+    draftStore: AttachmentStore? = nil, persistence: ComposerDraftStore? = nil,
+    sharedInbox: SharedDraftInbox? = nil,
     admit: @escaping @Sendable (String, InputMode, [LocalAttachment]) async -> Bool = { _, _, _ in
       false
     }
   ) {
     self.draftStore = draftStore
+    self.persistence = persistence
+    self.sharedInbox = sharedInbox
+    draftReady = persistence == nil
     self.admit = admit
   }
   deinit {
@@ -69,6 +90,112 @@ final class ChatModel {
   @ObservationIgnored private var address: CoordinatorAddress?
   @ObservationIgnored private var active = true
 
+  private var currentDraft: ComposerDraft {
+    ComposerDraft(
+      text: draft, mode: mode, attachments: attachments, consumedTransfers: consumedTransfers,
+      feedbackScreenshotID: feedbackScreenshotID)
+  }
+  private func scheduleDraftSave() {
+    guard draftReady, !changingDraft, let persistence else { return }
+    persistentRevision &+= 1
+    let revision = persistentRevision
+    let value = currentDraft
+    Task { [weak self] in
+      do { try await persistence.save(value, revision: revision) } catch {
+        if self?.persistentRevision == revision { self?.draftError = error.localizedDescription }
+      }
+    }
+  }
+  private func persistDraft() async throws {
+    guard let persistence else { return }
+    guard draftReady else { throw SharedDraftError.busy }
+    persistentRevision &+= 1
+    try await persistence.save(currentDraft, revision: persistentRevision)
+  }
+  @discardableResult func saveDraft() async -> Bool {
+    do {
+      try await persistDraft()
+      draftError = nil
+      return true
+    } catch {
+      draftError = error.localizedDescription
+      return false
+    }
+  }
+  func restoreDraft() async {
+    guard !draftReady, !restoringDraft, let persistence else { return }
+    restoringDraft = true
+    defer { restoringDraft = false }
+    let revision = draftRevision
+    do {
+      let restored = try await persistence.load(from: attachmentStore())
+      guard draftRevision == revision, draft.isEmpty, attachments.isEmpty else {
+        throw AttachmentError.unavailable(
+          "The saved draft was preserved. Clear the current composer before restoring it.")
+      }
+      changingDraft = true
+      draft = restored.draft.text
+      mode = restored.draft.mode
+      attachments = restored.draft.attachments
+      consumedTransfers = restored.draft.consumedTransfers
+      feedbackScreenshotID = restored.draft.feedbackScreenshotID
+      persistentRevision = restored.revision
+      changingDraft = false
+      draftReady = true
+      pendingSharedImport = !consumedTransfers.isEmpty
+      _ = await saveDraft()
+      guard sharedInbox != nil || consumedTransfers.isEmpty else {
+        throw SharedDraftError.notConfigured
+      }
+      await receiveSharedDrafts()
+    } catch { draftError = error.localizedDescription }
+  }
+  func receiveSharedDrafts() async {
+    guard draftReady, !preparingAttachments, !admitting, let sharedInbox, persistence != nil else {
+      return
+    }
+    preparingAttachments = true
+    defer { preparingAttachments = false }
+    do {
+      let store = try attachmentStore()
+      try await retireAcknowledgedTransfers(in: sharedInbox)
+      // One activation must not drain an unbounded queue or overfill the composer.
+      for _ in 0..<AttachmentLimits.maximumCount {
+        let consumed = try await sharedInbox.consumeNext(into: store) { [self] batch in
+          try await adoptSharedDraft(batch)
+        }
+        guard consumed else { break }
+        // Only acknowledged IDs may leave the durable host ledger. A crash
+        // before this cleanup is harmless and is reconciled on next launch.
+        try await retireAcknowledgedTransfers(in: sharedInbox)
+      }
+      draftError = nil
+    } catch {
+      if !(error is CancellationError) { draftError = error.localizedDescription }
+    }
+  }
+  private func retireAcknowledgedTransfers(in inbox: SharedDraftInbox) async throws {
+    let acknowledged = consumedTransfers.filter { inbox.acknowledged($0) }
+    consumedTransfers.subtract(acknowledged)
+    pendingSharedImport = !consumedTransfers.isEmpty
+    if !acknowledged.isEmpty { try await persistDraft() }
+  }
+  private func adoptSharedDraft(_ batch: SharedDraftBatch) async throws {
+    if !consumedTransfers.contains(batch.id) {
+      guard batch.attachments.count <= AttachmentLimits.maximumCount - attachments.count else {
+        throw AttachmentError.tooMany
+      }
+      changingDraft = true
+      if !batch.note.isEmpty { draft += (draft.isEmpty ? "" : "\n\n") + batch.note }
+      attachments.append(contentsOf: batch.attachments)
+      consumedTransfers.insert(batch.id)
+      changingDraft = false
+    }
+    pendingSharedImport = true
+    // This complete atomic record, including the UUID, must reach disk before
+    // SharedDraftInbox is allowed to acknowledge or delete the source batch.
+    try await persistDraft()
+  }
   func connect(host: String, port: String) async {
     do {
       guard let port = UInt16(port) else { throw ConnectionError.invalidAddress }
@@ -116,6 +243,11 @@ final class ChatModel {
     let ownedSession = session
     session = nil
     connection = .disconnected
+    settingsSupported = false
+    conversationSettings = nil
+    settingsRequest = nil
+    settingsBusy = false
+    settingsError = nil
     admit = { _, _, _ in false }
     await ownedSession?.disconnect()
   }
@@ -129,7 +261,8 @@ final class ChatModel {
     await registration.connect { request in try await session.notifications(request) }
   }
   var canSend: Bool {
-    !admitting && !preparingAttachments && connection == .connected
+    draftReady && !pendingSharedImport && !admitting && !preparingAttachments
+      && connection == .connected
       && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
   }
   func send(screenshot: (@MainActor () throws -> Data)? = nil) async {
@@ -174,12 +307,16 @@ final class ChatModel {
       let sentIDs = Set(files.map(\.id))
       attachments.removeAll { sentIDs.contains($0.id) }
       if let id = feedbackScreenshotID, sentIDs.contains(id) { feedbackScreenshotID = nil }
-      if let store = draftStore {
+      if await saveDraft(), let store = draftStore {
         for file in files { try? await store.remove(file) }
       }
     }
   }
   func restore(_ id: String) async {
+    guard draftReady else {
+      draftError = draftError ?? "Restore the saved draft before replacing the composer."
+      return
+    }
     guard !admitting, draft.isEmpty, attachments.isEmpty else {
       error = "Send or clear the current draft before restoring another message."
       return
@@ -205,7 +342,7 @@ final class ChatModel {
     return store
   }
   func attach(urls: [URL]) async {
-    guard !preparingAttachments else { return }
+    guard draftReady, !preparingAttachments else { return }
     preparingAttachments = true
     defer { preparingAttachments = false }
     do {
@@ -221,7 +358,7 @@ final class ChatModel {
     } catch { self.error = error.localizedDescription }
   }
   func attach(providers: [NSItemProvider]) async {
-    guard !preparingAttachments else { return }
+    guard draftReady, !preparingAttachments else { return }
     preparingAttachments = true
     defer { preparingAttachments = false }
     var staged: [LocalAttachment] = []
@@ -249,6 +386,7 @@ final class ChatModel {
     }
   }
   func attach(data: Data, name: String, mediaType: String) async {
+    guard draftReady else { return }
     do {
       guard attachments.count < AttachmentLimits.maximumCount else { throw AttachmentError.tooMany }
       let file = try await attachmentStore().stage(data: data, name: name, mediaType: mediaType)
@@ -261,7 +399,7 @@ final class ChatModel {
   }
   #if os(iOS)
     func attach(photo: PhotosPickerItem) async {
-      guard !preparingAttachments else { return }
+      guard draftReady, !preparingAttachments else { return }
       preparingAttachments = true
       defer { preparingAttachments = false }
       do {
@@ -273,14 +411,37 @@ final class ChatModel {
     }
   #endif
   func removeAttachment(_ file: LocalAttachment) async {
-    guard !admitting else { return }
+    guard !admitting, !preparingAttachments else { return }
     attachments.removeAll { $0.id == file.id }
     if feedbackScreenshotID == file.id { feedbackScreenshotID = nil }
-    try? await draftStore?.remove(file)
+    if await saveDraft() { try? await draftStore?.remove(file) }
   }
   func preview(_ reference: AttachmentRef) async {
     do { previewURL = try await session?.preview(reference) } catch {
       self.error = error.localizedDescription
+    }
+  }
+  func refreshSettings(change: ConversationChange? = nil) async {
+    guard !settingsBusy, settingsSupported, let session, connection == .connected else { return }
+    let id = UUID()
+    let generation = generation
+    settingsRequest = id
+    settingsBusy = true
+    settingsError = nil
+    defer {
+      if settingsRequest == id {
+        settingsRequest = nil
+        settingsBusy = false
+      }
+    }
+    do {
+      let settings = try await session.settings(change: change)
+      guard self.generation == generation, !Task.isCancelled else { return }
+      conversationSettings = settings
+    } catch {
+      if self.generation == generation, !(error is CancellationError) {
+        settingsError = error.localizedDescription
+      }
     }
   }
   func retry(_ id: String) async { await session?.retry(id) }
@@ -313,6 +474,8 @@ final class ChatModel {
     model = update.model
     busy = update.busy
     commands = update.commands
+    settingsSupported = update.settingsSupported
+    conversationSettings = update.settings
     canLoadEarlier = update.olderCursor != nil
     loadingHistory = update.loadingHistory
     includesLatest = update.includesLatest

@@ -86,6 +86,12 @@ Mode if requested, then Run.
   per-endpoint outbox before transmission. On iOS it
   uses complete file protection and is excluded from backup. History stays in
   memory; there is no separate phone conversation database.
+- The unsent composer saves its note, delivery mode and attachment references
+  together. Reopening restores that draft; importing or restoring never sends it.
+- **Connection → Conversation settings** changes the main conversation's model,
+  reasoning and Fast setting without submitting the draft. Configured and
+  effective selections are shown separately; an unknown active selection stays
+  unknown. Controls appear only when supported by the connected coordinator.
 - Coordinator acknowledgements are saved with each outbox input. Accepted
   messages stay saved through suspension, reconnect and app restart; they are
   observed by their original IDs until placement and cannot be resubmitted.
@@ -119,6 +125,8 @@ Mode if requested, then Run.
 - The shared protocol retains typed CLI/iOS input origins and scheduled-notice
   lineage. Missing legacy origin stays unknown. Live and restored rows use the
   same durable identities and causal ordering.
+- Sharing from other apps still needs a provisioned App Group and Share target.
+  The shared-draft queue alone does not install an extension.
 - `/feedback` captures the current app window before sending and includes it
   with the report. Failed admission keeps that exact screenshot for retry.
   Pi's existing adapter handles model image input; other files remain available

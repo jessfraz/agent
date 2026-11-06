@@ -54,7 +54,20 @@ final class HistoryInteractionTests: XCTestCase {
     }
     pasteCopiedText(text)
     XCTAssertEqual(composer.value as? String, text)
-    composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: text.count))
+    // Select the actual native range rather than assuming the insertion point
+    // starts at the end, then wait for the real editor to finish the deletion.
+    composer.press(forDuration: 1)
+    let selectAll = action("Select All", app: app)
+    XCTAssertTrue(selectAll.waitForExistence(timeout: 3))
+    selectAll.tap()
+    let delete = app.keys["delete"]
+    XCTAssertTrue(delete.exists)
+    delete.tap()
+    let cleared = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "value == %@", ""), object: composer)
+    XCTAssertEqual(
+      XCTWaiter.wait(for: [cleared], timeout: 3), .completed,
+      "Native Select All/Delete must clear the exact composer value: \(composer.debugDescription)")
     XCTAssertEqual(composer.value as? String, "")
     first.press(forDuration: 1)
     let select = action("Select text", app: app)
@@ -203,14 +216,111 @@ final class HistoryInteractionTests: XCTestCase {
     XCTAssertTrue(text("mail-primary").exists)
   }
 
+  func testConversationSettingsPreserveTheDraftAndUseOnlyAdvertisedMainControls() async throws {
+    continueAfterFailure = false
+    executionTimeAllowance = 90
+    let peer = InteractionPeer()
+    addTeardownBlock { await peer.stop() }
+    let history = NativeEventHistory(
+      messages: [
+        .init(
+          continuation: false, entryId: "scheduled", finalChunk: true,
+          noticeOrigin: .init(jobId: "invented-job", title: "Original run title"),
+          role: .notice, text: "An invented scheduled update."),
+        .init(
+          continuation: false, entryId: "legacy", finalChunk: true,
+          role: .notice, text: "An update with no supplied job provenance."),
+      ], nextCursor: nil, pageComplete: true)
+    await peer.history(initial: history, pages: [:], latest: history)
+    await peer.settings(
+      .init(
+        configured: .init(
+          catalog: [
+            .init(
+              fast: true, modelId: "test-model", name: "Test model", provider: .openaiCodex,
+              reasoning: [.low, .high, .xhigh])
+          ], conversationId: "fixture-root",
+          model: .init(fast: true, modelId: "test-model", provider: .openaiCodex)), effective: nil))
+    let app = XCUIApplication()
+    app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(try await peer.start())
+    app.launchArguments += ["-notificationsEnabled", "NO"]
+    app.launch()
+    defer { app.terminate() }
+    XCTAssertTrue(app.staticTexts["Job: Original run title"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts["Notice"].exists)
+    let composer = editor(app)
+    composer.tap()
+    let note = "Keep this unsent note."
+    composer.typeText(note)
+    app.buttons["Connection"].tap()
+    app.buttons["Conversation settings"].tap()
+    let reasoning = app.buttons["conversationReasoningPicker"]
+    XCTAssertTrue(reasoning.waitForExistence(timeout: 5))
+    XCTAssertTrue(
+      app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Unknown")).firstMatch
+        .exists)
+    reasoning.tap()
+    action("Extra High", app: app).tap()
+    try await eventually(description: "Extra High settings control") {
+      await peer.settingsControls().last?.change == .setReasoning(.init(reasoning: .xhigh))
+    }
+    reasoning.tap()
+    action("Provider default", app: app).tap()
+    try await eventually(description: "Provider default settings control") {
+      await peer.settingsControls().last?.change == .setReasoning(.init(reasoning: nil))
+    }
+    let fast = app.switches["conversationFastToggle"]
+    func waitForFast(_ value: String) {
+      let ready = XCTNSPredicateExpectation(
+        predicate: NSPredicate(format: "value == %@ AND enabled == true", value), object: fast)
+      XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 3), .completed, app.debugDescription)
+    }
+    func toggleFast() {
+      // A native Form can expose a labeled row and its actual UISwitch.
+      let control = fast.switches.firstMatch
+      let target = control.exists ? control : fast
+      XCTAssertTrue(target.isHittable)
+      target.tap()
+    }
+    waitForFast("1")
+    toggleFast()
+    waitForFast("0")
+    try await eventually(description: "explicit Fast off control") {
+      await peer.settingsControls().last?.change == .setFast(.init(mode: .off))
+    }
+    toggleFast()
+    waitForFast("1")
+    try await eventually(description: "explicit Fast on control") {
+      await peer.settingsControls().last?.change == .setFast(.init(mode: .on))
+    }
+    let submittedBeforeClosing = await peer.inputs()
+    XCTAssertTrue(submittedBeforeClosing.isEmpty)
+    let image = XCTAttachment(screenshot: app.screenshot())
+    image.name = "configured-effective-provider-default-extra-high-fast-controls"
+    image.lifetime = .keepAlways
+    add(image)
+    // New native toolbars expose BackButton outside NavigationBar descendants.
+    let back = app.buttons["BackButton"]
+    if back.exists {
+      back.tap()
+    } else {
+      app.navigationBars["Conversation settings"].buttons.element(boundBy: 0).tap()
+    }
+    app.buttons["dismissConnection"].tap()
+    XCTAssertEqual(editor(app).value as? String, note)
+    let submittedAfterClosing = await peer.inputs()
+    XCTAssertTrue(submittedAfterClosing.isEmpty)
+  }
+
   private func eventually(
+    description: String = "history navigation state",
     file: StaticString = #filePath, line: UInt = #line,
     _ predicate: () async throws -> Bool
   ) async throws {
     let deadline = ContinuousClock.now + .seconds(5)
     while try await !predicate() {
       guard ContinuousClock.now < deadline else {
-        XCTFail("Expected history navigation state did not arrive", file: file, line: line)
+        XCTFail("Expected \(description) did not arrive", file: file, line: line)
         return
       }
       try await Task.sleep(for: .milliseconds(20))
@@ -365,6 +475,12 @@ private actor InteractionPeer {
   private var pages: [String: NativeEventHistory] = [:]
   private var latest: NativeEventHistory?
   private var observer: NWConnection?
+  private var settingsValue: NativeSettingsSnapshot?
+  private var settingRequests: [NativeRequestSettings] = []
+  private var submitted: [NativeRequestSubmit] = []
+  func settings(_ value: NativeSettingsSnapshot) { settingsValue = value }
+  func settingsControls() -> [NativeRequestSettings] { settingRequests }
+  func inputs() -> [NativeRequestSubmit] { submitted }
   private var sourceStates: [SourceState]?
   private var requests: [String] = []
   private var held: Set<String> = []
@@ -438,12 +554,32 @@ private actor InteractionPeer {
       case .observe(let request):
         observer = socket
         try await emit(
-          .ready(.init(conversationId: "fixture-root", model: "fixture/model")), to: socket)
+          .ready(
+            .init(
+              conversationId: "fixture-root",
+              conversationSettings: settingsValue == nil ? nil : true,
+              inputOrigins: settingsValue == nil ? nil : true, model: "fixture/model")), to: socket)
         try await emit(.history(try XCTUnwrap(initial)), to: socket)
         if request.sourceStatus == true, let sourceStates {
           try await emit(.sources(.init(sources: sourceStates)), to: socket)
         }
         try await emit(.idle, to: socket)
+      case .settings(let request):
+        settingRequests.append(request)
+        var settings = try XCTUnwrap(settingsValue)
+        switch request.change {
+        case .setReasoning(let value): settings.configured.model.reasoning = value.reasoning
+        case .setFast(let value): settings.configured.model.fast = value.mode == .on
+        case .none: break
+        default: XCTFail("Unexpected settings control")
+        }
+        settingsValue = settings
+        try await emit(
+          .notice(.init(settings: settings, text: "Conversation settings")), to: socket)
+        try await emit(.done, to: socket)
+      case .submit(let request):
+        submitted.append(request)
+        try await emit(.accepted(.init(inputId: request.inputId)), to: socket)
       case .history(let request):
         let cursor = request.cursor ?? "<latest>"
         requests.append(cursor)

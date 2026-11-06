@@ -208,6 +208,112 @@ public enum AttachmentResponse: Codable, Sendable, Equatable {
     }
 }
 
+public struct ConversationChangeSetSelection: Codable, Sendable, Equatable {
+    public var `model`: ModelSelection
+    public init(`model`: ModelSelection) {
+        self.`model` = `model`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `model` = "model"
+    }
+}
+
+public struct ConversationChangeSetModel: Codable, Sendable, Equatable {
+    public var `modelId`: String
+    public var `provider`: ModelProvider?
+    public init(`modelId`: String, `provider`: ModelProvider? = nil) {
+        self.`modelId` = `modelId`
+        self.`provider` = `provider`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `modelId` = "model_id"
+        case `provider` = "provider"
+    }
+}
+
+public struct ConversationChangeSetReasoning: Codable, Sendable, Equatable {
+    public var `reasoning`: Reasoning?
+    public init(`reasoning`: Reasoning? = nil) {
+        self.`reasoning` = `reasoning`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `reasoning` = "reasoning"
+    }
+}
+
+public struct ConversationChangeSetFast: Codable, Sendable, Equatable {
+    public var `mode`: FastMode
+    public init(`mode`: FastMode) {
+        self.`mode` = `mode`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `mode` = "mode"
+    }
+}
+
+public enum ConversationChange: Codable, Sendable, Equatable {
+    case `setSelection`(ConversationChangeSetSelection)
+    case `setModel`(ConversationChangeSetModel)
+    case `setReasoning`(ConversationChangeSetReasoning)
+    case `setFast`(ConversationChangeSetFast)
+    enum CodingKeys: String, CodingKey { case type }
+    public init(from decoder: any Decoder) throws {
+        let tag = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .type)
+        switch tag {
+        case "set_selection": self = .`setSelection`(try ConversationChangeSetSelection(from: decoder))
+        case "set_model": self = .`setModel`(try ConversationChangeSetModel(from: decoder))
+        case "set_reasoning": self = .`setReasoning`(try ConversationChangeSetReasoning(from: decoder))
+        case "set_fast": self = .`setFast`(try ConversationChangeSetFast(from: decoder))
+        default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported protocol event: \(tag)"))
+        }
+    }
+    public func encode(to encoder: any Encoder) throws {
+        var tag = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .`setSelection`(let value):
+            try tag.encode("set_selection", forKey: .type)
+            try value.encode(to: encoder)
+        case .`setModel`(let value):
+            try tag.encode("set_model", forKey: .type)
+            try value.encode(to: encoder)
+        case .`setReasoning`(let value):
+            try tag.encode("set_reasoning", forKey: .type)
+            try value.encode(to: encoder)
+        case .`setFast`(let value):
+            try tag.encode("set_fast", forKey: .type)
+            try value.encode(to: encoder)
+        }
+    }
+}
+
+public struct ConversationSettings: Codable, Sendable, Equatable {
+    public var `agentId`: String?
+    public var `catalog`: [ModelOption]
+    public var `conversationId`: String
+    public var `model`: ModelSelection
+    public var `taskId`: TaskId?
+    public init(`agentId`: String? = nil, `catalog`: [ModelOption], `conversationId`: String, `model`: ModelSelection, `taskId`: TaskId? = nil) {
+        self.`agentId` = `agentId`
+        self.`catalog` = `catalog`
+        self.`conversationId` = `conversationId`
+        self.`model` = `model`
+        self.`taskId` = `taskId`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `agentId` = "agent_id"
+        case `catalog` = "catalog"
+        case `conversationId` = "conversation_id"
+        case `model` = "model"
+        case `taskId` = "task_id"
+    }
+}
+
+public enum FastMode: String, Codable, Sendable, Equatable {
+    case `toggle` = "toggle"
+    case `on` = "on"
+    case `off` = "off"
+}
+
 public struct FeedbackReceipt: Codable, Sendable, Equatable {
     public var `agentId`: String?
     public var `id`: String
@@ -251,15 +357,17 @@ public struct HistoryMessage: Codable, Sendable, Equatable {
     public var `continuation`: Bool
     public var `entryId`: String
     public var `finalChunk`: Bool
+    public var `noticeOrigin`: NoticeOrigin?
     public var `presentation`: MessagePresentation?
     public var `role`: HistoryRole
     public var `text`: String
     public var `tool`: ToolHistory?
-    public init(`attachments`: [AttachmentRef]? = nil, `continuation`: Bool, `entryId`: String, `finalChunk`: Bool, `presentation`: MessagePresentation? = nil, `role`: HistoryRole, `text`: String, `tool`: ToolHistory? = nil) {
+    public init(`attachments`: [AttachmentRef]? = nil, `continuation`: Bool, `entryId`: String, `finalChunk`: Bool, `noticeOrigin`: NoticeOrigin? = nil, `presentation`: MessagePresentation? = nil, `role`: HistoryRole, `text`: String, `tool`: ToolHistory? = nil) {
         self.`attachments` = `attachments`
         self.`continuation` = `continuation`
         self.`entryId` = `entryId`
         self.`finalChunk` = `finalChunk`
+        self.`noticeOrigin` = `noticeOrigin`
         self.`presentation` = `presentation`
         self.`role` = `role`
         self.`text` = `text`
@@ -270,6 +378,7 @@ public struct HistoryMessage: Codable, Sendable, Equatable {
         case `continuation` = "continuation"
         case `entryId` = "entry_id"
         case `finalChunk` = "final_chunk"
+        case `noticeOrigin` = "notice_origin"
         case `presentation` = "presentation"
         case `role` = "role"
         case `text` = "text"
@@ -298,6 +407,11 @@ public enum InputBlockReason: String, Codable, Sendable, Equatable {
 public enum InputMode: String, Codable, Sendable, Equatable {
     case `steer` = "steer"
     case `followUp` = "follow_up"
+}
+
+public enum InputOrigin: String, Codable, Sendable, Equatable {
+    case `cli` = "cli"
+    case `ios` = "ios"
 }
 
 public struct InputWorkStateCompleted: Codable, Sendable, Equatable {
@@ -356,6 +470,8 @@ public enum InputWorkState: Codable, Sendable, Equatable {
         }
     }
 }
+
+public typealias JobId = String
 
 public enum MediaOperation: String, Codable, Sendable, Equatable {
     case `view` = "view"
@@ -669,6 +785,92 @@ public enum ModelActivity: Codable, Sendable, Equatable {
     }
 }
 
+public struct ModelOption: Codable, Sendable, Equatable {
+    public var `fast`: Bool
+    public var `modelId`: String
+    public var `name`: String
+    public var `provider`: ModelProvider
+    public var `reasoning`: [Reasoning]
+    public init(`fast`: Bool, `modelId`: String, `name`: String, `provider`: ModelProvider, `reasoning`: [Reasoning]) {
+        self.`fast` = `fast`
+        self.`modelId` = `modelId`
+        self.`name` = `name`
+        self.`provider` = `provider`
+        self.`reasoning` = `reasoning`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `fast` = "fast"
+        case `modelId` = "model_id"
+        case `name` = "name"
+        case `provider` = "provider"
+        case `reasoning` = "reasoning"
+    }
+}
+
+public enum ModelProvider: String, Codable, Sendable, Equatable {
+    case `amazonBedrock` = "amazon-bedrock"
+    case `antLing` = "ant-ling"
+    case `anthropic` = "anthropic"
+    case `google` = "google"
+    case `googleVertex` = "google-vertex"
+    case `openai` = "openai"
+    case `azure` = "azure"
+    case `openaiCodex` = "openai-codex"
+    case `radius` = "radius"
+    case `typesafe` = "typesafe"
+    case `nvidia` = "nvidia"
+    case `deepseek` = "deepseek"
+    case `githubCopilot` = "github-copilot"
+    case `xai` = "xai"
+    case `groq` = "groq"
+    case `cerebras` = "cerebras"
+    case `openrouter` = "openrouter"
+    case `vercelAiGateway` = "vercel-ai-gateway"
+    case `zai` = "zai"
+    case `zaiCodingCn` = "zai-coding-cn"
+    case `mistral` = "mistral"
+    case `minimax` = "minimax"
+    case `minimaxCn` = "minimax-cn"
+    case `moonshotai` = "moonshotai"
+    case `moonshotaiCn` = "moonshotai-cn"
+    case `huggingface` = "huggingface"
+    case `fireworks` = "fireworks"
+    case `together` = "together"
+    case `baseten` = "baseten"
+    case `opencode` = "opencode"
+    case `opencodeGo` = "opencode-go"
+    case `kimiCoding` = "kimi-coding"
+    case `meta` = "meta"
+    case `cloudflareWorkersAi` = "cloudflare-workers-ai"
+    case `cloudflareAiGateway` = "cloudflare-ai-gateway"
+    case `qwenTokenPlan` = "qwen-token-plan"
+    case `qwenTokenPlanCn` = "qwen-token-plan-cn"
+    case `qwenTokenPlanIndividual` = "qwen-token-plan-individual"
+    case `xiaomi` = "xiaomi"
+    case `xiaomiTokenPlanCn` = "xiaomi-token-plan-cn"
+    case `xiaomiTokenPlanAms` = "xiaomi-token-plan-ams"
+    case `xiaomiTokenPlanSgp` = "xiaomi-token-plan-sgp"
+}
+
+public struct ModelSelection: Codable, Sendable, Equatable {
+    public var `fast`: Bool
+    public var `modelId`: String
+    public var `provider`: ModelProvider
+    public var `reasoning`: Reasoning?
+    public init(`fast`: Bool, `modelId`: String, `provider`: ModelProvider, `reasoning`: Reasoning? = nil) {
+        self.`fast` = `fast`
+        self.`modelId` = `modelId`
+        self.`provider` = `provider`
+        self.`reasoning` = `reasoning`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `fast` = "fast"
+        case `modelId` = "model_id"
+        case `provider` = "provider"
+        case `reasoning` = "reasoning"
+    }
+}
+
 public struct NativeCommandNative: Codable, Sendable, Equatable {
     public var `request`: NativeRequest
     public init(`request`: NativeRequest) {
@@ -734,13 +936,19 @@ public struct NativeEventCommands: Codable, Sendable, Equatable {
 
 public struct NativeEventReady: Codable, Sendable, Equatable {
     public var `conversationId`: String
+    public var `conversationSettings`: Bool?
+    public var `inputOrigins`: Bool?
     public var `model`: String
-    public init(`conversationId`: String, `model`: String) {
+    public init(`conversationId`: String, `conversationSettings`: Bool? = nil, `inputOrigins`: Bool? = nil, `model`: String) {
         self.`conversationId` = `conversationId`
+        self.`conversationSettings` = `conversationSettings`
+        self.`inputOrigins` = `inputOrigins`
         self.`model` = `model`
     }
     enum CodingKeys: String, CodingKey {
         case `conversationId` = "conversation_id"
+        case `conversationSettings` = "conversation_settings"
+        case `inputOrigins` = "input_origins"
         case `model` = "model"
     }
 }
@@ -864,11 +1072,14 @@ public struct NativeEventRejected: Codable, Sendable, Equatable {
 }
 
 public struct NativeEventNotice: Codable, Sendable, Equatable {
+    public var `settings`: NativeSettingsSnapshot?
     public var `text`: String
-    public init(`text`: String) {
+    public init(`settings`: NativeSettingsSnapshot? = nil, `text`: String) {
+        self.`settings` = `settings`
         self.`text` = `text`
     }
     enum CodingKeys: String, CodingKey {
+        case `settings` = "settings"
         case `text` = "text"
     }
 }
@@ -1032,17 +1243,20 @@ public struct NativeRequestSubmit: Codable, Sendable, Equatable {
     public var `attachments`: [AttachmentRef]?
     public var `inputId`: String
     public var `mode`: InputMode
+    public var `origin`: InputOrigin?
     public var `text`: String
-    public init(`attachments`: [AttachmentRef]? = nil, `inputId`: String, `mode`: InputMode, `text`: String) {
+    public init(`attachments`: [AttachmentRef]? = nil, `inputId`: String, `mode`: InputMode, `origin`: InputOrigin? = nil, `text`: String) {
         self.`attachments` = `attachments`
         self.`inputId` = `inputId`
         self.`mode` = `mode`
+        self.`origin` = `origin`
         self.`text` = `text`
     }
     enum CodingKeys: String, CodingKey {
         case `attachments` = "attachments"
         case `inputId` = "input_id"
         case `mode` = "mode"
+        case `origin` = "origin"
         case `text` = "text"
     }
 }
@@ -1054,6 +1268,19 @@ public struct NativeRequestHistory: Codable, Sendable, Equatable {
     }
     enum CodingKeys: String, CodingKey {
         case `cursor` = "cursor"
+    }
+}
+
+public struct NativeRequestSettings: Codable, Sendable, Equatable {
+    public var `catalog`: Bool
+    public var `change`: ConversationChange?
+    public init(`catalog`: Bool, `change`: ConversationChange? = nil) {
+        self.`catalog` = `catalog`
+        self.`change` = `change`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `catalog` = "catalog"
+        case `change` = "change"
     }
 }
 
@@ -1085,6 +1312,7 @@ public enum NativeRequest: Codable, Sendable, Equatable {
     case `observe`(NativeRequestObserve)
     case `submit`(NativeRequestSubmit)
     case `history`(NativeRequestHistory)
+    case `settings`(NativeRequestSettings)
     case `toolDetails`(NativeRequestToolDetails)
     case `interrupt`
     case `notifications`(NativeRequestNotifications)
@@ -1096,6 +1324,7 @@ public enum NativeRequest: Codable, Sendable, Equatable {
         case "observe": self = .`observe`(try NativeRequestObserve(from: decoder))
         case "submit": self = .`submit`(try NativeRequestSubmit(from: decoder))
         case "history": self = .`history`(try NativeRequestHistory(from: decoder))
+        case "settings": self = .`settings`(try NativeRequestSettings(from: decoder))
         case "tool_details": self = .`toolDetails`(try NativeRequestToolDetails(from: decoder))
         case "interrupt": self = .`interrupt`
         case "notifications": self = .`notifications`(try NativeRequestNotifications(from: decoder))
@@ -1117,6 +1346,9 @@ public enum NativeRequest: Codable, Sendable, Equatable {
         case .`history`(let value):
             try tag.encode("history", forKey: .type)
             try value.encode(to: encoder)
+        case .`settings`(let value):
+            try tag.encode("settings", forKey: .type)
+            try value.encode(to: encoder)
         case .`toolDetails`(let value):
             try tag.encode("tool_details", forKey: .type)
             try value.encode(to: encoder)
@@ -1126,6 +1358,32 @@ public enum NativeRequest: Codable, Sendable, Equatable {
             try tag.encode("notifications", forKey: .type)
             try value.encode(to: encoder)
         }
+    }
+}
+
+public struct NativeSettingsSnapshot: Codable, Sendable, Equatable {
+    public var `configured`: ConversationSettings
+    public var `effective`: ModelSelection?
+    public init(`configured`: ConversationSettings, `effective`: ModelSelection? = nil) {
+        self.`configured` = `configured`
+        self.`effective` = `effective`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `configured` = "configured"
+        case `effective` = "effective"
+    }
+}
+
+public struct NoticeOrigin: Codable, Sendable, Equatable {
+    public var `jobId`: JobId
+    public var `title`: String
+    public init(`jobId`: JobId, `title`: String) {
+        self.`jobId` = `jobId`
+        self.`title` = `title`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `jobId` = "job_id"
+        case `title` = "title"
     }
 }
 
@@ -1216,6 +1474,16 @@ public struct NotificationTarget: Codable, Sendable, Equatable {
         case `conversationId` = "conversation_id"
         case `entryId` = "entry_id"
     }
+}
+
+public enum Reasoning: String, Codable, Sendable, Equatable {
+    case `off` = "off"
+    case `minimal` = "minimal"
+    case `low` = "low"
+    case `medium` = "medium"
+    case `high` = "high"
+    case `xhigh` = "xhigh"
+    case `max` = "max"
 }
 
 public enum ReviewStage: String, Codable, Sendable, Equatable {
