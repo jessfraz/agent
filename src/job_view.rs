@@ -1,5 +1,9 @@
 //! Shared CLI and slash-command presentation of applied job state.
-use crate::{background::ScheduledJobStatus, jobs::UtcMillis, protocol::RuntimeEventKind};
+use crate::{
+    background::{JobExecutionState, ScheduledJobStatus},
+    jobs::UtcMillis,
+    protocol::RuntimeEventKind,
+};
 
 fn instant(value: Option<UtcMillis>, timezone: &str) -> String {
     let Some(value) = value else {
@@ -71,9 +75,59 @@ pub fn get(status: &ScheduledJobStatus) -> String {
         format!("Timezone: {}", job.timezone),
         format!("Directory: {}", job.cwd),
         format!("Revision: {}", job.revision),
-        String::new(),
-        job.prompt.clone(),
     ];
+    if let Some(run) = &status.last_run {
+        let state = match &run.state {
+            JobExecutionState::Queued => "queued",
+            JobExecutionState::Running => "running",
+            JobExecutionState::Waiting => "waiting",
+            JobExecutionState::Retrying { .. } => "retrying",
+            JobExecutionState::Blocked { .. } => "blocked",
+            JobExecutionState::Completed => "completed",
+            JobExecutionState::Failed { .. } => "failed",
+            JobExecutionState::Stopped => "stopped",
+        };
+        lines.push(format!(
+            "\nLast run: {state} (schedule {})",
+            run.schedule_id
+        ));
+        lines.push(format!(
+            "Scheduled: {}\nStarted: {}\nFinished: {}\nRun revision: {}",
+            instant(Some(run.scheduled_at), job.timezone.as_str()),
+            instant(run.started_at, job.timezone.as_str()),
+            instant(run.finished_at, job.timezone.as_str()),
+            run.revision
+        ));
+        match &run.state {
+            JobExecutionState::Retrying { at, message } => {
+                lines.push(format!(
+                    "Retry: {}",
+                    instant(Some(*at), job.timezone.as_str())
+                ));
+                if let Some(message) = message {
+                    lines.push(format!("Error: {message}"));
+                }
+            }
+            JobExecutionState::Blocked { message } | JobExecutionState::Failed { message } => {
+                lines.push(format!("Error: {message}"));
+            }
+            _ => {}
+        }
+        if let Some(id) = &run.task_id {
+            lines.push(format!("Task: {id}"));
+        }
+        if let Some(output) = &run.output {
+            lines.push(format!("\nLast output:\n{output}"));
+            if run.output_truncated {
+                lines.push("Output truncated; read the task for full history.".into());
+            }
+        } else {
+            lines.push("Output: no completed reply recorded for this run.".into());
+        }
+    } else {
+        lines.push("\nLast run: timing unavailable. No retained execution reference.".into());
+    }
+    lines.push(format!("\nPrompt:\n{}", job.prompt));
     for schedule in &job.schedules {
         let current = status
             .schedules

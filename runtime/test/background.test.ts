@@ -24,6 +24,27 @@ function untilReleased(promise: Promise<void>, signal: AbortSignal): Promise<voi
     promise.then(() => { signal.removeEventListener("abort", abort); resolve(); }, reject);
   });
 }
+
+test("job inspection retains Pi run timing across reopen without inventing old execution history", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-job-diagnostics-")), clock = new FakeClock();
+  let app = await openBackground(directory, clock);
+  try {
+    const job = exampleJob();
+    await app.scheduler.syncJobs([job]);
+    assert.equal((await app.scheduler.getJob(job.id)).last_run, undefined);
+    await app.scheduler.runJob({ type: "run_job", job_id: job.id, schedule_id: null, request_id: "diagnostics" });
+    await pump(async () => (await app.scheduler.status()).pending === 0);
+    const before = (await app.scheduler.getJob(job.id)).last_run;
+    assert.ok(before);
+    assert.deepEqual(before.state, { status: "completed" });
+    assert.equal(before.started_at, START); assert.equal(before.finished_at, START);
+    assert.equal(before.output, null, "No answer must remain distinct from an empty successful reply");
+    await app.session.close(BACKGROUND_CONTEXT);
+    app = await openBackground(directory, clock);
+    assert.deepEqual((await app.scheduler.getJob(job.id)).last_run, before);
+    assert.equal((await app.scheduler.status()).pending, 0, "Inspection cannot start work");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
 async function killAt(directory: string, boundary: "before" | "after"): Promise<void> {
   const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("./fixtures/background-kill-child.js", import.meta.url)), directory, boundary],
     { stdio: ["pipe", "pipe", "pipe"] });

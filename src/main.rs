@@ -4069,18 +4069,7 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
             println!("{}", agent_cli::resources::format_inventory(resources));
         }
         RuntimeEventKind::Sources { sources } => {
-            for source in sources {
-                let status = match source.coverage {
-                    agent_cli::sources::SourceCoverage::Complete => "current",
-                    agent_cli::sources::SourceCoverage::More => "catching up",
-                    agent_cli::sources::SourceCoverage::Partial { .. } => "partial",
-                    agent_cli::sources::SourceCoverage::Unavailable { .. } => "unavailable",
-                };
-                println!(
-                    "{} / {}: {status}",
-                    source.source.provider, source.source.account
-                );
-            }
+            println!("{}", agent_cli::source_view::format(sources));
         }
         event @ (RuntimeEventKind::JobsSynced { .. }
         | RuntimeEventKind::JobRun { .. }

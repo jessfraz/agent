@@ -2734,6 +2734,188 @@
         }
       ]
     },
+    "JobExecution": {
+      "description": "A view of the existing Pi execution, never a second execution state machine.",
+      "type": "object",
+      "properties": {
+        "finished_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UtcMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "output": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output_truncated": {
+          "type": "boolean"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "schedule_id": {
+          "$ref": "#/$defs/ScheduleId"
+        },
+        "scheduled_at": {
+          "$ref": "#/$defs/UtcMillis"
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UtcMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/JobExecutionState"
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "schedule_id",
+        "scheduled_at",
+        "revision",
+        "state",
+        "output_truncated"
+      ]
+    },
+    "JobExecutionState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "queued"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "running"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "waiting"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "at": {
+              "$ref": "#/$defs/UtcMillis"
+            },
+            "message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "type": "string",
+              "const": "retrying"
+            }
+          },
+          "required": [
+            "status",
+            "at"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "blocked"
+            }
+          },
+          "required": [
+            "status",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "completed"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "failed"
+            }
+          },
+          "required": [
+            "status",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "stopped"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        }
+      ]
+    },
     "JobId": {
       "type": "string"
     },
@@ -4868,6 +5050,16 @@
       "properties": {
         "job": {
           "$ref": "#/$defs/ScheduledJob"
+        },
+        "last_run": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobExecution"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "schedules": {
           "type": "array",

@@ -362,6 +362,11 @@ removed schedules stop admitting work. Missing directories, invalid TOML or
 duplicate IDs leave the applied catalog intact. An existing empty directory
 can intentionally remove all jobs. Source timers are outside job sync's scope.
 `/jobs` and `/jobs ID` use the same read requests and presentation as list/get.
+`get` includes the latest execution's start, finish, retry or blocking error,
+and exact completed reply. Pi owns these records; inspecting them starts no
+work. Older runs without a retained execution reference show unavailable
+timing rather than treating admission as completion. `--json` retains the
+typed result for scripts.
 
 `run` queues the applied job now with its saved prompt and model. A job with one
 schedule selects it automatically; a job with several requires `--schedule ID` .
@@ -423,8 +428,9 @@ internal task outcomes remain available.
 Omitting `namespaces` discovers all configured accounts for that provider. An
 explicit selection never falls back to another account. Slack additionally needs
 its account and command prefix. The source command must be available in the
-service's PATH. `beep-boop sources` reports coverage and checkpoints; an access
-failure is not an empty inbox.
+service's PATH. `beep-boop sources` shows each account's coverage, last check in
+local time and safe diagnostic. `--json` also retains opaque checkpoints for
+scripts. An access failure is not an empty inbox.
 
 Messages reads run headlessly through the local Rex Server, using its macOS Full
 Disk Access grant. Enable access for Rex Server once in System Settings;

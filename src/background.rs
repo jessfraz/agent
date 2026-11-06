@@ -215,6 +215,43 @@ pub struct JobScheduleStatus {
 pub struct ScheduledJobStatus {
     pub job: ScheduledJob,
     pub schedules: Vec<JobScheduleStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub last_run: Option<JobExecution>,
+}
+
+/// A view of the existing Pi execution, never a second execution state machine.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct JobExecution {
+    pub schedule_id: jobs::ScheduleId,
+    pub scheduled_at: UtcMillis,
+    pub started_at: Option<UtcMillis>,
+    pub finished_at: Option<UtcMillis>,
+    pub revision: String,
+    pub state: JobExecutionState,
+    pub task_id: Option<crate::protocol::TaskId>,
+    pub output: Option<String>,
+    pub output_truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum JobExecutionState {
+    Queued,
+    Running,
+    Waiting,
+    Retrying {
+        at: UtcMillis,
+        message: Option<String>,
+    },
+    Blocked {
+        message: String,
+    },
+    Completed,
+    Failed {
+        message: String,
+    },
+    Stopped,
 }
 
 pub async fn execute(request: BackgroundRequest) -> Result<BackgroundResponse> {
