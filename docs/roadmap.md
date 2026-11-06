@@ -104,7 +104,7 @@ recovery; [history](history.md) describes import and retrieval.
   so restarts and retries cannot run a job twice.
 - [x] Reuse each scheduled job's Rex chat and Pi conversation across timer and
   manual runs, preserving each admitted run's prompt, model and identity.
-- [ ] Release CLI account diagnostics and scheduled-run timing, outcome and
+- [x] Release CLI account diagnostics and scheduled-run timing, outcome and
   exact reply inspection. Keep unavailable historical timing explicit.
 - [x] Shared worktree inventory through the CLI and `/worktrees`, including
   native chat clients.
