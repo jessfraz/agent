@@ -326,7 +326,11 @@ private func admittedInputWorkReconcilesAfterReopenWithoutBecomingADeliveryError
     await fixture.describeWork(nil)
     await model.setActive(false)
     await model.setActive(true)
-    try await waitForReconnectState { model.connection == .connected }
+    // Foregrounding requests a connection; the model can still expose the
+    // previous connected snapshot until its observer applies reconciliation.
+    try await waitForReconnectState {
+      model.connection == .connected && model.rows.first?.row.work == nil
+    }
     #expect(model.rows.first?.row.delivery == .saved)
     #expect(
       model.rows.first?.row.work == nil, "An older server cannot leave a stale execution badge")
