@@ -37,7 +37,11 @@ public struct MainChatView: View {
   @Environment(\.displayScale) private var displayScale
 
   public init(notifications: AppNotifications? = nil) {
-    _model = State(initialValue: ChatModel())
+    _model = State(
+      initialValue: ChatModel(
+        persistence: ComposerDraftStore(
+          url: URL.applicationSupportDirectory.appending(path: "Agent/Composer/draft.json")),
+        sharedInbox: try? SharedDraftInbox.configured()))
     managesConnection = true
     detailLoader = nil
     initialScrollTarget = nil
@@ -89,6 +93,22 @@ public struct MainChatView: View {
           .accessibilityHint("Show source accounts and errors")
         }
         transcript
+        if let error = model.draftError {
+          VStack(alignment: .leading) {
+            Text(error).font(.callout).foregroundStyle(.red)
+            Button("Retry saving the unsent draft") {
+              Task {
+                if !model.draftReady {
+                  await model.restoreDraft()
+                } else if model.pendingSharedImport {
+                  await model.receiveSharedDrafts()
+                } else {
+                  _ = await model.saveDraft()
+                }
+              }
+            }
+          }.padding(.horizontal)
+        }
         if let error = model.error {
           Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal).padding(
@@ -140,7 +160,7 @@ public struct MainChatView: View {
         }
       }
       .dropDestination(for: URL.self) { urls, _ in
-        guard !urls.isEmpty else { return false }
+        guard model.draftReady, !urls.isEmpty else { return false }
         Task { await model.attach(urls: urls) }
         return true
       }
@@ -157,6 +177,7 @@ public struct MainChatView: View {
       #endif
       .task {
         guard managesConnection else { return }
+        await model.restoreDraft()
         // Keep the SwiftUI-owned task alive. Cancellation on removal
         // tears down both the UI subscription and its network owner.
         if host.isEmpty { settings = true } else { await model.connect(host: host, port: port) }
@@ -164,7 +185,18 @@ public struct MainChatView: View {
       }
       .onChange(of: scenePhase) { _, phase in
         notifications?.mainVisible = mainVisible
-        if managesConnection { Task { await model.setActive(phase == .active) } }
+        if managesConnection {
+          Task {
+            // Publish the scene's connection intent before file I/O yields.
+            // A late background save must not disconnect a newer foreground.
+            await model.setActive(phase == .active)
+            if phase == .active {
+              await model.receiveSharedDrafts()
+            } else {
+              _ = await model.saveDraft()
+            }
+          }
+        }
       }
       .onAppear { notifications?.mainVisible = mainVisible }
       .onDisappear { notifications?.mainVisible = false }
@@ -336,6 +368,10 @@ public struct MainChatView: View {
   private var composer: some View {
     VStack(spacing: 6) {
       if !model.attachments.isEmpty {
+        HStack {
+          Text("Unsent attachments").font(.caption).foregroundStyle(.secondary)
+          Spacer()
+        }
         ScrollView(.horizontal) {
           HStack(spacing: 8) {
             ForEach(model.attachments) { file in
@@ -384,11 +420,21 @@ public struct MainChatView: View {
             .frame(width: 44, height: 44).contentShape(Circle())
         }
         .tint(.primary).accessibilityLabel("Add attachments or commands")
-        .accessibilityIdentifier("composerMenu")
+        .accessibilityIdentifier("composerMenu").disabled(!model.draftReady)
+        PasteButton(supportedContentTypes: [.image]) { providers in
+          Task { await model.attach(providers: providers) }
+        }
+        .labelStyle(.iconOnly).buttonBorderShape(.circle)
+        .frame(minWidth: 44, minHeight: 44)
+        .accessibilityLabel("Paste images")
+        .disabled(
+          !model.draftReady || model.preparingAttachments || model.admitting
+            || model.attachments.count >= AttachmentLimits.maximumCount)
         TextField(
           model.mode == .steer ? "Message Beep Boop" : "Queue a follow-up", text: $model.draft,
           axis: .vertical
         )
+        .disabled(!model.draftReady)
         .lineLimit(1...6).textFieldStyle(.plain).padding(.vertical, 11).padding(.horizontal, 2)
         .accessibilityLabel("Message the coordinator").accessibilityIdentifier(
           "Message the coordinator")
@@ -438,6 +484,11 @@ public struct MainChatView: View {
           LabeledContent("Status", value: model.connection.label)
           LabeledContent("Model", value: model.model)
           NavigationLink("Sources") { SourceDetailsView(model: model) }
+          if model.settingsSupported {
+            NavigationLink("Conversation settings") { ConversationSettingsView(model: model) }
+          } else if model.connection == .connected {
+            Text("Conversation settings are not advertised by this coordinator.").font(.footnote)
+          }
           Picker("Appearance", selection: $appearance) {
             ForEach(AppAppearance.allCases) { appearance in
               Text(appearance.label).tag(appearance)
@@ -494,6 +545,7 @@ public struct MainChatView: View {
               }
             } else if model.connection != .connected {
               Text("Connect to the coordinator to receive updates.").font(.footnote)
+                .fixedSize(horizontal: false, vertical: true)
             } else if !registration.configured {
               Text("APNs setup is required on the coordinator.").font(.footnote)
             } else if registration.enabled, !registration.registered {
@@ -567,6 +619,9 @@ struct MessageRow: View {
         .frame(
           maxWidth: isUser && !typeSize.isAccessibilitySize ? 520 : .infinity,
           alignment: isUser ? .trailing : .leading)
+      if isUser, let provenance = model.row.provenanceLabel {
+        Text(provenance).font(.caption).foregroundStyle(.secondary)
+      }
       if let delivery = model.row.delivery {
         Label(delivery.rawValue, systemImage: delivery.symbol)
           .font(.caption.weight(.medium)).foregroundStyle(.primary)
@@ -600,9 +655,7 @@ struct MessageRow: View {
     .padding(.leading, isUser && !typeSize.isAccessibilitySize ? 32 : 0)
     .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
     .accessibilityElement(children: .contain).accessibilityLabel(title)
-    .contextMenu {
-      ShareLink(item: model.row.text) { Label("Share text", systemImage: "square.and.arrow.up") }
-    }
+    .messageTextActions(model.row.text)
   }
   private var isUser: Bool { model.row.role == .user }
   private var showsHeader: Bool {
@@ -643,7 +696,7 @@ struct MessageRow: View {
     case .assistant, .final: "Beep Boop"
     case .commentary: "Update"
     case .partialAnswer: "Partial answer"
-    case .notice: "Notice"
+    case .notice: model.row.provenanceLabel ?? "Notice"
     case .thinking: "Reasoning"
     case .tool: "Tool"
     }

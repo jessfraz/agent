@@ -3,8 +3,11 @@ import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { JsonObject } from "@earendil-works/pi-ai";
 
-export type ModelStep = { text: string } | { tool: string; args: JsonObject };
+export type ModelStep = { text: string } | { tool: string; args: JsonObject; commentary?: string };
 export type ModelQueue = Record<string, ModelStep[]>;
+type ResponseItem = { id: string; type: "message"; role: "assistant"; status: "completed"; phase?: "commentary";
+  content: [{ type: "output_text"; text: string; annotations: [] }] } |
+  { id: string; type: "function_call"; call_id: string; name: string; arguments: string; status: "completed" };
 function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
 
 // Only the external provider is synthetic. Pi, application tools and the bridge
@@ -27,23 +30,31 @@ globalThis.fetch = async (input, options) => {
   writeFileSync(path, JSON.stringify(queue));
   appendFileSync(path + ".requests", JSON.stringify({ key, body }) + "\n");
   const id = randomUUID();
-  const item = typeof step.text === "string"
-    ? { id, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: step.text, annotations: [] }] }
-    : { id, type: "function_call", call_id: id, name: step.tool, arguments: JSON.stringify(step.args), status: "completed" };
+  let item: ResponseItem;
+  if (typeof step.text === "string") item = { id, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: step.text, annotations: [] }] };
+  else {
+    assert.ok(typeof step.tool === "string" && object(step.args));
+    item = { id, type: "function_call", call_id: id, name: step.tool, arguments: JSON.stringify(step.args), status: "completed" };
+  }
+  const items: ResponseItem[] = typeof step.commentary === "string" && item.type === "function_call" ? [
+    { id: randomUUID(), type: "message", role: "assistant", status: "completed", phase: "commentary", content: [{ type: "output_text", text: step.commentary, annotations: [] }] }, item,
+  ] : [item];
   const response = { id: randomUUID(), object: "response", created_at: 1, model: "gpt-6.1-sol" };
   const events = [
     { type: "response.created", response: { ...response, status: "in_progress", output: [] } },
-    { type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", ...(item.type === "message" ? { content: [] } : { arguments: "" }) } },
-    ...(typeof step.text === "string" ? [
-      { type: "response.content_part.added", item_id: id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } },
-      { type: "response.output_text.delta", item_id: id, output_index: 0, content_index: 0, delta: step.text },
-      { type: "response.output_text.done", item_id: id, output_index: 0, content_index: 0, text: step.text },
-    ] : [
-      { type: "response.function_call_arguments.delta", item_id: id, output_index: 0, delta: JSON.stringify(step.args) },
-      { type: "response.function_call_arguments.done", item_id: id, output_index: 0, arguments: JSON.stringify(step.args) },
+    ...items.flatMap((item, output_index) => [
+      { type: "response.output_item.added", output_index, item: { ...item, status: "in_progress", ...(item.type === "message" ? { content: [] } : { arguments: "" }) } },
+      ...(item.type === "message" ? [
+        { type: "response.content_part.added", item_id: item.id, output_index, content_index: 0, part: { type: "output_text", text: "", annotations: [] } },
+        { type: "response.output_text.delta", item_id: item.id, output_index, content_index: 0, delta: item.content[0].text },
+        { type: "response.output_text.done", item_id: item.id, output_index, content_index: 0, text: item.content[0].text },
+      ] : [
+        { type: "response.function_call_arguments.delta", item_id: item.id, output_index, delta: item.arguments },
+        { type: "response.function_call_arguments.done", item_id: item.id, output_index, arguments: item.arguments },
+      ]),
+      { type: "response.output_item.done", output_index, item },
     ]),
-    { type: "response.output_item.done", output_index: 0, item },
-    { type: "response.completed", response: { ...response, status: "completed", output: [item], usage: {
+    { type: "response.completed", response: { ...response, status: "completed", output: items, usage: {
       input_tokens: 1, output_tokens: 1, total_tokens: 2, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 },
     } } },
   ];

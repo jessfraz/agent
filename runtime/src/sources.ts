@@ -413,8 +413,9 @@ export class SourceJournal {
     if (taskId !== null) await this.tasks.get(taskId);
     const conversation = await this.tasks.conversation(conversationId);
     const origin = await this.tasks.origin(conversation, callId);
+    const lineage = await this.tasks.noticeOrigin(conversation, origin.id);
     const publication = await publishMainNotice(this.session, conversation, origin, taskId, records.map((record) => record.event.source),
-      { key: callId, text, events: records.map((record) => record.event) });
+      { key: callId, text, events: records.map((record) => record.event), ...(lineage === undefined ? {} : { origin: lineage }) });
     if (publication === "published") emit?.(taskId, text);
     return publication;
   }

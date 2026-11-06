@@ -2,6 +2,7 @@
 import type { AttachmentRef } from "./AttachmentRef.js";
 import type { HistoryRole } from "./HistoryRole.js";
 import type { MessagePresentation } from "./MessagePresentation.js";
+import type { NoticeOrigin } from "./NoticeOrigin.js";
 import type { ToolHistory } from "./ToolHistory.js";
 
-export type HistoryMessage = { entry_id: string, role: HistoryRole, text: string, continuation: boolean, final_chunk: boolean, presentation?: MessagePresentation, tool?: ToolHistory, attachments?: Array<AttachmentRef>, };
+export type HistoryMessage = { notice_origin?: NoticeOrigin, entry_id: string, role: HistoryRole, text: string, continuation: boolean, final_chunk: boolean, presentation?: MessagePresentation, tool?: ToolHistory, attachments?: Array<AttachmentRef>, };

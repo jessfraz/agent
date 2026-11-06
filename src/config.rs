@@ -388,6 +388,93 @@ mod tests {
     use crate::config::{context_repository_path, load, tailnet_address, validate_coordinator};
 
     #[test]
+    fn provider_default_model_roundtrips_without_changing_the_application_default() {
+        use crate::{
+            config::ClientConfig,
+            models::{ModelSelection, Reasoning},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        // Only absence of the entire application model preference selects xhigh.
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(load(Some(&path)).unwrap().model, ModelSelection::default());
+        assert_eq!(
+            load(Some(&path)).unwrap().model.reasoning,
+            Some(Reasoning::Xhigh)
+        );
+        let expected = ModelSelection {
+            reasoning: None,
+            ..ModelSelection::default()
+        };
+        let mut config = ClientConfig {
+            model: expected.clone(),
+            ..ClientConfig::default()
+        };
+        for _ in 0..2 {
+            std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+            config = load(Some(&path)).unwrap();
+            assert_eq!(
+                config.model, expected,
+                "An explicitly present model must retain provider-default effort through TOML"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_managed_apply_preserves_provider_default_model() {
+        use crate::{config::ClientConfig, models::ModelSelection};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let expected = ModelSelection {
+            reasoning: None,
+            ..ModelSelection::default()
+        };
+        let config = ClientConfig {
+            model: expected.clone(),
+            ..ClientConfig::default()
+        };
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let settings = directory.path().join("managed.toml");
+        std::fs::write(&settings, "poll_interval_seconds = 120\n").unwrap();
+        assert!(crate::config::apply(&path, &settings).unwrap().changed);
+        let saved = load(Some(&path)).unwrap();
+        assert_eq!(
+            saved.model, expected,
+            "Applying an unrelated preference must not change effort"
+        );
+        assert_eq!(saved.poll_interval_seconds, 120);
+        assert!(!crate::config::apply(&path, &settings).unwrap().changed);
+    }
+
+    #[test]
+    fn managed_apply_can_select_provider_default_model() {
+        use crate::{config::ClientConfig, models::ModelSelection};
+        #[derive(serde::Serialize)]
+        struct ManagedModel {
+            model: ModelSelection,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, toml::to_string(&ClientConfig::default()).unwrap()).unwrap();
+        let expected = ModelSelection {
+            reasoning: None,
+            ..ModelSelection::default()
+        };
+        let settings = directory.path().join("managed.toml");
+        std::fs::write(
+            &settings,
+            toml::to_string(&ManagedModel {
+                model: expected.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(crate::config::apply(&path, &settings).unwrap().changed);
+        assert_eq!(load(Some(&path)).unwrap().model, expected);
+        assert!(!crate::config::apply(&path, &settings).unwrap().changed);
+    }
+
+    #[test]
     fn apns_is_private_preserved_configuration_not_a_managed_preference() {
         use crate::notifications::{ApnsConfig, ApnsEnvironment};
         let directory = tempfile::tempdir().unwrap();

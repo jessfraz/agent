@@ -5,6 +5,145 @@ import XCTest
 
 @MainActor
 final class HistoryInteractionTests: XCTestCase {
+  private func launchMessages(_ messages: [HistoryMessage]) async throws -> XCUIApplication {
+    continueAfterFailure = false
+    executionTimeAllowance = 90
+    let peer = InteractionPeer()
+    addTeardownBlock { await peer.stop() }
+    let history = NativeEventHistory(messages: messages, nextCursor: nil, pageComplete: true)
+    await peer.history(initial: history, pages: [:], latest: history)
+    let app = XCUIApplication()
+    app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(try await peer.start())
+    app.launchArguments += ["-notificationsEnabled", "NO"]
+    app.launch()
+    addTeardownBlock { @MainActor in app.terminate() }
+    return app
+  }
+
+  private func action(_ label: String, app: XCUIApplication) -> XCUIElement {
+    app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label)).firstMatch
+  }
+
+  private func editor(_ app: XCUIApplication) -> XCUIElement {
+    app.descendants(matching: .any).matching(identifier: "Message the coordinator").firstMatch
+  }
+
+  func testWholeMessageCopyAndPartialNativeSelectionPasteThroughComposer() async throws {
+    let text = "Alpha bracket Charlie.\n\nSecond paragraph from the same answer."
+    let app = try await launchMessages([
+      .init(continuation: false, entryId: "1", finalChunk: true, role: .final, text: text)
+    ])
+    let first = app.staticTexts["Alpha bracket Charlie."]
+    XCTAssertTrue(first.waitForExistence(timeout: 5))
+    first.press(forDuration: 1)
+    let copy = action("Copy message", app: app)
+    XCTAssertTrue(copy.waitForExistence(timeout: 3))
+    copy.tap()
+    let composer = editor(app)
+    func pasteCopiedText(_ expected: String) {
+      composer.tap()
+      composer.press(forDuration: 1)
+      let paste = action("Paste", app: app)
+      XCTAssertTrue(paste.waitForExistence(timeout: 3), app.debugDescription)
+      paste.tap()
+      let pasted = XCTNSPredicateExpectation(
+        predicate: NSPredicate(format: "value == %@", expected), object: composer)
+      XCTAssertEqual(
+        XCTWaiter.wait(for: [pasted], timeout: 3), .completed,
+        "The actual native Paste action must update the composer: \(composer.debugDescription)")
+    }
+    pasteCopiedText(text)
+    XCTAssertEqual(composer.value as? String, text)
+    // Select the actual native range rather than assuming the insertion point
+    // starts at the end, then wait for the real editor to finish the deletion.
+    composer.press(forDuration: 1)
+    let selectAll = action("Select All", app: app)
+    XCTAssertTrue(selectAll.waitForExistence(timeout: 3))
+    selectAll.tap()
+    let delete = app.keys["delete"]
+    XCTAssertTrue(delete.exists)
+    delete.tap()
+    let cleared = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "value == %@", ""), object: composer)
+    XCTAssertEqual(
+      XCTWaiter.wait(for: [cleared], timeout: 3), .completed,
+      "Native Select All/Delete must clear the exact composer value: \(composer.debugDescription)")
+    XCTAssertEqual(composer.value as? String, "")
+    first.press(forDuration: 1)
+    let select = action("Select text", app: app)
+    XCTAssertTrue(select.waitForExistence(timeout: 3))
+    select.tap()
+    let selection = app.textViews["Selectable message text"]
+    XCTAssertTrue(selection.waitForExistence(timeout: 3))
+    // Touch a word in the real, noneditable UITextView, not a test-only menu.
+    selection.coordinate(withNormalizedOffset: .zero).withOffset(
+      CGVector(dx: 35, dy: 27)
+    ).press(forDuration: 1)
+    let selectedCopy = action("Copy", app: app)
+    XCTAssertTrue(selectedCopy.waitForExistence(timeout: 3))
+    let screenshot = XCTAttachment(screenshot: app.screenshot())
+    screenshot.name = "partial-message-selection-handles"
+    screenshot.lifetime = .keepAlways
+    add(screenshot)
+    selectedCopy.tap()
+    app.buttons["Done"].tap()
+    pasteCopiedText("Alpha")
+    XCTAssertEqual(composer.value as? String, "Alpha")
+  }
+
+  func testPasteImagesKeepsTheNoteAndCreatesOnlyRemovableUnsentAttachments() async throws {
+    let app = try await launchMessages([
+      .init(continuation: false, entryId: "1", finalChunk: true, role: .final, text: "Ready")
+    ])
+    let composer = editor(app)
+    XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    let note = "Keep this note with the selected image."
+    composer.tap()
+    composer.typeText(note)
+    let renderer = UIGraphicsImageRenderer(size: CGSize(width: 32, height: 24))
+    UIPasteboard.general.image = renderer.image { context in
+      UIColor.systemTeal.setFill()
+      context.fill(CGRect(x: 0, y: 0, width: 32, height: 24))
+    }
+    let paste = app.buttons["Paste images"]
+    XCTAssertTrue(paste.waitForExistence(timeout: 3))
+    XCTAssertTrue(paste.isEnabled)
+    paste.tap()
+    let remove = app.buttons["Remove Image.jpg"]
+    XCTAssertTrue(remove.waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts["Unsent attachments"].exists)
+    XCTAssertEqual(composer.value as? String, note)
+    XCTAssertTrue(app.buttons["Send message"].isEnabled)
+    XCTAssertFalse(app.staticTexts["Sending"].exists)
+    XCTAssertFalse(app.staticTexts["Sent"].exists)
+    remove.tap()
+    XCTAssertTrue(remove.waitForNonExistence(timeout: 3))
+    XCTAssertEqual(composer.value as? String, note)
+  }
+
+  func testOneActivityExpansionShowsEverySuppliedSummaryWithoutFetchingHiddenThinking()
+    async throws
+  {
+    let app = try await launchMessages([
+      .init(
+        continuation: false, entryId: "1", finalChunk: true, role: .thinking,
+        text: "First supplied summary.\n\nEvery provider-supplied line stays visible."),
+      .init(
+        continuation: false, entryId: "2", finalChunk: true, role: .thinking,
+        text: "Second supplied summary.\n\nNo hidden thinking is fetched."),
+    ])
+    let group = app.buttons["activity:entry:1:0"]
+    XCTAssertTrue(group.waitForExistence(timeout: 5))
+    group.tap()
+    XCTAssertTrue(app.staticTexts["Every provider-supplied line stays visible."].exists)
+    XCTAssertTrue(app.staticTexts["No hidden thinking is fetched."].exists)
+    XCTAssertFalse(app.buttons["Retry details"].exists)
+    let screenshot = XCTAttachment(screenshot: app.screenshot())
+    screenshot.name = "all-provider-shareable-summaries-one-expansion"
+    screenshot.lifetime = .keepAlways
+    add(screenshot)
+  }
+
   func testSourceWarningShowsPerAccountErrorsAndUpdatesDuringRecovery() async throws {
     continueAfterFailure = false
     executionTimeAllowance = 90
@@ -77,14 +216,111 @@ final class HistoryInteractionTests: XCTestCase {
     XCTAssertTrue(text("mail-primary").exists)
   }
 
+  func testConversationSettingsPreserveTheDraftAndUseOnlyAdvertisedMainControls() async throws {
+    continueAfterFailure = false
+    executionTimeAllowance = 90
+    let peer = InteractionPeer()
+    addTeardownBlock { await peer.stop() }
+    let history = NativeEventHistory(
+      messages: [
+        .init(
+          continuation: false, entryId: "scheduled", finalChunk: true,
+          noticeOrigin: .init(jobId: "invented-job", title: "Original run title"),
+          role: .notice, text: "An invented scheduled update."),
+        .init(
+          continuation: false, entryId: "legacy", finalChunk: true,
+          role: .notice, text: "An update with no supplied job provenance."),
+      ], nextCursor: nil, pageComplete: true)
+    await peer.history(initial: history, pages: [:], latest: history)
+    await peer.settings(
+      .init(
+        configured: .init(
+          catalog: [
+            .init(
+              fast: true, modelId: "test-model", name: "Test model", provider: .openaiCodex,
+              reasoning: [.low, .high, .xhigh])
+          ], conversationId: "fixture-root",
+          model: .init(fast: true, modelId: "test-model", provider: .openaiCodex)), effective: nil))
+    let app = XCUIApplication()
+    app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(try await peer.start())
+    app.launchArguments += ["-notificationsEnabled", "NO"]
+    app.launch()
+    defer { app.terminate() }
+    XCTAssertTrue(app.staticTexts["Job: Original run title"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts["Notice"].exists)
+    let composer = editor(app)
+    composer.tap()
+    let note = "Keep this unsent note."
+    composer.typeText(note)
+    app.buttons["Connection"].tap()
+    app.buttons["Conversation settings"].tap()
+    let reasoning = app.buttons["conversationReasoningPicker"]
+    XCTAssertTrue(reasoning.waitForExistence(timeout: 5))
+    XCTAssertTrue(
+      app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Unknown")).firstMatch
+        .exists)
+    reasoning.tap()
+    action("Extra High", app: app).tap()
+    try await eventually(description: "Extra High settings control") {
+      await peer.settingsControls().last?.change == .setReasoning(.init(reasoning: .xhigh))
+    }
+    reasoning.tap()
+    action("Provider default", app: app).tap()
+    try await eventually(description: "Provider default settings control") {
+      await peer.settingsControls().last?.change == .setReasoning(.init(reasoning: nil))
+    }
+    let fast = app.switches["conversationFastToggle"]
+    func waitForFast(_ value: String) {
+      let ready = XCTNSPredicateExpectation(
+        predicate: NSPredicate(format: "value == %@ AND enabled == true", value), object: fast)
+      XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 3), .completed, app.debugDescription)
+    }
+    func toggleFast() {
+      // A native Form can expose a labeled row and its actual UISwitch.
+      let control = fast.switches.firstMatch
+      let target = control.exists ? control : fast
+      XCTAssertTrue(target.isHittable)
+      target.tap()
+    }
+    waitForFast("1")
+    toggleFast()
+    waitForFast("0")
+    try await eventually(description: "explicit Fast off control") {
+      await peer.settingsControls().last?.change == .setFast(.init(mode: .off))
+    }
+    toggleFast()
+    waitForFast("1")
+    try await eventually(description: "explicit Fast on control") {
+      await peer.settingsControls().last?.change == .setFast(.init(mode: .on))
+    }
+    let submittedBeforeClosing = await peer.inputs()
+    XCTAssertTrue(submittedBeforeClosing.isEmpty)
+    let image = XCTAttachment(screenshot: app.screenshot())
+    image.name = "configured-effective-provider-default-extra-high-fast-controls"
+    image.lifetime = .keepAlways
+    add(image)
+    // New native toolbars expose BackButton outside NavigationBar descendants.
+    let back = app.buttons["BackButton"]
+    if back.exists {
+      back.tap()
+    } else {
+      app.navigationBars["Conversation settings"].buttons.element(boundBy: 0).tap()
+    }
+    app.buttons["dismissConnection"].tap()
+    XCTAssertEqual(editor(app).value as? String, note)
+    let submittedAfterClosing = await peer.inputs()
+    XCTAssertTrue(submittedAfterClosing.isEmpty)
+  }
+
   private func eventually(
+    description: String = "history navigation state",
     file: StaticString = #filePath, line: UInt = #line,
     _ predicate: () async throws -> Bool
   ) async throws {
     let deadline = ContinuousClock.now + .seconds(5)
     while try await !predicate() {
       guard ContinuousClock.now < deadline else {
-        XCTFail("Expected history navigation state did not arrive", file: file, line: line)
+        XCTFail("Expected \(description) did not arrive", file: file, line: line)
         return
       }
       try await Task.sleep(for: .milliseconds(20))
@@ -239,6 +475,12 @@ private actor InteractionPeer {
   private var pages: [String: NativeEventHistory] = [:]
   private var latest: NativeEventHistory?
   private var observer: NWConnection?
+  private var settingsValue: NativeSettingsSnapshot?
+  private var settingRequests: [NativeRequestSettings] = []
+  private var submitted: [NativeRequestSubmit] = []
+  func settings(_ value: NativeSettingsSnapshot) { settingsValue = value }
+  func settingsControls() -> [NativeRequestSettings] { settingRequests }
+  func inputs() -> [NativeRequestSubmit] { submitted }
   private var sourceStates: [SourceState]?
   private var requests: [String] = []
   private var held: Set<String> = []
@@ -312,12 +554,32 @@ private actor InteractionPeer {
       case .observe(let request):
         observer = socket
         try await emit(
-          .ready(.init(conversationId: "fixture-root", model: "fixture/model")), to: socket)
+          .ready(
+            .init(
+              conversationId: "fixture-root",
+              conversationSettings: settingsValue == nil ? nil : true,
+              inputOrigins: settingsValue == nil ? nil : true, model: "fixture/model")), to: socket)
         try await emit(.history(try XCTUnwrap(initial)), to: socket)
         if request.sourceStatus == true, let sourceStates {
           try await emit(.sources(.init(sources: sourceStates)), to: socket)
         }
         try await emit(.idle, to: socket)
+      case .settings(let request):
+        settingRequests.append(request)
+        var settings = try XCTUnwrap(settingsValue)
+        switch request.change {
+        case .setReasoning(let value): settings.configured.model.reasoning = value.reasoning
+        case .setFast(let value): settings.configured.model.fast = value.mode == .on
+        case .none: break
+        default: XCTFail("Unexpected settings control")
+        }
+        settingsValue = settings
+        try await emit(
+          .notice(.init(settings: settings, text: "Conversation settings")), to: socket)
+        try await emit(.done, to: socket)
+      case .submit(let request):
+        submitted.append(request)
+        try await emit(.accepted(.init(inputId: request.inputId)), to: socket)
       case .history(let request):
         let cursor = request.cursor ?? "<latest>"
         requests.append(cursor)

@@ -724,6 +724,7 @@ process.stdin.on('data',chunk=>{
         let submission = tokio::spawn(async move {
             owner
                 .request(RuntimeCommand::Chat {
+                    origin: None,
                     attachments: None,
                     input: "x".repeat(2 * 1024 * 1024),
                     input_id: Some("large-input".into()),
@@ -841,6 +842,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
         let submission = tokio::spawn(async move {
             owner
                 .request(RuntimeCommand::Chat {
+                    origin: None,
                     attachments: None,
                     input: "x".repeat(2 * 1024 * 1024),
                     input_id: Some("canceled-input".into()),
@@ -933,6 +935,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
             .commands
             .send(CommandMessage::Request {
                 command: Box::new(RuntimeCommand::Chat {
+                    origin: None,
                     attachments: None,
                     input: "x".repeat(2 * 1024 * 1024),
                     input_id: Some("blocked-input".into()),
@@ -1088,6 +1091,7 @@ createInterface({input:process.stdin}).on('line',line=>{
         let runtime = Runtime::start(&script, state.path()).unwrap();
         let mut call = runtime
             .request(RuntimeCommand::Chat {
+                origin: None,
                 attachments: None,
                 input: "PRIVATE_PROMPT_SENTINEL".into(),
                 input_id: Some("initial-input".into()),
@@ -1135,6 +1139,7 @@ createInterface({input:process.stdin}).on('line',line=>{
                 .worker_control(
                     request_id,
                     RuntimeCommand::SubmitInput {
+                        origin: None,
                         attachments: None,
                         input_id: "queued-input".into(),
                         input: "PRIVATE_STEERING_SENTINEL".into(),
@@ -1159,6 +1164,7 @@ createInterface({input:process.stdin}).on('line',line=>{
             .worker_control(
                 request_id,
                 RuntimeCommand::SubmitInput {
+                    origin: None,
                     attachments: None,
                     input_id: "late-input".into(),
                     input: "PRIVATE_LATE_INPUT_SENTINEL".into(),

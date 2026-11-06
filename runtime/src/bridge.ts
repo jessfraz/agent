@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { AttachmentStore, AttachmentError, validateInput } from "./attachments.js";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { AssistantEntry, createRegistry, Harness, ROOT_CONVERSATION_ID, type Conversation, type Submission } from "@earendil-works/pi-durable";
+import { createRegistry, Harness, ROOT_CONVERSATION_ID, type Conversation, type Submission } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
@@ -30,8 +30,10 @@ import { activity, history, toolDetails } from "./transcript.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { conversationSettings } from "./settings.js";
+import { createInputOrigins } from "./input_origin.js";
 import { watchInputPlacements } from "./input_delivery.js";
 import { inspectMainWork, reconcileMainInput, recoverMainGeneration, watchMainNotices } from "./main_observation.js";
+import { createMainResponsePolicy, MAIN_RESPONSE_INSTRUCTIONS, mainResponse } from "./main_response.js";
 import { BackgroundScheduler } from "./background.js";
 import { openJobActor, runScheduled } from "./scheduled.js";
 import type { SourcePollCursor } from "./generated/SourcePollCursor.js";
@@ -137,6 +139,7 @@ async function openApplication(): Promise<Application> {
   const sources = new SourceJournal(harness, tasks, executions);
   const tools = createAppTools(tasks, executions);
   const guidance = createGuidance(executions); registry.install(guidance);
+  const inputOrigins = createInputOrigins(harness); registry.install(inputOrigins);
   const sourceTools = createSourceTools(sources, executions);
   const resources = new ResourceStore(harness, tasks);
   tasks.guardResources(resources);
@@ -192,7 +195,11 @@ async function openApplication(): Promise<Application> {
     async runJob(occurrence, signal, actor) { await runScheduled(occurrence, signal, { session: harness, tasks, sources, environment, executions, call: backgroundCall }, actor); },
   });
   const jobTools = createJobTools(background, executions); registry.install(jobTools);
+  const responsePolicy = createMainResponsePolicy(harness); registry.install(responsePolicy);
   const toolsets = createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools });
+  toolsets.main = [...toolsets.main, responsePolicy, inputOrigins];
+  toolsets.worker = [...toolsets.worker, inputOrigins];
+  toolsets.agent = [...toolsets.agent, inputOrigins];
   if (await notifications.start()) harness.resume();
   return { ...core, background, toolsets, startup };
   }); } catch (error) {
@@ -290,14 +297,14 @@ function submitInput(id: number, command: Extract<RuntimeCommand, { type: "submi
     const stopping = interrupts.get(id); await stopping;
     if (worker !== undefined) {
       if (worker.controller.signal.aborted) throw new TaskError("This worker is detaching");
-      await (await app()).tasks.input(worker.command, command.input, command.input_id, command.mode, command.attachments);
+      await (await app()).tasks.input(worker.command, command.input, command.input_id, command.mode, command.attachments, command.origin);
     } else {
       if (main === undefined || !main.accepting || main.conversation === undefined) throw new TaskError("The turn has finished; this input was not accepted");
       if (interrupts.get(id) === stopping) {
         interrupts.delete(id); interrupted.delete(id); hostRequests.resumeRequest(id);
       }
       const application = await app();
-      const prepared = await application.attachments.input(command.input, command.attachments, application.executions.get(main.conversation.id.toString()).call);
+      const prepared = await application.attachments.input(command.input, command.attachments, application.executions.get(main.conversation.id.toString()).call, command.origin);
       const conversation = main.conversation;
       const submission = await application.attachments.admit(command.attachments, () => {
         if (!main.accepting || interrupted.has(id) || interrupts.get(id) !== undefined) return undefined;
@@ -336,7 +343,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
   }
   try {
     if (effective.type === "conversation_input" && effective.conversation_id === ROOT_CONVERSATION_ID.toString()) {
-      effective = { type: "main_input", input_id: effective.input_id, input: effective.input, mode: effective.mode,
+      effective = { type: "main_input", ...(effective.origin === undefined ? {} : { origin: effective.origin }), input_id: effective.input_id, input: effective.input, mode: effective.mode,
         ...(effective.context === undefined ? {} : { context: effective.context }), ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) };
     }
     if (effective.type === "main_input") {
@@ -355,7 +362,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
       const owner = [...mainTurns].find(([owner, turn]) => turn.accepting && !ending.has(owner))?.[0];
       if (owner !== undefined) {
         if (reclaimedInput !== undefined) return;
-        await submitInput(owner, { type: "submit_input", input_id: effective.input_id, input: effective.input, mode: effective.mode, ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) }, id);
+        await submitInput(owner, { type: "submit_input", ...(effective.origin === undefined ? {} : { origin: effective.origin }), input_id: effective.input_id, input: effective.input, mode: effective.mode, ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) }, id);
         return;
       }
       const context = effective.context;
@@ -365,10 +372,10 @@ async function handle(request: RuntimeRequest): Promise<void> {
       const admittedOwner = [...mainTurns].find(([owner, turn]) => turn.accepting && !ending.has(owner))?.[0];
       if (admittedOwner !== undefined) {
         if (reclaimedInput !== undefined) return;
-        await submitInput(admittedOwner, { type: "submit_input", input_id: effective.input_id, input: effective.input, mode: effective.mode, ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) }, id);
+        await submitInput(admittedOwner, { type: "submit_input", ...(effective.origin === undefined ? {} : { origin: effective.origin }), input_id: effective.input_id, input: effective.input, mode: effective.mode, ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) }, id);
         return;
       }
-      effective = { type: "chat", input: effective.input, input_id: effective.input_id, instructions: context?.instructions ?? "", model: null,
+      effective = { type: "chat", ...(effective.origin === undefined ? {} : { origin: effective.origin }), input: effective.input, input_id: effective.input_id, instructions: context?.instructions ?? "", model: null,
         origin_host_id: context?.origin_host_id ?? host.host_id ?? null, cwd: context?.cwd ?? host.cwd, hosts, ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) };
       activeCommands.add(id); mainTurns.set(id, mainTurn());
     }
@@ -444,10 +451,18 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const settings = await conversationSettings(application.tasks, application.environment, command);
         if (command.change !== null) {
           application.executions.setModel(settings.conversation_id, settings.model);
+          const update = { type: "conversation_settings", settings: { ...settings, catalog: [] } } satisfies RuntimeEventKind;
+          let mainOwnerPublished = false;
           for (const [request, conversation] of activeConversations) {
             if (conversation.id.toString() === settings.conversation_id && !ending.has(request)) {
-              emit(request, { type: "conversation_settings", settings: { ...settings, catalog: [] } });
+              emit(request, update);
+              mainOwnerPublished ||= mainTurns.has(request);
             }
+          }
+          // A CLI can change settings while phones only observe the idle root.
+          // The active main owner already mirrors to them; never publish twice.
+          if (settings.conversation_id === ROOT_CONVERSATION_ID.toString() && !mainOwnerPublished) {
+            for (const [request, observer] of mainObservers) queueMainObserver(request, observer, update);
           }
         }
         emit(id, { type: "conversation_settings", settings }); break;
@@ -494,7 +509,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const application = await app();
         const task = await application.tasks.get(command.task_id);
         await conversationViews.input({ type: "conversation_input", conversation_id: task.conversation_id,
-          input_id: command.input_id, input: command.input, mode: command.mode },
+          input_id: command.input_id, input: command.input, mode: command.mode, ...(command.origin === undefined ? {} : { origin: command.origin }) },
         (operation) => hostRequests.call(id, operation), (event) => emit(id, event));
         break;
       }
@@ -667,7 +682,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const stopNotices = await watchMainNotices(application.harness, root, (event) => queueMainObserver(id, observer, event));
         let stopSources: (() => Promise<void>) | undefined;
         try {
-          emit(id, { type: "main_ready", conversation_id: root.id.toString(),
+          emit(id, { type: "main_ready", input_origins: true, conversation_settings: true, conversation_id: root.id.toString(),
             model: await inference.legacy(root, await application.environment.model(null)), cwd: "" });
           // Reconcile optimistic rows before history exposes their saved copies.
           // Page completion makes native clients ready, so receipts must precede it.
@@ -751,18 +766,18 @@ async function handle(request: RuntimeRequest): Promise<void> {
             const relatedContext = related.matches.length === 0 && related.gaps.length === 0 ? "" : "\n\nRelated saved conversations and retrieval coverage (read and reuse matching work):\n" +
               JSON.stringify(related);
             selected = await inference.configureCurrent(root, selected, {
-              instructions: (await environment.instructions(command.instructions)) + relatedContext, cwd: command.cwd, extensions: toolsets.main });
+              instructions: (await environment.instructions(command.instructions)) + "\n\n" + MAIN_RESPONSE_INSTRUCTIONS + relatedContext, cwd: command.cwd, extensions: toolsets.main });
             executions.setModel(root.id.toString(), selected);
             if (interrupted.has(id)) { await interrupts.get(id); return; }
             if (turn === undefined) throw new TaskError("The main execution owner is unavailable");
-            turn.conversation = root; turn.info = { type: "main_ready", conversation_id: root.id.toString(), model: selected, cwd: command.cwd };
+            turn.conversation = root; turn.info = { type: "main_ready", input_origins: true, conversation_settings: true, conversation_id: root.id.toString(), model: selected, cwd: command.cwd };
             // One owner must retain every saved root input. Completing the
             // selected input can hand Pi directly to an older queued follow-up.
             await retainMainInputs(harness, root, turn);
             await recoverMainGeneration(harness, root);
             let submission = reclaimedInput;
             if (submission === undefined) {
-              const prepared = await application.attachments.input(command.input, command.attachments, executions.get(root.id.toString()).call);
+              const prepared = await application.attachments.input(command.input, command.attachments, executions.get(root.id.toString()).call, command.origin);
               submission = await application.attachments.admit(command.attachments, () => {
                 if (interrupted.has(id)) return undefined;
                 submissionAttempted = true;
@@ -795,12 +810,10 @@ async function handle(request: RuntimeRequest): Promise<void> {
                 continue;
               }
               if (settled.type !== "input" || settled.status !== "done") throw new TaskError(await modelFailureMessage(root, "The model turn did not complete; its state is retained"));
-              if (answers.has(settled.answer.toString())) continue;
-              answers.add(settled.answer.toString());
-              const entry = await root.commit((tx) => tx.entry(AssistantEntry, settled.answer), BACKGROUND_CONTEXT);
-              const text = entry?.model?.flatMap((message) => message.role !== "assistant" ? []
-                : message.content.flatMap((part) => part.type === "text" ? [part.text] : [])).join("\n") ?? "";
-              emit(id, { type: "answer", conversation_id: root.id.toString(), text, ...(entry === undefined ? {} : { entry_id: entry.id.toString() }) });
+              const response = await mainResponse(harness, root, settled.entry, settled.answer);
+              if (!response.text.trim() || answers.has(response.entry_id)) continue;
+              answers.add(response.entry_id);
+              emit(id, { type: "answer", conversation_id: root.id.toString(), ...response });
             }
           } catch (error) {
             if (turn !== undefined) {

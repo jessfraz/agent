@@ -6,7 +6,6 @@ import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
-import { UserEntry } from "@earendil-works/pi-durable";
 import { BackgroundScheduler } from "../src/background.js";
 import { runScheduled } from "../src/scheduled.js";
 import { DAY, FakeClock, exampleJob, planned, pump } from "./fixtures/background-runtime.js";
@@ -63,7 +62,7 @@ test("timer and manual runs reuse one attached job conversation with each admitt
     const task = await app.tasks.get(first.task_id), conversation = await app.tasks.conversation(task.conversation_id);
     assert.equal(task.conversation_id, conversationId); assert.equal((await app.tasks.list()).length, 1);
     const page = await conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT);
-    assert.equal(page.items.filter((entry) => UserEntry.is(entry)).length, 3);
+    assert.equal(page.items.filter((entry) => entry.model?.some((message) => message.role === "user")).length, 3);
     assert.equal(app.commands.filter((command) => command.type === "spawn_worker").length, 1);
     assert.equal(app.commands.filter((command) => command.type === "resume_worker").length, 0);
     assert.deepEqual((await scheduler.status()).errors, []);

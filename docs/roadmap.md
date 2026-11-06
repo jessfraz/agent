@@ -16,7 +16,9 @@ recovery; [history](history.md) describes import and retrieval.
   against a large live corpus while background work runs.
 - [x] Recover main-chat admission after coordinator restart, preserving steer
   and queue modes. Independent workers and control requests remain responsive
-  while another worker's host effect is held.
+  while another worker's host effect is held. Ready observers and workers do
+  not consume startup capacity; the real bridge regression covers 64 observers,
+  bounded initialization, replies at capacity, recovery and detach cleanup.
 - [x] Test native outbox recovery against the production coordinator and Pi
   storage across reconnects and server restarts, without fake peers. CI runs
   the wire test on both platforms and the Swift client on macOS.
@@ -46,6 +48,15 @@ recovery; [history](history.md) describes import and retrieval.
   existing tasks with stale restrictions, without manual continuation.
   A fresh shipping notice resumed the existing task and its source investigation.
 - [ ] Verify chat reuse and native worktree inventory display live.
+- [ ] Release the qualified native copy, selection, clipboard-image and input
+  updates through protected CI and a matching coordinator deployment. Verify
+  the signed TestFlight build's source; local simulator checks alone do not
+  establish delivery.
+- [x] Show native input and scheduled-notice provenance and main-conversation
+  model settings; retain unsent drafts across reopen. Native consumer and UI
+  checks pass, including the matched production-coordinator restart check.
+- [ ] Provision and ship an iOS Share target backed by the shared-draft queue.
+- [ ] Verify native rendering against the original visual references.
 - [x] Ship private lifecycle logs, `/machines`, local usage-reset times and
   countdowns, and the remaining viewport correction.
 
@@ -79,7 +90,15 @@ recovery; [history](history.md) describes import and retrieval.
 - [ ] Voice input through a transcription provider interface.
 - [x] File/photo attachments on iOS and dragged files in the terminal, retained
   with the conversation and delivered to Pi on the selected execution host.
-- [ ] Paste image attachments from the clipboard.
+- [x] Paste clipboard images into removable, unsent iOS attachments while
+  preserving the note. Native UI checks cover import, removal and no automatic
+  send.
+- [x] Copy complete native messages or select a text range, including activity
+  summaries and tool output. Native copy/paste and partial selection are
+  verified against the actual composer.
+- [x] Retain typed CLI/iOS input origins and scheduled-notice lineage. Missing
+  legacy origins remain unknown. Native acknowledgement/history checks keep
+  sent inputs before their replies without duplicate echoes or retry badges.
 - [x] Scheduled jobs through the existing coordinator background process and
   task follow-through path. Reuse durable timers; persist occurrence identities
   so restarts and retries cannot run a job twice.

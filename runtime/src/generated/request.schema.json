@@ -1561,6 +1561,14 @@
         "follow_up"
       ]
     },
+    "InputOrigin": {
+      "description": "Trusted direct-input transport metadata, never inferred from text or host.\nOmission is unknown, including legacy clients and non-human work.",
+      "type": "string",
+      "enum": [
+        "cli",
+        "ios"
+      ]
+    },
     "JobId": {
       "type": "string"
     },
@@ -1827,6 +1835,16 @@
             "mode": {
               "$ref": "#/$defs/InputMode"
             },
+            "origin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/InputOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "text": {
               "type": "string"
             },
@@ -1855,6 +1873,34 @@
             "type": {
               "type": "string",
               "const": "history"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Main-only local controls. Never submits a composer input.",
+          "type": "object",
+          "properties": {
+            "catalog": {
+              "type": "boolean",
+              "default": false
+            },
+            "change": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ConversationChange"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "settings"
             }
           },
           "additionalProperties": false,
@@ -2779,6 +2825,16 @@
             "mode": {
               "$ref": "#/$defs/InputMode"
             },
+            "origin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/InputOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "const": "main_input"
@@ -2966,6 +3022,16 @@
                 }
               ]
             },
+            "origin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/InputOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "origin_host_id": {
               "type": [
                 "string",
@@ -3111,6 +3177,16 @@
             },
             "mode": {
               "$ref": "#/$defs/InputMode"
+            },
+            "origin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/InputOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "type": {
               "type": "string",
@@ -3347,6 +3423,16 @@
             },
             "mode": {
               "$ref": "#/$defs/InputMode"
+            },
+            "origin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/InputOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "task_id": {
               "$ref": "#/$defs/TaskId"
@@ -3596,6 +3682,16 @@
             },
             "mode": {
               "$ref": "#/$defs/InputMode"
+            },
+            "origin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/InputOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "type": {
               "type": "string",

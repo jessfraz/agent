@@ -8,7 +8,7 @@ import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { CoordinatorEnvironment } from "../../src/environment.js";
 import { createGuidance } from "../../src/guidance.js";
 import { ConversationModels } from "../../src/models.js";
-import { SourceJournal } from "../../src/sources.js";
+import { SourceJournal, createSourceTools } from "../../src/sources.js";
 import { TaskStore, type HostCall } from "../../src/tasks.js";
 import { createAppTools, Executions } from "../../src/tools.js";
 import type { AgentNode } from "../../src/generated/AgentNode.js";
@@ -43,9 +43,13 @@ export async function openScheduled(directory: string, guidanceVersion = "origin
   await executions.prepareRecovery(session);
   registry.install(guidance); registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker);
   const sources = new SourceJournal(session, tasks, executions);
+  const sourceTools = createSourceTools(sources, executions); registry.install(sourceTools.main); registry.install(sourceTools.worker);
   const commands: HostCommand[] = [];
   const call = async (command: HostCommand): Promise<HostResult> => {
     commands.push(command);
+    if (command.type === "on_node" && command.command.type === "inspect_worker") return { type: "worker_presence", presence: { state: "present", running: false } };
+    if (command.type === "resume_agent_worker") return { type: "spawned", binding: command.binding };
+    if (command.type === "spawn_subagent") return { type: "spawned", binding: { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" } };
     if (command.type === "spawn_worker" || command.type === "resume_worker") return { type: "spawned", binding };
     if (command.type === "reload_guidance") return { type: "shared_guidance", global: { text: "FRESH_GLOBAL_POLICY", sources: [] },
       workflow_policy: "Current execution policy.", context_repositories: [], context_sources: [] };
@@ -54,13 +58,14 @@ export async function openScheduled(directory: string, guidanceVersion = "origin
     if (command.type === "read_file") return { type: "file", content: await readFile(command.path, "utf8"), truncated: false };
     return { type: "failed", message: "The fixture received an unsupported host command" };
   };
-  async function worker(taskId: string, controller = new AbortController(), hostCall: HostCall = call, interactive = false) {
+  async function worker(taskId: string, controller = new AbortController(), hostCall: HostCall = call, interactive = false, agentId?: string) {
     const task = await tasks.get(taskId);
-    if (task.worker.state !== "bound") throw new Error("The scheduled fixture has no bound worker");
-    return tasks.run({ type: "run_task", task_id: task.id, allocation_id: task.worker.allocation_id, binding: task.worker.binding,
-      model: fixtureModel, cwd: task.worker.host.cwd, instructions: "", interactive },
-    (conversation, host, model) => executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [host], role: "worker", model, call: hostCall }), [guidance, tools.host, tools.worker], hostCall, undefined,
+    const actor = agentId === undefined ? task : task.agents.find((agent) => agent.id === agentId);
+    if (actor?.worker.state !== "bound") throw new Error("The scheduled fixture has no bound worker");
+    return tasks.run({ type: "run_task", task_id: task.id, ...(agentId === undefined ? {} : { agent_id: agentId }), allocation_id: actor.worker.allocation_id, binding: actor.worker.binding,
+      model: fixtureModel, cwd: actor.worker.host.cwd, instructions: "", interactive },
+    (conversation, host, model) => executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [host], role: "worker", model, call: hostCall }), [guidance, tools.host, agentId === undefined ? tools.worker : tools.agent, sourceTools.worker], hostCall, undefined,
     { signal: controller.signal, async ready() {}, answer() {}, idle() {} });
   }
-  return { session, tasks, sources, environment, call, commands, faux, executions, worker, registry };
+  return { session, tasks, sources, environment, call, commands, faux, executions, worker, registry, sourceTools };
 }

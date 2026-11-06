@@ -474,6 +474,7 @@ mod tests {
         tool: Option<ToolHistory>,
     ) -> HistoryMessage {
         HistoryMessage {
+            notice_origin: None,
             presentation: None,
             entry_id: id.into(),
             role,

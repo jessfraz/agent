@@ -23,6 +23,25 @@ actor FixtureCoordinator {
   private let closedToolContinuation: AsyncStream<Void>.Continuation
   private var toolRequests: [NativeRequestToolDetails] = []
   private var toolReply: [NativeEvent] = []
+  private var conversationSettings: Bool?
+  private var settingsReply: [NativeEvent] = []
+  private var settingsRequests: [NativeRequestSettings] = []
+  private let settingsObserved = AsyncStream<Void>.makeStream()
+  nonisolated var observedSettings: AsyncStream<Void> { settingsObserved.stream }
+  private let settingsClosed = AsyncStream<Void>.makeStream()
+  nonisolated var closedSettings: AsyncStream<Void> { settingsClosed.stream }
+  private let inputsObserved = AsyncStream<NativeRequestSubmit>.makeStream()
+  nonisolated var observedInputs: AsyncStream<NativeRequestSubmit> { inputsObserved.stream }
+  func advertiseSettings(_ value: Bool?) { conversationSettings = value }
+  func replyToSettings(_ value: NativeSettingsSnapshot) {
+    settingsReply = [.notice(.init(settings: value, text: "Conversation settings")), .done]
+  }
+  func rejectSettings(_ message: String) {
+    settingsReply = [.failure(.init(message: message)), .done]
+  }
+  func settingsControls() -> [NativeRequestSettings] { settingsRequests }
+  private var inputOrigins: Bool?
+  func advertiseInputOrigins(_ value: Bool?) { inputOrigins = value }
   private var notificationRequests: [NotificationRequest] = []
   private var notificationsRegistered = false
   private var notificationsHeld = false
@@ -122,6 +141,20 @@ actor FixtureCoordinator {
       bytes.removeSubrange(...end)
       guard case .native(let value) = command else { return }
       switch value.request {
+      case .settings(let request):
+        settingsRequests.append(request)
+        settingsObserved.continuation.yield(())
+        for event in settingsReply { try await emit(event, on: socket) }
+        if settingsReply.isEmpty {
+          await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            socket.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, complete, error in
+              #expect(complete || error != nil)
+              continuation.resume()
+            }
+          }
+          settingsClosed.continuation.yield(())
+        }
+        return
       case .notifications(let request):
         notificationRequests.append(request.request)
         notificationObserved.continuation.yield(())
@@ -163,7 +196,10 @@ actor FixtureCoordinator {
       case .observe(let request):
         observer = socket
         try await emit(
-          .ready(.init(conversationId: "fixture-root", model: "fixture/model")), on: socket)
+          .ready(
+            .init(
+              conversationId: "fixture-root", conversationSettings: conversationSettings,
+              inputOrigins: inputOrigins, model: "fixture/model")), on: socket)
         if delaySnapshot { await withCheckedContinuation { release = $0 } }
         let messages = submissions.filter { request.inputIds.contains($0.inputId) }.map { input in
           HistoryMessage(
@@ -189,6 +225,7 @@ actor FixtureCoordinator {
         return
       case .submit(let request):
         submissions.append(request)
+        inputsObserved.continuation.yield(request)
         if request.text.hasPrefix("/feedback ") {
           try await emit(
             .feedbackReady(

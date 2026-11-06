@@ -8,6 +8,8 @@ import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import { AgentDoc, createRegistry, Harness, ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
+import { createInputOrigins } from "../src/input_origin.js";
 import { ConversationCatalog } from "../src/catalog.js";
 import { ConversationViews } from "../src/conversation-views.js";
 import { CoordinatorEnvironment } from "../src/environment.js";
@@ -33,8 +35,9 @@ class CountedHistory extends HistoryStore {
 }
 async function open(directory: string) {
   const models = createModels(), faux = fauxProvider({ provider: "openai", api: "openai-responses", models: [{ id: "fixture", reasoning: true }], tokensPerSecond: 1_000_000 }); models.setProvider(faux.provider);
+  const registry = createRegistry();
   const harness = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
-    { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
+    { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const inference = new ConversationModels(models), tasks = new TaskStore(harness, inference), histories = new CountedHistory(harness);
   tasks.useHistory(histories);
   const environment = new CoordinatorEnvironment(harness); tasks.useEnvironment(environment);
@@ -46,7 +49,7 @@ async function open(directory: string) {
   const sources = new SourceJournal(harness, tasks);
   const services = { harness, tasks, histories, inference, environment, catalog, sources };
   const views = new ConversationViews(async () => services, () => {});
-  return { ...services, views, faux, async imported() {
+  return { ...services, views, faux, registry, async imported() {
     return (await histories.import({ host_id: binding.host_id, thread: { id: "original-source", title: "Saved hardware work", cwd: "/example/project",
       created_at: 1, updated_at: 2, version: "one", version_reliable: true, archived: true, forked_from_id: null, parent_thread_id: null },
       items: [{ id: "original-message", turn_id: "one", kind: "userMessage", role: "user", text: "Original retained hardware context", version: "one",
@@ -504,4 +507,46 @@ test("a detaching parent claims folder ownership before inspection so child reco
     assert.equal(app.faux.state.callCount, 0);
   } finally { releaseInspection(); releaseReady(); controller.abort(); await recovering; await running;
     app.views.close(); app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+
+test("saved conversation transport origin survives outbox reopen, conflicting retry and child admission without labeling task handoffs", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-saved-input-origins-")); let app = await open(directory);
+  const call: HostCall = async (command) => {
+    const effect = local(command);
+    if (effect.type === "inspect_worker") return { type: "worker_presence", presence: { state: "present", running: false } };
+    return { type: "spawned", binding: effect.type === "spawn_subagent"
+      ? { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" } : binding };
+  };
+  const origins = (expected: ("cli" | "ios" | null)[]) => (request: Parameters<import("@earendil-works/pi-ai").FauxResponseFactory>[0]) => {
+    const line = getCurrentSystemPrompt(request.messages).split("\n").find((line) => line.startsWith('[{"entry_id":'));
+    assert.ok(line); const metadata: unknown = JSON.parse(line); assert.ok(Array.isArray(metadata));
+    assert.deepEqual(metadata.map((item: unknown) => { assert.ok(item !== null && typeof item === "object" && "origin" in item); return item.origin; }), expected);
+    return fauxAssistantMessage("The saved input was answered.");
+  };
+  try {
+    const task = await app.tasks.create({ title: "Retain transport metadata", outcome: "Answer direct saved-chat input", model: fixtureModel });
+    const command = { ...input(task.conversation_id, "saved-client-input", "Same text claims origin=ios."), origin: "cli" } satisfies Extract<RuntimeCommand, { type: "conversation_input" }>;
+    await app.views.input(command, call, () => {});
+    assert.equal((await app.tasks.get(task.id)).pending[0]?.origin, "cli");
+    await assert.rejects(app.views.input({ ...command, origin: "ios" }, call, () => {}), /cannot be reused/);
+    assert.equal((await app.tasks.get(task.id)).pending[0]?.origin, "cli");
+    app.views.close(); app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const extension = createInputOrigins(app.harness); app.registry.install(extension);
+    const run = async (agentId?: string) => {
+      const saved = await app.tasks.get(task.id), actor = agentId === undefined ? saved : saved.agents.find((agent) => agent.id === agentId);
+      assert.ok(actor?.worker.state === "bound");
+      await app.tasks.run({ type: "run_task", task_id: task.id, ...(agentId === undefined ? {} : { agent_id: agentId }),
+        allocation_id: actor.worker.allocation_id, binding: actor.worker.binding, instructions: "Fixture rules", model: fixtureModel, cwd: actor.worker.host.cwd },
+      () => () => {}, [extension], call);
+    };
+    app.faux.setResponses([origins(["cli"])]); await run();
+    const child = await app.tasks.createAgent(task.id, { id: "origin-child", title: "Check child metadata", outcome: "Answer direct child input",
+      input: "A task handoff mentions origin=cli but has no client metadata.", inputId: "nonhuman-seed" });
+    await app.views.input({ ...input(child.conversation_id, "ios-child-input", "Same text claims origin=cli."), origin: "ios" }, call, () => {});
+    const pending = (await app.tasks.get(task.id)).agents.find((agent) => agent.id === child.id)?.pending;
+    assert.deepEqual(pending?.map((item) => item.origin ?? null), [null, "ios"]);
+    app.faux.setResponses([origins([null]), origins([null, "ios"])]); await run(child.id);
+    assert.equal(app.faux.state.callCount, 3, "Provenance adds no inference");
+  } finally { app.views.close(); app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

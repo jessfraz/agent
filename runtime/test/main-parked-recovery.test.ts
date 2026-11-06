@@ -73,7 +73,7 @@ async function seed(path: string, deferred = false) {
   return task;
 }
 
-function bridge(directory: string, options: { holdGuidance?: boolean; denyNetwork?: boolean } = {}) {
+function bridge(directory: string, options: { holdGuidance?: boolean; denyNetwork?: boolean; beforeHostReply?: () => Promise<void> } = {}) {
   const permissions = options.denyNetwork === true ? ["--permission", "--allow-fs-read=*", "--allow-fs-write=*", "--allow-addons", "--allow-ffi"] : [];
   const child = spawn(process.execPath, ["--no-warnings", ...permissions, fileURLToPath(new URL("../src/bridge.js", import.meta.url)), directory],
     { stdio: ["pipe", "pipe", "pipe"], env: { PATH: process.env.PATH, HOME: directory, OPENAI_API_KEY: "sk-invented-unused-fixture",
@@ -81,9 +81,16 @@ function bridge(directory: string, options: { holdGuidance?: boolean; denyNetwor
   const closed = new Promise<number | null>((resolve, reject) => { child.once("close", resolve); child.once("error", reject); });
   const frames: RuntimeEvent[] = [], changes = new Set<() => void>();
   let heldGuidance: { request: number; call_id: string } | undefined;
+  let replying = true;
   let errors = "";
   child.stderr.setEncoding("utf8").on("data", (value: string) => { errors += value; });
-  const send = (id: number, command: RuntimeCommand) => child.stdin.write(JSON.stringify({ version: 1, id, command }) + "\n");
+  const diagnostics = () => ({ pid: child.pid, exitCode: child.exitCode, signalCode: child.signalCode, killed: child.killed,
+    inputEnded: child.stdin.writableEnded, stderr: errors.slice(-4096), frames: frames.slice(-16).map((frame) => ({
+      id: frame.id, type: frame.event.type, ...(frame.event.type === "host_call" ? { command: frame.event.command.type } : {}),
+    })) });
+  child.stdin.on("error", (error) => { console.error("Owned bridge stdin failed", diagnostics()); throw error; });
+  const send = (id: number, command: RuntimeCommand) => child.stdin.write(JSON.stringify({ version: 1, id, command }) + "\n",
+    (error) => { assert.ifError(error); });
   const events = (id: number) => frames.filter((frame) => frame.id === id).map((frame) => frame.event);
   const wait = (id: number, predicate: (event: RuntimeEventKind) => boolean): Promise<RuntimeEventKind> => new Promise((resolve, reject) => {
     const timer = setTimeout(() => { changes.delete(check); reject(new Error(`Request ${id} stalled: ${errors}`)); }, 5_000);
@@ -107,7 +114,8 @@ function bridge(directory: string, options: { holdGuidance?: boolean; denyNetwor
         ? { type: "shared_guidance", global: { text: "", sources: [] }, workflow_policy: "", context_repositories: [], context_sources: [] }
         : command.type === "project_guidance" ? { type: "project_guidance", snapshot: { text: "", sources: [] } }
         : { type: "failed", message: "No external services are installed" };
-      send(frame.id, { type: "host_reply", call_id: frame.event.call_id, result });
+      if (options.beforeHostReply !== undefined) await options.beforeHostReply();
+      if (replying) send(frame.id, { type: "host_reply", call_id: frame.event.call_id, result });
     }
   })(); void reader.catch(() => {});
   const releaseGuidance = () => {
@@ -116,7 +124,18 @@ function bridge(directory: string, options: { holdGuidance?: boolean; denyNetwor
       result: { type: "shared_guidance", global: { text: "", sources: [] }, workflow_policy: "", context_repositories: [], context_sources: [] } });
     heldGuidance = undefined;
   };
-  return { child, closed, reader, send, events, wait, done, releaseGuidance, errors: () => errors };
+  const stop = async () => {
+    // Retire the reply producer, then flush writes already accepted by stdin
+    // before terminating its consumer. Buffered host calls may still arrive.
+    replying = false;
+    try {
+      if (!child.stdin.writableEnded && !child.stdin.destroyed) {
+        await new Promise<void>((resolve, reject) => child.stdin.write("", (error) => error ? reject(error) : resolve()));
+      }
+    } finally { child.kill("SIGKILL"); await closed; }
+    await reader;
+  };
+  return { child, closed, reader, send, events, wait, done, releaseGuidance, diagnostics, stop, errors: () => errors };
 }
 
 async function records(session: NativeHarness) {
@@ -128,9 +147,12 @@ async function records(session: NativeHarness) {
   }), BACKGROUND_CONTEXT);
 }
 
-test("source triage recovers its parked tool without replaying an unsafe effect or unrelated work", { timeout: 15_000 }, async () => {
+test("source triage recovers its parked tool without replaying an unsafe effect or unrelated work", { timeout: 15_000 }, async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-parked-")), path = join(directory, "session.sqlite");
   let peer: ReturnType<typeof bridge> | undefined;
+  let durable = "Recovery readback has not started";
+  let releaseReply = () => {};
+  const replyGate = new Promise<void>((resolve) => { releaseReply = resolve; });
   try {
     await new ChatGptAuth(directory).status();
     peer = bridge(directory, { denyNetwork: true });
@@ -186,25 +208,37 @@ test("source triage recovers its parked tool without replaying an unsafe effect 
       } finally { await app.session.close(BACKGROUND_CONTEXT); }
     })();
 
-    peer = bridge(directory, { denyNetwork: true });
+    peer = bridge(directory, { denyNetwork: true, beforeHostReply: () => replyGate });
     peer.send(3, { type: "triage_sources", instructions: "", model: DEFAULT_MODEL, cwd: "/tmp", hosts: [] });
     const readback = await SqliteStorage.open(await openNodeSqliteDatabase(path));
     try {
       const deadline = Date.now() + 5_000;
-      while ((await readback.task(round.tool, BACKGROUND_CONTEXT))?.state.status !== "terminal") {
+      let tool = await readback.task(round.tool, BACKGROUND_CONTEXT);
+      while (tool?.state.status !== "terminal") {
+        durable = JSON.stringify({ tool });
         assert.ok(Date.now() < deadline, "Production source triage must release its parked native tool: " + JSON.stringify(peer.events(3)) + peer.errors());
         await new Promise((resolve) => setTimeout(resolve, 10));
+        tool = await readback.task(round.tool, BACKGROUND_CONTEXT);
       }
       const entries = (await readback.scanEntries({ conversationId: round.conversation }, 100, undefined, BACKGROUND_CONTEXT)).items;
       const result = entries.find((entry) => ToolResultEntry.is(entry)); assert.ok(result);
       assert.ok(result.model?.some((message) => message.role === "toolResult" && message.isError &&
         message.content.some((part) => part.type === "text" && part.text.includes("was interrupted"))),
       "Native recovery must retain an interrupted result, never execute the unsafe tool again");
-      assert.deepEqual(await readback.task(round.unrelated, BACKGROUND_CONTEXT), round.unrelatedRecord,
+      const unrelated = await readback.task(round.unrelated, BACKGROUND_CONTEXT);
+      durable = JSON.stringify({ tool, unrelated, result });
+      assert.deepEqual(unrelated, round.unrelatedRecord,
         "Source recovery must not retry unrelated background work");
     } finally { await readback.close(BACKGROUND_CONTEXT); }
+    // Keep a genuine host reply queued across the owned process shutdown.
+    // The recovery assertions above must still hold before this cutover.
+    await peer.wait(3, (event) => event.type === "host_call");
   } finally {
-    peer?.child.kill("SIGKILL"); await peer?.closed; await peer?.reader.catch(() => {});
+    t.diagnostic("Owned source recovery before cleanup: " + JSON.stringify({ child: peer?.diagnostics(), durable: durable.slice(-12000) }));
+    const stopping = peer?.stop();
+    await peer?.closed;
+    releaseReply();
+    await stopping;
     await rm(directory, { recursive: true, force: true });
   }
 });

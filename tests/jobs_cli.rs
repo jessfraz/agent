@@ -389,6 +389,13 @@ fn direct_task_messages_survive_offline_delivery_and_never_post_to_main() {
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].content, message);
         assert_eq!(retained[0].mode, Some(InputMode::FollowUp));
+        assert!(
+            matches!(
+                retained[0].origin,
+                Some(agent_cli::protocol::InputOrigin::Cli)
+            ),
+            "The actual tasks-send CLI origin survives offline admission and retry"
+        );
     }
     server.stop();
     let _reopened = fixture.start();
@@ -584,6 +591,7 @@ fn native_job_input_replay_reaches_one_durable_admission_after_restart() {
     let input_id = uuid::Uuid::new_v4().to_string();
     let produce = |text: &str| {
         let Operation::Runtime(command) = native::prepare(NativeRequest::Submit {
+            origin: None,
             attachments: None,
             input_id: input_id.clone(),
             text: text.to_owned(),

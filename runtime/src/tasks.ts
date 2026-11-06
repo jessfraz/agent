@@ -19,6 +19,9 @@ import type { TaskInputReceipt } from "./generated/TaskInputReceipt.js";
 import type { TaskState } from "./generated/TaskState.js";
 import type { TaskRecord } from "./generated/TaskRecord.js";
 import type { JobRunReceipt } from "./generated/JobRunReceipt.js";
+import { NoticeLineage, readNoticeOrigin } from "./notice_origin.js";
+import type { InputOrigin } from "./generated/InputOrigin.js";
+import type { NoticeOrigin } from "./generated/NoticeOrigin.js";
 import type { ScheduledOccurrence } from "./generated/ScheduledOccurrence.js";
 import type { TaskAgentRecord } from "./generated/TaskAgentRecord.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
@@ -72,7 +75,7 @@ export type OutcomeSink = {
 /** Only an explicit coordinator notification becomes user-visible context. */
 export async function publishMainNotice(session: Harness, conversation: Conversation, entry: EntryRecord,
   taskId: string | null, sources: readonly SourceRef[],
-  notice: { key: string; text: string; events: readonly SourceEvent[] }): Promise<NoticePublication> {
+  notice: { key: string; text: string; events: readonly SourceEvent[]; origin?: NoticeOrigin }): Promise<NoticePublication> {
   const root = await session.root(BACKGROUND_CONTEXT);
   const requestId = "notice:" + entry.id.toString() + ":" + notice.key;
   // Legacy model-bearing notices already own their eventual visible entry.
@@ -100,7 +103,7 @@ export async function publishMainNotice(session: Harness, conversation: Conversa
   }) ?? [];
   if (model.length === 0) throw new TaskError("The notification has no assistant origin");
   const data: UserNoticeData = { task_id: taskId, source_conversation_id: conversation.id.toString(),
-    source_entry_id: entry.id.toString(), text: notice.text };
+    source_entry_id: entry.id.toString(), text: notice.text, ...(notice.origin === undefined ? {} : { notice_origin: notice.origin }) };
   // Pi can publish display-only writes while main is busy. Model context stays
   // in its ordered inbox so compaction and resets retain their native boundary.
   const display = await root.submit({ type: "write", requestId, entry: {
@@ -157,10 +160,35 @@ export class TaskStore {
     if (this.attachments === undefined) throw new TaskError("Attachment storage is unavailable");
     return this.attachments.input("", await this.attachmentRefs([id]), call);
   }
-  private async prepareInput(text: string, refs: readonly AttachmentRef[] | undefined, call?: HostCall): Promise<Awaited<ReturnType<AttachmentStore["input"]>>> {
-    if (refs === undefined || refs.length === 0) return { content: text };
-    if (this.attachments === undefined || call === undefined) throw new TaskError("The attachment execution host is unavailable");
-    return this.attachments.input(text, refs, call);
+  private async prepareInput(conversation: Conversation, text: string, refs: readonly AttachmentRef[] | undefined, call?: HostCall, inputOrigin?: InputOrigin): Promise<Awaited<ReturnType<AttachmentStore["input"]>>> {
+    let prepared: Awaited<ReturnType<AttachmentStore["input"]>>;
+    if (refs === undefined || refs.length === 0) prepared = { content: text,
+      ...(inputOrigin === undefined ? {} : { entry: { kind: "agent.input", data: { text, origin: inputOrigin } } }) };
+    else {
+      if (this.attachments === undefined || call === undefined) throw new TaskError("The attachment execution host is unavailable");
+      prepared = await this.attachments.input(text, refs, call, inputOrigin);
+    }
+    const origin = (await this.session.snapshot(NoticeLineage, conversation.id, BACKGROUND_CONTEXT))?.origin;
+    if (origin === undefined || origin === null) return prepared;
+    const metadata = prepared.entry?.data;
+    return { ...prepared, entry: { ...prepared.entry, kind: "agent.input", data: {
+      ...(metadata !== null && typeof metadata === "object" && !Array.isArray(metadata) ? metadata : { text }), notice_origin: origin,
+    } } };
+  }
+  /** Anchor publication to its actual input, including a queued or recovered run.
+   * Stop at unknown legacy input rather than borrowing an earlier job's name. */
+  async noticeOrigin(conversation: Conversation, at: EntryId): Promise<NoticeOrigin | undefined> {
+    let cursor: Cursor | undefined;
+    do {
+      const page = await conversation.entries({ order: "descending", maxEntryId: at }, 32, cursor, BACKGROUND_CONTEXT);
+      for (const entry of page.items) if (entry.kind === "agent.input" || entry.model?.some((message) => message.role === "user")) {
+        if (entry.kind !== "agent.input") return undefined;
+        const data = entry.data;
+        return readNoticeOrigin(data !== null && typeof data === "object" && !Array.isArray(data) ? data.notice_origin : undefined);
+      }
+      cursor = page.next;
+    } while (cursor !== undefined);
+    return undefined;
   }
   async saved(id: string): Promise<ImportedConversation | undefined> { return this.histories?.byConversation(id); }
   async instructions(project: string): Promise<string> { return this.environment?.instructions(project) ?? project; }
@@ -595,27 +623,27 @@ export class TaskStore {
     }, BACKGROUND_CONTEXT);
     return this.get(id);
   }
-  async enqueue(id: string, content: string, inputId: string = randomUUID(), delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[]): Promise<TaskRecord> {
-    return this.enqueueActor(id, content, inputId, undefined, delivered, mode, attachments);
+  async enqueue(id: string, content: string, inputId: string = randomUUID(), delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[], origin?: InputOrigin): Promise<TaskRecord> {
+    return this.enqueueActor(id, content, inputId, undefined, delivered, mode, attachments, undefined, origin);
   }
   async enqueueScheduled(id: string, content: string, occurrence: ScheduledOccurrence): Promise<TaskRecord> {
     return this.enqueueActor(id, content, occurrence.id, undefined, undefined, undefined, undefined, occurrence);
   }
-  async input(input: WorkerInput, content: string, inputId: string, mode?: InputMode, attachments?: AttachmentRef[]): Promise<TaskRecord> {
+  async input(input: WorkerInput, content: string, inputId: string, mode?: InputMode, attachments?: AttachmentRef[], origin?: InputOrigin): Promise<TaskRecord> {
     const active = this.running.get(this.actorKey(input.task_id, input.agent_id));
     if (active?.attached !== true || active.input !== input) throw new TaskError("This worker is no longer attached");
-    return this.enqueueActor(input.task_id, content, inputId, input.agent_id, undefined, mode, attachments);
+    return this.enqueueActor(input.task_id, content, inputId, input.agent_id, undefined, mode, attachments, undefined, origin);
   }
-  async continueAgent(id: string, agentId: string, content: string, inputId: string, call?: HostCall, mode?: InputMode, admitted?: () => void, attachments?: AttachmentRef[]): Promise<TaskRecord> {
+  async continueAgent(id: string, agentId: string, content: string, inputId: string, call?: HostCall, mode?: InputMode, admitted?: () => void, attachments?: AttachmentRef[], origin?: InputOrigin): Promise<TaskRecord> {
     const active = this.running.get(this.actorKey(id, agentId));
     const attached = active?.attached === true && active.observer?.signal.aborted !== true;
     if (!attached && call === undefined) throw new TaskError("This agent is no longer attached; its conversation is retained");
-    const task = await this.enqueueActor(id, content, inputId, agentId, undefined, mode, attachments);
+    const task = await this.enqueueActor(id, content, inputId, agentId, undefined, mode, attachments, undefined, origin);
     admitted?.();
     const current = this.running.get(this.actorKey(id, agentId));
     return (current?.attached === true && current.observer?.signal.aborted !== true) || call === undefined ? task : this.dispatchAgent(id, agentId, call);
   }
-  private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[], scheduled?: ScheduledOccurrence): Promise<TaskRecord> {
+  private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[], scheduled?: ScheduledOccurrence, origin?: InputOrigin): Promise<TaskRecord> {
     validateInput(content, attachments);
     const store = this.attachments;
     if (attachments !== undefined && attachments.length > 0) {
@@ -633,13 +661,13 @@ export class TaskStore {
         const previous = actor.pending.find((input) => input.id === inputId);
         if (previous !== undefined && (previous.content !== content || (previous.mode ?? "follow_up") !== (mode ?? "follow_up") ||
             JSON.stringify(previous.attachments ?? []) !== JSON.stringify(attachments ?? []) ||
-            JSON.stringify(previous.scheduled) !== JSON.stringify(scheduled))) {
+            JSON.stringify(previous.scheduled) !== JSON.stringify(scheduled) || previous.origin !== origin)) {
           throw new TaskError("A task input ID cannot be reused with different content or mode");
         }
         if (previous === undefined && store !== undefined && attachments !== undefined) await store.retain(attachments);
         if (previous === undefined) actor.pending.push({ id: inputId, content, ...(mode === undefined ? {} : { mode }),
           ...(attachments === undefined ? {} : { attachments }),
-          ...(scheduled === undefined ? {} : { scheduled }) });
+          ...(scheduled === undefined ? {} : { scheduled }), ...(origin === undefined ? {} : { origin }) });
         actor.state = { state: "open" };
         task.state = { state: "open" };
       });
@@ -655,7 +683,7 @@ export class TaskStore {
             // Scheduled turns must apply their captured configuration at the
             // actor boundary, before admitting this or any later native input.
             if (input.scheduled !== undefined) break;
-            const prepared = await this.prepareInput(input.content, input.attachments, active.call);
+            const prepared = await this.prepareInput(active.conversation, input.content, input.attachments, active.call, input.origin);
             if (!active.attached || active.fenced || active.observer?.signal.aborted) break;
             await active.conversation.submit({ type: "input", ...prepared, requestId: input.id,
               whenBusy: input.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
@@ -682,6 +710,7 @@ export class TaskStore {
     }
     const selected = input.model ?? await this.selection(taskId, DEFAULT_MODEL);
     const owner = await this.get(taskId);
+    const parent = await this.conversation(owner.conversation_id);
     if (owner.worker.state === "bound") await this.workerHost(taskId);
     await this.resources?.attach(taskId);
     const native = await this.session.commit(async (tx) => {
@@ -693,6 +722,8 @@ export class TaskStore {
       if (task.agents.filter((agent) => agent.state.state === "open").length >= 8) throw new TaskError("This task already has eight unfinished agents");
       if (store !== undefined && input.attachments !== undefined) await store.retain(input.attachments);
       const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
+      const lineage = await tx.doc(NoticeLineage, parent.id);
+      if (lineage.origin !== null) (await tx.doc(NoticeLineage, conversation.id)).origin = { ...lineage.origin };
       task.agents.push({ id: input.id, model: selected, conversation_id: conversation.id.toString(), title: input.title.trim(),
         outcome: input.outcome.trim(), summary: "", state: { state: "open" }, worker: { state: "unassigned" },
         pending: [{ id: input.inputId, content: input.input, ...(input.attachments === undefined ? {} : { attachments: input.attachments }) }], updated_at: Date.now() });
@@ -1217,17 +1248,21 @@ export class TaskStore {
           await conversation.waitForIdle(BACKGROUND_CONTEXT);
           await prepare?.(job.model);
           await this.inference.configure(conversation, job.model, { instructions: await instructions(job.prompt), cwd: job.cwd, extensions });
-          task = await this.update(task.id, (current) => {
-            current.title = job.title; current.outcome = job.prompt; current.model = { ...job.model };
-            if (current.worker.state !== "bound") throw new TaskError("The scheduled execution detached before its configuration could be applied");
-            current.worker.host.cwd = job.cwd;
-          });
+          await this.session.commit(async (tx) => {
+            (await tx.doc(NoticeLineage, conversation.id)).origin = readNoticeOrigin({ job_id: job.id, title: job.title }) ?? null;
+            await this.updateIn(tx, task.id, (current) => {
+              current.title = job.title; current.outcome = job.prompt; current.model = { ...job.model };
+              if (current.worker.state !== "bound") throw new TaskError("The scheduled execution detached before its configuration could be applied");
+              current.worker.host.cwd = job.cwd;
+            });
+          }, BACKGROUND_CONTEXT);
+          task = await this.get(task.id);
           selected = { ...job.model };
           executionHost = { ...executionHost, cwd: job.cwd };
           unbind?.(); unbind = bind(conversation, executionHost, selected);
           await observer?.configured?.(conversation, task.title);
         }
-        const prepared = await this.prepareInput(next.content, next.attachments, call);
+        const prepared = await this.prepareInput(conversation, next.content, next.attachments, call, next.origin);
         if (active.fenced || observer?.signal.aborted) break;
         const submission = await conversation.submit({ type: "input", ...prepared, requestId: next.id,
           whenBusy: next.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);

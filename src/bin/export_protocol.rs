@@ -16,6 +16,8 @@ fn main() -> Result<()> {
     let config = Config::from_env().with_out_dir(&output);
     RuntimeRequest::export_all(&config)?;
     RuntimeEvent::export_all(&config)?;
+    agent_cli::native::NativeCommand::export_all(&config)?;
+    agent_cli::native::NativeEvent::export_all(&config)?;
     agent_cli::notifications::ApnsConfig::export_all(&config)?;
     agent_cli::notifications::NotificationTarget::export_all(&config)?;
     fs::write(

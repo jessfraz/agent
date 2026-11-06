@@ -212,7 +212,7 @@ function complete(response: ServerResponse): void {
   response.end(events.map((event) => "data: " + JSON.stringify(event) + "\n\n").join(""));
 }
 
-test("native HTTP requests keep concurrent conversation fast policies separate and recover them after reopen", { timeout: 15_000 }, async () => {
+test("native HTTP requests preserve explicit effort and default xhigh with separate fast policies through reopen", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-models-")); const requests: WireRequest[] = []; const waiting: ServerResponse[] = [];
   let failure: unknown;
   const server = createServer((request, response) => {
@@ -237,18 +237,58 @@ test("native HTTP requests keep concurrent conversation fast policies separate a
     const normal = await app.session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT);
     const fast = await app.session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT);
     await app.inference.configure(normal, { ...DEFAULT_MODEL, reasoning: "low", fast: false }, {});
-    await app.inference.configure(fast, { ...DEFAULT_MODEL, reasoning: "high", fast: true }, {});
+    await app.inference.configure(fast, { ...DEFAULT_MODEL, fast: true }, {});
+    const inherited = await app.tasks.create({ title: "Use the application default", outcome: "Keep its effective selection", model: DEFAULT_MODEL });
+    assert.deepEqual(inherited.model, DEFAULT_MODEL);
+    await app.tasks.enqueue(inherited.id, "Check the default on this task.");
+    await app.tasks.dispatch(inherited.id, host, async () => ({ type: "spawned", binding }));
+    assert.deepEqual((await app.tasks.get(inherited.id)).model, DEFAULT_MODEL);
     const submitted = await Promise.all([normal, fast].map((conversation) => conversation.submit({ type: "input", content: "Verify this request." }, BACKGROUND_CONTEXT)));
     const results = await Promise.all(submitted.map((submission) => submission.wait(BACKGROUND_CONTEXT)));
     assert.equal(results.every((result) => result.status === "done"), true);
     if (failure !== undefined) throw failure;
-    assert.deepEqual(requests.map((request) => [request.tier, request.effort]).sort(), [[null, "low"], ["priority", "high"]].sort());
+    assert.deepEqual(requests.map((request) => [request.tier, request.effort]).sort(), [[null, "low"], ["priority", "xhigh"]].sort());
+    await app.inference.edit(normal, DEFAULT_MODEL, { type: "set_reasoning", reasoning: "high" });
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory, catalog());
     const resumed = await app.session.conversation(fast.id, BACKGROUND_CONTEXT); assert.ok(resumed);
     assert.equal((await (await resumed.submit({ type: "input", content: "Continue the saved policy." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
-    assert.equal(requests[2]?.tier, "priority"); assert.equal(requests[2]?.effort, "high");
+    assert.equal(requests[2]?.tier, "priority"); assert.equal(requests[2]?.effort, "xhigh");
     const state = await app.session.snapshot(AgentDoc, fast.id, BACKGROUND_CONTEXT);
     assert.deepEqual(state?.model, { provider: "openai", modelId: DEFAULT_MODEL.model_id });
+    assert.equal(state?.thinkingLevel, "xhigh");
+    // A legacy native default has no committed effort. A read may not pretend
+    // the new application default was configured, or rewrite the saved state.
+    await resumed.configure({ thinkingLevel: null }, BACKGROUND_CONTEXT);
+    const legacy = await app.session.snapshot(AgentDoc, fast.id, BACKGROUND_CONTEXT);
+    assert.equal((await app.inference.peek(resumed, DEFAULT_MODEL)).reasoning, null);
+    assert.equal((await app.inference.legacy(resumed, DEFAULT_MODEL)).reasoning, null);
+    assert.deepEqual(await app.session.snapshot(AgentDoc, fast.id, BACKGROUND_CONTEXT), legacy);
+    assert.equal((await (await resumed.submit({ type: "input", content: "Read-only settings did not change the native effort." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+    assert.notEqual(requests[3]?.effort, "xhigh");
+    const defaulted = await app.inference.edit(resumed, DEFAULT_MODEL, { type: "set_reasoning", reasoning: null });
+    assert.equal(defaulted.reasoning, null, "An explicit native default remains a real default, not a fabricated xhigh badge");
+    assert.equal((await app.inference.configureCurrent(resumed, DEFAULT_MODEL, {})).reasoning, null);
+    const task = await app.tasks.get(inherited.id); assert.ok(task.worker.state === "bound");
+    await app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: task.worker.allocation_id, binding,
+      instructions: "", cwd: host.cwd, model: { ...DEFAULT_MODEL, reasoning: "low" } }, (_conversation, _host, selected) => {
+        assert.deepEqual(selected, DEFAULT_MODEL); return () => {};
+      });
+    assert.equal(requests[4]?.effort, "xhigh");
+    const child = await app.tasks.createAgent(task.id, { id: "default-review", title: "Review", outcome: "Check the task", input: "Check the saved default.", inputId: "default-review-input" });
+    assert.deepEqual(child.model, DEFAULT_MODEL);
+    const childBinding = { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" };
+    await app.tasks.dispatchAgent(task.id, child.id, async () => ({ type: "spawned", binding: childBinding }));
+    const saved = (await app.tasks.get(task.id)).agents.find((agent) => agent.id === child.id); assert.ok(saved?.worker.state === "bound");
+    await app.tasks.run({ type: "run_task", task_id: task.id, agent_id: child.id, allocation_id: saved.worker.allocation_id, binding: childBinding,
+      instructions: "", cwd: host.cwd, model: { ...DEFAULT_MODEL, reasoning: "low" } }, (_conversation, _host, selected) => {
+        assert.deepEqual(selected, DEFAULT_MODEL); return () => {};
+      });
+    assert.equal(requests[5]?.effort, "xhigh");
+    const savedHigh = await app.session.conversation(normal.id, BACKGROUND_CONTEXT); assert.ok(savedHigh);
+    assert.equal((await app.inference.peek(savedHigh, DEFAULT_MODEL)).reasoning, "high");
+    assert.equal((await app.inference.configureCurrent(savedHigh, DEFAULT_MODEL, {})).reasoning, "high");
+    assert.equal((await (await savedHigh.submit({ type: "input", content: "Preserve the saved explicit high choice." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+    assert.equal(requests[6]?.effort, "high");
     if (failure !== undefined) throw failure;
   } finally {
     await app.session.close(BACKGROUND_CONTEXT); server.closeAllConnections();

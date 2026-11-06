@@ -198,9 +198,14 @@ impl ModelArgs {
             && !self.default_reasoning
     }
     fn resolve(self, defaults: &ModelSelection) -> Result<ModelSelection> {
+        let provider = self.provider.unwrap_or(defaults.provider);
+        let model_id = self.model.unwrap_or_else(|| defaults.model_id.clone());
+        // Coordinator settings contain the selected value, not its provenance.
+        // Preserve unselected fields; runtime validation rejects unsupported
+        // combinations before authentication or provider inference.
         let selection = ModelSelection {
-            provider: self.provider.unwrap_or(defaults.provider),
-            model_id: self.model.unwrap_or_else(|| defaults.model_id.clone()),
+            provider,
+            model_id,
             reasoning: if self.default_reasoning {
                 None
             } else {
@@ -408,6 +413,14 @@ impl Wire {
     }
 }
 
+fn runtime_script(explicit: Option<PathBuf>) -> PathBuf {
+    explicit
+        .or_else(|| env::var_os("AGENT_RUNTIME_PATH").map(PathBuf::from))
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/dist/src/bridge.js")
+        })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut arguments = Arguments::parse();
@@ -523,13 +536,7 @@ async fn main() -> Result<()> {
         _ => {}
     }
     let directory = state::directory(arguments.state_dir.clone())?;
-    let script = arguments
-        .runtime
-        .clone()
-        .or_else(|| env::var_os("AGENT_RUNTIME_PATH").map(PathBuf::from))
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/dist/src/bridge.js")
-        });
+    let script = runtime_script(arguments.runtime.clone());
     let mut config = config::load(arguments.config.as_deref())?;
     config.launch = Some(worker_launch(&arguments, &config, &directory, &script)?);
     let coordinator = arguments
@@ -695,6 +702,7 @@ async fn main() -> Result<()> {
                 mode,
                 input_id,
             } => RuntimeCommand::TaskInput {
+                origin: Some(agent_cli::protocol::InputOrigin::Cli),
                 task_id,
                 input_id: input_id.unwrap_or_else(uuid::Uuid::new_v4).to_string(),
                 input,
@@ -1630,6 +1638,7 @@ fn selected_input(
                     directory: &directory,
                 },
                 RuntimeCommand::ConversationInput {
+                    origin: Some(agent_cli::protocol::InputOrigin::Cli),
                     conversation_id: admission.conversation_id.clone(),
                     input_id: admission.id.clone(),
                     input: admission.text.clone(),
@@ -3135,6 +3144,7 @@ async fn chat_command(
         );
     }
     Ok(RuntimeCommand::Chat {
+        origin: Some(agent_cli::protocol::InputOrigin::Cli),
         input,
         attachments: None,
         input_id: None,
@@ -3525,7 +3535,8 @@ async fn request_presented(
                                 let input_id = uuid::Uuid::new_v4().to_string();
                                 ui.handle.pending_composer(input_id.clone(), &input, mode)?;
                                 ui.submitted.push_back(QueuedInput {id:input_id.clone(), input:input.clone(), mode});
-                                write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: input.text, attachments: (!input.attachments.is_empty()).then_some(input.attachments), mode }).await?;
+                                write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput {
+                                    origin: Some(agent_cli::protocol::InputOrigin::Cli), input_id, input: input.text, attachments: (!input.attachments.is_empty()).then_some(input.attachments), mode }).await?;
                             } else { ui.enqueue(input, mode)?; }
                         }
                     }
@@ -3633,6 +3644,7 @@ async fn request_presented(
                         }
                     } else if !line.trim().is_empty() {
                         write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput {
+                            origin: Some(agent_cli::protocol::InputOrigin::Cli),
                             input_id: uuid::Uuid::new_v4().to_string(), input: line, attachments:None, mode: InputMode::Steer,
                         }).await?;
                     }
@@ -3786,7 +3798,8 @@ async fn request_presented(
                     while let Some(input) = ui.queued.pop_front() {
                         let input_id = input.id.clone();
                         ui.submitted.push_back(input.clone());
-                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: input.input.text, attachments: (!input.input.attachments.is_empty()).then_some(input.input.attachments), mode: input.mode }).await?;
+                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput {
+                            origin: Some(agent_cli::protocol::InputOrigin::Cli), input_id, input: input.input.text, attachments: (!input.input.attachments.is_empty()).then_some(input.input.attachments), mode: input.mode }).await?;
                     }
                 }
                 if arguments.json { display(&event, true)?; }
@@ -3801,7 +3814,8 @@ async fn request_presented(
                     while let Some(input) = ui.queued.pop_front() {
                         let input_id = input.id.clone();
                         ui.submitted.push_back(input.clone());
-                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput { input_id, input: input.input.text, attachments: (!input.input.attachments.is_empty()).then_some(input.input.attachments), mode: input.mode }).await?;
+                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput {
+                            origin: Some(agent_cli::protocol::InputOrigin::Cli), input_id, input: input.input.text, attachments: (!input.input.attachments.is_empty()).then_some(input.input.attachments), mode: input.mode }).await?;
                     }
                 } else if arguments.json {
                     display(&event, true)?;
@@ -5061,6 +5075,206 @@ esac
                 })
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn selected_model_retains_explicit_saved_xhigh_across_model_override() {
+        use agent_cli::{
+            config::{ClientConfig, load},
+            protocol::{CoordinatorSettings, RuntimeCommand, RuntimeEventKind},
+            runtime::FrameReader,
+        };
+        use tokio::{
+            io::{AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("coordinator.toml");
+        let saved_config = ClientConfig {
+            model: ModelSelection {
+                reasoning: Some(Reasoning::Xhigh),
+                ..ModelSelection::default()
+            },
+            ..ClientConfig::default()
+        };
+        std::fs::write(&path, toml::to_string(&saved_config).unwrap()).unwrap();
+        let saved = load(Some(&path)).unwrap().model;
+        let expected = ModelSelection {
+            model_id: "gpt-5.5".into(),
+            ..saved.clone()
+        };
+        let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = FrameReader::new(BufReader::new(reader));
+            let command: RuntimeCommand =
+                serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(
+                command,
+                RuntimeCommand::Environment { telemetry: false }
+            ));
+            let event = RuntimeEventKind::Environment {
+                settings: CoordinatorSettings {
+                    model: saved,
+                    instructions: String::new(),
+                    context_repositories: vec![],
+                    sources: vec![],
+                },
+                nodes: vec![],
+                online_host_ids: vec![],
+                unavailable_host_ids: None,
+            };
+            let mut frame = serde_json::to_vec(&event).unwrap();
+            frame.push(b'\n');
+            writer.write_all(&frame).await.unwrap();
+            writer.write_all(b"{\"type\":\"done\"}\n").await.unwrap();
+        });
+        let client = ClientConfig {
+            model: ModelSelection {
+                reasoning: Some(Reasoning::Low),
+                ..ModelSelection::default()
+            },
+            ..ClientConfig::default()
+        };
+        let parsed = Arguments::try_parse_from(["agent", "chat", "--model", "gpt-5.5"]).unwrap();
+        let Some(Action::Chat { selection, .. }) = parsed.command else {
+            panic!("Expected parsed chat")
+        };
+        let actual = crate::selected_model(
+            selection,
+            &client,
+            None,
+            Path::new("/unused-runtime"),
+            directory.path(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            actual, expected,
+            "A model-only override must preserve the coordinator's explicitly saved xhigh, not infer implicit provenance from equality"
+        );
+    }
+
+    #[test]
+    fn clap_model_overrides_preserve_saved_effort_and_validate_the_real_catalog() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        #[derive(serde::Serialize)]
+        struct Case {
+            selection: ModelSelection,
+            valid: bool,
+        }
+        let mut cases = Vec::new();
+        for (flags, expected, valid) in [
+            (vec![], Some(Reasoning::Xhigh), true),
+            (vec!["--model", "gpt-6.1-sol"], Some(Reasoning::Xhigh), true),
+            (vec!["--model", "gpt-5.5"], Some(Reasoning::Xhigh), true),
+            (vec!["--model", "gpt-4.1"], Some(Reasoning::Xhigh), false),
+            (vec!["--model", "gpt-5"], Some(Reasoning::Xhigh), false),
+            (
+                vec!["--model", "gpt-5", "--reasoning", "low"],
+                Some(Reasoning::Low),
+                true,
+            ),
+            (
+                vec!["--model", "gpt-5", "--reasoning", "high"],
+                Some(Reasoning::High),
+                true,
+            ),
+            (
+                vec!["--model", "gpt-5", "--reasoning", "xhigh"],
+                Some(Reasoning::Xhigh),
+                false,
+            ),
+            (
+                vec!["--model", "gpt-4.1", "--reasoning", "high"],
+                Some(Reasoning::High),
+                false,
+            ),
+            (
+                vec!["--model", "gpt-4.1", "--reasoning", "off"],
+                Some(Reasoning::Off),
+                true,
+            ),
+            (
+                vec!["--model", "gpt-4.1", "--default-reasoning"],
+                None,
+                true,
+            ),
+            (vec!["--default-reasoning"], None, true),
+        ] {
+            let parsed = Arguments::try_parse_from(
+                ["agent", "chat"].into_iter().chain(flags.iter().copied()),
+            )
+            .unwrap();
+            let Some(Action::Chat { selection, .. }) = parsed.command else {
+                panic!("Expected parsed chat");
+            };
+            let selection = selection.resolve(&ModelSelection::default()).unwrap();
+            assert_eq!(
+                selection.reasoning, expected,
+                "A model-only override must preserve effort rather than infer implicit provenance: {flags:?}"
+            );
+            cases.push(Case { selection, valid });
+        }
+        for effort in [
+            None,
+            Some(Reasoning::Low),
+            Some(Reasoning::High),
+            Some(Reasoning::Xhigh),
+        ] {
+            let defaults = ModelSelection {
+                reasoning: effort,
+                ..ModelSelection::default()
+            };
+            let parsed =
+                Arguments::try_parse_from(["agent", "chat", "--model", "gpt-5.5"]).unwrap();
+            let Some(Action::Chat { selection, .. }) = parsed.command else {
+                panic!("Expected parsed chat");
+            };
+            let selection = selection.resolve(&defaults).unwrap();
+            assert_eq!(selection.reasoning, effort);
+            cases.push(Case {
+                selection,
+                valid: true,
+            });
+        }
+        // Exercise the actual runtime catalog validator, not a Rust copy of its
+        // capabilities. No auth, provider request, config write or inference.
+        let models = crate::runtime_script(None)
+            .with_file_name("models.js")
+            .canonicalize()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut child = Command::new("node").current_dir(directory.path())
+            .args(["--input-type=module", "-e", r#"
+                import assert from 'node:assert/strict'; import {readFileSync} from 'node:fs';
+                import {pathToFileURL} from 'node:url';
+                const {ConversationModels} = await import(pathToFileURL(process.argv[1]));
+                globalThis.fetch = async () => { throw new Error('Catalog validation must not perform network requests'); };
+                const models = new ConversationModels();
+                for (const item of JSON.parse(readFileSync(0, 'utf8'))) {
+                    if (item.valid) models.validate(item.selection);
+                    else await assert.rejects(models.preflight(item.selection), /Reasoning .* unavailable/);
+                }
+            "#]).arg(models).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(&cases).unwrap())
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 
     #[test]

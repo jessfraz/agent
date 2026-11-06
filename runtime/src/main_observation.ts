@@ -1,8 +1,9 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { LiveDoc, type Conversation, type Harness, type Session, type TaskId, type TaskInspection } from "@earendil-works/pi-durable";
+import { LiveDoc, ROOT_CONVERSATION_ID, type Conversation, type Harness, type Session, type TaskId, type TaskInspection } from "@earendil-works/pi-durable";
 import type { InputWorkState } from "./generated/InputWorkState.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
-import { isUserNotice, visibleTranscript } from "./transcript.js";
+import { isUserNotice, MainResponses, visibleTranscript } from "./transcript.js";
+import { mainResponse } from "./main_response.js";
 import { observeTranscriptVisibility } from "./transcript_visibility.js";
 
 type BlockedMainWork = Extract<InputWorkState, { type: "blocked" }> & { recovery: "message" | "inspect_outcome" | "update_runtime" };
@@ -47,8 +48,15 @@ export async function reconcileMainInput(root: Conversation, input_id: string, s
     work = current.type === "blocked" ? { type: "blocked", reason: current.reason }
       : { type: saved.status === "queued" ? "queued" : "running" };
   }
-  return [{ type: "input_accepted", input_id, work }, ...(saved.entry === undefined ? []
+  const events: RuntimeEventKind[] = [{ type: "input_accepted", input_id, work }, ...(saved.entry === undefined ? []
     : [{ type: "input_placed", input_id, entry_id: saved.entry.toString() } satisfies RuntimeEventKind])];
+  if (root.id === ROOT_CONVERSATION_ID && saved.type === "input" && saved.status === "done" && saved.entry !== undefined) {
+    const response = await mainResponse(session, root, saved.entry, saved.answer);
+    if (response.text.trim() && await session.snapshot(MainResponses, root.id, saved.answer.toString(), BACKGROUND_CONTEXT) !== undefined) {
+      events.push({ type: "answer", conversation_id: root.id.toString(), ...response });
+    }
+  }
+  return events;
 }
 
 /** Only an explicit continuation, with its execution owner ready, grants another

@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import { chmod, mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { UserInput } from "@earendil-works/pi-durable";
+import type { InputEntry, UserInput } from "@earendil-works/pi-durable";
 import { DEFAULT_IMAGE_LIMITS, type ImageProcessor } from "@earendil-works/pi-durable/tools";
 import { createNodePhotonImages } from "@earendil-works/pi-durable/images/node";
+import type { InputOrigin } from "./generated/InputOrigin.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
 import type { AttachmentRequest } from "./generated/AttachmentRequest.js";
 import type { AttachmentResponse } from "./generated/AttachmentResponse.js";
@@ -200,8 +201,10 @@ export class AttachmentStore {
     }
     throw new AttachmentError("Attachment transfer did not complete");
   }
-  async input(text: string, refs: readonly AttachmentRef[] | undefined, call: HostCall): Promise<{ content: UserInput; entry?: { kind: string; data: { attachments: AttachmentRef[]; text: string } } }> {
-    if (refs === undefined || refs.length === 0) return { content: text };
+  async input(text: string, refs: readonly AttachmentRef[] | undefined, call: HostCall, origin?: InputOrigin): Promise<{ content: UserInput; entry?: InputEntry }> {
+    if (refs === undefined || refs.length === 0) return { content: text, ...(origin === undefined ? {} : {
+      entry: { kind: "agent.input", data: { origin, text } },
+    }) };
     const canonical = await this.resolve(refs), content: Exclude<UserInput, string> = [{ type: "text", text }];
     for (const ref of canonical) {
       const path = await this.materialize(ref, call);
@@ -215,6 +218,6 @@ export class AttachmentStore {
         } else content.push({ type: "image", data: prepared.data, mimeType: prepared.mimeType });
       }
     }
-    return { content, entry: { kind: "agent.input", data: { attachments: canonical, text } } };
+    return { content, entry: { kind: "agent.input", data: { attachments: canonical, text, ...(origin === undefined ? {} : { origin }) } } };
   }
 }

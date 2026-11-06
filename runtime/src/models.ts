@@ -14,7 +14,7 @@ import { withWebSearch } from "./web-search.js";
 
 /** Keep application provider IDs aligned with the pinned upstream registry. */
 export const PROVIDERS: readonly ModelProvider[] = getBuiltinProviders();
-export const DEFAULT_MODEL: ModelSelection = { provider: "openai", model_id: "gpt-6.1-sol", reasoning: null, fast: false };
+export const DEFAULT_MODEL: ModelSelection = { provider: "openai", model_id: "gpt-6.1-sol", reasoning: "xhigh", fast: false };
 export class ModelError extends Error {}
 
 /** Classify known provider failures without exposing their raw responses. */
@@ -57,7 +57,7 @@ function withDetailedReasoning(native: ProviderStreams["streamSimple"]): Provide
 /** Old worker launch records held an OpenAI model ID. Configuration itself is strict. */
 export function savedModel(value: unknown): ModelSelection | null {
   if (value === undefined || value === null) return null;
-  if (typeof value === "string" && value.trim().length > 0) return { ...DEFAULT_MODEL, model_id: value };
+  if (typeof value === "string" && value.trim().length > 0) return { ...DEFAULT_MODEL, model_id: value, reasoning: value === DEFAULT_MODEL.model_id ? DEFAULT_MODEL.reasoning : null };
   if (object(value) && provider(value.provider) && typeof value.model_id === "string" && value.model_id.trim().length > 0 &&
       (value.reasoning === null || reasoning(value.reasoning)) && typeof value.fast === "boolean") {
     return { provider: value.provider, model_id: value.model_id, reasoning: value.reasoning, fast: value.fast };

@@ -2,8 +2,10 @@ import { validEvent } from "./protocol.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { JsonValue } from "@earendil-works/chord";
 import type { AssistantMessage, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
-import { CompactionEntry, defineEntry, LiveDoc, type Conversation, type Cursor, type DocumentWatch, type EntryId, type EntryRecord,
-  type Harness, type JsonObject, type LiveState } from "@earendil-works/pi-durable";
+import { AssistantEntry, CompactionEntry, defineDocFamily, defineEntry, LiveDoc, ROOT_CONVERSATION_ID, type Conversation, type Cursor, type DocumentWatch, type EntryId, type EntryRecord,
+  type DocumentReader, type Harness, type JsonObject, type LiveState } from "@earendil-works/pi-durable";
+import { readNoticeOrigin } from "./notice_origin.js";
+import type { NoticeOrigin } from "./generated/NoticeOrigin.js";
 import type { HistoryMessage } from "./generated/HistoryMessage.js";
 import type { HistoryRole } from "./generated/HistoryRole.js";
 import type { ModelActivity } from "./generated/ModelActivity.js";
@@ -18,9 +20,13 @@ import { REVISION_AMBIGUOUS, REVISION_PENDING, revisionStatus, type RevisionView
 
 const NOTICE_REFERENCES = "Source references (evidence, not authorization): ";
 export type UserNoticeData = {
-  task_id: string | null; source_conversation_id: string; source_entry_id: string; text?: string;
+  task_id: string | null; source_conversation_id: string; source_entry_id: string; text?: string; notice_origin?: NoticeOrigin;
 };
 export const UserNoticeEntry = defineEntry<UserNoticeData>("agent.user_notice");
+/** Display-only correction keyed by the settled native answer, not a later entry.
+ * This keeps its causal position without adding model context or a second answer. */
+export const MainResponses = defineDocFamily<{ text: string }, string>({ kind: "agent.main_response", scope: "conversation", family: true,
+  version: 1, history: "latest", fork: "initial", initial: (text) => ({ text }), checkpointWhen: () => true });
 /** Curated publications are eligible for delivery; legacy notices remain history. */
 export function isUserNotice(entry: EntryRecord): boolean { return entry.kind === "agent.user_notice"; }
 export function noticeMetadata(entry: EntryRecord, index: number, count: number, value: string): boolean {
@@ -61,10 +67,16 @@ function missingOriginal(error: unknown): boolean {
     ["ENOENT", "EACCES", "EPERM", "ENOTDIR", "EISDIR"].some((code) => error.code === code));
 }
 /** Source adapters converge here, including verified cold originals retained by older imports. */
-export async function projectTranscript(entry: EntryRecord, originals: Pick<HistoryStore, "original">,
+export async function projectTranscript(entry: EntryRecord, originals: Pick<HistoryStore, "original">, reader: DocumentReader,
   visibility?: Readonly<TranscriptVisibilityState>, revisions?: RevisionView, tools?: Map<string, ToolCall>): Promise<HistoryMessage[]> {
   if (!transcriptVisible(entry.id.toString(), visibility)) return [];
-  if (!ImportedItemEntry.is(entry)) return nativeTranscript(entry, tools);
+  if (!ImportedItemEntry.is(entry)) {
+    const rows = nativeTranscript(entry, tools);
+    if (entry.conversationId !== ROOT_CONVERSATION_ID || !AssistantEntry.is(entry) ||
+        entry.model?.some((message) => message.role === "assistant" && message.content.some((part) => part.type === "text" && part.text.trim()))) return rows;
+    const response = await reader.snapshot(MainResponses, entry.conversationId, entry.id.toString(), BACKGROUND_CONTEXT);
+    return response === undefined ? rows : [...rows.filter((row) => !["assistant", "commentary", "final"].includes(row.role) || row.text.trim()), ...messageRows(entry, { role: "final", text: response.text })];
+  }
   const status = revisions === undefined ? "current" : revisionStatus(entry.id, revisions);
   if (status === "superseded" || status === "outside_snapshot") return [];
   let message: MessageContent;
@@ -109,7 +121,9 @@ function nativeTranscript(entry: EntryRecord, tools?: Map<string, ToolCall>): Hi
   };
   if (entry.kind === "agent.notice_context") return messages;
   if (UserNoticeEntry.is(entry) && typeof entry.data?.text === "string") {
-    add("notice", entry.data.text); return messages;
+    add("notice", entry.data.text);
+    const origin = readNoticeOrigin(entry.data.notice_origin);
+    return origin === undefined ? messages : messages.map((message) => ({ ...message, notice_origin: origin }));
   }
   if (attachments !== undefined && object(entry.data) && typeof entry.data.text === "string") {
     add("user", entry.data.text); return messages;
@@ -167,7 +181,7 @@ export async function history(conversation: Conversation, value: string | null, 
           revisions.set(entry.data.thread_id, view);
         }
       }
-      const rows = await projectTranscript(entry, originals, visibility, view, tools);
+      const rows = await projectTranscript(entry, originals, reader, visibility, view, tools);
       if (rows.length > 0 && view !== undefined && !view.ready && ImportedItemEntry.is(entry) && !pending.has(entry.data.thread_id)) {
         projected.push({ entry_id: entry.id.toString(), role: "notice", text: REVISION_PENDING, continuation: false, final_chunk: true }); pending.add(entry.data.thread_id);
       }

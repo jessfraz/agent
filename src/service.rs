@@ -731,6 +731,7 @@ mod tests {
         write_frame(
             &mut unscoped,
             &RuntimeCommand::SubmitInput {
+                origin: None,
                 attachments: None,
                 input_id: "unscoped".into(),
                 input: "Rejected".into(),
@@ -754,6 +755,7 @@ mod tests {
         write_frame(
             &mut chat,
             &RuntimeCommand::Chat {
+                origin: None,
                 attachments: None,
                 input: "Start chat".into(),
                 input_id: None,
@@ -773,6 +775,7 @@ mod tests {
             write_frame(
                 &mut write,
                 &RuntimeCommand::SubmitInput {
+                    origin: None,
                     attachments: None,
                     input_id: input_id.into(),
                     input: input_id.into(),
@@ -1028,6 +1031,7 @@ mod tests {
             &mut native_write,
             &RuntimeCommand::Native {
                 request: NativeRequest::Submit {
+                    origin: None,
                     input_id: uuid::Uuid::new_v4().to_string(),
                     text: "/help".into(),
                     mode: InputMode::Steer,
@@ -1092,6 +1096,7 @@ mod tests {
             write_frame(
                 &mut client,
                 &RuntimeCommand::Chat {
+                    origin: None,
                     attachments: None,
                     input: "Keep this synthetic request active".into(),
                     input_id: None,

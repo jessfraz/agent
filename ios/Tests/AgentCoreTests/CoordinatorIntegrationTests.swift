@@ -47,8 +47,12 @@ func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
   let model = ChatModel()
   func verifySavedInput(_ rows: [ChatRow]) throws {
     #expect(rows.filter { $0.text == text }.map(\.entryID) == [entryID])
+    let user = try #require(rows.first(where: { $0.role == .user }))
     #expect(rows.filter { $0.role == .user }.count == 1)
-    #expect(rows.allSatisfy { $0.delivery == nil })
+    #expect(user.entryID == entryID)
+    #expect(user.delivery == .saved)
+    #expect(user.delivery?.rawValue == "Sent")
+    #expect(rows.filter { $0.role != .user }.allSatisfy { $0.delivery == nil })
     #expect(
       try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
         .isEmpty)

@@ -22,18 +22,19 @@
         url = "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/370f27d7550e0def9b39c1f16d3fbaa13aa67728/Qwen3-Embedding-0.6B-Q8_0.gguf";
         hash = "sha256-BlB8e0JohGnE5ymLCh4W3v8GyvKRzwpbJ4wwgknD5Dk=";
       };
+      runtimeFiles = pkgs.lib.fileset.unions [
+        ./runtime/src
+        ./runtime/scripts
+        ./runtime/package.json
+        ./runtime/package-lock.json
+        ./runtime/tsconfig.json
+      ];
       runtime = pkgs.buildNpmPackage {
         pname = "beep-boop-runtime";
         version = "0.1.0";
         src = pkgs.lib.fileset.toSource {
           root = ./runtime;
-          fileset = pkgs.lib.fileset.unions [
-            ./runtime/src
-            ./runtime/scripts
-            ./runtime/package.json
-            ./runtime/package-lock.json
-            ./runtime/tsconfig.json
-          ];
+          fileset = runtimeFiles;
         };
         nodejs = pkgs.nodejs_26;
         npmDeps = pkgs.importNpmLock {npmRoot = ./runtime;};
@@ -52,6 +53,16 @@
           runHook postInstall
         '';
       };
+      runtimeChecks = runtime.overrideAttrs (_: {
+        pname = "beep-boop-runtime-checks";
+        src = pkgs.lib.fileset.toSource {
+          root = ./runtime;
+          fileset = pkgs.lib.fileset.unions [runtimeFiles ./runtime/test];
+        };
+        postInstall = ''
+          cp -r dist/test "$out/lib/beep-boop-runtime/dist/"
+        '';
+      });
       cli = pkgs.rustPlatform.buildRustPackage {
         pname = "beep-boop";
         version = "0.1.0";
@@ -66,6 +77,8 @@
         AGENT_RUNTIME_PATH = "${runtime}/lib/beep-boop-runtime/dist/src/bridge.js";
         AGENT_SQLITE_VEC = "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
         preCheck = ''
+          # Integration fixtures belong to checks, outside the installed runtime.
+          ln -s ${runtimeChecks}/lib/beep-boop-runtime runtime
           patchShebangs tests/fixtures
           fixtureProfileFlags=()
           if [ "$cargoCheckType" != debug ]; then

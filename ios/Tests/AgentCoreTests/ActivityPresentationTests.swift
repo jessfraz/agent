@@ -31,7 +31,7 @@ import Testing
     return nil
   }
   #expect(groups.map { $0.rows.count } == [3, 1])
-  #expect(groups.first?.summary == "1 tool call · 2 thoughts")
+  #expect(groups.first?.summary == "1 tool call · 2 summaries")
 }
 
 @MainActor @Test func incomingActivityKeepsItsExistingDisclosureIdentity() throws {
