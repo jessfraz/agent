@@ -296,32 +296,38 @@ final class AgentUITests: XCTestCase {
     }
   }
 
-  func testConnectionAndEmptyMainAccessibility() throws {
+  func testConnectionAndEmptyMainAccessibilityInLightAppearance() throws {
+    try checkConnectionAndEmptyMainAccessibility(.light)
+  }
+
+  func testConnectionAndEmptyMainAccessibilityInDarkAppearance() throws {
+    try checkConnectionAndEmptyMainAccessibility(.dark)
+  }
+
+  private func checkConnectionAndEmptyMainAccessibility(_ appearance: Appearance) throws {
     let previous = XCUIDevice.shared.appearance
     defer { XCUIDevice.shared.appearance = previous }
-    for appearance in Appearance.allCases {
-      // An unsigned, offline simulator cannot enroll with APNs. Keep its
-      // notification preference off so an asynchronous enrollment failure cannot
-      // replace the disconnected guidance while this view is being audited.
-      let app = launch(appearance: appearance, notificationsEnabled: false)
-      defer { app.terminate() }
-      try revealCompleteConnectionForm(app)
-      try audit(app)
-      capture("connection-accessibility-\(appearance.rawValue)", app: app)
-      if !app.buttons["dismissConnection"].exists {
-        let window = app.windows.firstMatch
-        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
-        start.press(
-          forDuration: 0.05,
-          thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8)),
-          withVelocity: .slow, thenHoldForDuration: 0.1)
-      }
-      XCTAssertTrue(
-        app.buttons["dismissConnection"].waitForExistence(timeout: 3), app.debugDescription)
-      app.buttons["Done"].tap()
-      try audit(app)
-      capture("main-accessibility-\(appearance.rawValue)", app: app)
+    // An unsigned, offline simulator cannot enroll with APNs. Keep its
+    // notification preference off so an asynchronous enrollment failure cannot
+    // replace the disconnected guidance while this view is being audited.
+    let app = launch(appearance: appearance, notificationsEnabled: false)
+    defer { app.terminate() }
+    try revealCompleteConnectionForm(app)
+    try audit(app)
+    capture("connection-accessibility-\(appearance.rawValue)", app: app)
+    if !app.buttons["dismissConnection"].exists {
+      let window = app.windows.firstMatch
+      let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+      start.press(
+        forDuration: 0.05,
+        thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8)),
+        withVelocity: .slow, thenHoldForDuration: 0.1)
     }
+    XCTAssertTrue(
+      app.buttons["dismissConnection"].waitForExistence(timeout: 3), app.debugDescription)
+    app.buttons["Done"].tap()
+    try audit(app)
+    capture("main-accessibility-\(appearance.rawValue)", app: app)
   }
 
   private func revealCompleteConnectionForm(_ app: XCUIApplication) throws {
@@ -372,6 +378,7 @@ final class AgentUITests: XCTestCase {
         // Target the real Form collection, not its window or the sheet chrome.
         form.swipeUp(velocity: .slow)
       } else if let partial {
+        let guidanceBeforeAlignment = guidance.frame
         let adjustment = visible.minY - partial.frame.minY
         // Align the first partial row only if the complete guidance still fits.
         // Otherwise scroll that row out, rather than cropping the guidance again.
@@ -384,6 +391,13 @@ final class AgentUITests: XCTestCase {
         start.press(
           forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: bounded)),
           withVelocity: .slow, thenHoldForDuration: 0.1)
+        // A tiny alignment drag can leave a native Form unchanged. Do not repeat
+        // it once the actual viewport and fully visible guidance have not moved.
+        if viewport() == visible, guidance.exists, guidance.isHittable,
+          guidance.frame == guidanceBeforeAlignment
+        {
+          break
+        }
       }
     }
     XCTAssertTrue(guidance.waitForExistence(timeout: 3), app.debugDescription)
