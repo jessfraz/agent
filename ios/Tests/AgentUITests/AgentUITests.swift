@@ -72,15 +72,14 @@ final class AgentUITests: XCTestCase {
 
   private func replace(_ field: XCUIElement, with text: String) {
     field.tap()
-    if field.identifier == "Message the coordinator", let value = field.value as? String,
-      !value.isEmpty, value != field.placeholderValue
+    // The default port equals its prompt, but is still real text to select.
+    if let value = field.value as? String, !value.isEmpty,
+      field.elementType == .textField || value != field.placeholderValue
     {
       field.press(forDuration: 1)
       let selectAll = XCUIApplication().menuItems["Select All"]
       XCTAssertTrue(selectAll.waitForExistence(timeout: 3), XCUIApplication().debugDescription)
       selectAll.tap()
-    } else {
-      field.typeKey("a", modifierFlags: .command)
     }
     field.typeText(text.isEmpty ? XCUIKeyboardKey.delete.rawValue : text)
     let value = field.value as? String
@@ -448,39 +447,54 @@ final class AgentUITests: XCTestCase {
     let previous = continueAfterFailure
     continueAfterFailure = true
     defer { continueAfterFailure = previous }
+    let partialRowFrames: [CGRect]
+    if types.contains(.contrast), let visibleForm {
+      partialRowFrames = visibleForm.element.cells.allElementsBoundByIndex.map { $0.frame }
+        .filter { !visibleForm.viewport.contains($0) }
+    } else {
+      partialRowFrames = []
+    }
+    let version = ProcessInfo.processInfo.operatingSystemVersion
+    let nativeDoneException =
+      version.majorVersion == 27 || (version.majorVersion == 26 && version.minorVersion == 5)
+    var diagnosticElements: [XCUIElement?] = []
+    var doneReceipt: XCUIElement?
+    // Snapshot a bounded set only after the native audit returns. Asking for
+    // descriptions or pixels inside its callback can reenter accessibility.
+    defer {
+      for element in diagnosticElements {
+        let nativeElement = XCTAttachment(string: element?.debugDescription ?? "No native element")
+        nativeElement.name = "native-audit-issue-element"
+        nativeElement.lifetime = .keepAlways
+        add(nativeElement)
+      }
+      if let doneReceipt {
+        let receipt = XCTAttachment(screenshot: doneReceipt.screenshot())
+        receipt.name = "native-done-contrast-receipt"
+        receipt.lifetime = .keepAlways
+        add(receipt)
+      }
+    }
     try app.performAccessibilityAudit(for: types) { issue in
-      let nativeElement = XCTAttachment(
-        string: issue.element?.debugDescription ?? "No native element")
-      nativeElement.name = "native-audit-issue-element"
-      nativeElement.lifetime = .keepAlways
-      self.add(nativeElement)
+      let element = issue.element
+      if diagnosticElements.count < 8 { diagnosticElements.append(element) }
+      guard issue.auditType == .contrast, let element else { return false }
       // WCAG 1.4.3 excludes inactive controls from text-contrast requirements.
       // https://www.w3.org/WAI/WCAG21/Understanding/contrast-minimum#inactive-user-interface-components
-      if issue.auditType == .contrast, issue.element?.isEnabled == false { return true }
-      if issue.auditType == .contrast, let visibleForm, let element = issue.element {
-        let identity = element.identifier.isEmpty ? element.label : element.identifier
-        let rows = visibleForm.element.cells.containing(element.elementType, identifier: identity)
-        if let row = rows.allElementsBoundByIndex.first(where: { $0.frame.contains(element.frame) }
-        ),
-          !visibleForm.viewport.contains(row.frame)
-        {
-          // This Form row is occluded at this pose. Its contrast belongs to the
-          // pose that exposes it, not to the navigation bar covering its text.
-          return true
-        }
+      if !element.isEnabled { return true }
+      if !partialRowFrames.isEmpty {
+        let frame = element.frame
+        // Readable-row geometry is captured for this pose before the audit;
+        // the callback must not query or enumerate the Form again.
+        if partialRowFrames.contains(where: { $0.contains(frame) }) { return true }
       }
-      let version = ProcessInfo.processInfo.operatingSystemVersion
-      guard version.majorVersion == 27 || (version.majorVersion == 26 && version.minorVersion == 5),
-        issue.auditType == .contrast, let element = issue.element,
+      guard nativeDoneException,
         element.identifier == "dismissConnection", element.label == "Done"
       else { return false }
       // Native glass Done is flagged despite measured contrast: iOS 26.5 has
       // 13.36:1 Dark / 20.34:1 Light; iOS 27 exceeds 19:1. Retain its pixels and
       // exempt only this exact control on these demonstrated OS versions.
-      let receipt = XCTAttachment(screenshot: element.screenshot())
-      receipt.name = "native-done-contrast-receipt"
-      receipt.lifetime = .keepAlways
-      self.add(receipt)
+      doneReceipt = element
       return true
     }
   }

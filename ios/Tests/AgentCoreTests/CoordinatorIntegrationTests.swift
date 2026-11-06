@@ -6,9 +6,10 @@ import Testing
 @testable import AgentUI
 
 private actor NativeConnectionTrace {
+  private let started = ContinuousClock.now
   private var states: [String] = []
   func record(_ state: String) {
-    states.append(state)
+    states.append("\(started.duration(to: ContinuousClock.now)): \(state)")
     if states.count > 12 { states.removeFirst() }
   }
   var description: String { states.joined(separator: ", ") }
@@ -18,7 +19,7 @@ private actor NativeConnectionTrace {
 // selecting this test. Ordinary Swift unit runs have no server to connect to.
 @Test(
   .enabled(if: ProcessInfo.processInfo.environment["AGENT_E2E_SOCKET"] != nil),
-  .timeLimit(.minutes(1)))
+  .timeLimit(.minutes(2)))
 @MainActor
 func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
   let environment = ProcessInfo.processInfo.environment
@@ -29,6 +30,7 @@ func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
   let text = try #require(environment["AGENT_E2E_TEXT"])
   let restart = URL(filePath: try #require(environment["AGENT_E2E_RESTART_REQUEST"]))
   let reconnecting = URL(filePath: try #require(environment["AGENT_E2E_RECONNECTING"]))
+  let restartReady = URL(filePath: try #require(environment["AGENT_E2E_RESTART_READY"]))
   let draft = "Keep this unsent composer draft across the service restart."
   let outbox = directory.appending(path: "native-pending.json")
   let input = NativeRequestSubmit(inputId: inputID, mode: .steer, text: text)
@@ -57,8 +59,10 @@ func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
       try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
         .isEmpty)
   }
-  func waitFor(_ description: String, _ predicate: () -> Bool) async throws {
-    let deadline = ContinuousClock.now + .seconds(20)
+  func waitFor(
+    _ description: String, timeout: Duration = .seconds(20), _ predicate: () -> Bool
+  ) async throws {
+    let deadline = ContinuousClock.now + timeout
     while !predicate() {
       if ContinuousClock.now >= deadline {
         let states = await trace.description
@@ -99,7 +103,15 @@ func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
     #expect(model.draft == draft)
     try verifySavedInput(model.rows.map(\.row))
     try Data().write(to: reconnecting, options: .atomic)
-    try await waitFor("connected after service restart") { model.connection == .connected }
+    try await waitFor("coordinator ready after service restart", timeout: .seconds(60)) {
+      FileManager.default.fileExists(atPath: restartReady.path())
+    }
+    await trace.record("coordinator restart ready")
+    // Start recovery timing after the real service is ready, allowing its
+    // maximum 32-second retry backoff without changing production retries.
+    try await waitFor("connected after service restart", timeout: .seconds(60)) {
+      model.connection == .connected
+    }
     try verifySavedInput(model.rows.map(\.row))
     #expect(model.draft == draft)
     #expect(model.error == nil)

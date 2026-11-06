@@ -452,7 +452,8 @@ func terminalCoordinatorRejectionStopsRetryingAndStaysOutOfHistory(_ behavior: R
   async throws
 {
   try await withReconnectCoordinator(behavior) { model, fixture, _ in
-    try await waitForReconnectState { model.error != nil || model.connection != .connecting }
+    // The initial disconnected snapshot is not a terminal server response.
+    try await waitForReconnectState { model.connection == .disconnected && model.error != nil }
     try await Task.sleep(for: .milliseconds(2300))
     #expect(model.connection == .disconnected)
     #expect(model.error != nil)
