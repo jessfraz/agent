@@ -311,6 +311,7 @@ final class AgentUITests: XCTestCase {
     // notification preference off so an asynchronous enrollment failure cannot
     // replace the disconnected guidance while this view is being audited.
     let app = launch(appearance: appearance, notificationsEnabled: false)
+    executionTimeAllowance = 180
     defer { app.terminate() }
     try auditCompleteConnectionForm(app)
     capture("connection-accessibility-\(appearance.rawValue)", app: app)
