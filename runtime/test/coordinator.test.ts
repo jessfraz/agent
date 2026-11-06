@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { createConnection } from "node:net";
 import { test } from "node:test";
@@ -577,6 +577,23 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     assert.deepEqual(finalTask.worker.binding, original.binding);
     actor.child.stdin.end("/exit\n"); assert.equal(await actor.exited, 0, actor.errors());
     worker.child.kill("SIGINT"); await worker.exited; server.child.kill("SIGTERM"); assert.equal(await server.exited, 0, server.errors());
+  } catch (error) {
+    const durable = await Promise.all(homes.flatMap((home) => ["state/runtime.jsonl", "state/session.sqlite", "rex.json", "rex.json.calls"].map(async (name) => {
+      try {
+        const file = await open(join(home, name), "r");
+        try {
+          const metadata = await file.stat(), bytes = Buffer.alloc(4096);
+          const read = name.endsWith(".sqlite") ? 0 : (await file.read(bytes, 0, bytes.length, Math.max(0, metadata.size - bytes.length))).bytesRead;
+          return { host: homes.indexOf(home), name, bytes: metadata.size, tail: bytes.subarray(0, read).toString("utf8") };
+        } finally { await file.close(); }
+      } catch (failure) { return { host: homes.indexOf(home), name, error: String(failure) }; }
+    })));
+    t.diagnostic("Owned coordinator failure before cleanup: " + JSON.stringify({ durable, children: children.slice(-10).map((owned) => ({
+      pid: owned.child.pid, executable: owned.child.spawnfile, arguments: owned.child.spawnargs.slice(1, 8),
+      exitCode: owned.child.exitCode, signalCode: owned.child.signalCode, killed: owned.child.killed,
+      stdout: owned.output().slice(-4096), stderr: owned.errors().slice(-4096),
+    })) }));
+    throw error;
   } finally {
     for (const owned of children.slice().reverse()) if (owned.child.pid !== undefined && owned.child.exitCode === null && owned.child.signalCode === null) {
       try { process.kill(-owned.child.pid, "SIGTERM"); } catch { /* This owned group already exited. */ }
