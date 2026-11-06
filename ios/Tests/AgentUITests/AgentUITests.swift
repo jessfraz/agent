@@ -72,7 +72,16 @@ final class AgentUITests: XCTestCase {
 
   private func replace(_ field: XCUIElement, with text: String) {
     field.tap()
-    field.typeKey("a", modifierFlags: .command)
+    if field.identifier == "Message the coordinator", let value = field.value as? String,
+      !value.isEmpty, value != field.placeholderValue
+    {
+      field.press(forDuration: 1)
+      let selectAll = XCUIApplication().menuItems["Select All"]
+      XCTAssertTrue(selectAll.waitForExistence(timeout: 3), XCUIApplication().debugDescription)
+      selectAll.tap()
+    } else {
+      field.typeKey("a", modifierFlags: .command)
+    }
     field.typeText(text.isEmpty ? XCUIKeyboardKey.delete.rawValue : text)
     let value = field.value as? String
     if text.isEmpty {
@@ -114,8 +123,9 @@ final class AgentUITests: XCTestCase {
       identifier: "Message the coordinator"
     ).firstMatch
     XCTAssertTrue(composer.waitForExistence(timeout: 5))
-    composer.tap()
-    composer.typeText("Synthetic draft kept safely offline.")
+    app.buttons["composerMenu"].tap()
+    app.buttons["Steer"].tap()
+    replace(composer, with: "Synthetic draft kept safely offline.")
     XCTAssertFalse(app.buttons["Send message"].isEnabled)
     capture("offline-composer-keyboard", app: app)
     app.buttons["composerMenu"].tap()
@@ -132,9 +142,10 @@ final class AgentUITests: XCTestCase {
       identifier: "Message the coordinator"
     ).firstMatch
     XCTAssertTrue(composer.waitForExistence(timeout: 5))
-    composer.tap()
     let draft = "Synthetic draft survives a transcript drag."
-    composer.typeText(draft)
+    app.buttons["composerMenu"].tap()
+    app.buttons["Steer"].tap()
+    replace(composer, with: draft)
     XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
     XCTAssertTrue(app.staticTexts["No messages yet"].exists)
     let transcript = app.scrollViews.containing(.staticText, identifier: "No messages yet")
@@ -168,8 +179,7 @@ final class AgentUITests: XCTestCase {
       identifier: "Message the coordinator"
     ).firstMatch
     let draft = "Synthetic draft survives appearance changes."
-    composer.tap()
-    composer.typeText(draft)
+    replace(composer, with: draft)
     XCUIDevice.shared.appearance = .light
     app.buttons["Connection"].tap()
     chooseAppearance("Dark", app: app)
