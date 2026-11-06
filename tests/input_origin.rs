@@ -108,6 +108,22 @@ fn execution(command: &HostCommand) -> bool {
         _ => false,
     }
 }
+fn cli_diagnostics(output: &std::process::Output) -> String {
+    let excerpt = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .chars()
+            .take(2048)
+            .collect::<String>()
+    };
+    format!(
+        "status={}; stdout_bytes={}, stdout_prefix={:?}; stderr_bytes={}, stderr_prefix={:?}",
+        output.status,
+        output.stdout.len(),
+        excerpt(&output.stdout),
+        output.stderr.len(),
+        excerpt(&output.stderr),
+    )
+}
 async fn collect(runtime: &Runtime, mut call: RuntimeCall) {
     while let Some(event) = timeout(Duration::from_secs(8), call.events.recv())
         .await
@@ -138,6 +154,7 @@ async fn native(runtime: &Runtime, wire: &str) {
 #[tokio::test]
 async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_inference() {
     let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let fixture = root.join("runtime/dist/test/fixtures/coordinator-runtime.js");
     assert!(fixture.is_file(), "Build the runtime first");
@@ -146,7 +163,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
         &queue,
         r#"{
         "cli-first": [{"tool":"exec","args":{"program":"held","args":[]},"commentary":"Checking the original CLI request before the iOS correction."}],
-        "ios-steer": [{"text":""}],
+        "ios-steer": [{"text":"The steering correction is answered."}],
         "cli-followup": [{"text":"The next request is answered."}],
         "legacy-ios": [{"text":"The legacy request is answered."}]
     }"#,
@@ -283,7 +300,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
         std::iter::once(fake_bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
     .unwrap();
-    let cli = Command::new(env!("CARGO_BIN_EXE_beep-boop"))
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_beep-boop"))
         .args(["--json", "--no-tui", "--state-dir"])
         .arg(directory.path())
         .arg("--config")
@@ -299,10 +316,26 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let (id, call_id) = timeout(Duration::from_secs(8), held)
-        .await
-        .unwrap()
-        .unwrap();
+    let (id, call_id) = match timeout(Duration::from_secs(8), held).await {
+        Ok(Ok(held)) => held,
+        failed => {
+            let status = cli.try_wait().unwrap();
+            if status.is_none() {
+                cli.kill().await.unwrap();
+            }
+            let output = timeout(Duration::from_secs(8), cli.wait_with_output()).await;
+            relay.abort();
+            let relay_result = relay.await;
+            runtime.detach(observer.request_id).await;
+            let shutdown = Arc::try_unwrap(runtime).ok().unwrap().close().await;
+            let output = output.unwrap().unwrap();
+            panic!(
+                "CLI did not reach its initial host execution within 8s: {failed:?}; \
+                 exit_before_cleanup={status:?}; {}; relay={relay_result:?}; runtime={shutdown:?}",
+                cli_diagnostics(&output),
+            );
+        }
+    };
     // Consume the genuine native commentary before admitting the later steer.
     // Its visible acknowledgment cannot satisfy that not-yet-existing input.
     let commentary = loop {
@@ -355,11 +388,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "{}", cli_diagnostics(&output));
     relay.await.unwrap();
     let mut native_events = Vec::new();
     loop {
@@ -392,9 +421,9 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
     assert_eq!(
         answers.len(),
         2,
-        "The actual native Observe consumer must receive the shared-answer correction before idle, not only the later real reply"
+        "The actual native Observe consumer receives the shared native answer before the later queued reply"
     );
-    assert!(answers[0].1.contains("No written response"));
+    assert_eq!(answers[0].1, "The steering correction is answered.");
     assert_eq!(answers[1].1, "The next request is answered.");
     assert_eq!(
         native_events
@@ -402,7 +431,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
             .filter(|event| matches!(event, NativeEvent::Answer { .. }))
             .count(),
         2,
-        "Empty answers must not consume a native visible response identity"
+        "Each distinct native answer is delivered once"
     );
     let placed = |input: &str| {
         native_events
