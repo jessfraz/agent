@@ -258,7 +258,7 @@ import UniformTypeIdentifiers
     #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700)
     #expect(
       try queue.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true)
-    #if os(iOS)
+    #if os(iOS) && !targetEnvironment(simulator)
       #expect(attributes[.protectionKey] as? FileProtectionType == .complete)
     #endif
     let partial = queue.appending(path: "\(UUID().uuidString).partial")
