@@ -566,12 +566,20 @@
         host.view.frame = CGRect(origin: .zero, size: dimensions)
         host.didMove(toParent: container)
         host.view.layoutIfNeeded()
-        // Native navigation/scroll layout and the disclosure's owned async lookup
-        // settle before capture. No live account, transport or saved address is used.
+        // Allow native navigation/scroll layout to settle. The latest viewport
+        // can virtualize the expanded detail rows; only the focused reasoning
+        // capture promises that those rows are mounted and request their data.
         try await Task.sleep(for: .milliseconds(100))
         host.view.layoutIfNeeded()
         if !expanded { #expect(fixture.requests.isEmpty) }
-        if expanded && !size.isAccessibilitySize { #expect(!fixture.requests.isEmpty) }
+        if focus == .reasoning && !size.isAccessibilitySize {
+          let deadline = ContinuousClock.now + .seconds(3)
+          while fixture.requests.isEmpty && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+            host.view.layoutIfNeeded()
+          }
+          #expect(!fixture.requests.isEmpty, "Expanded tool details must request their data")
+        }
         #expect(fixture.requests.isSubset(of: Set((0..<8).map { "command-\($0)" })))
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1

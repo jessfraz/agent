@@ -326,54 +326,71 @@ final class AgentUITests: XCTestCase {
 
   private func revealCompleteConnectionForm(_ app: XCUIApplication) throws {
     let window = app.windows.firstMatch
+    let form = app.collectionViews.firstMatch
     let status = app.cells.containing(.staticText, identifier: "Status").firstMatch
-    // Use the same text node the native audit inspects, not its containing
-    // cell. The guidance itself must be completely onscreen.
+    // Use the same text node the native audit inspects, not its containing cell.
     let guidance = app.staticTexts["Connect to the coordinator to receive updates."].firstMatch
+    XCTAssertTrue(form.exists, app.debugDescription)
     XCTAssertTrue(status.exists)
     XCTAssertTrue(status.isHittable, app.debugDescription)
     XCTAssertTrue(window.frame.contains(status.frame), "The first form row must be fully onscreen")
-    let hasGuidance = guidance.exists
-    let overflow = hasGuidance ? max(0, guidance.frame.maxY - window.frame.maxY) : 0
-    let distance = overflow > 0 ? max(44, overflow + 8) : 0
-    // An unmaterialized final row is wholly outside a short viewport. Retain
-    // top coverage there, but never audit known partially visible guidance.
-    if !hasGuidance {
+    capture("connection-top-accessibility", app: app)
+    // Preserve top coverage separately when the last row is unmaterialized.
+    // Never audit a known partially visible guidance node before revealing it.
+    if !guidance.exists {
       XCTAssertFalse(
         guidance.exists && window.frame.intersects(guidance.frame)
           && !window.frame.contains(guidance.frame),
         "Reveal partially visible guidance before its contrast audit")
-      capture("connection-top-accessibility", app: app)
       try audit(app)
     }
-    // Scrolling can collapse the large title. Use only post-scroll geometry.
-    if !hasGuidance {
-      let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75))
-      start.press(
-        forDuration: 0.05,
-        thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.2)),
-        withVelocity: .slow, thenHoldForDuration: 0.1)
-    } else if distance > 0 {
-      let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.65))
-      start.press(
-        forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -distance)),
-        withVelocity: .slow, thenHoldForDuration: 0.1)
+
+    func viewport() -> CGRect {
+      let visible = window.frame.intersection(form.frame)
+      let top = max(visible.minY, app.navigationBars["Connection"].frame.maxY)
+      return CGRect(
+        x: visible.minX, y: top, width: visible.width, height: max(0, visible.maxY - top))
     }
-    XCTAssertTrue(guidance.waitForExistence(timeout: 3), app.debugDescription)
-    let navigationBottom = app.navigationBars["Connection"].frame.maxY
-    if let partial = app.cells.allElementsBoundByIndex.first(where: {
-      $0.isHittable && $0.frame.minY < navigationBottom && $0.frame.maxY > navigationBottom
-    }) {
-      let adjustment = navigationBottom - partial.frame.minY
-      if guidance.frame.maxY + adjustment <= window.frame.maxY {
-        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4))
+
+    // A short form viewport with larger text can need several native scrolls.
+    // Re-query materialization, hittability and geometry after every gesture;
+    // neither a single window swipe nor the original title frame proves arrival.
+    for attempt in 0..<6 {
+      let visible = viewport()
+      XCTAssertFalse(visible.isEmpty, app.debugDescription)
+      let complete =
+        guidance.exists && guidance.isHittable && visible.contains(guidance.frame)
+      let partial = form.cells.allElementsBoundByIndex.first {
+        $0.isHittable && $0.frame.minY < visible.minY && $0.frame.maxY > visible.minY
+      }
+      if complete && partial == nil { break }
+      let state = XCTAttachment(string: form.debugDescription)
+      state.name = "connection-form-before-scroll-\(attempt)"
+      state.lifetime = .keepAlways
+      add(state)
+      if !complete {
+        // Target the real Form collection, not its window or the sheet chrome.
+        form.swipeUp(velocity: .slow)
+      } else if let partial {
+        let adjustment = visible.minY - partial.frame.minY
+        // Align the first partial row only if the complete guidance still fits.
+        // Otherwise scroll that row out, rather than cropping the guidance again.
+        let distance =
+          guidance.frame.maxY + adjustment <= visible.maxY
+          ? adjustment : visible.minY - partial.frame.maxY
+        let bounded = max(-visible.height / 2, min(distance, visible.height / 2))
+        let start = form.coordinate(withNormalizedOffset: .zero).withOffset(
+          CGVector(dx: visible.midX - form.frame.minX, dy: visible.midY - form.frame.minY))
         start.press(
-          forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: adjustment)),
+          forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: bounded)),
           withVelocity: .slow, thenHoldForDuration: 0.1)
       }
     }
+    XCTAssertTrue(guidance.waitForExistence(timeout: 3), app.debugDescription)
     XCTAssertTrue(guidance.isHittable, app.debugDescription)
     XCTAssertTrue(window.frame.contains(guidance.frame), "The last form row must be fully onscreen")
+    XCTAssertTrue(
+      viewport().contains(guidance.frame), "Guidance must clear the form and navigation")
     let complete = XCTAttachment(string: app.debugDescription)
     complete.name = "connection-guidance-before-audit-native-hierarchy"
     complete.lifetime = .keepAlways
