@@ -72,15 +72,14 @@ final class AgentUITests: XCTestCase {
 
   private func replace(_ field: XCUIElement, with text: String) {
     field.tap()
-    if field.identifier == "Message the coordinator", let value = field.value as? String,
-      !value.isEmpty, value != field.placeholderValue
+    // The default port equals its prompt, but is still real text to select.
+    if let value = field.value as? String, !value.isEmpty,
+      field.elementType == .textField || value != field.placeholderValue
     {
       field.press(forDuration: 1)
       let selectAll = XCUIApplication().menuItems["Select All"]
       XCTAssertTrue(selectAll.waitForExistence(timeout: 3), XCUIApplication().debugDescription)
       selectAll.tap()
-    } else {
-      field.typeKey("a", modifierFlags: .command)
     }
     field.typeText(text.isEmpty ? XCUIKeyboardKey.delete.rawValue : text)
     let value = field.value as? String
