@@ -312,8 +312,7 @@ final class AgentUITests: XCTestCase {
     // replace the disconnected guidance while this view is being audited.
     let app = launch(appearance: appearance, notificationsEnabled: false)
     defer { app.terminate() }
-    try revealCompleteConnectionForm(app)
-    try audit(app)
+    try auditCompleteConnectionForm(app)
     capture("connection-accessibility-\(appearance.rawValue)", app: app)
     if !app.buttons["dismissConnection"].exists {
       let window = app.windows.firstMatch
@@ -330,7 +329,7 @@ final class AgentUITests: XCTestCase {
     capture("main-accessibility-\(appearance.rawValue)", app: app)
   }
 
-  private func revealCompleteConnectionForm(_ app: XCUIApplication) throws {
+  private func auditCompleteConnectionForm(_ app: XCUIApplication) throws {
     let window = app.windows.firstMatch
     let form = app.collectionViews.firstMatch
     let status = app.cells.containing(.staticText, identifier: "Status").firstMatch
@@ -358,58 +357,92 @@ final class AgentUITests: XCTestCase {
         x: visible.minX, y: top, width: visible.width, height: max(0, visible.maxY - top))
     }
 
-    // A short form viewport with larger text can need several native scrolls.
-    // Re-query materialization, hittability and geometry after every gesture;
-    // neither a single window swipe nor the original title frame proves arrival.
-    for attempt in 0..<6 {
-      let visible = viewport()
-      XCTAssertFalse(visible.isEmpty, app.debugDescription)
-      let complete =
-        guidance.exists && guidance.isHittable && visible.contains(guidance.frame)
-      let partial = form.cells.allElementsBoundByIndex.first {
-        $0.isHittable && $0.frame.minY < visible.minY && $0.frame.maxY > visible.minY
-      }
-      if complete && partial == nil { break }
-      let state = XCTAttachment(string: form.debugDescription)
-      state.name = "connection-form-before-scroll-\(attempt)"
-      state.lifetime = .keepAlways
-      add(state)
-      if !complete {
-        // Target the real Form collection, not its window or the sheet chrome.
-        form.swipeUp(velocity: .slow)
-      } else if let partial {
-        let guidanceBeforeAlignment = guidance.frame
-        let adjustment = visible.minY - partial.frame.minY
-        // Align the first partial row only if the complete guidance still fits.
-        // Otherwise scroll that row out, rather than cropping the guidance again.
-        let distance =
-          guidance.frame.maxY + adjustment <= visible.maxY
-          ? adjustment : visible.minY - partial.frame.maxY
-        let bounded = max(-visible.height / 2, min(distance, visible.height / 2))
-        let start = form.coordinate(withNormalizedOffset: .zero).withOffset(
-          CGVector(dx: visible.midX - form.frame.minX, dy: visible.midY - form.frame.minY))
-        start.press(
-          forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: bounded)),
-          withVelocity: .slow, thenHoldForDuration: 0.1)
-        // A tiny alignment drag can leave a native Form unchanged. Do not repeat
-        // it once the actual viewport and fully visible guidance have not moved.
-        if viewport() == visible, guidance.exists, guidance.isHittable,
-          guidance.frame == guidanceBeforeAlignment
-        {
-          break
+    var scrollAttempts = 0
+    func revealGuidance() {
+      // A short form viewport with larger text can need several native scrolls.
+      // Re-query materialization, hittability and geometry after every gesture;
+      // neither a single window swipe nor the original title frame proves arrival.
+      for attempt in scrollAttempts..<6 {
+        let visible = viewport()
+        XCTAssertFalse(visible.isEmpty, app.debugDescription)
+        let complete =
+          guidance.exists && guidance.isHittable && visible.contains(guidance.frame)
+        let partial = form.cells.allElementsBoundByIndex.first {
+          $0.isHittable && $0.frame.minY < visible.minY && $0.frame.maxY > visible.minY
+        }
+        if complete && partial == nil { break }
+        scrollAttempts = attempt + 1
+        let state = XCTAttachment(string: form.debugDescription)
+        state.name = "connection-form-before-scroll-\(attempt)"
+        state.lifetime = .keepAlways
+        add(state)
+        if !complete {
+          // Target the real Form collection, not its window or the sheet chrome.
+          form.swipeUp(velocity: .slow)
+        } else if let partial {
+          let guidanceBeforeAlignment = guidance.frame
+          let adjustment = visible.minY - partial.frame.minY
+          // Align the first partial row only if the complete guidance still fits.
+          // Otherwise scroll that row out, rather than cropping the guidance again.
+          let distance =
+            guidance.frame.maxY + adjustment <= visible.maxY
+            ? adjustment : visible.minY - partial.frame.maxY
+          let bounded = max(-visible.height / 2, min(distance, visible.height / 2))
+          let start = form.coordinate(withNormalizedOffset: .zero).withOffset(
+            CGVector(dx: visible.midX - form.frame.minX, dy: visible.midY - form.frame.minY))
+          start.press(
+            forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: bounded)),
+            withVelocity: .slow, thenHoldForDuration: 0.1)
+          // A tiny alignment drag can leave a native Form unchanged. Do not repeat
+          // it once the actual viewport and fully visible guidance have not moved.
+          if viewport() == visible, guidance.exists, guidance.isHittable,
+            guidance.frame == guidanceBeforeAlignment
+          {
+            break
+          }
         }
       }
+      XCTAssertTrue(guidance.waitForExistence(timeout: 3), app.debugDescription)
+      XCTAssertTrue(guidance.isHittable, app.debugDescription)
+      XCTAssertTrue(
+        window.frame.contains(guidance.frame), "The last form row must be fully onscreen")
+      XCTAssertTrue(
+        viewport().contains(guidance.frame), "Guidance must clear the form and navigation")
     }
-    XCTAssertTrue(guidance.waitForExistence(timeout: 3), app.debugDescription)
-    XCTAssertTrue(guidance.isHittable, app.debugDescription)
-    XCTAssertTrue(window.frame.contains(guidance.frame), "The last form row must be fully onscreen")
-    XCTAssertTrue(
-      viewport().contains(guidance.frame), "Guidance must clear the form and navigation")
+
+    revealGuidance()
     let complete = XCTAttachment(string: app.debugDescription)
     complete.name = "connection-guidance-before-audit-native-hierarchy"
     complete.lifetime = .keepAlways
     add(complete)
     capture("connection-guidance-before-audit", app: app)
+
+    let guidanceBeforeGeometryAudit = guidance.frame
+    let viewportBeforeGeometryAudit = viewport()
+    // Finish the non-contrast checks before restoring the viewport for contrast.
+    // Native audits can scroll after arrival; also verify the viewport on return.
+    try audit(app, types: [.hitRegion, .sufficientElementDescription, .textClipped])
+    if !guidance.exists || !guidance.isHittable
+      || guidance.frame != guidanceBeforeGeometryAudit || viewport() != viewportBeforeGeometryAudit
+    {
+      revealGuidance()
+    }
+    let beforeContrast = XCTAttachment(string: app.debugDescription)
+    beforeContrast.name = "connection-guidance-before-contrast-native-hierarchy"
+    beforeContrast.lifetime = .keepAlways
+    add(beforeContrast)
+    capture("connection-guidance-before-contrast", app: app)
+    try audit(app, types: .contrast)
+    // Arrival alone does not prove the audit retained the complete text. Never
+    // accept a contrast pass that leaves this node clipped or unhittable.
+    XCTAssertTrue(guidance.exists && guidance.isHittable, app.debugDescription)
+    XCTAssertTrue(
+      window.frame.contains(guidance.frame), "Contrast must retain the complete guidance")
+    XCTAssertTrue(viewport().contains(guidance.frame), "Contrast must retain the guidance viewport")
+    let afterContrast = XCTAttachment(string: app.debugDescription)
+    afterContrast.name = "connection-guidance-after-contrast-native-hierarchy"
+    afterContrast.lifetime = .keepAlways
+    add(afterContrast)
   }
 
   func testConnectionHeaderContrastAtSmallText() throws {
