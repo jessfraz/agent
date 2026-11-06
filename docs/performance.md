@@ -23,8 +23,10 @@ The isolated environment exposes only Node on PATH, and provider requests are
 rejected. No model, credentials, network provider or Rex is involved. `/resume`
 opens saved history and `/exit` closes each sample; no model prompt is submitted.
 
-Seven measured pairs run per scenario. CI fails when the candidate's median
-exceeds both 125% of the baseline median and the baseline plus 20 milliseconds.
+Seven measured pairs run per scenario. Each candidate gets the greater of a
+25% or 20-millisecond allowance over its paired baseline. CI fails when the
+median fraction of that budget exceeds 1. Pairing prevents uneven runner
+stalls from turning separate medians into a false regression.
 There are no automatic retries or discarded slow samples. A missing conversation
 or failed CLI also fails the job. `performance/results.json` contains the raw
 samples and thresholds. A JSONL file retains completed samples if a later run
@@ -56,7 +58,9 @@ full-text retrieval with hydration, and vector-cache reuse have separate paired
 measurements. Seeding and inference stay outside the clock; each sample checks
 ranking, hydrated text and provenance against the other revision. Query samples
 contain eight lookups; cached-index samples contain four updates. The same
-median gate applies, with raw results in `performance/search.json` and JSONL.
+paired-budget gate applies. Both reports use schema 2 and retain the raw
+medians alongside the paired budget score. Native results are in
+`performance/search.json` and JSONL.
 
 Run that comparison after building both runtimes:
 
