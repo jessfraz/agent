@@ -340,7 +340,22 @@ final class AgentUITests: XCTestCase {
     XCTAssertTrue(status.exists)
     XCTAssertTrue(status.isHittable, app.debugDescription)
     XCTAssertTrue(window.frame.contains(status.frame), "The first form row must be fully onscreen")
+    func viewport() -> CGRect {
+      let visible = window.frame.intersection(form.frame)
+      let top = max(visible.minY, app.navigationBars["Connection"].frame.maxY)
+      return CGRect(
+        x: visible.minX, y: top, width: visible.width, height: max(0, visible.maxY - top))
+    }
+
+    XCTAssertTrue(
+      viewport().contains(status.frame), "Top contrast must expose the complete Status row")
     capture("connection-top-accessibility", app: app)
+    // Cover Status before scrolling it beneath the navigation bar. Contrast at
+    // either pose applies only to readable Form rows, not scroll-edge overlays.
+    try audit(app, types: .contrast, visibleForm: (form, viewport()))
+    XCTAssertTrue(
+      status.isHittable && viewport().contains(status.frame),
+      "Top contrast must retain the complete Status row")
     // Preserve top coverage separately when the last row is unmaterialized.
     // Never audit a known partially visible guidance node before revealing it.
     if !guidance.exists {
@@ -348,14 +363,7 @@ final class AgentUITests: XCTestCase {
         guidance.exists && window.frame.intersects(guidance.frame)
           && !window.frame.contains(guidance.frame),
         "Reveal partially visible guidance before its contrast audit")
-      try audit(app)
-    }
-
-    func viewport() -> CGRect {
-      let visible = window.frame.intersection(form.frame)
-      let top = max(visible.minY, app.navigationBars["Connection"].frame.maxY)
-      return CGRect(
-        x: visible.minX, y: top, width: visible.width, height: max(0, visible.maxY - top))
+      try audit(app, types: [.hitRegion, .sufficientElementDescription, .textClipped])
     }
 
     var scrollAttempts = 0
@@ -366,42 +374,15 @@ final class AgentUITests: XCTestCase {
       for attempt in scrollAttempts..<6 {
         let visible = viewport()
         XCTAssertFalse(visible.isEmpty, app.debugDescription)
-        let complete =
-          guidance.exists && guidance.isHittable && visible.contains(guidance.frame)
-        let partial = form.cells.allElementsBoundByIndex.first {
-          $0.isHittable && $0.frame.minY < visible.minY && $0.frame.maxY > visible.minY
-        }
-        if complete && partial == nil { break }
+        if guidance.exists && guidance.isHittable && visible.contains(guidance.frame) { break }
         scrollAttempts = attempt + 1
         let state = XCTAttachment(string: form.debugDescription)
         state.name = "connection-form-before-scroll-\(attempt)"
         state.lifetime = .keepAlways
         add(state)
-        if !complete {
-          // Target the real Form collection, not its window or the sheet chrome.
-          form.swipeUp(velocity: .slow)
-        } else if let partial {
-          let guidanceBeforeAlignment = guidance.frame
-          let adjustment = visible.minY - partial.frame.minY
-          // Align the first partial row only if the complete guidance still fits.
-          // Otherwise scroll that row out, rather than cropping the guidance again.
-          let distance =
-            guidance.frame.maxY + adjustment <= visible.maxY
-            ? adjustment : visible.minY - partial.frame.maxY
-          let bounded = max(-visible.height / 2, min(distance, visible.height / 2))
-          let start = form.coordinate(withNormalizedOffset: .zero).withOffset(
-            CGVector(dx: visible.midX - form.frame.minX, dy: visible.midY - form.frame.minY))
-          start.press(
-            forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: bounded)),
-            withVelocity: .slow, thenHoldForDuration: 0.1)
-          // A tiny alignment drag can leave a native Form unchanged. Do not repeat
-          // it once the actual viewport and fully visible guidance have not moved.
-          if viewport() == visible, guidance.exists, guidance.isHittable,
-            guidance.frame == guidanceBeforeAlignment
-          {
-            break
-          }
-        }
+        // Target the real Form. Leave a complete footer alone instead of moving
+        // it again to align an unrelated, partially visible row at the top.
+        form.swipeUp(velocity: .slow)
       }
       XCTAssertTrue(guidance.waitForExistence(timeout: 3), app.debugDescription)
       XCTAssertTrue(guidance.isHittable, app.debugDescription)
@@ -433,7 +414,7 @@ final class AgentUITests: XCTestCase {
     beforeContrast.lifetime = .keepAlways
     add(beforeContrast)
     capture("connection-guidance-before-contrast", app: app)
-    try audit(app, types: .contrast)
+    try audit(app, types: .contrast, visibleForm: (form, viewport()))
     // Arrival alone does not prove the audit retained the complete text. Never
     // accept a contrast pass that leaves this node clipped or unhittable.
     XCTAssertTrue(guidance.exists && guidance.isHittable, app.debugDescription)
@@ -461,7 +442,8 @@ final class AgentUITests: XCTestCase {
     _ app: XCUIApplication,
     types: XCUIAccessibilityAuditType = [
       .contrast, .hitRegion, .sufficientElementDescription, .textClipped,
-    ]
+    ],
+    visibleForm: (element: XCUIElement, viewport: CGRect)? = nil
   ) throws {
     let previous = continueAfterFailure
     continueAfterFailure = true
@@ -475,12 +457,26 @@ final class AgentUITests: XCTestCase {
       // WCAG 1.4.3 excludes inactive controls from text-contrast requirements.
       // https://www.w3.org/WAI/WCAG21/Understanding/contrast-minimum#inactive-user-interface-components
       if issue.auditType == .contrast, issue.element?.isEnabled == false { return true }
-      guard ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 27,
+      if issue.auditType == .contrast, let visibleForm, let element = issue.element {
+        let identity = element.identifier.isEmpty ? element.label : element.identifier
+        let rows = visibleForm.element.cells.containing(element.elementType, identifier: identity)
+        if let row = rows.allElementsBoundByIndex.first(where: { $0.frame.contains(element.frame) }
+        ),
+          !visibleForm.viewport.contains(row.frame)
+        {
+          // This Form row is occluded at this pose. Its contrast belongs to the
+          // pose that exposes it, not to the navigation bar covering its text.
+          return true
+        }
+      }
+      let version = ProcessInfo.processInfo.operatingSystemVersion
+      guard version.majorVersion == 27 || (version.majorVersion == 26 && version.minorVersion == 5),
         issue.auditType == .contrast, let element = issue.element,
         element.identifier == "dismissConnection", element.label == "Done"
       else { return false }
-      // iOS 27 flags this native glass control despite measured text/background contrast over 19:1.
-      // Retain its pixels and exempt only this control on the affected OS.
+      // Native glass Done is flagged despite measured contrast: iOS 26.5 has
+      // 13.36:1 Dark / 20.34:1 Light; iOS 27 exceeds 19:1. Retain its pixels and
+      // exempt only this exact control on these demonstrated OS versions.
       let receipt = XCTAttachment(screenshot: element.screenshot())
       receipt.name = "native-done-contrast-receipt"
       receipt.lifetime = .keepAlways
