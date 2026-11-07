@@ -17,7 +17,7 @@ Configure one release workflow:
 | Scheme | `Agent` |
 | Start condition | Branch Changes, exact branch `main`, any file in `/ios` |
 | Superseded builds | Auto-cancel enabled |
-| Environment | Xcode 27.1 (27A9275), latest released macOS |
+| Environment | Xcode 27.1 (27A9275), macOS 27.0.1 (26A434) |
 | Test action | iOS, `Agent`, Use Scheme Settings, **Required To Pass** |
 | Test destination | A supported iPhone simulator |
 | Archive action | iOS, `Agent`, **TestFlight (Internal Testing Only)** |
@@ -34,9 +34,9 @@ The `/ios` filter includes the app, generated native contracts, package tests
 and release scripts. CLI-only and runtime-only changes do not create a signed
 iOS build. Manual starts from `main` remain available.
 
-Keep Xcode pinned to the qualified version. Xcode 27.2's native contrast audit
-stalled before returning on the compact Cloud simulator; its cause remains
-unverified. Qualify both appearance audits before advancing the pin.
+Pin Xcode and host macOS together. Qualify both appearance audits on Cloud
+before advancing either version. The top form, revealed footer and empty main
+view each use a fresh app launch; the 180-second budget covers the whole case.
 
 Keep GitHub's native and shared-protocol checks enabled for pull requests and
 `main`. Xcode Cloud provides the signed delivery step and its own required

@@ -9,10 +9,11 @@ final class AgentUITests: XCTestCase {
   }
 
   private func launch(
-    appearance: Appearance? = nil, smallText: Bool = false, notificationsEnabled: Bool? = nil
+    appearance: Appearance? = nil, smallText: Bool = false, notificationsEnabled: Bool? = nil,
+    allowance: TimeInterval = 60
   ) -> XCUIApplication {
     continueAfterFailure = false
-    executionTimeAllowance = 60
+    executionTimeAllowance = allowance
     let app = XCUIApplication()
     if let notificationsEnabled {
       // This is the existing user preference, not a test-only app interface.
@@ -309,11 +310,15 @@ final class AgentUITests: XCTestCase {
     // An unsigned, offline simulator cannot enroll with APNs. Keep its
     // notification preference off so an asynchronous enrollment failure cannot
     // replace the disconnected guidance while this view is being audited.
-    let app = launch(appearance: appearance, notificationsEnabled: false)
-    executionTimeAllowance = 180
+    for pose in ConnectionAuditPose.allCases {
+      let app = launch(appearance: appearance, notificationsEnabled: false, allowance: 180)
+      defer { app.terminate() }
+      try auditConnectionForm(app, pose: pose)
+    }
+    // Each contrast audit starts from a fresh foreground app. Native audits
+    // mutate scroll state; one viewport must not inherit another audit's state.
+    let app = launch(appearance: appearance, notificationsEnabled: false, allowance: 180)
     defer { app.terminate() }
-    try auditCompleteConnectionForm(app)
-    capture("connection-accessibility-\(appearance.rawValue)", app: app)
     if !app.buttons["dismissConnection"].exists {
       let window = app.windows.firstMatch
       let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
@@ -329,7 +334,12 @@ final class AgentUITests: XCTestCase {
     capture("main-accessibility-\(appearance.rawValue)", app: app)
   }
 
-  private func auditCompleteConnectionForm(_ app: XCUIApplication) throws {
+  private enum ConnectionAuditPose: CaseIterable, Equatable {
+    case top
+    case guidance
+  }
+
+  private func auditConnectionForm(_ app: XCUIApplication, pose: ConnectionAuditPose) throws {
     let window = app.windows.firstMatch
     let form = app.collectionViews.firstMatch
     let status = app.cells.containing(.staticText, identifier: "Status").firstMatch
@@ -346,68 +356,38 @@ final class AgentUITests: XCTestCase {
         x: visible.minX, y: top, width: visible.width, height: max(0, visible.maxY - top))
     }
 
-    XCTAssertTrue(
-      viewport().contains(status.frame), "Top contrast must expose the complete Status row")
-    capture("connection-top-accessibility", app: app)
-    // Cover Status before scrolling it beneath the navigation bar. Contrast at
-    // either pose applies only to readable Form rows, not scroll-edge overlays.
-    try audit(app, types: .contrast, visibleForm: (form, viewport()))
-    XCTAssertTrue(
-      status.isHittable && viewport().contains(status.frame),
-      "Top contrast must retain the complete Status row")
-    // Preserve top coverage separately when the last row is unmaterialized.
-    // Never audit a known partially visible guidance node before revealing it.
-    if !guidance.exists {
-      XCTAssertFalse(
-        guidance.exists && window.frame.intersects(guidance.frame)
-          && !window.frame.contains(guidance.frame),
-        "Reveal partially visible guidance before its contrast audit")
-      try audit(app, types: [.hitRegion, .sufficientElementDescription, .textClipped])
-    }
-
-    var scrollAttempts = 0
-    func revealGuidance() {
-      // A short form viewport with larger text can need several native scrolls.
-      // Re-query materialization, hittability and geometry after every gesture;
-      // neither a single window swipe nor the original title frame proves arrival.
-      for attempt in scrollAttempts..<6 {
-        let visible = viewport()
-        XCTAssertFalse(visible.isEmpty, app.debugDescription)
-        if guidance.exists && guidance.isHittable && visible.contains(guidance.frame) { break }
-        scrollAttempts = attempt + 1
-        let state = XCTAttachment(string: form.debugDescription)
-        state.name = "connection-form-before-scroll-\(attempt)"
-        state.lifetime = .keepAlways
-        add(state)
-        // Target the real Form. Leave a complete footer alone instead of moving
-        // it again to align an unrelated, partially visible row at the top.
-        form.swipeUp(velocity: .slow)
+    if pose == .top {
+      XCTAssertTrue(
+        viewport().contains(status.frame), "Top contrast must expose the complete Status row")
+      capture("connection-top-accessibility", app: app)
+      // Contrast applies to readable Form rows, not scroll-edge overlays.
+      try audit(app, types: .contrast, visibleForm: (form, viewport()))
+      XCTAssertTrue(
+        status.isHittable && viewport().contains(status.frame),
+        "Top contrast must retain the complete Status row")
+      if !guidance.exists {
+        try audit(app, types: [.hitRegion, .sufficientElementDescription, .textClipped])
       }
-      XCTAssertTrue(guidance.waitForExistence(timeout: 3), app.debugDescription)
-      XCTAssertTrue(guidance.isHittable, app.debugDescription)
-      XCTAssertTrue(
-        window.frame.contains(guidance.frame), "The last form row must be fully onscreen")
-      XCTAssertTrue(
-        viewport().contains(guidance.frame), "Guidance must clear the form and navigation")
+      return
     }
 
-    revealGuidance()
-    let complete = XCTAttachment(string: app.debugDescription)
-    complete.name = "connection-guidance-before-audit-native-hierarchy"
-    complete.lifetime = .keepAlways
-    add(complete)
-    capture("connection-guidance-before-audit", app: app)
-
-    let guidanceBeforeGeometryAudit = guidance.frame
-    let viewportBeforeGeometryAudit = viewport()
-    // Finish the non-contrast checks before restoring the viewport for contrast.
-    // Native audits can scroll after arrival; also verify the viewport on return.
-    try audit(app, types: [.hitRegion, .sufficientElementDescription, .textClipped])
-    if !guidance.exists || !guidance.isHittable
-      || guidance.frame != guidanceBeforeGeometryAudit || viewport() != viewportBeforeGeometryAudit
-    {
-      revealGuidance()
+    // Re-query the real Form after each native gesture. Stop as soon as the
+    // complete footer is visible, including on compact or larger-text layouts.
+    for attempt in 0..<6 {
+      let visible = viewport()
+      XCTAssertFalse(visible.isEmpty, app.debugDescription)
+      if guidance.exists && guidance.isHittable && visible.contains(guidance.frame) { break }
+      let state = XCTAttachment(string: form.debugDescription)
+      state.name = "connection-form-before-scroll-\(attempt)"
+      state.lifetime = .keepAlways
+      add(state)
+      form.swipeUp(velocity: .slow)
     }
+    XCTAssertTrue(guidance.waitForExistence(timeout: 3), app.debugDescription)
+    XCTAssertTrue(guidance.isHittable, app.debugDescription)
+    XCTAssertTrue(window.frame.contains(guidance.frame), "The last form row must be fully onscreen")
+    XCTAssertTrue(
+      viewport().contains(guidance.frame), "Guidance must clear the form and navigation")
     let beforeContrast = XCTAttachment(string: app.debugDescription)
     beforeContrast.name = "connection-guidance-before-contrast-native-hierarchy"
     beforeContrast.lifetime = .keepAlways
@@ -424,6 +404,9 @@ final class AgentUITests: XCTestCase {
     afterContrast.name = "connection-guidance-after-contrast-native-hierarchy"
     afterContrast.lifetime = .keepAlways
     add(afterContrast)
+    // Keep every geometry check, after contrast so its scrolling cannot change
+    // the pose used for the footer's contrast result.
+    try audit(app, types: [.hitRegion, .sufficientElementDescription, .textClipped])
   }
 
   func testConnectionHeaderContrastAtSmallText() throws {

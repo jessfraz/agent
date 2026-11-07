@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        phase: [host, simulator]
+        phase: [host, simulator-core, simulator-performance, simulator-ui]
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Check Swift and iOS

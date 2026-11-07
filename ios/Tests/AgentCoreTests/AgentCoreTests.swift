@@ -220,9 +220,31 @@ func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: Unava
       to: .unix(path: directory.appending(path: "missing.sock").path), using: .tcp)
     expectedFailure = .posix(.ENOENT)
   }
+  let failures = AsyncStream<NWError>.makeStream(bufferingPolicy: .bufferingNewest(1))
+  socket.stateUpdateHandler = { state in
+    switch state {
+    case .waiting(let error), .failed(let error): failures.continuation.yield(error)
+    default: break
+    }
+  }
+  defer { failures.continuation.finish() }
   let client = LineConnection(connection: socket)
   defer { socket.cancel() }
-  let sending = Task { try await client.send(.observe(.init(inputIds: []))) }
+  let sending = Task {
+    defer { failures.continuation.finish() }
+    do {
+      try await client.send(.observe(.init(inputIds: [])))
+    } catch {
+      // A send may fail before the optional state observer receives the error.
+      if let failure = error as? NWError { failures.continuation.yield(failure) }
+      throw error
+    }
+  }
+  defer { sending.cancel() }
+  // Bound release after either Network.framework or the send reports refusal;
+  // OS path establishment is outside that response-time contract.
+  let original = try #require(await failures.stream.first(where: { _ in true }))
+  #expect(original == expectedFailure)
   do {
     try await withThrowingTaskGroup(of: Void.self) { group in
       group.addTask { try await sending.value }
@@ -240,7 +262,7 @@ func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: Unava
   } catch {
     #expect(!(error is ConnectionError), "Refusal must release the send before its timeout")
     #expect(
-      error as? NWError == expectedFailure, "The owner must classify the original network failure")
+      error as? NWError == original, "The owner must classify the original network failure")
     #expect(ConnectionError.shouldReconnect(after: error))
   }
   await client.close()
