@@ -9,11 +9,12 @@ final class AgentUITests: XCTestCase {
   }
 
   private func launch(
-    appearance: Appearance? = nil, smallText: Bool = false, notificationsEnabled: Bool? = nil,
-    allowance: TimeInterval = 60
+    appearance: Appearance? = nil, smallText: Bool = false, notificationsEnabled: Bool? = nil
   ) -> XCUIApplication {
     continueAfterFailure = false
-    executionTimeAllowance = allowance
+    // Native launch and accessibility work share the standard XCTest hang ceiling.
+    // Product latency has separate performance tests.
+    executionTimeAllowance = 600
     let app = XCUIApplication()
     if let notificationsEnabled {
       // This is the existing user preference, not a test-only app interface.
@@ -169,7 +170,6 @@ final class AgentUITests: XCTestCase {
     let previous = XCUIDevice.shared.appearance
     defer { XCUIDevice.shared.appearance = previous }
     let app = launch(appearance: .dark)
-    executionTimeAllowance = 120
     chooseAppearance("Light", app: app)
     app.buttons["Done"].tap()
     assertBackground(.light, app: app)
@@ -203,7 +203,6 @@ final class AgentUITests: XCTestCase {
     let previous = XCUIDevice.shared.appearance
     defer { XCUIDevice.shared.appearance = previous }
     let app = launch(appearance: .dark)
-    executionTimeAllowance = 120
     defer { app.terminate() }
     chooseAppearance("Light", app: app)
     app.buttons["Done"].tap()
@@ -311,13 +310,13 @@ final class AgentUITests: XCTestCase {
     // notification preference off so an asynchronous enrollment failure cannot
     // replace the disconnected guidance while this view is being audited.
     for pose in ConnectionAuditPose.allCases {
-      let app = launch(appearance: appearance, notificationsEnabled: false, allowance: 180)
+      let app = launch(appearance: appearance, notificationsEnabled: false)
       defer { app.terminate() }
       try auditConnectionForm(app, pose: pose)
     }
     // Each contrast audit starts from a fresh foreground app. Native audits
     // mutate scroll state; one viewport must not inherit another audit's state.
-    let app = launch(appearance: appearance, notificationsEnabled: false, allowance: 180)
+    let app = launch(appearance: appearance, notificationsEnabled: false)
     defer { app.terminate() }
     if !app.buttons["dismissConnection"].exists {
       let window = app.windows.firstMatch

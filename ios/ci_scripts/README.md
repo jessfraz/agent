@@ -36,7 +36,9 @@ iOS build. Manual starts from `main` remain available.
 
 Pin Xcode and host macOS together. Qualify both appearance audits on Cloud
 before advancing either version. The top form, revealed footer and empty main
-view each use a fresh app launch; the 180-second budget covers the whole case.
+view each use a fresh app launch. UI cases use the standard XCTest hang guard
+of 600 seconds for the whole case; product latency has separate performance
+tests.
 
 Keep GitHub's native and shared-protocol checks enabled for pull requests and
 `main`. Xcode Cloud provides the signed delivery step and its own required
