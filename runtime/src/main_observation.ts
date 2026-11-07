@@ -5,6 +5,7 @@ import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import { isUserNotice, MainResponses, visibleTranscript } from "./transcript.js";
 import { mainResponse } from "./main_response.js";
 import { observeTranscriptVisibility } from "./transcript_visibility.js";
+import { inputReceipts } from "./input_delivery.js";
 
 type BlockedMainWork = Extract<InputWorkState, { type: "blocked" }> & { recovery: "message" | "inspect_outcome" | "update_runtime" };
 export type MainWorkState = { type: "idle" } | { type: "running" } | BlockedMainWork;
@@ -38,18 +39,13 @@ export async function inspectMainWork(session: Harness, root: Conversation): Pro
 export async function reconcileMainInput(root: Conversation, input_id: string, session: Harness, snapshot?: MainWorkState): Promise<RuntimeEventKind[] | undefined> {
   const saved = await root.commit((tx) => tx.submissionByRequest(root.id, input_id), BACKGROUND_CONTEXT);
   if (saved === undefined) return undefined;
-  if (saved.status === "unanswered" && saved.entry === undefined) return [{ type: "input_rejected", input_id,
-    message: "This saved input was stopped without an answer. Restore its text to send a new message." }];
-  let work: InputWorkState;
-  if (saved.status === "done" && saved.type === "input") work = { type: "completed", answer_entry_id: saved.answer.toString() };
-  else if (saved.status === "unanswered" || saved.status === "done") work = { type: "stopped" };
-  else {
+  let work: InputWorkState | undefined;
+  if (saved.status === "queued" || saved.status === "placed") {
     const current = snapshot ?? await inspectMainWork(session, root);
     work = current.type === "blocked" ? { type: "blocked", reason: current.reason }
       : { type: saved.status === "queued" ? "queued" : "running" };
   }
-  const events: RuntimeEventKind[] = [{ type: "input_accepted", input_id, work }, ...(saved.entry === undefined ? []
-    : [{ type: "input_placed", input_id, entry_id: saved.entry.toString() } satisfies RuntimeEventKind])];
+  const events = inputReceipts(saved, input_id, work);
   if (root.id === ROOT_CONVERSATION_ID && saved.type === "input" && saved.status === "done" && saved.entry !== undefined) {
     const response = await mainResponse(session, root, saved.entry, saved.answer);
     if (response.text.trim() && await session.snapshot(MainResponses, root.id, saved.answer.toString(), BACKGROUND_CONTEXT) !== undefined) {

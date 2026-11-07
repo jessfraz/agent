@@ -181,6 +181,10 @@ opens the retained reasoning and tool details; progress commentary stays prose.
 Enter steers, Tab queues a separate turn, and Esc stops the current Pi turn and
 drains owned host operations. Tool results remain recorded; stopping cannot
 undo an external effect that already completed.
+Pi submission commits publish terminal input receipts to connected observers,
+including inputs admitted after attachment and recovered runs without a
+transport owner. Live delivery and reconnect use the same receipt projection;
+stopped, unplaced inputs return as unsent drafts instead of waiting forever.
 
 Main and resumed views detach from coordinator-owned execution. Direct
 `RunTask` processes still own their host effects; transferring that execution

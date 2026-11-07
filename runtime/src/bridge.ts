@@ -31,7 +31,7 @@ import type { SearchMode } from "./generated/SearchMode.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { conversationSettings } from "./settings.js";
 import { createInputOrigins } from "./input_origin.js";
-import { watchInputPlacements } from "./input_delivery.js";
+import { watchInputDelivery } from "./input_delivery.js";
 import { inspectMainWork, reconcileMainInput, recoverMainGeneration, watchMainNotices } from "./main_observation.js";
 import { createMainResponsePolicy, MAIN_RESPONSE_INSTRUCTIONS, mainResponse } from "./main_response.js";
 import { BackgroundScheduler } from "./background.js";
@@ -106,7 +106,7 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
   return hostRequests.call(backgroundOwner, command);
 }
 
-type Application = TriageApplication & { stopPlacements(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore; notifications: Notifications;
+type Application = TriageApplication & { stopInputDelivery(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore; notifications: Notifications;
   histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler;
   telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics };
 async function openApplication(): Promise<Application> {
@@ -155,12 +155,20 @@ async function openApplication(): Promise<Application> {
   registry.install(resourceTools.main);
   registry.install(resourceTools.worker);
   registry.install(browserTools);
-  const stopPlacements = watchInputPlacements(harness, (conversationId, input_id, entry_id) => {
+  const stopInputDelivery = watchInputDelivery(harness, (conversationId, event) => {
+    let mirroredToMain = false;
     for (const [id, conversation] of activeConversations) {
-      if (conversation.id.toString() === conversationId && !ending.has(id)) emit(id, { type: "input_placed", input_id, entry_id });
+      if (conversation.id.toString() !== conversationId || ending.has(id)) continue;
+      emit(id, event);
+      mirroredToMain ||= mainTurns.has(id);
+    }
+    // A recovered generation can outlive its transport owner. Native main
+    // observers still need its terminal receipts, exactly once per commit.
+    if (conversationId === ROOT_CONVERSATION_ID.toString() && !mirroredToMain) {
+      for (const [id, observer] of mainObservers) queueMainObserver(id, observer, event);
     }
   });
-  const core = { stopPlacements, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, attachments, feedback, repairs, notifications, telemetry };
+  const core = { stopInputDelivery, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, attachments, feedback, repairs, notifications, telemetry };
   const background = new BackgroundScheduler(harness, registry, tasks, {
     async plan(cadence, after, now) {
       const result = await backgroundCall({ type: "background", request: { type: "plan", cadence, after, now } });
@@ -646,7 +654,6 @@ async function handle(request: RuntimeRequest): Promise<void> {
           configured,
           answer(conversation_id, text, entry_id) { emit(id, { type: "answer", conversation_id, text, ...(entry_id === undefined ? {} : { entry_id }) }); },
           idle() { emit(id, { type: "worker_idle" }); },
-          rejected(input_id, message) { emit(id, { type: "input_rejected", input_id, message }); },
         });
         if (worker === undefined) emit(id, { type: "answer", ...answer });
         } finally { await stop?.(); }
@@ -806,7 +813,8 @@ async function handle(request: RuntimeRequest): Promise<void> {
               next += 1;
               const settled = await input.submission.wait(BACKGROUND_CONTEXT);
               if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted") {
-                if (input.input_id !== undefined) for (const event of await reconcileMainInput(root, input.input_id, harness) ?? []) emit(id, event);
+                // The native settlement commit already published its terminal
+                // receipt to this owner and every connected observer.
                 continue;
               }
               if (settled.type !== "input" || settled.status !== "done") throw new TaskError(await modelFailureMessage(root, "The model turn did not complete; its state is retained"));
@@ -818,9 +826,6 @@ async function handle(request: RuntimeRequest): Promise<void> {
           } catch (error) {
             if (turn !== undefined) {
               turn.accepting = false; await root.abort(BACKGROUND_CONTEXT);
-              for (const input of turn.inputs) if (input.input_id !== undefined && (await input.submission.status(BACKGROUND_CONTEXT)).status === "unanswered") {
-                for (const event of await reconcileMainInput(root, input.input_id, harness) ?? []) emit(id, event);
-              }
             }
             throw error;
           } finally {
@@ -937,7 +942,7 @@ try {
   if (application !== undefined) {
     const opened = await application.catch(() => undefined);
     if (opened !== undefined) {
-      opened.notifications.close(); opened.stopPlacements();
+      opened.notifications.close(); opened.stopInputDelivery();
       try { await opened.retrieval.close(); await opened.harness.close(BACKGROUND_CONTEXT); }
       finally { await opened.telemetry.close(); }
     }
