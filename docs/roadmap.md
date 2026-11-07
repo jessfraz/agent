@@ -12,8 +12,10 @@ recovery; [history](history.md) describes import and retrieval.
   query while background work runs.
 - [x] Verify a real incoming supplier version reaches its original imported
   task conversation and completes the existing worker's native submission.
-- [ ] Verify chat admission, steering, interruption, reopening and scrolling
-  against a large live corpus while background work runs.
+- [x] Verify chat admission, steering, interruption, reopening and scrolling
+  against a large live corpus while background work runs. Live checks passed
+  with over a million retained entries, including pending-input recovery after
+  stop and bounded main-history reopen.
 - [x] Recover main-chat admission after coordinator restart, preserving steer
   and queue modes. Independent workers and control requests remain responsive
   while another worker's host effect is held. Ready observers and workers do
@@ -47,7 +49,9 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Verify autonomous handoff under the revised source instructions, including
   existing tasks with stale restrictions, without manual continuation.
   A fresh shipping notice resumed the existing task and its source investigation.
-- [ ] Verify chat reuse and native worktree inventory display live.
+- [x] Verify chat reuse and native worktree inventory display live. Reopening
+  retained the task, conversation and allocation; `/worktrees` displayed real
+  inventory with ready, held and removed states.
 - [ ] Release the qualified native copy, selection, clipboard-image and input
   updates through protected CI and a matching coordinator deployment. Verify
   the signed TestFlight build's source; local simulator checks alone do not
