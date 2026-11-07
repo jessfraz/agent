@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     protocol::SourceRef,
@@ -155,16 +156,28 @@ impl SlackSource {
                 } else {
                     &message.channel.name
                 };
+                let title = format!("Slack: {channel}");
+                let legacy_version = message.edited.map_or(message.ts, |edited| edited.ts);
+                // Search can return edited text without an edited timestamp.
+                // Version the normalized immutable content, excluding cursors
+                // and other polling metadata.
+                let mut digest = Sha256::new();
+                for part in [&thread_id, &title, &message.text] {
+                    digest.update((part.len() as u64).to_be_bytes());
+                    digest.update(part.as_bytes());
+                }
+                let version = hex::encode(digest.finalize());
                 Some(SourceEvent {
                     occurred_at: None,
                     id,
-                    version: message.edited.map_or(message.ts, |edited| edited.ts),
+                    version,
+                    legacy_version: Some(legacy_version),
                     source: SourceRef {
                         provider: key.provider.clone(),
                         account: key.account.clone(),
                         thread_id,
                     },
-                    title: format!("Slack: {channel}"),
+                    title,
                     text: message.text,
                 })
             })
@@ -318,6 +331,75 @@ mod tests {
                 .window(batch.checkpoint.as_ref(), 1_700_000_000)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn text_edits_without_edit_metadata_receive_distinct_stable_versions() {
+        let source = source();
+        let original = source.normalize(
+            output(RESPONSE),
+            source.window(None, 1_700_000_000).unwrap(),
+        );
+        let changed = RESPONSE.replace("Review the board", "Review the board.");
+        let updated = source.normalize(
+            output(&changed),
+            source.window(None, 1_700_000_000).unwrap(),
+        );
+        assert_eq!(original.events[0].id, updated.events[0].id);
+        assert_eq!(
+            original.events[0].source.thread_id,
+            updated.events[0].source.thread_id
+        );
+        assert_ne!(
+            original.events[0].version, updated.events[0].version,
+            "Search text can change without an edited timestamp"
+        );
+        let repeated = source.normalize(
+            output(&changed),
+            source.window(None, 1_700_000_000).unwrap(),
+        );
+        assert_eq!(updated.events[0].version, repeated.events[0].version);
+    }
+
+    #[test]
+    fn content_versions_cover_normalized_fields_and_keep_exact_legacy_identity() {
+        let source = source();
+        let original = source.normalize(
+            output(RESPONSE),
+            source.window(None, 1_700_000_000).unwrap(),
+        );
+        assert_eq!(
+            original.events[0].legacy_version.as_deref(),
+            Some("1700000000.000001")
+        );
+        let later_poll = source.normalize(
+            output(RESPONSE),
+            source.window(None, 1_710_000_000).unwrap(),
+        );
+        assert_eq!(original.events[0].version, later_poll.events[0].version);
+        for changed in [
+            RESPONSE.replace("engineering", "another-channel-name"),
+            RESPONSE.replace("1699999999.000002", "1699999999.000003"),
+        ] {
+            let updated = source.normalize(
+                output(&changed),
+                source.window(None, 1_700_000_000).unwrap(),
+            );
+            assert_ne!(original.events[0].version, updated.events[0].version);
+        }
+        let response = RESPONSE.replace(
+            "\"text\":",
+            "\"edited\":{\"ts\":\"1700000001.000001\"},\"text\":",
+        );
+        let edited = source.normalize(
+            output(&response),
+            source.window(None, 1_700_000_000).unwrap(),
+        );
+        assert_eq!(
+            edited.events[0].legacy_version.as_deref(),
+            Some("1700000001.000001")
+        );
+        assert_eq!(original.events[0].version, edited.events[0].version);
     }
 
     #[test]

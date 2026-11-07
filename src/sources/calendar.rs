@@ -412,6 +412,7 @@ impl CalendarSource {
                         occurred_at: None,
                         id: id.clone(),
                         version,
+                        legacy_version: None,
                         source: SourceRef {
                             provider: self.key().provider,
                             account: self.namespace.clone(),

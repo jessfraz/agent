@@ -205,6 +205,7 @@ impl GoogleSource {
                 Some(SourceEvent {
                     id: message.gmail_message_id.clone(),
                     version: message.gmail_message_id,
+                    legacy_version: None,
                     source: SourceRef {
                         provider: key.provider.clone(),
                         account: key.account.clone(),

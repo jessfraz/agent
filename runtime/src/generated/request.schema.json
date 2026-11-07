@@ -4053,6 +4053,13 @@
         "id": {
           "type": "string"
         },
+        "legacy_version": {
+          "description": "An earlier producer identity that may deduplicate identical normalized\ncontent. The consumer must retain the earlier original and its decision.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "occurred_at": {
           "description": "Provider message time in Unix milliseconds. Missing times retain admission order.",
           "type": [

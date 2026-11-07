@@ -222,6 +222,7 @@ impl GitHubSource {
                     occurred_at: None,
                     id: notification.id.clone(),
                     version,
+                    legacy_version: None,
                     source: SourceRef {
                         provider: key.provider.clone(),
                         account: key.account.clone(),

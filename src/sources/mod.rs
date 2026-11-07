@@ -40,6 +40,11 @@ pub struct SourceCheckpoint {
 pub struct SourceEvent {
     pub id: String,
     pub version: String,
+    /// An earlier producer identity that may deduplicate identical normalized
+    /// content. The consumer must retain the earlier original and its decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "string")]
+    pub legacy_version: Option<String>,
     pub source: SourceRef,
     pub title: String,
     pub text: String,
