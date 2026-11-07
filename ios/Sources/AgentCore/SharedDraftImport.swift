@@ -115,11 +115,19 @@ public enum SharedDraftImport {
           }
           let text: String?
           if data.starts(with: Data("bplist00".utf8)) {
-            // Foundation's cross-process provider bridge may archive its
-            // string/URL. Decode only those classes, never arbitrary objects.
-            let value = try NSKeyedUnarchiver.unarchivedObject(
-              ofClasses: [NSString.self, NSURL.self], from: data)
-            text = (value as? String) ?? (value as? URL)?.absoluteString
+            if UTType(type)?.conforms(to: .url) == true,
+              try PropertyListSerialization.propertyList(from: data, format: nil) is NSArray
+            {
+              // NSURL owns its provider array format, including relative URLs.
+              text = try NSURL.object(withItemProviderData: data, typeIdentifier: type)
+                .absoluteString
+            } else {
+              // Foundation's cross-process provider bridge may archive its
+              // string/URL. Decode only those classes, never arbitrary objects.
+              let value = try NSKeyedUnarchiver.unarchivedObject(
+                ofClasses: [NSString.self, NSURL.self], from: data)
+              text = (value as? String) ?? (value as? URL)?.absoluteString
+            }
           } else {
             text = String(
               data: data,
