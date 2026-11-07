@@ -75,3 +75,26 @@ Add native scenarios to `runtime/test/fixtures/search-performance.ts`. Keep
 setup outside timing and verify the actual result as well as its latency.
 These synthetic measurements complement live corpus latency and retrieval
 recall checks.
+
+## Source journal
+
+Source decisions use Pi's native deltas. Rewriting a full retained journal on
+each decision blocks unrelated settings reads on the shared commit queue.
+The runtime regression verifies bounded persisted decision bytes, concurrent
+settings reads, atomic decisions, original versions and replay after reopening.
+It covers the former 64-delta checkpoint boundary. CI uses a 4 MiB synthetic
+journal; the same test accepts a larger qualification corpus:
+
+```sh
+nix develop .#ci --command env AGENT_SOURCE_JOURNAL_BYTES=366639229 \
+  node --test runtime/dist/test/source-journal-performance.test.js
+```
+
+Local qualification with 366.7 MB of synthetic evidence reduced a settings read
+beside a decision from 1,603 ms to 5.6 ms. At 65 decisions, the read took 5.3 ms
+and cold replay took 224 ms. These timings are observations, not CI thresholds;
+CI rejects a decision that rewrites the corpus instead of a bounded delta.
+
+The delta tail grows until a future compaction mechanism is provided. Replay
+cost beyond the qualified tail remains unmeasured; initial creation still
+writes a complete base. No schema or data migration is required.
