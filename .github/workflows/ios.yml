@@ -28,7 +28,7 @@ jobs:
         run: bash ios/scripts/check.sh "${{ matrix.phase }}"
       - name: Retain native test results
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ios-validation-${{ matrix.phase }}-${{ github.run_attempt }}
           path: |
