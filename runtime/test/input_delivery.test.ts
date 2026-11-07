@@ -9,7 +9,7 @@ import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } from "
 import { createRegistry, defineExtension, defineTool, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { Type } from "typebox";
-import { watchInputPlacements } from "../src/input_delivery.js";
+import { watchInputDelivery } from "../src/input_delivery.js";
 import { activity } from "../src/transcript.js";
 
 type Delivery = { type: "accepted"; input_id: string } | { type: "placed"; conversation_id: string; input_id: string; entry_id: string }
@@ -26,7 +26,7 @@ test("native placement follows queued admission, precedes transcript publication
     async execute() { entered(); await held; return { output: [{ type: "text", text: "Checked" }] }; } })] }); registry.install(tools);
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models, registry, identity: { attribution: null }, settings: { steeringMode: "all", followUpMode: "one-at-a-time" } }, BACKGROUND_CONTEXT);
-  let stopMessages: (() => Promise<void>) | undefined, stopPlacements = () => {};
+  let stopMessages: (() => Promise<void>) | undefined, stopInputDelivery = () => {};
   try {
     const root = await session.root(BACKGROUND_CONTEXT);
     await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [tools] }, BACKGROUND_CONTEXT);
@@ -36,8 +36,8 @@ test("native placement follows queued admission, precedes transcript publication
     stopMessages = await activity(session, root, () => {}, (message) => {
       if (message.role === "user") delivery.push({ type: "message", entry_id: message.entry_id, text: message.text });
     });
-    stopPlacements = watchInputPlacements(session, (conversation_id, input_id, entry_id) => {
-      delivery.push({ type: "placed", conversation_id, input_id, entry_id });
+    stopInputDelivery = watchInputDelivery(session, (conversation_id, event) => {
+      if (event.type === "input_placed") delivery.push({ type: "placed", conversation_id, input_id: event.input_id, entry_id: event.entry_id });
     });
     faux.setResponses([
       fauxAssistantMessage(fauxToolCall("check", {}), { stopReason: "toolUse" }),
@@ -83,8 +83,8 @@ test("native placement follows queued admission, precedes transcript publication
     await (await root.submit({ type: "input", content: "No request identifier" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
     await (await root.submit({ type: "write", requestId: "passive", entry: { kind: "fixture.note", data: { text: "Passive note" } } }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
     assert.equal(delivery.filter((event) => event.type === "placed").length, 4, "Unidentified input and passive writes are not correlated controls");
-    stopPlacements(); stopPlacements();
+    stopInputDelivery(); stopInputDelivery();
     await (await root.submit({ type: "input", requestId: "after-disposal", content: "Continue after disposal" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
     assert.equal(delivery.filter((event) => event.type === "placed").length, 4, "Disposal must stop observing subsequent commits");
-  } finally { release(); stopPlacements(); await stopMessages?.(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  } finally { release(); stopInputDelivery(); await stopMessages?.(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

@@ -310,7 +310,30 @@ test("a fresh main input resumes the parked foreground generation before waiting
       const root = (await readback.scanConversations({}, 1, undefined, BACKGROUND_CONTEXT)).items[0]; assert.ok(root);
       assert.equal((await readback.submissionByRequest(root.id, "new", BACKGROUND_CONTEXT))?.status, "queued");
     } finally { await readback.close(BACKGROUND_CONTEXT); }
+    peer.send(20, { type: "observe_main", input_ids: [] });
+    await peer.wait(20, (event) => event.type === "history" && event.page_complete);
     peer.send(3, { type: "main_interrupt" }); await peer.done(3); await peer.done(2);
+    await peer.wait(20, (event) => event.type === "worker_idle");
+    for (const id of [2, 20]) {
+      for (const input_id of ["queued", "new"]) {
+        assert.equal(peer.events(id).filter((event) => event.type === "input_rejected" && event.input_id === input_id).length, 1,
+          `Request ${id} must receive exactly one terminal receipt for aborted unplaced input ${input_id}`);
+      }
+      assert.equal(peer.events(id).some((event) => event.type === "input_rejected" && event.input_id === "placed"), false,
+        "Stopping must preserve an input already placed in native history");
+    }
+    peer.send(20, { type: "detach_main" }); await peer.done(20);
+    peer.send(21, { type: "observe_main", input_ids: ["placed", "queued", "new"] });
+    await peer.wait(21, (event) => event.type === "worker_idle");
+    for (const input_id of ["queued", "new"]) {
+      assert.equal(peer.events(21).filter((event) => event.type === "input_rejected" && event.input_id === input_id).length, 1,
+        "Reconnect must still reconcile each withdrawn input from its native submission");
+    }
+    assert.ok(peer.events(21).some((event) => event.type === "input_accepted" && event.input_id === "placed" && event.work?.type === "stopped"));
+    assert.ok(peer.events(21).some((event) => event.type === "input_placed" && event.input_id === "placed"));
+    assert.equal(peer.events(21).some((event) => event.type === "host_call" || event.type === "activity" || event.type === "failure"), false,
+      "Reconciliation must not restart execution or replay a stopped input");
+    peer.send(21, { type: "detach_main" }); await peer.done(21);
     peer.child.stdin.end(); assert.equal(await peer.closed, 0, peer.errors()); await peer.reader;
   } finally {
     peer?.child.kill("SIGKILL"); await peer?.closed; await peer?.reader.catch(() => {});
