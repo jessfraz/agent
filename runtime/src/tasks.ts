@@ -668,29 +668,33 @@ export class TaskStore {
       });
       if (delivered !== undefined) await this.outcomes?.deliveredIn(tx, delivered);
       }, BACKGROUND_CONTEXT);
-      if (mode !== undefined && active?.nativeActive && active.attached && !active.fenced &&
-          active.observer?.signal.aborted !== true && active.conversation !== undefined) {
-        // The outbox is committed first. A crash between these commits retries
-        // the same native request ID instead of injecting the input twice.
-        try {
-          const queued = this.actor(await this.get(id), agentId).pending;
-          for (const input of queued) {
-            // Scheduled turns must apply their captured configuration at the
-            // actor boundary, before admitting this or any later native input.
-            if (input.scheduled !== undefined) break;
-            const prepared = await this.prepareInput(active.conversation, input.content, input.attachments, active.call, input.origin);
-            if (!active.attached || active.fenced || active.observer?.signal.aborted) break;
-            await active.conversation.submit({ type: "input", ...prepared, requestId: input.id,
-              whenBusy: input.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
-          }
-        } catch { /* The durable outbox still owns admission through this actor. */ }
-      }
+      if (mode !== undefined && active !== undefined) await this.admitActiveInputs(active);
     } finally {
       if (active !== undefined) { active.admissions -= 1; if (active.admissions === 0) active.drained?.(); }
     }
     const task = await this.get(id);
     if (active !== undefined) { active.revision += 1; active.wake?.(); }
     return task;
+  }
+  private async admitActiveInputs(active: AttachedWorker): Promise<void> {
+    const conversation = active.conversation;
+    if (!active.nativeActive || !active.attached || active.fenced || active.observer?.signal.aborted || conversation === undefined) return;
+    // The outbox is committed first. A crash between these commits retries
+    // the same native request ID instead of injecting the input twice.
+    try {
+      const queued = this.actor(await this.get(active.input.task_id), active.input.agent_id).pending;
+      let scheduled = false;
+      for (const input of queued) {
+        // Scheduled turns and later follow-ups wait for their captured
+        // configuration. Explicit steering belongs to the active turn.
+        if (input.scheduled !== undefined) { scheduled = true; continue; }
+        if (scheduled && input.mode !== "steer") continue;
+        const prepared = await this.prepareInput(conversation, input.content, input.attachments, active.call, input.origin);
+        if (!active.nativeActive || !active.attached || active.fenced || active.observer?.signal.aborted) break;
+        await conversation.submit({ type: "input", ...prepared, requestId: input.id,
+          whenBusy: input.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
+      }
+    } catch { /* The durable outbox still owns admission through this actor. */ }
   }
   async createAgent(taskId: string, input: { id: string; title: string; outcome: string; input: string; inputId: string; model?: ModelSelection; attachments?: AttachmentRef[] }): Promise<TaskAgentRecord> {
     if (input.title.trim().length === 0 || input.title.length > 80 || input.outcome.trim().length === 0 ||
@@ -1266,6 +1270,9 @@ export class TaskStore {
           const currentActor = this.actor(current, input.agent_id);
           currentActor.pending = currentActor.pending.filter((item) => item.id !== next.id);
         });
+        // Inputs admitted during configuration could not enter Pi yet. Drain
+        // them now rather than waiting for this turn's answer to wake the actor.
+        await this.admitActiveInputs(active);
         const settled = await submission.wait(BACKGROUND_CONTEXT).finally(() => { active.nativeActive = false; });
         if (active.fenced) { await conversation.waitForIdle(BACKGROUND_CONTEXT); break; }
         if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted" && input.interactive === true && observer !== undefined) {
