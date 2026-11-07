@@ -8,6 +8,204 @@ import UniformTypeIdentifiers
 @testable import AgentUI
 
 @Suite struct SharedDraftInboxTests {
+  @Test @MainActor func sharedTextRepresentationsDecodeOnlyStringsAndRespectTheirEncoding()
+    async throws
+  {
+    let root = try temporaryRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = AttachmentStore(directory: root)
+    let archived = try NSKeyedArchiver.archivedData(
+      withRootObject: "Shared archived text" as NSString, requiringSecureCoding: true)
+    let address = try #require(NSURL(string: "https://example.com/shared"))
+    let archivedURL = try NSKeyedArchiver.archivedData(
+      withRootObject: address, requiringSecureCoding: true)
+    let variants: [(String, Data, String)] = [
+      (UTType.plainText.identifier, archived, "Shared archived text"),
+      (UTType.url.identifier, archivedURL, "https://example.com/shared"),
+      (UTType.utf8PlainText.identifier, Data("Shared UTF-8 text".utf8), "Shared UTF-8 text"),
+      (
+        UTType.utf16PlainText.identifier, try #require("Shared UTF-16 text".data(using: .utf16)),
+        "Shared UTF-16 text"
+      ),
+    ]
+    func item(_ type: String, data: Data) -> NSExtensionItem {
+      let provider = NSItemProvider()
+      provider.registerDataRepresentation(forTypeIdentifier: type, visibility: .all) { done in
+        done(data, nil)
+        return nil
+      }
+      let item = NSExtensionItem()
+      item.attachments = [provider]
+      return item
+    }
+    for (type, data, expected) in variants {
+      let content = try await SharedDraftImport.load([item(type, data: data)], into: store)
+      #expect(content.note == expected)
+      #expect(content.attachments.isEmpty)
+    }
+    let invalid = try NSKeyedArchiver.archivedData(
+      withRootObject: NSNumber(value: 42), requiringSecureCoding: true)
+    await #expect(throws: (any Error).self) {
+      try await SharedDraftImport.load(
+        [item(UTType.plainText.identifier, data: invalid)], into: store)
+    }
+  }
+
+  @Test @MainActor func sharedTextURLImageAndFileUseOwnedCopiesAndOneDurableUnsentBatch()
+    async throws
+  {
+    let root = try temporaryRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let imageURL = root.appending(path: "Selected.png")
+    try png().write(to: imageURL)
+    let document = root.appending(path: "Selected.pdf")
+    let bytes = Data("%PDF-1.7\nSelected document\n%%EOF\n".utf8)
+    try bytes.write(to: document)
+    let pdf = NSItemProvider()
+    pdf.registerFileRepresentation(forTypeIdentifier: UTType.pdf.identifier, visibility: .all) {
+      done in
+      done(document, false, nil)
+      return nil
+    }
+    let image = try #require(NSItemProvider(contentsOf: imageURL))
+    let item = NSExtensionItem()
+    item.attributedContentText = NSAttributedString(string: "Selected note")
+    item.attachments = [
+      NSItemProvider(object: "Selected note" as NSString),
+      NSItemProvider(object: try #require(NSURL(string: "https://example.com/article"))), image,
+      pdf,
+    ]
+    let staging = root.appending(path: "Extension")
+    let content = try await SharedDraftImport.load(
+      [item], into: AttachmentStore(directory: staging))
+    #expect(content.note == "Selected note\n\nhttps://example.com/article")
+    #expect(content.attachments.map(\.reference.mediaType) == ["image/jpeg", "application/pdf"])
+    try FileManager.default.removeItem(at: document)
+    try FileManager.default.removeItem(at: imageURL)
+    let inbox = SharedDraftInbox(containerURL: root)
+    let id = try await inbox.enqueue(attachments: content.attachments, note: content.note)
+    try FileManager.default.removeItem(at: staging)
+    let consumed = try await inbox.consumeNext(
+      into: AttachmentStore(directory: root.appending(path: "Host"))
+    ) { batch in
+      #expect(batch.id == id)
+      #expect(batch.note == content.note)
+      #expect(batch.attachments.map(\.reference) == content.attachments.map(\.reference))
+      let copied = try Data(contentsOf: batch.attachments[1].url)
+      #expect(copied == bytes)
+    }
+    #expect(consumed)
+  }
+
+  @Test @MainActor func failedSharePreparationPreservesExistingFilesAndCancellationResumes()
+    async throws
+  {
+    let root = try temporaryRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let files = AttachmentStore(directory: root.appending(path: "Draft"))
+    let existing = try await files.stage(
+      data: Data("Keep".utf8), name: "Existing.txt", mediaType: "text/plain")
+    let item = NSExtensionItem()
+    let unsupported = NSItemProvider()
+    unsupported.registerDataRepresentation(
+      forTypeIdentifier: "dev.example.unsupported-share", visibility: .all
+    ) { done in
+      done(Data(), nil)
+      return nil
+    }
+    let imageURL = root.appending(path: "Selected.png")
+    try png().write(to: imageURL)
+    let image = try #require(NSItemProvider(contentsOf: imageURL))
+    item.attachments = [image, unsupported]
+    await #expect(throws: AttachmentError.self) {
+      try await SharedDraftImport.load([item], into: files)
+    }
+    #expect(try await files.existing(existing.reference) == existing)
+    #expect(
+      try FileManager.default.contentsOfDirectory(atPath: root.appending(path: "Draft").path)
+        == [existing.id])
+    let started = AsyncStream<Void>.makeStream()
+    let provider = NSItemProvider()
+    provider.registerDataRepresentation(
+      forTypeIdentifier: UTType.plainText.identifier, visibility: .all
+    ) { _ in
+      started.continuation.yield(())
+      started.continuation.finish()
+      return Progress(totalUnitCount: 1)
+    }
+    item.attachments = [image, provider]
+    let task = Task { try await SharedDraftImport.load([item], into: files) }
+    for await _ in started.stream { break }
+    task.cancel()
+    await #expect(throws: CancellationError.self) { try await task.value }
+    #expect(try await files.existing(existing.reference) == existing)
+    #expect(
+      try FileManager.default.contentsOfDirectory(atPath: root.appending(path: "Draft").path)
+        == [existing.id])
+  }
+
+  @Test @MainActor func sharedFileURLsAndSelectionBoundsUseTheRealProviderAndInbox() async throws {
+    let root = try temporaryRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let url = root.appending(path: "Selected.pdf")
+    let bytes = Data("Selected file contents".utf8)
+    try bytes.write(to: url)
+    let item = NSExtensionItem()
+    item.attachments = [NSItemProvider(object: url as NSURL)]
+    let files = AttachmentStore(directory: root.appending(path: "Staged"))
+    let content = try await SharedDraftImport.load([item], into: files)
+    let file = try #require(content.attachments.first)
+    try FileManager.default.removeItem(at: url)
+    #expect(try Data(contentsOf: file.url) == bytes)
+    let inbox = SharedDraftInbox(containerURL: root)
+    await #expect(throws: SharedDraftError.self) {
+      try await inbox.enqueue(attachments: [file, file])
+    }
+    #expect(
+      try await !inbox.consumeNext(into: files) { _ in Issue.record("Rejected duplicate IDs") })
+    item.attachments = Array(
+      repeating: NSItemProvider(object: "Selected text" as NSString),
+      count: AttachmentLimits.maximumCount + 1)
+    await #expect(throws: AttachmentError.self) {
+      try await SharedDraftImport.load([item], into: files)
+    }
+    item.attachments = []
+    item.attributedContentText = NSAttributedString(
+      string: String(repeating: "x", count: 65 * 1024))
+    await #expect(throws: SharedDraftError.self) {
+      try await SharedDraftImport.load([item], into: files)
+    }
+    #expect(try await files.existing(file.reference) == file)
+  }
+
+  @Test @MainActor func textOnlyShareJoinsTheSavedDraftWithoutSendingOrLosingFiles() async throws {
+    let root = try temporaryRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inbox = SharedDraftInbox(containerURL: root)
+    let store = AttachmentStore(directory: root.appending(path: "DraftFiles"))
+    let file = try await store.stage(
+      data: Data("Existing attachment".utf8), name: "Existing.txt", mediaType: "text/plain")
+    let persistence = ComposerDraftStore(url: root.appending(path: "draft.json"))
+    _ = try await persistence.load(from: store)
+    try await persistence.save(
+      ComposerDraft(text: "Already typing", attachments: [file]), revision: 1)
+    let id = try await inbox.enqueue(images: [], note: "https://example.com/article")
+    let model = ChatModel(
+      draftStore: store, persistence: ComposerDraftStore(url: root.appending(path: "draft.json")),
+      sharedInbox: inbox)
+    await model.restoreDraft()
+    #expect(model.draft == "Already typing\n\nhttps://example.com/article")
+    #expect(model.attachments == [file])
+    #expect(model.connection == .disconnected)
+    #expect(model.rows.isEmpty)
+    #expect(inbox.acknowledged(id))
+    await model.receiveSharedDrafts()
+    #expect(model.draft == "Already typing\n\nhttps://example.com/article")
+    await #expect(throws: AttachmentError.self) {
+      try await inbox.enqueue(images: [], note: " \n ")
+    }
+  }
+
   private func temporaryRoot() throws -> URL {
     let base =
       ProcessInfo.processInfo.environment["AGENT_SHARE_TEST_ROOT"].map {

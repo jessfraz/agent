@@ -53,6 +53,13 @@ Settings, connect the phone, and select it as the `Agent` scheme's run
 destination. Choose the team under Signing & Capabilities. Enable Developer
 Mode if requested, then Run.
 
+The app embeds `AgentShare`. For signed installs, register its bundle ID
+`$(AGENT_BUNDLE_IDENTIFIER).Share` and enable the same App Group for both IDs.
+`Shared.xcconfig` owns the base bundle ID, group, versions and signing team;
+the group defaults to `group.$(AGENT_BUNDLE_IDENTIFIER)`. Keep the existing
+host bundle ID when updating an installed app. Provisioning both targets is
+required for sharing on a phone; an unsigned build does not establish that.
+
 ## Behavior and data
 
 - Saved history, streamed answer text, provider-shareable summaries, tool status,
@@ -73,6 +80,11 @@ Mode if requested, then Run.
 - Consecutive tool calls and summaries share a compact disclosure. Progress
   messages stay visible. Expand activity to read every supplied summary or
   inspect a command's arguments, output, errors and status.
+- Activity rows label the supplied action and use category icons. Unclassified
+  shell commands remain **Ran**; the client does not guess Read/Search intent
+  from command text. Expanded commands use one **Shell** card with literal,
+  scrollable output and a result footer. Input metadata stays behind
+  **Input details**; missing results never become Success.
 - Long-press a message, summary or tool output for **Copy message**, **Select
   text** or **Share text**. Selection opens native text handles on a stable
   snapshot, so streaming cannot move the selected range.
@@ -125,8 +137,12 @@ Mode if requested, then Run.
 - The shared protocol retains typed CLI/iOS input origins and scheduled-notice
   lineage. Missing legacy origin stays unknown. Live and restored rows use the
   same durable identities and causal ordering.
-- Sharing from other apps still needs a provisioned App Group and Share target.
-  The shared-draft queue alone does not install an extension.
+- In another app's Share sheet, choose **Beep Boop**, review the note and files,
+  then **Save draft**. Selected text, links, images and regular files enter the
+  shared-draft inbox. Opening Beep Boop merges them into the existing unsent
+  composer once, preserving its note and attachments. Sharing never sends or
+  starts agent work. Cancel before saving leaves the composer untouched.
+  An uncertain save retries the same frozen selection and transfer ID.
 - `/feedback` captures the current app window before sending and includes it
   with the report. Failed admission keeps that exact screenshot for retry.
   Pi's existing adapter handles model image input; other files remain available
@@ -171,6 +187,8 @@ pass `--attachments-path /absolute/existing/directory` to `swift test`.
 `bash ios/scripts/check.sh` runs strict Swift lint, macOS tests, the unsigned
 app build, package tests on iOS and app-hosted rendering tests. It requires an
 installed compatible iOS runtime and cleans up only its own simulator.
+Simulator UI checks use ad-hoc signing for real App Group entitlements; no
+Apple account or provisioning profile is needed.
 CI runs `host`, `simulator-core`, `simulator-performance` and `simulator-ui` in
 parallel; every phase must pass. The default local command runs all checks;
 `simulator` keeps the three simulator suites together for local use. Each

@@ -5,9 +5,10 @@ App Store Connect; this directory supplies the archive's additional test gate.
 No signing certificates, API keys or developer account identifiers belong in
 the repository.
 
-`App.xcconfig` reads the signing team from Apple's built-in `CI_TEAM_ID`.
+`Shared.xcconfig` reads the signing team from Apple's built-in `CI_TEAM_ID`.
 Local signed builds can override `DEVELOPMENT_TEAM` without committing an
-account identifier.
+account identifier. The host and embedded Share extension need the same
+provisioned App Group; see [native setup](../README.md#build-and-connect).
 
 Configure one release workflow:
 

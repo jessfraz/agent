@@ -56,7 +56,11 @@ recovery; [history](history.md) describes import and retrieval.
   model settings; retain unsent drafts across reopen. Native consumer and UI
   checks pass, including the matched production-coordinator restart check.
 - [ ] Provision and ship an iOS Share target backed by the shared-draft queue.
-- [ ] Verify native rendering against the original visual references.
+  Extension and unsent-draft handoff are locally verified; phone provisioning
+  and signed delivery remain.
+- [x] Verify native rendering against the original visual references.
+  Typed action rows and the shared Shell card passed native rendering,
+  copy/selection and Light/Dark checks. Unknown shell intent remains explicit.
 - [x] Ship private lifecycle logs, `/machines`, local usage-reset times and
   countdowns, and the remaining viewport correction.
 
