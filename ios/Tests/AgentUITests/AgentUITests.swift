@@ -168,8 +168,7 @@ final class AgentUITests: XCTestCase {
   func testAppearanceExplicitOverridesPersistAcrossRelaunch() {
     let previous = XCUIDevice.shared.appearance
     defer { XCUIDevice.shared.appearance = previous }
-    let app = launch(appearance: .dark)
-    executionTimeAllowance = 120
+    let app = launch(appearance: .dark, allowance: 120)
     chooseAppearance("Light", app: app)
     app.buttons["Done"].tap()
     assertBackground(.light, app: app)
@@ -202,8 +201,7 @@ final class AgentUITests: XCTestCase {
   func testAppearanceSamplingRequiresTheVisibleForegroundApp() {
     let previous = XCUIDevice.shared.appearance
     defer { XCUIDevice.shared.appearance = previous }
-    let app = launch(appearance: .dark)
-    executionTimeAllowance = 120
+    let app = launch(appearance: .dark, allowance: 120)
     defer { app.terminate() }
     chooseAppearance("Light", app: app)
     app.buttons["Done"].tap()
