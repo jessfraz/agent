@@ -2,13 +2,20 @@
 set -euo pipefail
 
 phase=${1:-all}
+usage() {
+  printf 'Usage: %s [all|host|simulator|simulator-core|simulator-performance|simulator-ui]\n' "$0" >&2
+}
 if (( $# > 1 )); then
-  printf 'Usage: %s [all|host|simulator]\n' "$0" >&2
+  usage
   exit 64
 fi
+suites=(core performance rendering)
 case "$phase" in
   all|host|simulator) ;;
-  *) printf 'Usage: %s [all|host|simulator]\n' "$0" >&2; exit 64 ;;
+  simulator-core) suites=(core) ;;
+  simulator-performance) suites=(performance) ;;
+  simulator-ui) suites=(rendering) ;;
+  *) usage; exit 64 ;;
 esac
 
 native_dir=$(cd "$(dirname "$0")/.." && pwd)
@@ -18,7 +25,7 @@ run_dir=$(mktemp -d "$repo_root/target/ios-validation/run.XXXXXX")
 printf 'Native validation output: %s\n' "$run_dir"
 printf 'Native validation phase: %s\n' "$phase"
 performance_test=pagedHistoryAndStreamingPreparationRemainBoundedAndKeepCanonicalIdentity
-if [[ "$phase" != simulator ]]; then
+if [[ "$phase" == all || "$phase" == host ]]; then
   plutil -lint "$native_dir/Agent.xcodeproj/project.pbxproj" \
     "$native_dir/AgentApp/PrivacyInfo.xcprivacy" "$native_dir/TestFlightExport.plist"
 
@@ -45,6 +52,7 @@ xcrun simctl list runtimes --json > "$run_dir/runtimes.json"
 xcrun simctl list devicetypes --json > "$run_dir/device-types.json"
 python3 - "$run_dir" "$native_dir" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -64,6 +72,11 @@ runtimes = sorted(
      and version(runtime["version"]) >= (18, 0, 0)),
     key=lambda runtime: version(runtime["version"]), reverse=True,
 )
+requested_runtime = os.environ.get("IOS_SIMULATOR_RUNTIME")
+if requested_runtime is not None:
+    runtimes = [runtime for runtime in runtimes if runtime["identifier"] == requested_runtime]
+    if not runtimes:
+        sys.exit(f"Requested iOS Simulator runtime is not installed and available: {requested_runtime}")
 devices = json.loads((run / "device-types.json").read_text())["devicetypes"]
 for runtime in runtimes:
     major, minor, patch = version(runtime["version"])
@@ -126,21 +139,31 @@ trap 'exit 143' TERM
 simulator_id=$(xcrun simctl create "Agent native checks $(basename "$run_dir")" "$device_type_id" "$runtime_id")
 xcrun simctl boot "$simulator_id"
 xcrun simctl bootstatus "$simulator_id" -b
-xcodebuild -quiet -workspace "$run_dir/NativeTests.xcworkspace" -scheme AgentCoreTests \
-  -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
-  -parallel-testing-enabled NO -derivedDataPath "$run_dir/tests" \
-  -resultBundlePath "$run_dir/ios-core-tests.xcresult" CODE_SIGNING_ALLOWED=NO test
-xcodebuild -quiet -workspace "$run_dir/NativeTests.xcworkspace" -scheme AgentCoreTests \
-  -configuration Release -only-testing:"AgentCoreTests/$performance_test()" \
-  -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
-  -parallel-testing-enabled NO -derivedDataPath "$run_dir/tests" \
-  -resultBundlePath "$run_dir/ios-performance-tests.xcresult" \
-  CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES test
-xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
-  -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
-  -parallel-testing-enabled NO -test-timeouts-enabled YES -derivedDataPath "$run_dir/app" \
-  -resultBundlePath "$run_dir/ios-rendering-tests.xcresult" CODE_SIGNING_ALLOWED=NO test
-for suite in core performance rendering; do
+for suite in "${suites[@]}"; do
+  case "$suite" in
+    core)
+      xcodebuild -quiet -workspace "$run_dir/NativeTests.xcworkspace" -scheme AgentCoreTests \
+        -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
+        -parallel-testing-enabled NO -derivedDataPath "$run_dir/tests" \
+        -resultBundlePath "$run_dir/ios-core-tests.xcresult" CODE_SIGNING_ALLOWED=NO test
+      ;;
+    performance)
+      xcodebuild -quiet -workspace "$run_dir/NativeTests.xcworkspace" -scheme AgentCoreTests \
+        -configuration Release -only-testing:"AgentCoreTests/$performance_test()" \
+        -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
+        -parallel-testing-enabled NO -derivedDataPath "$run_dir/tests" \
+        -resultBundlePath "$run_dir/ios-performance-tests.xcresult" \
+        CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES test
+      ;;
+    rendering)
+      xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
+        -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
+        -parallel-testing-enabled NO -test-timeouts-enabled YES -derivedDataPath "$run_dir/app" \
+        -resultBundlePath "$run_dir/ios-rendering-tests.xcresult" CODE_SIGNING_ALLOWED=NO test
+      ;;
+  esac
+done
+for suite in "${suites[@]}"; do
   xcrun xcresulttool get test-results summary --path "$run_dir/ios-$suite-tests.xcresult" \
     --compact > "$run_dir/ios-$suite-summary.json"
   python3 - "$run_dir/ios-$suite-summary.json" "$suite" <<'PY'
