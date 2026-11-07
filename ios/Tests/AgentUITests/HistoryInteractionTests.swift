@@ -5,16 +5,21 @@ import XCTest
 
 @MainActor
 final class HistoryInteractionTests: XCTestCase {
-  private func launchMessages(_ messages: [HistoryMessage]) async throws -> XCUIApplication {
+  private func launchMessages(
+    _ messages: [HistoryMessage], toolDetails: [String: ToolDetails] = [:],
+    appearance: String? = nil
+  ) async throws -> XCUIApplication {
     continueAfterFailure = false
-    executionTimeAllowance = 90
+    executionTimeAllowance = 600
     let peer = InteractionPeer()
     addTeardownBlock { await peer.stop() }
     let history = NativeEventHistory(messages: messages, nextCursor: nil, pageComplete: true)
     await peer.history(initial: history, pages: [:], latest: history)
+    await peer.toolDetails(toolDetails)
     let app = XCUIApplication()
     app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(try await peer.start())
     app.launchArguments += ["-notificationsEnabled", "NO"]
+    if let appearance { app.launchArguments += ["-appearance", appearance] }
     app.launch()
     addTeardownBlock { @MainActor in app.terminate() }
     return app
@@ -26,6 +31,68 @@ final class HistoryInteractionTests: XCTestCase {
 
   private func editor(_ app: XCUIApplication) -> XCUIElement {
     app.descendants(matching: .any).matching(identifier: "Message the coordinator").firstMatch
+  }
+
+  func testShareExtensionSavesAnUnsentDraftAndHostImportsItOnceAfterRelaunch() async throws {
+    let text = "Selected content for the unsent shared draft."
+    let app = try await launchMessages([
+      .init(
+        continuation: false, entryId: "share-source", finalChunk: true, role: .final, text: text)
+    ])
+    let message = app.staticTexts[text]
+    XCTAssertTrue(message.waitForExistence(timeout: 5))
+    func presentShare() -> XCUIElement {
+      message.press(forDuration: 1)
+      let share = action("Share text", app: app)
+      XCTAssertTrue(share.waitForExistence(timeout: 3))
+      share.tap()
+      let destination = app.cells["Beep Boop"]
+      XCTAssertTrue(destination.waitForExistence(timeout: 5), app.debugDescription)
+      destination.tap()
+      let save = app.buttons["Save draft"]
+      XCTAssertTrue(save.waitForExistence(timeout: 5), app.debugDescription)
+      let ready = XCTNSPredicateExpectation(
+        predicate: NSPredicate(format: "enabled == true"), object: save)
+      XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 5), .completed, app.debugDescription)
+      return save
+    }
+    let cancelled = presentShare()
+    app.buttons["Cancel"].tap()
+    XCTAssertTrue(cancelled.waitForNonExistence(timeout: 5))
+    // The system owns the dismissal animation. Reopening the source also
+    // verifies that cancel left no published draft before the real save.
+    app.terminate()
+    app.launch()
+    XCTAssertTrue(message.waitForExistence(timeout: 5))
+    let save = presentShare()
+    let selection = XCTAttachment(screenshot: app.screenshot())
+    selection.name = "native-share-unsent-draft"
+    selection.lifetime = .keepAlways
+    add(selection)
+    save.tap()
+    XCTAssertTrue(save.waitForNonExistence(timeout: 5), app.debugDescription)
+    app.terminate()
+    app.launchEnvironment.removeValue(forKey: "AGENT_INTERACTION_PORT")
+    app.launch()
+    if app.buttons["dismissConnection"].waitForExistence(timeout: 3) {
+      app.buttons["dismissConnection"].tap()
+    }
+    let composer = editor(app)
+    let imported = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "value CONTAINS %@", text), object: composer)
+    XCTAssertEqual(XCTWaiter.wait(for: [imported], timeout: 5), .completed, app.debugDescription)
+    let draft = try XCTUnwrap(composer.value as? String)
+    XCTAssertEqual(draft.components(separatedBy: text).count, 2)
+    XCTAssertFalse(app.buttons["Send message"].isEnabled)
+    app.terminate()
+    app.launch()
+    if app.buttons["dismissConnection"].waitForExistence(timeout: 3) {
+      app.buttons["dismissConnection"].tap()
+    }
+    let restored = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "value == %@", draft), object: editor(app))
+    XCTAssertEqual(XCTWaiter.wait(for: [restored], timeout: 5), .completed, app.debugDescription)
+    XCTAssertFalse(app.buttons["Send message"].isEnabled)
   }
 
   func testWholeMessageCopyAndPartialNativeSelectionPasteThroughComposer() async throws {
@@ -119,6 +186,88 @@ final class HistoryInteractionTests: XCTestCase {
     remove.tap()
     XCTAssertTrue(remove.waitForNonExistence(timeout: 3))
     XCTAssertEqual(composer.value as? String, note)
+  }
+
+  func testShellActivityKeepsOneCardLiteralOutputAndAFinalResult() async throws {
+    struct Input: Encodable {
+      let program = "printf"
+      let args = ["fixture"]
+      let cwd = "/workspace/project"
+    }
+    struct Output: Encodable {
+      let type = "process"
+      let exitCode = 0
+      enum CodingKeys: String, CodingKey {
+        case type, stdout, stderr, truncated
+        case exitCode = "exit_code"
+      }
+      let stdout = "Literal **stdout** 🦀\nA second output line"
+      let stderr = ""
+      let truncated = false
+    }
+    let output = Output()
+    let encoder = JSONEncoder()
+    let details = ToolDetails.available(
+      .init(
+        callId: "shell-card",
+        input: .text(
+          .init(
+            text: String(decoding: try encoder.encode(Input()), as: UTF8.self), truncated: false)),
+        name: "exec",
+        output: .text(
+          .init(text: String(decoding: try encoder.encode(output), as: UTF8.self), truncated: false)
+        ),
+        status: .finished))
+    for appearance in ["dark", "light"] {
+      let app = try await launchMessages(
+        [
+          .init(
+            continuation: false, entryId: "shell-entry", finalChunk: true,
+            presentation: .command(.init(command: "printf fixture", durationMs: 12, exitCode: 0)),
+            role: .tool, text: output.stdout,
+            tool: .init(callId: "shell-card", name: "exec", status: .finished))
+        ], toolDetails: ["shell-card": details], appearance: appearance)
+      let group = app.buttons["activity:tool:shell-card"]
+      XCTAssertTrue(group.waitForExistence(timeout: 5), app.debugDescription)
+      let collapsed = XCTAttachment(screenshot: app.screenshot())
+      collapsed.name = "native-shell-collapsed-\(appearance)"
+      collapsed.lifetime = .keepAlways
+      add(collapsed)
+      group.tap()
+      let command = app.buttons["activity-item:tool:shell-card"]
+      XCTAssertTrue(command.waitForExistence(timeout: 3), app.debugDescription)
+      command.tap()
+      let success = app.staticTexts["Success"]
+      XCTAssertTrue(success.waitForExistence(timeout: 5), app.debugDescription)
+      XCTAssertEqual(command.label, "Ran printf fixture")
+      XCTAssertEqual(app.staticTexts.matching(NSPredicate(format: "label == %@", "Shell")).count, 1)
+      XCTAssertTrue(app.staticTexts["$ printf fixture"].exists)
+      XCTAssertEqual(
+        app.staticTexts.matching(NSPredicate(format: "label == %@", output.stdout)).count, 1)
+      XCTAssertFalse(app.staticTexts["Command"].exists)
+      XCTAssertFalse(app.staticTexts["Output"].exists)
+      XCTAssertFalse(app.staticTexts["Finished"].exists)
+      XCTAssertFalse(app.staticTexts["Working directory"].exists)
+      XCTAssertGreaterThan(success.frame.minY, app.staticTexts[output.stdout].frame.maxY)
+      let expanded = XCTAttachment(screenshot: app.screenshot())
+      expanded.name = "native-shell-expanded-\(appearance)"
+      expanded.lifetime = .keepAlways
+      add(expanded)
+      app.staticTexts[output.stdout].press(forDuration: 1)
+      let copy = action("Copy message", app: app)
+      XCTAssertTrue(copy.waitForExistence(timeout: 3), app.debugDescription)
+      copy.tap()
+      let composer = editor(app)
+      composer.tap()
+      composer.press(forDuration: 1)
+      let paste = action("Paste", app: app)
+      XCTAssertTrue(paste.waitForExistence(timeout: 3), app.debugDescription)
+      paste.tap()
+      let pasted = XCTNSPredicateExpectation(
+        predicate: NSPredicate(format: "value == %@", output.stdout), object: composer)
+      XCTAssertEqual(XCTWaiter.wait(for: [pasted], timeout: 3), .completed, app.debugDescription)
+      app.terminate()
+    }
   }
 
   func testOneActivityExpansionShowsEverySuppliedSummaryWithoutFetchingHiddenThinking()
@@ -488,9 +637,11 @@ private actor InteractionPeer {
   private var pages: [String: NativeEventHistory] = [:]
   private var latest: NativeEventHistory?
   private var observer: NWConnection?
+  private var toolReplies: [String: ToolDetails] = [:]
   private var settingsValue: NativeSettingsSnapshot?
   private var settingRequests: [NativeRequestSettings] = []
   private var submitted: [NativeRequestSubmit] = []
+  func toolDetails(_ values: [String: ToolDetails]) { toolReplies = values }
   func settings(_ value: NativeSettingsSnapshot) { settingsValue = value }
   func settingsControls() -> [NativeRequestSettings] { settingRequests }
   func inputs() -> [NativeRequestSubmit] { submitted }
@@ -577,6 +728,10 @@ private actor InteractionPeer {
           try await emit(.sources(.init(sources: sourceStates)), to: socket)
         }
         try await emit(.idle, to: socket)
+      case .toolDetails(let request):
+        let details = toolReplies[request.callId] ?? .unavailable(.init(callId: request.callId))
+        try await emit(.toolDetails(.init(details: details)), to: socket)
+        try await emit(.done, to: socket)
       case .settings(let request):
         settingRequests.append(request)
         var settings = try XCTUnwrap(settingsValue)

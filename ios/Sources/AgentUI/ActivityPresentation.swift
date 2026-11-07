@@ -190,6 +190,30 @@ struct ActivityGroupView: View {
 }
 
 extension ToolStatus {
+  func commandTitle(_ command: String?, ordinal: Int? = nil) -> String {
+    let description = command ?? "command\(ordinal.map { " \($0)" } ?? "")"
+    return switch self {
+    case .finished: "Ran " + description
+    case .running: "Running " + description
+    case .failed: "Failed command · " + description
+    case .declined: "Declined command · " + description
+    case .interrupted: "Interrupted command · " + description
+    case .unknown: command.map { "Command " + $0 } ?? description.capitalized
+    }
+  }
+
+  func commandResult(exitCode: Int?) -> String {
+    switch self {
+    case .running: return "Running"
+    case .declined: return "Declined"
+    case .interrupted: return "Interrupted"
+    case .failed: return exitCode.map { "Failed (exit \($0))" } ?? "Failed"
+    case .finished, .unknown:
+      if let exitCode { return exitCode == 0 ? "Success" : "Failed (exit \(exitCode))" }
+      return self == .finished ? "Finished" : "Status unavailable"
+    }
+  }
+
   fileprivate var activityPriority: Int {
     switch self {
     case .finished: 0
@@ -247,44 +271,51 @@ struct ActivityItemView: View {
         if expanded { onExpand() }
       } label: {
         HStack(alignment: .center, spacing: 8) {
-          if let tool = model.row.tool {
+          if let tool = model.row.tool, tool.status != .finished {
             ActivityStatus(status: tool.status)
-          } else {
-            Image(systemName: "text.alignleft").font(.caption).frame(width: 18)
           }
-          Text(title).lineLimit(1).truncationMode(.middle).multilineTextAlignment(.leading)
-            .font(isCommand ? .system(.footnote, design: .monospaced) : .footnote)
+          Image(
+            systemName: model.row.presentation?.activitySymbol ?? (isShell ? "terminal" : "wrench")
+          )
+          .font(.callout).frame(width: 20).accessibilityHidden(true)
+          Text(title).lineLimit(1).truncationMode(.tail).multilineTextAlignment(.leading)
+            .font(.callout)
           Image(systemName: expanded ? "chevron.down" : "chevron.right").font(.caption2)
         }
-        .font(.footnote).foregroundStyle(.secondary)
+        .font(.footnote).foregroundStyle(.primary.opacity(0.65))
         .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading).contentShape(Rectangle())
       }
       .buttonStyle(.plain).accessibilityIdentifier("activity-item:\(model.id)")
+      .accessibilityLabel(title)
       .accessibilityValue(expanded ? "Expanded" : "Collapsed")
       if expanded {
-        VStack(alignment: .leading, spacing: 8) {
-          presentationDetails
-          if !model.row.text.isEmpty {
+        if isShell {
+          shellCard.padding(.leading, 26).padding(.bottom, 8)
+        } else {
+          VStack(alignment: .leading, spacing: 8) {
+            presentationDetails
+            if !model.row.text.isEmpty {
+              if model.row.tool != nil {
+                ToolText(title: "Output", text: model.row.text)
+              } else {
+                RichMessage(blocks: model.row.blocks, textStyle: .callout, compact: true)
+                  .foregroundStyle(.primary.opacity(0.75))
+              }
+            }
             if model.row.tool != nil {
-              ToolText(title: "Output", text: model.row.text)
-            } else {
-              RichMessage(blocks: model.row.blocks, textStyle: .callout, compact: true)
-                .foregroundStyle(.primary.opacity(0.75))
+              VStack(alignment: .leading, spacing: 8) { toolDetails }
+                .padding(12)
+                .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
+                .overlay {
+                  RoundedRectangle(cornerRadius: 12).strokeBorder(
+                    model.row.tool?.status == .failed
+                      ? Color.red.opacity(0.2) : Color.primary.opacity(0.08),
+                    lineWidth: 0.5)
+                }
             }
           }
-          if model.row.tool != nil {
-            VStack(alignment: .leading, spacing: 8) { toolDetails }
-              .padding(12)
-              .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
-              .overlay {
-                RoundedRectangle(cornerRadius: 12).strokeBorder(
-                  model.row.tool?.status == .failed
-                    ? Color.red.opacity(0.2) : Color.primary.opacity(0.08),
-                  lineWidth: 0.5)
-              }
-          }
+          .padding(.leading, 26).padding(.bottom, 8)
         }
-        .padding(.leading, 26).padding(.bottom, 8)
       }
     }
     .frame(maxWidth: .infinity, alignment: .leading)
@@ -320,15 +351,15 @@ struct ActivityItemView: View {
   private var title: String {
     if let presentation = model.row.presentation {
       if case .command(let value) = presentation {
-        return value.command ?? commandInput?.display
-          ?? "Command\(ordinal.map { " \($0)" } ?? "")"
+        return shellStatus.commandTitle(value.command ?? commandInput?.display, ordinal: ordinal)
       }
       return presentation.activityTitle(
         toolName: model.row.tool?.name, status: model.row.tool?.status)
     }
     if let tool = model.row.tool {
-      if let commandInput { return commandInput.display }
-      if tool.name == "exec" { return "Command\(ordinal.map { " \($0)" } ?? "")" }
+      if tool.name == "exec" {
+        return shellStatus.commandTitle(commandInput?.display, ordinal: ordinal)
+      }
       return tool.name.replacingOccurrences(of: "_", with: " ")
     }
     for block in model.row.blocks {
@@ -343,22 +374,116 @@ struct ActivityItemView: View {
     return "Thinking"
   }
 
-  private var isCommand: Bool {
-    if case .command? = model.row.presentation { return true }
-    return commandInput != nil
+  private var isShell: Bool {
+    switch model.row.presentation {
+    case .command?: true
+    case nil: model.row.tool?.name == "exec"
+    default: false
+    }
+  }
+
+  private var shellStatus: ToolStatus {
+    model.row.tool?.status ?? availableDetails?.status ?? .unknown
+  }
+
+  private var availableDetails: ToolDetailsAvailable? {
+    guard case .available(let value) = loaded else { return nil }
+    return value
+  }
+
+  private var shellExitCode: Int? {
+    if let output = availableDetails?.output, let process = ProcessOutput.decode(output) {
+      return process.exitCode
+    }
+    guard case .command(let value)? = model.row.presentation else { return nil }
+    return value.exitCode
+  }
+
+  private var shellDurationMs: Int? {
+    guard case .command(let value)? = model.row.presentation else { return nil }
+    return value.durationMs
+  }
+
+  private var shellCard: some View {
+    VStack(alignment: .leading, spacing: 16) {
+      Text("Shell").font(.callout.weight(.medium)).foregroundStyle(.primary.opacity(0.65))
+      if let command = commandPreview ?? commandInput?.display {
+        Text("$ " + command).font(.system(.callout, design: .monospaced))
+          .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+          .messageTextActions(command)
+      } else {
+        Text("Command not recorded.").font(.callout).foregroundStyle(.secondary)
+      }
+      shellOutput
+      if let error {
+        Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+        Button("Try again") { reload += 1 }.buttonStyle(.plain).frame(minHeight: 44)
+      }
+      if availableDetails != nil || shellDurationMs != nil {
+        DisclosureGroup("Input details", isExpanded: $showsRawInput) {
+          if let commandInput {
+            if let cwd = commandInput.cwd { ToolText(title: "Working directory", text: cwd) }
+            if let host = commandInput.host { ToolText(title: "Host", text: host) }
+            if let seconds = commandInput.timeoutSeconds {
+              Text("Timeout: \(seconds) seconds").font(.caption).foregroundStyle(.secondary)
+            }
+          }
+          if let duration = shellDurationMs {
+            Text("\(duration) ms").font(.caption).foregroundStyle(.secondary)
+          }
+          if let details = availableDetails { ToolContent(title: "Input", content: details.input) }
+        }.font(.caption).tint(.primary)
+      }
+      Text(shellStatus.commandResult(exitCode: shellExitCode))
+        .font(.caption).foregroundStyle(
+          shellStatus == .failed || (shellExitCode ?? 0) != 0
+            ? Color.red : Color.primary.opacity(0.65)
+        )
+        .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+    .padding(16)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(Color.primary.opacity(0.1), in: RoundedRectangle(cornerRadius: 16))
+    .overlay {
+      RoundedRectangle(cornerRadius: 16).strokeBorder(
+        shellStatus == .failed ? Color.red.opacity(0.2) : Color.primary.opacity(0.08),
+        lineWidth: 0.5)
+    }
+  }
+
+  @ViewBuilder private var shellOutput: some View {
+    if let output = availableDetails?.output, case .text(let value) = output {
+      let process = ProcessOutput.decode(output)
+      let text = process?.stdout ?? value.text
+      if !model.row.text.isEmpty && !model.row.text.utf8.elementsEqual(text.utf8)
+        && !model.row.text.utf8.elementsEqual(value.text.utf8)
+      {
+        ToolText(title: "Preview", text: model.row.text)
+      }
+      if !text.isEmpty { ShellOutput(text: text) }
+      if let process, !process.stderr.isEmpty {
+        Label("Error output", systemImage: "exclamationmark.circle").font(.caption)
+          .foregroundStyle(.red)
+        ShellOutput(text: process.stderr)
+      }
+      if value.truncated || process?.truncated == true {
+        Text("Output truncated.").font(.caption).foregroundStyle(.secondary)
+      }
+    } else {
+      if !model.row.text.isEmpty { ShellOutput(text: model.row.text) }
+      if let output = availableDetails?.output, case .unavailable(let value) = output {
+        Text("Output: \(value.reason.description)").font(.caption).foregroundStyle(.secondary)
+      } else if case .unavailable = loaded, model.row.text.isEmpty {
+        Text("Output not recorded.").font(.caption).foregroundStyle(.secondary)
+      } else if loaded == nil, model.row.tool != nil, error == nil {
+        ProgressView("Loading output…").font(.caption).foregroundStyle(.secondary)
+      }
+    }
   }
 
   @ViewBuilder private var presentationDetails: some View {
     if let presentation = model.row.presentation {
       switch presentation {
-      case .command(let value):
-        if let command = value.command { ToolText(title: "Command", text: command) }
-        if let code = value.exitCode {
-          Text("Exit code \(code)").font(.caption).foregroundStyle(.secondary)
-        }
-        if let duration = value.durationMs {
-          Text("\(duration) ms").font(.caption).foregroundStyle(.secondary)
-        }
       case .fileChanges(let value):
         ForEach(Array(value.changes.enumerated()), id: \.offset) { _, change in
           Text("\(change.operation?.rawValue ?? "change") \(change.path)")
@@ -400,30 +525,7 @@ struct ActivityItemView: View {
         VStack(alignment: .leading, spacing: 12) {
           Text(value.status.rawValue.capitalized).font(.caption.weight(.medium))
             .foregroundStyle(value.status == .failed ? .red : .secondary)
-          if value.name == "exec", let command = CommandInput.decode(value.input) {
-            if commandPreview == nil {
-              ToolText(title: "Command", text: command.display)
-            }
-            if let cwd = command.cwd { ToolText(title: "Working directory", text: cwd) }
-            if let host = command.host { ToolText(title: "Host", text: host) }
-            if let seconds = command.timeoutSeconds {
-              Text("Timeout: \(seconds) seconds").font(.caption).foregroundStyle(.secondary)
-            }
-            Button {
-              showsRawInput.toggle()
-            } label: {
-              HStack {
-                Text("Input details")
-                Spacer()
-                Image(systemName: showsRawInput ? "chevron.down" : "chevron.right")
-              }.contentShape(Rectangle())
-            }
-            .font(.caption).buttonStyle(.plain).frame(minHeight: 44)
-            .accessibilityValue(showsRawInput ? "Expanded" : "Collapsed")
-            if showsRawInput { ToolContent(title: "Input", content: value.input) }
-          } else {
-            ToolContent(title: "Input", content: value.input)
-          }
+          ToolContent(title: "Input", content: value.input)
           ToolContent(
             title: "Output", content: value.output, name: value.name,
             preview: model.row.presentation == nil ? nil : model.row.text)
@@ -484,22 +586,39 @@ extension MessagePresentationAgentCoordination {
 }
 
 extension MessagePresentation {
+  var activitySymbol: String {
+    switch self {
+    case .command: "terminal"
+    case .fileChanges: "pencil"
+    case .tool: "wrench.and.screwdriver"
+    case .agentCoordination, .agentActivity: "person.2"
+    case .webSearch(let value): value.action == .openPage ? "book" : "magnifyingglass"
+    case .media: "photo"
+    case .sleep: "clock"
+    case .plan: "checklist"
+    case .review: "checkmark.shield"
+    case .hookPrompt: "text.quote"
+    case .compaction: "arrow.triangle.2.circlepath"
+    case .unknown, .unavailable: "questionmark.circle"
+    }
+  }
+
   func activityTitle(toolName: String? = nil, status: ToolStatus? = nil) -> String {
     switch self {
-    case .command(let value): value.command ?? "Command"
+    case .command(let value):
+      status.map { $0.commandTitle(value.command) } ?? value.command ?? "Command"
     case .fileChanges(let value):
-      value.changes.isEmpty ? "File changes" : value.changes.map(\.path).joined(separator: ", ")
+      value.changes.isEmpty
+        ? "File changes"
+        : (status == .running
+          ? "Editing " : status == .finished ? "Edited " : status == nil ? "" : "File changes · ")
+          + value.changes.map(\.path).joined(separator: ", ")
     case .tool(let value):
       [value.namespace, toolName ?? "Tool"].compactMap { $0 }.joined(separator: ".")
     case .agentCoordination(let value):
       value.activityTitle(status: status)
     case .agentActivity: "Agent activity"
-    case .webSearch(let value):
-      switch value.action {
-      case .openPage: "Open page"
-      case .findInPage: "Search page"
-      default: "Web search"
-      }
+    case .webSearch(let value): value.activityTitle(status: status)
     case .media(let value):
       switch value.operation {
       case .generate: "Image generation"
@@ -514,6 +633,45 @@ extension MessagePresentation {
     case .unknown(let value): "Unknown history item · \(value.kind)"
     case .unavailable(let value): "Original unavailable · \(value.kind)"
     }
+  }
+}
+
+extension MessagePresentationWebSearch {
+  fileprivate func activityTitle(status: ToolStatus?) -> String {
+    let title: String
+    switch action {
+    case .openPage:
+      title = status == .finished ? "Read page" : status == .running ? "Reading page" : "Open page"
+    case .findInPage:
+      title =
+        status == .finished
+        ? "Searched page" : status == .running ? "Searching page" : "Search page"
+    default:
+      title =
+        status == .finished ? "Searched web" : status == .running ? "Searching web" : "Web search"
+    }
+    return title + (query.isEmpty ? "" : " " + query)
+  }
+}
+
+private struct ShellOutput: View {
+  let text: String
+  @ScaledMetric(relativeTo: .callout) private var lineHeight: CGFloat = 22
+
+  private var visibleLines: Int {
+    min(10, max(1, text.split(separator: "\n", omittingEmptySubsequences: false).count))
+  }
+
+  var body: some View {
+    ScrollView([.horizontal, .vertical]) {
+      Text(text).font(.system(.callout, design: .monospaced)).foregroundStyle(
+        .primary.opacity(0.75)
+      )
+      .fixedSize(horizontal: true, vertical: true).textSelection(.enabled)
+    }
+    .frame(height: CGFloat(visibleLines) * lineHeight + 4)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .messageTextActions(text)
   }
 }
 

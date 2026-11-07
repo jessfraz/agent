@@ -4,7 +4,10 @@ import PackageDescription
 let package = Package(
   name: "Agent",
   platforms: [.iOS(.v18), .macOS(.v15)],
-  products: [.library(name: "AgentUI", targets: ["AgentUI"])],
+  products: [
+    .library(name: "AgentCore", targets: ["AgentCore"]),
+    .library(name: "AgentUI", targets: ["AgentUI"]),
+  ],
   targets: [
     .target(name: "AgentCore"),
     .target(name: "AgentUI", dependencies: ["AgentCore"]),

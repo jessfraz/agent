@@ -4,6 +4,35 @@ import Testing
 @testable import AgentCore
 @testable import AgentUI
 
+@MainActor @Test func typedActivityLabelsDescribeTheActionWithoutClassifyingShellText() {
+  let command = MessagePresentation.command(.init(command: "cat example.rs"))
+  #expect(command.activityTitle(status: .finished) == "Ran cat example.rs")
+  #expect(command.activityTitle(status: .running) == "Running cat example.rs")
+  #expect(!command.activityTitle(status: .declined).hasPrefix("Ran "))
+  let edit = MessagePresentation.fileChanges(
+    .init(changes: [.init(operation: .update, path: "example.rs")]))
+  #expect(edit.activityTitle(status: .finished) == "Edited example.rs")
+  #expect(edit.activityTitle(status: .running) == "Editing example.rs")
+  #expect(!edit.activityTitle(status: .unknown).hasPrefix("Edited "))
+  let page = MessagePresentation.webSearch(.init(action: .openPage, query: "schema"))
+  #expect(page.activityTitle(status: .finished) == "Read page schema")
+  let find = MessagePresentation.webSearch(.init(action: .findInPage, query: "schema"))
+  #expect(find.activityTitle(status: .finished) == "Searched page schema")
+  let search = MessagePresentation.webSearch(.init(query: "schema"))
+  #expect(search.activityTitle(status: .finished) == "Searched web schema")
+}
+
+@MainActor @Test func shellResultsKeepKnownFailuresAndUnknownCompletionTruthful() {
+  #expect(ToolStatus.finished.commandResult(exitCode: 0) == "Success")
+  #expect(ToolStatus.finished.commandResult(exitCode: 7) == "Failed (exit 7)")
+  #expect(ToolStatus.finished.commandResult(exitCode: nil) == "Finished")
+  #expect(ToolStatus.running.commandResult(exitCode: 0) == "Running")
+  #expect(ToolStatus.failed.commandResult(exitCode: nil) == "Failed")
+  #expect(ToolStatus.unknown.commandResult(exitCode: nil) == "Status unavailable")
+  #expect(ToolStatus.interrupted.commandResult(exitCode: nil) == "Interrupted")
+  #expect(ToolStatus.declined.commandResult(exitCode: nil) == "Declined")
+}
+
 @MainActor @Test func activityGroupsPreserveChronologyAndEveryOriginalRow() {
   var transcript = Transcript()
   for (index, role) in [

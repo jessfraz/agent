@@ -27,11 +27,13 @@ printf 'Native validation phase: %s\n' "$phase"
 performance_test=pagedHistoryAndStreamingPreparationRemainBoundedAndKeepCanonicalIdentity
 if [[ "$phase" == all || "$phase" == host ]]; then
   plutil -lint "$native_dir/Agent.xcodeproj/project.pbxproj" \
-    "$native_dir/AgentApp/PrivacyInfo.xcprivacy" "$native_dir/TestFlightExport.plist"
+    "$native_dir/AgentApp/PrivacyInfo.xcprivacy" "$native_dir/TestFlightExport.plist" \
+    "$native_dir/AgentApp/Info.plist" "$native_dir/AgentApp/Agent.entitlements" \
+    "$native_dir/ShareExtension/Info.plist" "$native_dir/ShareExtension/Share.entitlements"
 
   # Rust's exporter owns Generated.swift and its formatting.
   xcrun swift-format lint --strict "$native_dir/Package.swift"
-  find "$native_dir/AgentApp" "$native_dir/Sources" "$native_dir/Tests" \
+  find "$native_dir/AgentApp" "$native_dir/ShareExtension" "$native_dir/Sources" "$native_dir/Tests" \
     -name '*.swift' ! -name Generated.swift -print0 \
     | xargs -0 xcrun swift-format lint --strict
   mkdir "$run_dir/macos-rendered"
@@ -156,10 +158,13 @@ for suite in "${suites[@]}"; do
         CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES test
       ;;
     rendering)
+      # App Group access is enforced in the simulator too. Ad-hoc signing
+      # supplies real entitlements without an Apple account or profile.
       xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
         -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
         -parallel-testing-enabled NO -test-timeouts-enabled YES -derivedDataPath "$run_dir/app" \
-        -resultBundlePath "$run_dir/ios-rendering-tests.xcresult" CODE_SIGNING_ALLOWED=NO test
+        -resultBundlePath "$run_dir/ios-rendering-tests.xcresult" \
+        CODE_SIGNING_ALLOWED=YES CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= test
       ;;
   esac
 done

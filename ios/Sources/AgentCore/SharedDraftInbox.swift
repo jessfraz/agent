@@ -58,8 +58,25 @@ public struct SharedDraftInbox: Sendable {
   @discardableResult public func enqueue(
     images: [ImportedImage], note: String = "", id: UUID = UUID()
   ) async throws -> UUID {
-    guard !images.isEmpty else { throw AttachmentError.invalidFile }
-    guard images.count <= AttachmentLimits.maximumCount else { throw AttachmentError.tooMany }
+    try await enqueue(images.map { .image($0) }, note: note, id: id)
+  }
+
+  @discardableResult public func enqueue(
+    attachments: [LocalAttachment], note: String = "", id: UUID = UUID()
+  ) async throws -> UUID {
+    try await enqueue(attachments.map { .file($0) }, note: note, id: id)
+  }
+
+  private enum Selection: Sendable {
+    case image(ImportedImage)
+    case file(LocalAttachment)
+  }
+
+  private func enqueue(_ selection: [Selection], note: String, id: UUID) async throws -> UUID {
+    guard !selection.isEmpty || !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      throw AttachmentError.invalidFile
+    }
+    guard selection.count <= AttachmentLimits.maximumCount else { throw AttachmentError.tooMany }
     guard note.utf8.count <= 64 * 1024 else { throw SharedDraftError.invalidBatch }
     try Task.checkCancellation()
     let lock = try acquire()
@@ -74,14 +91,24 @@ public struct SharedDraftInbox: Sendable {
     let pending = directory.appending(path: "\(id.uuidString).partial", directoryHint: .isDirectory)
     try makeDirectory(pending)
     defer { try? FileManager.default.removeItem(at: pending) }
-    let store = AttachmentStore(directory: pending.appending(path: "Files"))
+    let files = pending.appending(path: "Files")
+    try makeDirectory(files)
+    let store = AttachmentStore(directory: files)
     var references: [AttachmentRef] = []
-    for image in images {
+    for item in selection {
       try Task.checkCancellation()
-      let attachment = try await store.stage(
-        data: image.data, name: image.name, mediaType: image.mediaType)
+      let attachment: LocalAttachment
+      switch item {
+      case .image(let image):
+        attachment = try await store.stage(
+          data: image.data, name: image.name, mediaType: image.mediaType)
+      case .file(let file): attachment = try await store.adopt(file)
+      }
       references.append(attachment.reference)
       try synchronize(attachment.url.deletingLastPathComponent())
+    }
+    guard Set(references.map(\.id)).count == references.count else {
+      throw SharedDraftError.invalidBatch
     }
     try synchronize(pending.appending(path: "Files"))
     let manifest = Manifest(id: id, created: Date(), note: note, attachments: references)
@@ -164,9 +191,10 @@ public struct SharedDraftInbox: Sendable {
     guard data.count <= Self.maximumManifestBytes else { throw SharedDraftError.invalidBatch }
     let manifest = try JSONDecoder().decode(Manifest.self, from: data)
     guard manifest.id == id, manifest.note.utf8.count <= 64 * 1024,
-      (1...AttachmentLimits.maximumCount).contains(manifest.attachments.count),
-      Set(manifest.attachments.map(\.id)).count == manifest.attachments.count,
-      manifest.attachments.allSatisfy({ $0.mediaType == "image/jpeg" })
+      (0...AttachmentLimits.maximumCount).contains(manifest.attachments.count),
+      !manifest.attachments.isEmpty
+        || !manifest.note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+      Set(manifest.attachments.map(\.id)).count == manifest.attachments.count
     else { throw SharedDraftError.invalidBatch }
     return manifest
   }

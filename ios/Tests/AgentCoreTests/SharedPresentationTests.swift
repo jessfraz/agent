@@ -133,7 +133,10 @@ import Testing
       .agentCoordination(.init(action: .followup, agents: [], receiverThreadIds: ["child"])), "",
       "Queue agent input · Agent"
     ),
-    (.webSearch(.init(action: .openPage, query: "schema")), "https://example.invalid", "Open page"),
+    (
+      .webSearch(.init(action: .openPage, query: "schema")), "https://example.invalid",
+      "Open page schema"
+    ),
     (.media(.init(operation: .generate, status: "inProgress")), "", "Image generation"),
     (.plan, "1. **Keep** current work.", "Plan"),
     (.hookPrompt, "", "Historical hook prompt · inert"),

@@ -24,32 +24,25 @@ public enum ItemProviderImages {
           UTType($0)?.conforms(to: .image) == true
         })
       else { throw AttachmentError.invalidFile }
-      let load = ImageProviderLoad()
-      let image = try await withTaskCancellationHandler {
-        try await withCheckedThrowingContinuation { continuation in
-          guard load.begin(continuation) else { return }
-          let progress = provider.loadFileRepresentation(forTypeIdentifier: type) { url, error in
-            guard !load.isCancelled else { return }
-            do {
-              guard error == nil, let url else { throw AttachmentError.invalidFile }
-              let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-              guard values.isRegularFile == true else { throw AttachmentError.invalidFile }
-              guard (values.fileSize ?? Int.max) <= AttachmentLimits.maximumBytes else {
-                throw AttachmentError.tooLarge
-              }
-              let input = try FileHandle(forReadingFrom: url)
-              defer { try? input.close() }
-              let data = try input.read(upToCount: AttachmentLimits.maximumBytes + 1) ?? Data()
-              guard data.count <= AttachmentLimits.maximumBytes else {
-                throw AttachmentError.tooLarge
-              }
-              load.finish(.success(try prepare(data)))
-            } catch { load.finish(.failure(error)) }
-          }
-          load.setProgress(progress)
+      let image = try await ItemProviderLoad<ImportedImage>.read { load in
+        provider.loadFileRepresentation(forTypeIdentifier: type) { url, error in
+          guard !load.isCancelled else { return }
+          do {
+            guard error == nil, let url else { throw AttachmentError.invalidFile }
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            guard values.isRegularFile == true else { throw AttachmentError.invalidFile }
+            guard (values.fileSize ?? Int.max) <= AttachmentLimits.maximumBytes else {
+              throw AttachmentError.tooLarge
+            }
+            let input = try FileHandle(forReadingFrom: url)
+            defer { try? input.close() }
+            let data = try input.read(upToCount: AttachmentLimits.maximumBytes + 1) ?? Data()
+            guard data.count <= AttachmentLimits.maximumBytes else {
+              throw AttachmentError.tooLarge
+            }
+            load.finish(.success(try prepare(data)))
+          } catch { load.finish(.failure(error)) }
         }
-      } onCancel: {
-        load.cancel()
       }
       try Task.checkCancellation()
       images.append(image)
@@ -82,14 +75,27 @@ public enum ItemProviderImages {
 }
 
 /// The callback and task cancellation can win in either order, including before progress exists.
-private final class ImageProviderLoad: @unchecked Sendable {
+final class ItemProviderLoad<Value: Sendable>: @unchecked Sendable {
   private let lock = NSLock()
-  private var continuation: CheckedContinuation<ImportedImage, any Error>?
+  private var continuation: CheckedContinuation<Value, any Error>?
   private var progress: Progress?
   private var cancelled = false
 
+  @MainActor static func read(_ start: (ItemProviderLoad<Value>) -> Progress) async throws -> Value
+  {
+    let load = ItemProviderLoad<Value>()
+    return try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        guard load.begin(continuation) else { return }
+        load.setProgress(start(load))
+      }
+    } onCancel: {
+      load.cancel()
+    }
+  }
+
   var isCancelled: Bool { lock.withLock { cancelled } }
-  func begin(_ continuation: CheckedContinuation<ImportedImage, any Error>) -> Bool {
+  func begin(_ continuation: CheckedContinuation<Value, any Error>) -> Bool {
     let started = lock.withLock {
       if cancelled { return false }
       self.continuation = continuation
@@ -105,7 +111,7 @@ private final class ImageProviderLoad: @unchecked Sendable {
     }
     if cancel { progress.cancel() }
   }
-  func finish(_ result: Result<ImportedImage, any Error>) {
+  func finish(_ result: Result<Value, any Error>) {
     let continuation = lock.withLock {
       let owned = self.continuation
       self.continuation = nil
