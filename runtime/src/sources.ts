@@ -25,7 +25,10 @@ const OUTCOMES: SourceKey = { provider: "task_outcomes", account: "local" };
 function outcomeState(): SourceState { return { source: OUTCOMES, checkpoint: null, coverage: { status: "complete" }, checked_at: 0 }; }
 const Sources = defineDoc<Journal>({
   kind: "agent.sources", scope: "session", version: 1,
-  initial: () => ({ sources: [outcomeState()], events: [], conversation_id: null, active: null }), checkpointWhen: () => true,
+  initial: () => ({ sources: [outcomeState()], events: [], conversation_id: null, active: null }),
+  // Periodic bases would rewrite hundreds of MB on the shared session line.
+  // Keep native deltas; reopening replays their retained tail.
+  checkpointWhen: () => false,
 });
 function sameSource(left: SourceKey, right: SourceKey): boolean {
   return left.provider === right.provider && left.account === right.account;
