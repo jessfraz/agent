@@ -537,6 +537,7 @@ impl MessagesSource {
                         occurred_at: None,
                         id: message.id,
                         version,
+                        legacy_version: None,
                         source: SourceRef {
                             provider: "messages".into(),
                             account: self.key().account,

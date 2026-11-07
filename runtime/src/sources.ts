@@ -5,6 +5,7 @@ import { defineDoc, defineExtension, defineTool, LiveDoc, ROOT_CONVERSATION_ID, 
   type ConversationId, type Extension, type Harness, type TaskId, type TaskInspection, type Tx, type ToolExecutionResult } from "@earendil-works/pi-durable";
 import type { SourceBatch } from "./generated/SourceBatch.js";
 import type { SourceCheckpoint } from "./generated/SourceCheckpoint.js";
+import type { SourceCoverage } from "./generated/SourceCoverage.js";
 import type { SourceEvent } from "./generated/SourceEvent.js";
 import type { SourceKey } from "./generated/SourceKey.js";
 import type { SourceRef } from "./generated/SourceRef.js";
@@ -192,16 +193,55 @@ export class SourceJournal {
     const result = await this.session.commit(async (tx) => {
       const journal = await tx.doc(Sources);
       let new_events = 0;
+      // Validate the whole page before changing originals or their decisions.
+      // A broken provider version must not put every source into global backoff.
+      const originals = new Map<string, SourceEvent>();
+      const indices = new Map<string, number>();
+      const remaining = new Set<string>();
       for (const event of batch.events) {
+        remaining.add(eventKey(event));
+        if (event.legacy_version !== undefined) remaining.add(eventKey({ ...event, version: event.legacy_version }));
+      }
+      // Resolve only this page's identities in one pass over retained evidence.
+      for (const [index, record] of journal.events.entries()) {
+        if (remaining.size === 0) break;
+        if (remaining.delete(record.key)) indices.set(record.key, index);
+      }
+      const changed: string[] = [];
+      const conflict = batch.events.some((event) => {
         const key = eventKey(event);
-        const saved = journal.events.find((record) => record.key === key);
+        let original = originals.get(key);
+        if (original === undefined) {
+          const legacyVersion = event.legacy_version;
+          const legacyKey = legacyVersion === undefined ? undefined : eventKey({ ...event, version: legacyVersion });
+          const legacyIndex = legacyKey === undefined ? -1 : indices.get(legacyKey) ?? -1;
+          const index = indices.get(key) ?? -1;
+          original = journal.events[index]?.event;
+          const legacy = journal.events[legacyIndex]?.event;
+          // Upgrade a producer's version scheme without reopening an unchanged
+          // handled original. Exact current versions always take precedence.
+          const unchanged = index < 0 && legacyVersion !== undefined && legacy !== undefined &&
+            sameEvent(legacy, { ...event, version: legacyVersion });
+          indices.set(key, unchanged ? legacyIndex : index);
+        }
+        originals.set(key, event);
+        if (original === undefined || sameEvent(original, event)) return false;
+        if (original.source.thread_id !== event.source.thread_id) changed.push("thread_id");
+        if (original.title !== event.title) changed.push("title");
+        if (original.text !== event.text) changed.push("text");
+        return true;
+      });
+      for (const event of conflict ? [] : batch.events) {
+        const key = eventKey(event);
+        const saved = journal.events[indices.get(key) ?? -1];
         if (saved !== undefined) {
-          if (!sameEvent(saved.event, event)) throw new TaskError("A source version was reused for different content");
           // Enrich scheduling metadata without rewriting an admitted original.
           if (saved.event.occurred_at === undefined && saved.occurred_at === undefined && event.occurred_at !== undefined) {
             saved.occurred_at = event.occurred_at;
           }
-        } else { journal.events.push({ key, event, decision: null }); new_events += 1; }
+        } else {
+          journal.events.push({ key, event, decision: null }); indices.set(key, journal.events.length - 1); new_events += 1;
+        }
       }
       const previous = journal.sources.find((state) => sameSource(state.source, batch.source));
       const previousValue = checkpoint(previous?.checkpoint);
@@ -210,9 +250,12 @@ export class SourceJournal {
           coverage: { status: "unavailable", message: "The source cursor baseline changed; a current read is required" }, checked_at: Date.now() });
         return { new_events, checkpoint_advanced: false };
       }
-      const complete = batch.coverage.status === "complete" || batch.coverage.status === "more";
+      const coverage: SourceCoverage = conflict
+        ? { status: "unavailable", message: `Source content changed without a new version (${changed.join(", ")}); checkpoint retained.` }
+        : batch.coverage;
+      const complete = coverage.status === "complete" || coverage.status === "more";
       const next = complete ? batch.checkpoint ?? previous?.checkpoint ?? null : previous?.checkpoint ?? null;
-      const state: SourceState = { source: batch.source, checkpoint: next, coverage: batch.coverage, checked_at: Date.now() };
+      const state: SourceState = { source: batch.source, checkpoint: next, coverage, checked_at: Date.now() };
       if (previous === undefined) journal.sources.push(state);
       else Object.assign(previous, state);
       return { new_events, checkpoint_advanced: checkpoint(next) !== previousValue };

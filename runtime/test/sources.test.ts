@@ -252,7 +252,8 @@ test("stale and incomplete reads retain new events without rolling back canonica
     assert.equal(unavailable.state.checkpoint?.value, "a1"); assert.equal(unavailable.state.coverage.status, "unavailable");
     assert.equal((await app.sources.events({ pending: true })).length, 3);
     await assert.rejects(app.sources.admit(batch([event("wrong", "beta")], "bad"), { value: "a1" }), /identity/);
-    await assert.rejects(app.sources.admit(batch([event("new"), { ...event("one"), text: "Conflicting same version" }], "bad"), { value: "a1" }), /reused/);
+    const conflict = await app.sources.admit(batch([event("new"), { ...event("one"), text: "Conflicting same version" }], "bad"), { value: "a1" });
+    assert.equal(conflict.new_events, 0); assert.equal(conflict.state.coverage.status, "unavailable");
     assert.equal((await app.sources.events({ query: "new" })).length, 0);
     assert.equal((await app.sources.states()).find((state) => state.source.provider === "mail")?.checkpoint?.value, "a1");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }

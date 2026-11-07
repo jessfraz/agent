@@ -257,6 +257,12 @@ A long model turn cannot delay the next provider poll. Poll completion requests
 judgment; its own durable timer also handles due follow-ups and retries. The
 source journal retains one claimed batch across restart and retry.
 
+An immutable-version conflict marks only that source batch unavailable. It
+retains originals, decisions and the checkpoint while other sources continue.
+Slack revisions include normalized content because search results can omit edit
+metadata. An unchanged legacy snapshot reuses its admitted identity and decision;
+changed content receives a new revision.
+
 Messages reads use Rex Server's existing macOS permission identity. A short
 action starts a headless Rust helper; subsequent calls collect bounded chunks.
 The helper owns the read deadline and process group cleanup. Rex retains one
